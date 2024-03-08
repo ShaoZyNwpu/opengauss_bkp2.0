@@ -6,7 +6,7 @@
  * You may obtain a copy of Mulan PSL v2 at:
  *
  *          http://license.coscl.org.cn/MulanPSL2
- *
+ *resource_manager_context
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
@@ -175,5 +175,7 @@ extern void RequestPgwrSync(void);
 extern void PageWriterSync(void);
 extern bool PgwrForwardSyncRequest(const FileTag *ftag, SyncRequestType type);
 extern void PageWriterSyncWithAbsorption(void);
+extern long getPidOutput(double pid_input, double pid_target);
+extern void adpat_create_dirty_page_rate();
 
 #endif /* _PAGEWRITER_H */

@@ -2275,17 +2275,7 @@ bool dw_read_data_page(BufferTag buf_tag, SMgrRelation reln, char* data_block)
  */
 bool backend_can_flush_dirty_page()
 {
-    /*
-    if (dw_enabled() && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 0 &&
-        (t_thrd.proc->workingVersionNum < DW_SUPPORT_NEW_SINGLE_FLUSH ||
-        pg_atomic_read_u32(&g_instance.dw_single_cxt.dw_version) < DW_SUPPORT_NEW_SINGLE_FLUSH)) {
-        Assert(g_instance.dw_single_cxt.closed == 0);
-        return false;
-    }
-    return true;
-    */
-    //hpy改动
-    return false;
+    return g_instance.attr.attr_storage.enable_backend_flush_dirty_page;
 }
 
 void init_proc_dw_buf()

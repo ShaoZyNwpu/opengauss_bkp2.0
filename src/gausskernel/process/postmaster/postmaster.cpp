@@ -83,6 +83,8 @@
 #include "access/obs/obs_am.h"
 #include "access/transam.h"
 #include "access/ustore/undo/knl_uundoapi.h"
+#include "workload/resource_manager.h"
+
 #include "access/xlog.h"
 #include "access/xact.h"
 #include "bootstrap/bootstrap.h"
@@ -3299,7 +3301,11 @@ static int ServerLoop(void)
             g_instance.pid_cxt.TsCompactionAuxiliaryPID == 0) {
             g_instance.pid_cxt.TsCompactionAuxiliaryPID = initialize_util_thread(TS_COMPACTION_AUXILIAY);
         }
-#endif   /* ENABLE_MULTIPLE_NODES */
+#endif   /* ENABLE_MULTIPLE_NODES */ //!g_instance.is_aux_db
+        if(g_instance.attr.attr_storage.enable_ustore  && (pmState == PM_RUN) &&
+        g_instance.pid_cxt.ResourceManagerPID == 0 && u_sess->attr.attr_common.upgrade_mode != 1){
+            g_instance.pid_cxt.ResourceManagerPID = initialize_util_thread(RESOURCE_MANAGER);
+        }
         /* TDE cache timer checking */
         if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
             /* TDE cache watchdog */
@@ -11677,6 +11683,8 @@ static void SetAuxType()
             t_thrd.bootstrap_cxt.MyAuxProcType = TsCompactionAuxiliaryProcess;
             break;
 #endif   /* ENABLE_MULTIPLE_NODES */
+        case RESOURCE_MANAGER:
+            t_thrd.bootstrap_cxt.MyAuxProcType = ResourceManagerProcess;
         default:
             ereport(ERROR, (errmsg("unrecorgnized proc type %d", thread_role)));
     }
@@ -11980,6 +11988,11 @@ int GaussDbAuxiliaryThreadMain(knl_thread_arg* arg)
             proc_exit(1);
             break;
 #endif   /* ENABLE_MULTIPLE_NODES */
+        case RESOURCE_MANAGER:{
+            resource_manager_main();
+            proc_exit(1);
+            break;
+        }
         default:
             ereport(PANIC, (errmsg("unrecognized process type: %d", (int)t_thrd.bootstrap_cxt.MyAuxProcType)));
             proc_exit(1);
@@ -12209,6 +12222,7 @@ int GaussDbThreadMain(knl_thread_arg* arg)
         case THREADPOOL_SCHEDULER:
         case LOGICAL_READ_RECORD:
         case PARALLEL_DECODE:
+        case RESOURCE_MANAGER:
         case UNDO_RECYCLER: {
             SetAuxType<thread_role>();
             /* Restore basic shared memory pointers */
@@ -12705,7 +12719,7 @@ static ThreadMetaData GaussdbThreadGate[] = {
     { GaussDbThreadMain<SHARE_STORAGE_XLOG_COPYER>, SHARE_STORAGE_XLOG_COPYER, "xlogcopyer", "xlog copy backend" },
     { GaussDbThreadMain<APPLY_LAUNCHER>, APPLY_LAUNCHER, "applylauncher", "apply launcher" },
     { GaussDbThreadMain<APPLY_WORKER>, APPLY_WORKER, "applyworker", "apply worker" },
-
+    { GaussDbThreadMain<RESOURCE_MANAGER>, RESOURCE_MANAGER, "resourcemanager", "resource manager" }
     /* Keep the block in the end if it may be absent !!! */
 #ifdef ENABLE_MULTIPLE_NODES
     { GaussDbThreadMain<BARRIER_PREPARSE>, BARRIER_PREPARSE, "barrierpreparse", "barrier preparse backend" },

@@ -90,7 +90,7 @@ static void init_candidate_list();
 static uint32 incre_ckpt_pgwr_flush_dirty_page(WritebackContext wb_context,
     const CkptSortItem *dirty_buf_list, int start, int batch_num);
 static int incre_ckpt_pgwr_flush_dirty_queue(WritebackContext wb_context);
-static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext wb_context);
+static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext wb_context); 
 static bool push_to_candidate_list(BufferDesc *buf_desc);
 static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 max_flush_num,
     bool *contain_hashbucket);
@@ -470,6 +470,8 @@ bool push_pending_flush_queue(Buffer buffer)
     BufferDesc* buf_desc = GetBufferDescriptor(buffer - 1);
     bool push_finish = false;
 
+    pg_usleep(g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep);
+
     Assert(XLogRecPtrIsInvalid(pg_atomic_read_u64(&buf_desc->rec_lsn)));
 #if defined(__x86_64__) || defined(__aarch64__)
     push_finish = atomic_push_pending_flush_queue(buffer, &queue_head_lsn, &new_tail_loc);
@@ -571,31 +573,10 @@ static uint32 ckpt_get_expected_flush_num()
     if (flush_num < DW_DIRTY_PAGE_MAX_FOR_NOHBK) {
         flush_num = DW_DIRTY_PAGE_MAX_FOR_NOHBK;
     }
+  
+    g_instance.resource_manager_cxt.expected_flush_num = (uint32)Min(expected_flush_num, flush_num);
 
-    /*
-    freopen("expected_flush_num.txt","a",stdout);
-    printf("%d\n",expected_flush_num);
-    fclose(stdout);
-    freopen("flush_num.txt","a",stdout);
-    printf("%d\n",flush_num);
-    fclose(stdout);	
-    
-
-    FILE *fp=fopen("/home/jianghp/opengauss_lc/openGauss-server-3.0.0/src/gausskernel/process/postmaster/expected_flush_num.txt","a");
-    if(fp){
-	fprintf(fp,"%d\n",expected_flush_num);
-	fclose(fp);
-    }
-    fp=fopen("/home/jianghp/opengauss_lc/openGauss-server-3.0.0/src/gausskernel/process/postmaster/flush_num.txt","a");
-    if(fp){
-	fprintf(fp,"%d\n",flush_num);
-	fclose(fp);
-    }
-
-    */	    
-
-    
-    return 1000000;
+    return g_instance.resource_manager_cxt.expected_flush_num;
 }
 
 /**
@@ -1780,37 +1761,17 @@ void ckpt_pagewriter_main(void)
             }
 
             //改动，统计每批脏页产生数量及刷每批脏页的时间
-           uint64  begin_time=get_time_ms();
-            g_instance.ckpt_cxt_ctl->create_dirty_page_num=0;
+            uint64  begin_time=get_time_ms();
+            
             
             ckpt_pagewriter_main_thread_loop();
             
             
             uint64 end_time=get_time_ms();
             auto time_diff=end_time-begin_time;
-            ereport(LOG, (errmodule(MOD_INCRE_CKPT),
-                errmsg("HPY_OUTPUT: create_dirty_page_num is :%u, page_writer_last_flush is %u,"
-                        "main and sub time is %lu,candidate_num:%lu,avg_dirty:%lu,avg_flush_dirty:%lu,avg_candidate:%lu,"
-                        "buffer_sync_flush_one_time:%lu",
-                        g_instance.ckpt_cxt_ctl->create_dirty_page_num,
-                        g_instance.ckpt_cxt_ctl->page_writer_last_flush,
-                        end_time-begin_time,
-                        g_instance.ckpt_cxt_ctl->push_to_candidate,
-                        g_instance.ckpt_cxt_ctl->create_dirty_page_num/time_diff*1000,
-                        g_instance.ckpt_cxt_ctl->page_writer_last_flush/time_diff*1000,
-                        g_instance.ckpt_cxt_ctl->push_to_candidate/time_diff*1000,
-                        g_instance.ckpt_cxt_ctl->smgrwrite_time)));         
-
-            /*
-            FILE *fp=fopen("/home/jianghp/opengauss_lc/openGauss-server-3.0.0/src/gausskernel/process/postmaster/create_dirty_page_num_and_time_diff.txt","a");
-            if(fp){
-                fprintf(fp,"num:%d\n",g_instance.ckpt_cxt_ctl->create_dirty_page_num);
-                fprintf(fp,"time:%d\n",end_time-begin_time);
-		fclose(fp);         
-        
-            }
-
-            */
+            double page_writer_last_flush_per_second = time_diff == 0 ? 0 : (double)g_instance.ckpt_cxt_ctl->page_writer_last_flush/(time_diff/1000.0);
+            g_instance.ckpt_cxt_ctl->consumer_speed = page_writer_last_flush_per_second;
+            g_instance.ckpt_cxt_ctl->flush_total = 0;
         } else {
             ckpt_pagewriter_sub_thread_loop();
         }
@@ -2037,6 +1998,7 @@ static uint32 incre_ckpt_pgwr_flush_dirty_page(WritebackContext wb_context,
         if ((sync_state & BUF_WRITTEN)) {
             num_actual_flush++;
         }
+        (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->flush_total, 1);
     }
     return num_actual_flush;
 }
@@ -2163,6 +2125,7 @@ static void incre_ckpt_pgwr_flush_dirty_list(WritebackContext wb_context, uint32
         num_actual_flush += flush_num;
     }
     (void)pg_atomic_fetch_add_u64(&g_instance.ckpt_cxt_ctl->page_writer_actual_flush, num_actual_flush);
+    (void)pg_atomic_fetch_add_u64(&g_instance.resource_manager_cxt.buffer_pool_flush_num, num_actual_flush);
     (void)pg_atomic_fetch_add_u32(&g_instance.ckpt_cxt_ctl->page_writer_last_flush, num_actual_flush);
 
     uint32 candidate_count=0;
@@ -2286,7 +2249,7 @@ static uint32 get_list_flush_num(bool is_segment)
  * @Description: First , the pagewriter sub thread scan the normal buffer pool,
  *            then scan the segment buffer pool.
  */
-const int MAX_SCAN_BATCH_NUM = 131072 * 10; /* 10GB buffers */
+const int MAX_SCAN_BATCH_NUM = 131072 * 20; /* 20GB buffers */
 static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext wb_context)
 {
     int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
@@ -2441,14 +2404,13 @@ UNLOCK:
 
 static bool push_to_candidate_list(BufferDesc *buf_desc)
 {
-    bool ret=false;
     uint32 thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
     int buf_id = buf_desc->buf_id;
     uint32 buf_state = pg_atomic_read_u32(&buf_desc->state);
     bool emptyUsageCount = (!NEED_CONSIDER_USECOUNT || BUF_STATE_GET_USAGECOUNT(buf_state) == 0);
 
     if (BUF_STATE_GET_REFCOUNT(buf_state) > 0 || !emptyUsageCount) {
-        return ret;
+        return false;
     }
 
     if (g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] == false) {
@@ -2462,12 +2424,11 @@ static bool push_to_candidate_list(BufferDesc *buf_desc)
                     seg_candidate_buf_push(buf_id, thread_id);
                 }
                 g_instance.ckpt_cxt_ctl->candidate_free_map[buf_id] = true;
-                ret=true;
             }
         }
         UnlockBufHdr(buf_desc, buf_state);
     }
-    return ret;
+    return true;
 }
 
 

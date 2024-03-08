@@ -92,6 +92,8 @@ const uint32 PARALLEL_DECODE_WORKER_EXIT = 3;
 const int DB_CMPT_MAX = 4;
 #endif
 
+#define MAX_PRODUCER_SPEED_SIZE 100
+
 enum knl_virtual_role {
     VUNKNOWN = 0,
     VCOORDINATOR = 1,
@@ -201,6 +203,7 @@ typedef struct knl_g_pid_context {
     ThreadId LogicalDecoderWorkerPID;
     ThreadId BarrierPreParsePID;
     ThreadId ApplyLauncerPID;
+    ThreadId ResourceManagerPID;
 } knl_g_pid_context;
 
 typedef struct {
@@ -493,8 +496,19 @@ typedef struct knl_g_ckpt_context {
     PageWriterProcs pgwr_procs;
     volatile uint32 page_writer_last_flush;
     volatile uint32 page_writer_last_queue_flush;
-    //hpy改动，新增变量create_dirty_page_num统计每批产生脏页数量,以及统计smgrwrite和writeback时间的变量
+    // for resource manager
     volatile uint32 create_dirty_page_num;
+    volatile uint64 producer_speed_array[MAX_PRODUCER_SPEED_SIZE];
+    int producer_speed_count;
+    volatile uint64 producer_speed;
+    volatile uint64 consumer_speed;
+    volatile long push_pending_flush_queue_sleep;
+    volatile long pow_count;
+    volatile double last_pc_rate;
+    volatile double last_pid_error;
+    volatile uint64 last_time;
+    uint64 flush_total;
+    
     uint64 smgrwrite_time;
     uint64 writeback_time;
     Buffer *candidate_buffers;
@@ -539,6 +553,28 @@ typedef struct recovery_dw_buf {
     volatile uint16 write_pos;
     bool *single_flush_state;
 } recovery_dw_buf;
+
+typedef struct knl_g_resource_manager_context{
+    volatile PgBackendStatus* resourceManagerBEEntry;
+    double producer_v;
+    double producer_consumer_ratio;
+    double sleep_ratio;
+    double func_output;
+    pg_atomic_uint64 buffer_pool_flush_num;
+    double time_to_fill_candidate_slot;
+    double time_to_fill_dirty_page_queue;
+    double time_to_fill_buffer_zone;
+    uint64 last_dirty_page_queue_capacity;
+    uint64 last_candidate_slot_capacity;
+    double last_timestamp_calculate_sleep_time;
+    double last_dirty_page_queue_change_speed;
+    double last_candidate_slot_change_speed;
+    double last_dirty_page_queue_speed_diff;
+    double last_candidate_slot_speed_diff;
+    double last_speed_diff;
+
+    uint32 expected_flush_num;
+}knl_g_resource_manager_context;
 
 typedef struct dw_batch_file_context{
     int id;
@@ -1223,6 +1259,7 @@ typedef struct knl_instance_context {
 #endif
     pg_atomic_uint32 extensionNum;
     knl_g_audit_context audit_cxt;
+    knl_g_resource_manager_context resource_manager_cxt;
 } knl_instance_context;
 
 extern long random();

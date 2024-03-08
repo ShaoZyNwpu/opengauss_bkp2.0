@@ -413,7 +413,7 @@ static TransactionId GetForceRecycleXid(TransactionId oldestXmin, int retry)
 static void UndoRecycleSigHupHandler(SIGNAL_ARGS)
 {
     int save_errno = errno;
-    t_thrd.undorecycler_cxt.got_SIGHUP = true;
+    t_thrd.resource_manager_cxt.got_SIGHUP = true;
     if (t_thrd.proc)
         SetLatch(&t_thrd.proc->procLatch);
     errno = save_errno;

@@ -411,6 +411,10 @@ typedef struct knl_t_xact_context {
     Oid ActiveLobRelid;
     bool isSelectInto;
 } knl_t_xact_context;
+typedef struct knl_t_resource_manager_context{
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+}knl_t_resource_manager_context;
 
 typedef struct RepairBlockKey RepairBlockKey;
 typedef void (*RedoInterruptCallBackFunc)(void);
@@ -3369,6 +3373,7 @@ typedef struct knl_thrd_context {
     knl_t_statement_context statement_cxt;
     knl_t_streaming_context streaming_cxt;
     knl_t_csnmin_sync_context csnminsync_cxt;
+    
 #ifdef ENABLE_MOT
     knl_t_mot_context mot_cxt;
 #endif
@@ -3387,6 +3392,7 @@ typedef struct knl_thrd_context {
     knl_t_apply_launcher_context applylauncher_cxt;
     knl_t_apply_worker_context applyworker_cxt;
     knl_t_publication_context publication_cxt;
+    knl_t_resource_manager_context resource_manager_cxt;
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT

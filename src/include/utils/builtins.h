@@ -1687,7 +1687,10 @@ extern Datum pg_get_publication_tables(PG_FUNCTION_ARGS);
 
 /* launcher.cpp */
 extern Datum pg_stat_get_subscription(PG_FUNCTION_ARGS);
+/*resource maneger.cpp*/
+extern Datum gs_stat_resource_manager(PG_FUNCTION_ARGS);
 
 #endif /* !FRONTEND_PARSER */
+
 
 #endif /* BUILTINS_H */
