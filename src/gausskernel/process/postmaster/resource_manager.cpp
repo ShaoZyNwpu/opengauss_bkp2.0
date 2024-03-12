@@ -31,7 +31,7 @@ const float PAGE_QUEUE_SLOT_USED_MAX_PERCENTAGE = 0.8;
 
 void resource_manager_sigh_up_handler();
 void resource_manager_sigterm_handler();
-void quick_die();
+void quick_die(SIGNAL_ARGS);
 void shutdown_resource_manager();
 void adapt_create_dirty_page_rate();
 void resource_manager_main();
@@ -169,6 +169,10 @@ void adapt_create_dirty_page_rate(){
     pg_usleep(adapt_period);
 }
 void resource_manager_main(){
+      ereport(LOG,
+            (errmodule(MOD_INCRE_CKPT),
+                errmsg("resource_manager_main start")));
+    
     sigjmp_buf local_sigjmp_buf;
     t_thrd.shemem_ptr_cxt.MyBEEntry->st_userid = BOOTSTRAP_SUPERUSERID;
     g_instance.resource_manager_cxt.resourceManagerBEEntry = t_thrd.shemem_ptr_cxt.MyBEEntry;

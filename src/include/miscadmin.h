@@ -454,6 +454,7 @@ typedef enum {
     AsyncIOCompleterProcess,
     TpoolSchdulerProcess,
     UndoRecyclerProcess,
+    ResourceManagerProcess,
     TsCompactionProcess,
     TsCompactionAuxiliaryProcess,
     XlogCopyBackendProcess,
@@ -471,9 +472,7 @@ typedef enum {
     TsCompactionConsumerProcess,
     CsnMinSyncProcess,
     ParallelDecodeProcess,
-    LogicalReadRecord,
-    ResourceManagerProcess,
-    
+    LogicalReadRecord,    
     NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
 

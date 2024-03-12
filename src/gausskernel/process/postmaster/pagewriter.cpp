@@ -90,7 +90,7 @@ static void init_candidate_list();
 static uint32 incre_ckpt_pgwr_flush_dirty_page(WritebackContext wb_context,
     const CkptSortItem *dirty_buf_list, int start, int batch_num);
 static int incre_ckpt_pgwr_flush_dirty_queue(WritebackContext wb_context);
-static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext wb_context); 
+static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext wb_context);
 static bool push_to_candidate_list(BufferDesc *buf_desc);
 static uint32 get_candidate_buf_and_flush_list(uint32 start, uint32 end, uint32 max_flush_num,
     bool *contain_hashbucket);
@@ -335,7 +335,7 @@ void candidate_buf_init(void)
     if (!ENABLE_INCRE_CKPT) {
         return;
     }
-    /*
+    /*`
      * Each thread manages a part of the buffer. Several slots are reserved to
      * prevent the thread first and last slots equals.
      */
@@ -2011,20 +2011,6 @@ static int incre_ckpt_pgwr_flush_dirty_queue(WritebackContext wb_context)
     uint32 start_loc = pgwr->start_loc;
     int need_flush_num = pgwr->need_flush_num;
 
-    /*
-    freopen("queue_need_flush_num.txt","a",stdout);
-    printf("%d\n",need_flush_num);
-    fclose(stdout);
-    
-
-    FILE *fp=fopen("/home/jianghp/opengauss_lc/openGauss-server-3.0.0/src/gausskernel/process/postmaster/queue_need_flush_num.txt","a");
-    if(fp){
-	fprintf(fp,"%d\n",need_flush_num);
-	fclose(fp);
-    }
-    */    
-
-    //need_flush_num=1000000;
     //hpy改动
     int dw_batch_page_max = GET_DW_DIRTY_PAGE_MAX(is_new_relfilenode);
     //int dw_batch_page_max = 8000;
@@ -2081,21 +2067,6 @@ static int incre_ckpt_pgwr_flush_dirty_queue(WritebackContext wb_context)
 static void incre_ckpt_pgwr_flush_dirty_list(WritebackContext wb_context, uint32 need_flush_num,
     bool is_new_relfilenode)
 {
-    //need_flush_num=1000000;
-    
-    /*
-    freopen("list_need_flush_num.txt","a",stdout);
-    printf("%d\n",need_flush_num);
-    fclose(stdout);
-    
- 
-    FILE *fp=fopen("/home/jianghp/opengauss_lc/openGauss-server-3.0.0/src/gausskernel/process/postmaster/list_need_flush_num.txt","a");
-    if(fp){
-	fprintf(fp,"%d\n",need_flush_num);
-	fclose(fp);
-    }
-    */    
-
     int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
     PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
     CkptSortItem *dirty_buf_list = pgwr->dirty_buf_list;
@@ -2294,9 +2265,9 @@ static void incre_ckpt_pgwr_scan_buf_pool(WritebackContext wb_context)
         } else {
             pgwr->next_scan_seg_loc = end;
         }
-        if (need_flush_num > 0) {
-            incre_ckpt_pgwr_flush_dirty_list(wb_context, need_flush_num, is_new_relfilenode);
-        }
+        // if (need_flush_num > 0) {
+        //     incre_ckpt_pgwr_flush_dirty_list(wb_context, need_flush_num, is_new_relfilenode);
+        // }
     }
     return;
 }

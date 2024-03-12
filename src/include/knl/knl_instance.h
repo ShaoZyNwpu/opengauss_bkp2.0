@@ -196,6 +196,7 @@ typedef struct knl_g_pid_context {
     ThreadId GlobalStatsPID;
     ThreadId* CommReceiverPIDS;
     ThreadId UndoRecyclerPID;
+    ThreadId ResourceManagerPID;
     ThreadId TsCompactionPID;
     ThreadId TsCompactionAuxiliaryPID;
     ThreadId sharedStorageXlogCopyThreadPID;
@@ -203,7 +204,6 @@ typedef struct knl_g_pid_context {
     ThreadId LogicalDecoderWorkerPID;
     ThreadId BarrierPreParsePID;
     ThreadId ApplyLauncerPID;
-    ThreadId ResourceManagerPID;
 } knl_g_pid_context;
 
 typedef struct {

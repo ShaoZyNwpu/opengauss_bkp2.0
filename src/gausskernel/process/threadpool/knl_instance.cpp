@@ -757,7 +757,6 @@ void knl_g_resource_manager_init(knl_g_resource_manager_context* resource_manage
     resource_manager_cxt->last_dirty_page_queue_speed_diff = 0;
     resource_manager_cxt->last_candidate_slot_speed_diff = 0;
     resource_manager_cxt->last_speed_diff = 0;
-
     resource_manager_cxt->expected_flush_num = 0;
 }
 
