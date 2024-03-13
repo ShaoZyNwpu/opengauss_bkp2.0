@@ -64,7 +64,7 @@ void shutdown_resource_manager(){
     // resbookkeeper_release(t_thrd.utils_cxt.CurrentResourceOwner, RESOUCE_RELEASE_BEFORE_LOCKS, false, true);
     proc_exit(0);
 }
-void adapt_create_dirty_page_rate(){
+void adapt_create_dirty_page_rate() {
     uint64 curr_dirty_page_queue_capacity = g_instance.ckpt_cxt_ctl->dirty_page_queue_size * PAGE_QUEUE_SLOT_USED_MAX_PERCENTAGE - get_dirty_page_num();
     uint64 curr_candidate_slot_capacity = get_curr_candidate_nums(false);
     uint64 curr_timestamp = get_time_ms();
@@ -74,87 +74,50 @@ void adapt_create_dirty_page_rate(){
 
     uint64 time_diff = curr_timestamp - g_instance.resource_manager_cxt.last_timestamp_calculate_sleep_time;
 
-    double dirty_page_queue_change_speed = (double)dirty_page_queue_capacity_change_num / ((double)time_diff/1000.0);
-    double candidate_slot_change_speed = (double)candidate_slot_capacity_change_num / ((double)time_diff/1000.0);
-
-    double delta_dirty_page_queue_change_speed = dirty_page_queue_change_speed - g_instance.resource_manager_cxt.last_dirty_page_queue_change_speed;
-    double delta_candidate_slot_change_speed = candidate_slot_change_speed - g_instance.resource_manager_cxt.last_candidate_slot_change_speed;
-
-    double dirty_page_queue_change_speed_change_speed_differentiation = (double)delta_dirty_page_queue_change_speed / (double)time_diff;
-    double candidate_slot_change_speed_change_speed_differentiation = (double)delta_candidate_slot_change_speed / (double)time_diff;
-
-    g_instance.resource_manager_cxt.last_dirty_page_queue_speed_diff = dirty_page_queue_change_speed_change_speed_differentiation;
-    g_instance.resource_manager_cxt.last_candidate_slot_speed_diff = candidate_slot_change_speed_change_speed_differentiation;
-
-    if(dirty_page_queue_change_speed_change_speed_differentiation < 0){
-        dirty_page_queue_change_speed_change_speed_differentiation = 0;
-    }
-    if(candidate_slot_change_speed_change_speed_differentiation < 0){
-        candidate_slot_change_speed_change_speed_differentiation = 0;
-    }
-
-    const double MAX_REMAIN_TIME = 40.0;
-    const double MIN_REMIAN_TIME = 1.0;
-
-    double dirty_page_queue_remain_time = (double)curr_dirty_page_queue_capacity / (double)dirty_page_queue_change_speed;
-    if(dirty_page_queue_change_speed <= 0){
-        dirty_page_queue_remain_time = MAX_REMAIN_TIME;
-    }
-
-    if(dirty_page_queue_remain_time > MAX_REMAIN_TIME){
-        dirty_page_queue_remain_time = MAX_REMAIN_TIME;
-    }else if(dirty_page_queue_remain_time < MIN_REMIAN_TIME){
-        dirty_page_queue_remain_time = MIN_REMIAN_TIME;
-    }
-
-    g_instance.resource_manager_cxt.time_to_fill_dirty_page_queue = dirty_page_queue_remain_time;
-
-    double sleep_time = 0;
-    bool sleep_is_zero = false;
-
-    const double unit_sleep_time = 100; // 100 us
-
-    if((candidate_slot_change_speed == 0 && curr_candidate_slot_capacity == 0) || (dirty_page_queue_remain_time && curr_dirty_page_queue_capacity == 0)){
-        sleep_is_zero = true;
-        sleep_time = unit_sleep_time;
-    }
-    double candidate_slot_remain_time = (double) curr_candidate_slot_capacity / (double)candidate_slot_change_speed;
-
-    if(candidate_slot_change_speed <= 0){
-        candidate_slot_remain_time = MAX_REMAIN_TIME;
-    }
-    if(candidate_slot_remain_time > MAX_REMAIN_TIME){
-        candidate_slot_remain_time = MAX_REMAIN_TIME;
-    }else if(candidate_slot_remain_time < MIN_REMIAN_TIME){
-        candidate_slot_remain_time = MIN_REMIAN_TIME;
-    }
-    g_instance.resource_manager_cxt.time_to_fill_candidate_slot = candidate_slot_remain_time;
-
-    double time_to_fill_buffer_zone = MAX_REMAIN_TIME;
-    if(dirty_page_queue_remain_time != 0 &&candidate_slot_remain_time != 0){
-        time_to_fill_buffer_zone = MIN(dirty_page_queue_remain_time, candidate_slot_remain_time);
-    }else if(dirty_page_queue_remain_time == 0 &&candidate_slot_remain_time == 0){
-        time_to_fill_buffer_zone = dirty_page_queue_remain_time + candidate_slot_remain_time;
-    }
-    time_to_fill_buffer_zone /= MAX_REMAIN_TIME;
-    g_instance.resource_manager_cxt.time_to_fill_buffer_zone = time_to_fill_buffer_zone;
+    double dirty_page_queue_change_speed = (double)dirty_page_queue_capacity_change_num / ((double)time_diff / 1000.0);
+    double candidate_slot_change_speed = (double)candidate_slot_capacity_change_num / ((double)time_diff / 1000.0);
 
     double adapt_period = g_instance.attr.attr_storage.adapt_period; // 1s
 
-    double speed_differentiation = dirty_page_queue_change_speed_change_speed_differentiation;
-    if(dirty_page_queue_remain_time == candidate_slot_remain_time){
-        speed_differentiation = candidate_slot_change_speed_change_speed_differentiation;
+    const double unit_sleep_time = 100; // 100 us
+    const double MIN_SLEEP_TIME = 10;
+    // 设置睡眠时间为上一次的睡眠时间
+    double sleep_time = g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep;
+    if(sleep_time < MIN_SLEEP_TIME){
+        sleep_time = MIN_SLEEP_TIME;
     }
+    /* 新算法 方案一*/
+    // 快速启动: 指数增长，条件：candidate仍在消耗
+    if (candidate_slot_change_speed > 0) {
+        sleep_time *= 2;
+    } else{
+    // 拥塞避免: 线性增/减,条件：candidate不消耗(candidate_slot_change_speed <= 0)
+    if (curr_candidate_slot_capacity > 0.2 * TOTAL_BUFFER_NUM) { // candidate_slot 仍剩余 20% 以上
+        sleep_time -= unit_sleep_time;
+    } else { // candidate_slot 不足 20%, 这里可以考虑sleep_time不变
+        sleep_time += unit_sleep_time;
+    }
+}
+    /* 新算法 方案二(加入门限sleep_time_threshold)*/
+    /*
+    // 快速启动: 指数增长，条件：candidate仍在消耗并且sleep_time没有超过门限
+    double threshold = g_instance.ckpt_cxt_ctl->sleep_time_threshold;
+    if (candidate_slot_change_speed > 0 && sleep_time < threshold) {
+        sleep_time += g_instance.ckpt_cxt_ctl->sleep_time_exponential_step;
+        g_instance.ckpt_cxt_ctl->sleep_time_step *= 2;
+    } else if(candidate_slot_change_speed <= 0 || sleep_time >= threshold) {
+        // 拥塞避免: 线性增/减，条件：candidate不消耗或sleep_time超过门限
 
-    if(speed_differentiation > 0){
-        g_instance.resource_manager_cxt.last_speed_diff += unit_sleep_time;
-    }else{
-        g_instance.resource_manager_cxt.last_speed_diff = 0;
-    }
+        // 更新门限为上一次的sleep_time值
+        g_instance.ckpt_cxt_ctl->sleep_time_threshold = g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep - g_instance.ckpt_cxt_ctl->sleep_time_step/2;
 
-    if(time_to_fill_buffer_zone < MAX_REMAIN_TIME && !sleep_is_zero){
-        sleep_time = unit_sleep_time / time_to_fill_buffer_zone + g_instance.resource_manager_cxt.last_speed_diff;
+        if (curr_candidate_slot_capacity > 0.2 * TOTAL_BUFFER_NUM) { // candidate_slot 仍剩余 20% 以上
+            sleep_time -= unit_sleep_time;
+        } else {
+            sleep_time += unit_sleep_time;
+        }
     }
+*/
 
     g_instance.resource_manager_cxt.last_dirty_page_queue_capacity = curr_dirty_page_queue_capacity;
     g_instance.resource_manager_cxt.last_candidate_slot_capacity = curr_candidate_slot_capacity;
@@ -162,17 +125,11 @@ void adapt_create_dirty_page_rate(){
     g_instance.resource_manager_cxt.last_dirty_page_queue_change_speed = dirty_page_queue_change_speed;
     g_instance.resource_manager_cxt.last_candidate_slot_change_speed = candidate_slot_change_speed;
 
-    g_instance.resource_manager_cxt.last_timestamp_calculate_sleep_time = curr_timestamp;
-
     g_instance.ckpt_cxt_ctl->push_pending_flush_queue_sleep = sleep_time;
 
     pg_usleep(adapt_period);
 }
 void resource_manager_main(){
-      ereport(LOG,
-            (errmodule(MOD_INCRE_CKPT),
-                errmsg("resource_manager_main start")));
-    
     sigjmp_buf local_sigjmp_buf;
     t_thrd.shemem_ptr_cxt.MyBEEntry->st_userid = BOOTSTRAP_SUPERUSERID;
     g_instance.resource_manager_cxt.resourceManagerBEEntry = t_thrd.shemem_ptr_cxt.MyBEEntry;
