@@ -205,6 +205,8 @@ typedef struct knl_instance_attr_storage {
     int wal_flush_delay;
     int max_logical_replication_workers;
     char *redo_bind_cpu_attr;
+    bool enable_backend_flush_dirty_page;
+    int64 adapt_period;
     int max_active_gtt;
 #ifndef ENABLE_MULTIPLE_NODES
     bool enable_save_confirmed_lsn;

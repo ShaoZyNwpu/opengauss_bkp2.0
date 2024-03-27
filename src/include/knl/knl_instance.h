@@ -91,6 +91,7 @@ const int MAX_AUDIT_NUM = 48;
 #ifndef ENABLE_MULTIPLE_NODES
 const int DB_CMPT_MAX = 4;
 #endif
+#define MAX_PRODUCER_SPEED_SIZE 100
 
 enum knl_virtual_role {
     VUNKNOWN = 0,
@@ -209,6 +210,7 @@ typedef struct knl_g_pid_context {
     ThreadId GlobalStatsPID;
     ThreadId* CommReceiverPIDS;
     ThreadId UndoRecyclerPID;
+    ThreadId ResourceManagerPID;
     ThreadId TsCompactionPID;
     ThreadId TsCompactionAuxiliaryPID;
     ThreadId sharedStorageXlogCopyThreadPID;
@@ -525,6 +527,19 @@ typedef struct knl_g_ckpt_context {
     PageWriterProcs pgwr_procs;
     volatile uint32 page_writer_last_flush;
     volatile uint32 page_writer_last_queue_flush;
+    // for resource manager
+    volatile uint32 create_dirty_page_num;
+    volatile uint64 producer_speed_array[MAX_PRODUCER_SPEED_SIZE];
+    int producer_speed_count;
+    volatile uint64 producer_speed;
+    volatile uint64 consumer_speed;
+    volatile long push_pending_flush_queue_sleep;
+    volatile long pow_count;
+    volatile double last_pc_rate;
+    volatile double last_pid_error;
+    volatile uint64 last_time;
+    uint64 flush_total;
+
     Buffer *candidate_buffers;
     bool *candidate_free_map;
 
@@ -570,7 +585,27 @@ typedef struct recovery_dw_buf {
     volatile uint16 write_pos;
     bool *single_flush_state;
 } recovery_dw_buf;
+typedef struct knl_g_resource_manager_context{
+    volatile PgBackendStatus* resourceManagerBEEntry;
+    double producer_v;
+    double producer_consumer_ratio;
+    double sleep_ratio;
+    double func_output;
+    pg_atomic_uint64 buffer_pool_flush_num;
+    double time_to_fill_candidate_slot;
+    double time_to_fill_dirty_page_queue;
+    double time_to_fill_buffer_zone;
+    uint64 last_dirty_page_queue_capacity;
+    uint64 last_candidate_slot_capacity;
+    double last_timestamp_calculate_sleep_time;
+    double last_dirty_page_queue_change_speed;
+    double last_candidate_slot_change_speed;
+    double last_dirty_page_queue_speed_diff;
+    double last_candidate_slot_speed_diff;
+    double last_speed_diff;
 
+    uint32 expected_flush_num;
+}knl_g_resource_manager_context;
 typedef struct dw_batch_file_context{
     int id;
 
@@ -1349,6 +1384,7 @@ typedef struct knl_instance_context {
 #endif
     pg_atomic_uint32 extensionNum;
     knl_g_audit_context audit_cxt;
+    knl_g_resource_manager_context resource_manager_cxt;
     knl_g_abo_context abo_cxt;
     knl_g_listen_context listen_cxt;
     knl_g_datadir_context datadir_cxt;

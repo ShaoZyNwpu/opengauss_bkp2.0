@@ -112,6 +112,7 @@ typedef enum knl_thread_role {
     PARALLEL_DECODE,
 
     UNDO_RECYCLER,
+    RESOURCE_MANAGER,
     UNDO_LAUNCHER,
     UNDO_WORKER,
     CSNMIN_SYNC,

@@ -1830,7 +1830,8 @@ extern Datum pg_get_publication_tables(PG_FUNCTION_ARGS);
 
 /* launcher.cpp */
 extern Datum pg_stat_get_subscription(PG_FUNCTION_ARGS);
-
+/*resource maneger.cpp*/
+extern Datum gs_stat_resource_manager(PG_FUNCTION_ARGS);
 /* sqlpatch.cpp */
 extern Datum create_sql_patch_by_id_hint(PG_FUNCTION_ARGS);
 extern Datum enable_sql_patch(PG_FUNCTION_ARGS);

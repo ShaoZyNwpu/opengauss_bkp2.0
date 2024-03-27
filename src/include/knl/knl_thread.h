@@ -414,7 +414,10 @@ typedef struct knl_t_xact_context {
     bool isSelectInto;
     bool callPrint;
 } knl_t_xact_context;
-
+typedef struct knl_t_resource_manager_context{
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+}knl_t_resource_manager_context;
 typedef struct RepairBlockKey RepairBlockKey;
 typedef void (*RedoInterruptCallBackFunc)(void);
 typedef void (*RedoPageRepairCallBackFunc)(RepairBlockKey key, XLogPhyBlock pblk);
@@ -3516,6 +3519,7 @@ typedef struct knl_thrd_context {
     knl_t_apply_launcher_context applylauncher_cxt;
     knl_t_apply_worker_context applyworker_cxt;
     knl_t_publication_context publication_cxt;
+    knl_t_resource_manager_context resource_manager_cxt;
     knl_t_page_compression_context page_compression_cxt;
     knl_t_cfs_shrinker_context cfs_shrinker_cxt;
     knl_t_sql_patch_context sql_patch_cxt;

@@ -903,7 +903,26 @@ static void knl_g_audit_init(knl_g_audit_context *audit_cxt)
         g_instance.audit_cxt.audit_coru_fnum[i] = UINT32_MAX;
     }
 }
-
+void knl_g_resource_manager_init(knl_g_resource_manager_context* resource_manager_cxt){
+    resource_manager_cxt->func_output = 0;
+    resource_manager_cxt->producer_consumer_ratio = 0;
+    resource_manager_cxt->producer_v = 0;
+    resource_manager_cxt->resourceManagerBEEntry = NULL;
+    resource_manager_cxt->sleep_ratio = 0;
+    resource_manager_cxt->buffer_pool_flush_num;
+    resource_manager_cxt->time_to_fill_candidate_slot = -1;
+    resource_manager_cxt->time_to_fill_dirty_page_queue = -1;
+    resource_manager_cxt->time_to_fill_buffer_zone = -1;
+    resource_manager_cxt->last_dirty_page_queue_capacity = 0;
+    resource_manager_cxt->last_candidate_slot_capacity = 0;
+    resource_manager_cxt->last_timestamp_calculate_sleep_time = get_time_ms();
+    resource_manager_cxt->last_dirty_page_queue_change_speed;
+    resource_manager_cxt->last_candidate_slot_change_speed = 0;
+    resource_manager_cxt->last_dirty_page_queue_speed_diff = 0;
+    resource_manager_cxt->last_candidate_slot_speed_diff = 0;
+    resource_manager_cxt->last_speed_diff = 0;
+    resource_manager_cxt->expected_flush_num = 0;
+}
 void knl_plugin_vec_func_init(knl_g_plugin_vec_func_context* func_cxt) {
     for (int i = 0; i < PLUGIN_VEC_FUNC_HATB_COUNT; i++) {
         func_cxt->vec_func_plugin[i] = NULL;
@@ -1003,6 +1022,7 @@ void knl_instance_init()
     knl_g_csn_barrier_init(&g_instance.csn_barrier_cxt);
     knl_g_audit_init(&g_instance.audit_cxt);
     knl_plugin_vec_func_init(&g_instance.plugin_vec_func_cxt);
+    knl_g_resource_manager_init(&g_instance.resource_manager_cxt);
     
 #ifndef ENABLE_MULTIPLE_NODES
     for (int i = 0; i < DB_CMPT_MAX; i++) {

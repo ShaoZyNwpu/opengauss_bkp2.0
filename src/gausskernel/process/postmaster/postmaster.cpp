@@ -74,7 +74,7 @@
 #include <sys/param.h>
 #include <arpa/inet.h>
 #include <sys/resource.h>
-
+#include "workload/resource_manager.h"
 #ifdef HAVE_POLL_H
 #include <poll.h>
 #endif
@@ -4233,7 +4233,12 @@ static int ServerLoop(void)
             g_instance.pid_cxt.TsCompactionAuxiliaryPID == 0) {
             g_instance.pid_cxt.TsCompactionAuxiliaryPID = initialize_util_thread(TS_COMPACTION_AUXILIAY);
         }
-#endif   /* ENABLE_MULTIPLE_NODES */
+#endif   /* ENABLE_MULTIPLE_NODES */ 
+        //!g_instance.is_aux_db
+        if(g_instance.attr.attr_storage.enable_ustore  && (pmState == PM_RUN) &&
+        g_instance.pid_cxt.ResourceManagerPID == 0 && u_sess->attr.attr_common.upgrade_mode != 1){
+            g_instance.pid_cxt.ResourceManagerPID = initialize_util_thread(RESOURCE_MANAGER);
+        }
         /* TDE cache timer checking */
         if (g_instance.attr.attr_security.enable_tde && IS_PGXC_DATANODE) {
             /* TDE cache watchdog */
@@ -13172,6 +13177,9 @@ static void SetAuxType()
             t_thrd.bootstrap_cxt.MyAuxProcType = TsCompactionAuxiliaryProcess;
             break;
 #endif   /* ENABLE_MULTIPLE_NODES */
+        case RESOURCE_MANAGER:
+            t_thrd.bootstrap_cxt.MyAuxProcType = ResourceManagerProcess;
+            break;
         case DMS_AUXILIARY_THREAD:
             t_thrd.bootstrap_cxt.MyAuxProcType = DmsAuxiliaryProcess;
             break;
@@ -13469,6 +13477,10 @@ int GaussDbAuxiliaryThreadMain(knl_thread_arg* arg)
             proc_exit(1);
             break;
 #endif   /* ENABLE_MULTIPLE_NODES */
+        case RESOURCE_MANAGER:
+            resource_manager_main();
+            proc_exit(1);
+            break;  
         case DMS_AUXILIARY_THREAD:
             DmsAuxiliaryMain();
             proc_exit(1);
@@ -13714,6 +13726,7 @@ int GaussDbThreadMain(knl_thread_arg* arg)
 #endif   /* ENABLE_MULTIPLE_NODES */
         case THREADPOOL_LISTENER:
         case THREADPOOL_SCHEDULER:
+        case RESOURCE_MANAGER:
         case DMS_AUXILIARY_THREAD:
         case UNDO_RECYCLER: {
             SetAuxType<thread_role>();
@@ -14247,6 +14260,7 @@ static ThreadMetaData GaussdbThreadGate[] = {
     { GaussDbThreadMain<LOGICAL_READ_RECORD>, LOGICAL_READ_RECORD, "LogicalReader", "logical reader" },
     { GaussDbThreadMain<PARALLEL_DECODE>, PARALLEL_DECODE, "LogicalDecoder", "logical decoder" },
     { GaussDbThreadMain<UNDO_RECYCLER>, UNDO_RECYCLER, "undorecycler", "undo recycler" },
+    { GaussDbThreadMain<RESOURCE_MANAGER>, RESOURCE_MANAGER, "resourcemanager", "resource manager" },
     { GaussDbThreadMain<UNDO_LAUNCHER>, UNDO_LAUNCHER, "asyncundolaunch", "async undo launcher" },
     { GaussDbThreadMain<UNDO_WORKER>, UNDO_WORKER, "asyncundoworker", "async undo worker" },
     { GaussDbThreadMain<CSNMIN_SYNC>, CSNMIN_SYNC, "csnminsync", "csnmin sync" },

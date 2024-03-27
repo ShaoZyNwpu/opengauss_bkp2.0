@@ -187,7 +187,8 @@ extern void RequestPgwrSync(void);
 extern void PageWriterSync(void);
 extern bool PgwrForwardSyncRequest(const FileTag *ftag, SyncRequestType type);
 extern void PageWriterSyncWithAbsorption(void);
-
+extern long getPidOutput(double pid_input, double pid_target);
+extern void adpat_create_dirty_page_rate();
 void crps_create_ctxs(knl_thread_role role);
 void crps_destory_ctxs();
 

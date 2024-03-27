@@ -84,6 +84,7 @@ set(gaussdb_objects
     $<TARGET_OBJECTS:gausskernel_cbb_communication_comm_proxy>
     $<TARGET_OBJECTS:gausskernel_cbb_communication_libcomm_utils>
     $<TARGET_OBJECTS:gausskernel_cbb_communication>
+    $<TARGET_OBJECTS:gausskernel_cbb_workload_resource_manager>
     $<TARGET_OBJECTS:gausskernel_cbb_workload>
     $<TARGET_OBJECTS:gausskernel_cbb_utils_aes>
     $<TARGET_OBJECTS:gausskernel_cbb_utils_biginteger>

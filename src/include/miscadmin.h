@@ -544,6 +544,7 @@ typedef enum {
     AsyncIOCompleterProcess,
     TpoolSchdulerProcess,
     UndoRecyclerProcess,
+    ResourceManagerProcess,
     TsCompactionProcess,
     TsCompactionAuxiliaryProcess,
     XlogCopyBackendProcess,
