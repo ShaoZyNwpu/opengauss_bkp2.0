@@ -28,6 +28,7 @@
 #include "utils/memutils.h"
 #include "executor/node/nodeHashjoin.h"
 
+static TupleTableSlot* ExecNestLoop(PlanState* state);
 static void MaterialAll(PlanState* node)
 {
     if (IsA(node, MaterialState)) {
@@ -81,8 +82,9 @@ static void MaterialAll(PlanState* node)
  *			   are prepared to return the first tuple.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecNestLoop(NestLoopState* node)
+static TupleTableSlot* ExecNestLoop(PlanState* state)
 {
+    NestLoopState* node = castNode(NestLoopState, state);
     TupleTableSlot* outer_tuple_slot = NULL;
     TupleTableSlot* inner_tuple_slot = NULL;
     ListCell* lc = NULL;
@@ -99,6 +101,8 @@ TupleTableSlot* ExecNestLoop(NestLoopState* node)
     PlanState* inner_plan = innerPlanState(node);
     ExprContext* econtext = node->js.ps.ps_ExprContext;
 
+    CHECK_FOR_INTERRUPTS();
+    
     /*
      * Check to see if we're still projecting out tuples from a previous join
      * tuple (because there is a function-returning-set in the projection
@@ -278,12 +282,9 @@ TupleTableSlot* ExecNestLoop(NestLoopState* node)
                 continue; /* return to top of loop */
             }
 
-            /*
-             * In a semijoin, we'll consider returning the first match, but
-             * after that we're done with this outer tuple.
-             */
-            if (node->js.jointype == JOIN_SEMI)
+            if (node->js.single_match) {
                 node->nl_NeedNewOuter = true;
+            }
 
             if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                 /*
@@ -340,6 +341,7 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
     nlstate->js.ps.plan = (Plan*)node;
     nlstate->js.ps.state = estate;
     nlstate->nl_MaterialAll = node->materialAll;
+    nlstate->js.ps.ExecProcNode = ExecNestLoop;
 
     /*
      * Miscellaneous initialization
@@ -378,6 +380,8 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
      */
     ExecInitResultTupleSlot(estate, &nlstate->js.ps);
 
+    nlstate->js.single_match = (node->join.inner_unique || node->join.jointype == JOIN_SEMI);
+
     switch (node->join.jointype) {
         case JOIN_INNER:
         case JOIN_SEMI:
@@ -398,8 +402,7 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
      * initialize tuple type and projection info
      * the result in this case would hold only virtual data.
      */
-    ExecAssignResultTypeFromTL(&nlstate->js.ps, TAM_HEAP);
-
+    ExecAssignResultTypeFromTL(&nlstate->js.ps, TableAmHeap);
     ExecAssignProjectionInfo(&nlstate->js.ps, NULL);
 
     /*
@@ -423,7 +426,6 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
 void ExecEndNestLoop(NestLoopState* node)
 {
     NL1_printf("ExecEndNestLoop: %s\n", "ending node processing");
-
     /*
      * Free the exprcontext
      */

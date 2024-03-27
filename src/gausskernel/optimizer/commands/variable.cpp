@@ -524,6 +524,11 @@ bool check_transaction_read_only(bool* newval, void** extra, GucSource source)
             GUC_check_errmsg("cannot set transaction read-write mode during recovery");
             return false;
         }
+        if (SSIsServerModeReadOnly()) {
+            GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+            GUC_check_errmsg("cannot set transaction read-write mode at Standby while DMS enabled");
+            return false;
+        }
     }
 
     return true;
@@ -595,6 +600,18 @@ bool check_XactIsoLevel(char** newval, void** extra, GucSource source)
             GUC_check_errhint("You can use REPEATABLE READ instead.");
             return false;
         }
+        
+        do {
+            /* Supporting the gs_dump in DSS mode */
+            if (strcmp(u_sess->attr.attr_common.application_name, "gs_dump") == 0 && SS_PRIMARY_MODE)
+                break;
+            /* Only support read committed while DMS enabled */
+            if (ENABLE_DMS && newXactIsoLevel != XACT_READ_COMMITTED) {
+                GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+                GUC_check_errmsg("Only support read committed transaction isolation level while DMS and DSS enabled");
+                return false;
+            }
+        } while (0);
     }
 
     *extra = MemoryContextAlloc(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER), sizeof(int));
@@ -701,6 +718,38 @@ bool check_mix_replication_param(bool* newval, void** extra, GucSource source)
     return true;
 }
 
+static bool check_danger_character(const char *inputEnvValue)
+{
+    if (inputEnvValue == NULL) {
+        return true;
+    }
+
+    const char *dangerCharacterList[] = { ";", "`", "\\", "'", "\"", ">", "<", "&", "|", "!", NULL };
+    int i = 0;
+
+    for (i = 0; dangerCharacterList[i] != NULL; i++) {
+        if (strstr(inputEnvValue, dangerCharacterList[i]) != NULL) {
+            ereport(LOG, (errmsg("Failed to check input value: invalid token \"%s\".\n", dangerCharacterList[i])));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool check_security_path(char **newval, void **extra, GucSource source)
+{
+    if (*newval == NULL) {
+        return true;
+    }
+    // judge length
+    if (strlen(*newval) > PATH_MAX) {
+        ereport(LOG, (errmsg("The length of path cannot be more than \"%d\".\n", PATH_MAX)));
+        return false;
+    }
+    // danger character
+    return check_danger_character(*const_cast<const char **>(newval));
+}
+
 /*
  * SET CLIENT_ENCODING
  */
@@ -796,6 +845,7 @@ typedef struct {
     bool is_superuser;
 } role_auth_extra;
 
+HeapTuple SearchUserHostName(const char* userName, Oid* oid);
 bool check_session_authorization(char** newval, void** extra, GucSource source)
 {
     HeapTuple roleTup;
@@ -817,7 +867,7 @@ bool check_session_authorization(char** newval, void** extra, GucSource source)
     }
 
     /* Look up the username */
-    roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(*newval));
+    roleTup = SearchUserHostName(*newval, NULL);
     if (!HeapTupleIsValid(roleTup)) {
         GUC_check_errmsg("role \"%s\" does not exist", *newval);
         return false;
@@ -894,7 +944,7 @@ bool check_role(char** newval, void** extra, GucSource source)
         }
 
         /* Look up the username */
-        roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(*newval));
+        roleTup = SearchUserHostName(*newval, NULL);
         if (!HeapTupleIsValid(roleTup)) {
             GUC_check_errmsg("role \"%s\" does not exist", *newval);
             return false;

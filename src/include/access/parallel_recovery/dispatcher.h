@@ -42,6 +42,11 @@
 
 namespace parallel_recovery {
 
+typedef struct _DispatchFix {
+    int dispatchRandom;
+    XLogRecPtr lastCheckLsn;
+}DispatchFix;
+
 typedef struct LogDispatcher {
     MemoryContext oldCtx;
     PageRedoWorker** pageWorkers; /* Array of page redo workers. */
@@ -69,6 +74,7 @@ typedef struct LogDispatcher {
     RedoInterruptCallBackFunc oldStartupIntrruptFunc;
     XLogRedoNumStatics xlogStatics[RM_NEXT_ID][MAX_XLOG_INFO_NUM];
     RedoTimeCost *startupTimeCost;
+    DispatchFix dispatchFix;
 } LogDispatcher;
 
 extern LogDispatcher* g_dispatcher;
@@ -84,7 +90,7 @@ const static uint64 OUTPUT_WAIT_COUNT = 0x7FFFFFF;
 const static uint64 PRINT_ALL_WAIT_COUNT = 0x7FFFFFFFF;
 
 
-void StartRecoveryWorkers();
+void StartRecoveryWorkers(XLogRecPtr startLsn);
 
 /* RedoItem lifecycle. */
 void DispatchRedoRecordToFile(XLogReaderState* record, List* expectedTLIs, TimestampTz recordXTime);
@@ -115,12 +121,12 @@ uint32 GetWorkerId(const RelFileNode& node, BlockNumber block, ForkNumber forkNu
 XLogReaderState* NewReaderState(XLogReaderState* readerState, bool bCopyState = false);
 void FreeAllocatedRedoItem();
 void GetReplayedRecPtrFromWorkers(XLogRecPtr *readPtr, XLogRecPtr *endPtr);
-void GetReplayedRecPtrFromWorkers(XLogRecPtr *endPtr);
+void GetReplayingRecPtrFromWorkers(XLogRecPtr *endPtr);
 void GetReplayedRecPtrFromUndoWorkers(XLogRecPtr *readPtr, XLogRecPtr *endPtr);
 List* CheckImcompleteAction(List* imcompleteActionList);
 void SetPageWorkStateByThreadId(uint32 threadState);
 RedoWaitInfo redo_get_io_event(int32 event_id);
-void redo_get_wroker_statistic(uint32* realNum, RedoWorkerStatsData* worker, uint32 workerLen);
+void redo_get_worker_statistic(uint32* realNum, RedoWorkerStatsData* worker, uint32 workerLen);
 extern void redo_dump_all_stats();
 void WaitRedoWorkerIdle();
 void SendClearMarkToAllWorkers();
@@ -133,7 +139,7 @@ extern void InitReaderStateByOld(XLogReaderState *newState, XLogReaderState *old
 extern void CopyDataFromOldReader(XLogReaderState *newReaderState, XLogReaderState *oldReaderState);
 
 bool TxnQueueIsEmpty(TxnRedoWorker* worker);
-void redo_get_wroker_time_count(RedoWorkerTimeCountsInfo **workerCountInfoList, uint32 *realNum);
+void redo_get_worker_time_count(RedoWorkerTimeCountsInfo **workerCountInfoList, uint32 *realNum);
 
 }
 

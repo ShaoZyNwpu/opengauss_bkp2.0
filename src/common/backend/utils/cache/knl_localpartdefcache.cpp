@@ -74,7 +74,10 @@ Partition LocalPartDefCache::SearchPartitionFromGlobalCopy(Oid part_oid)
     if (!g_instance.global_sysdbcache.hot_standby) {
         return NULL;
     }
-    if (unlikely(!g_instance.global_sysdbcache.recovery_finished)) {
+    if (unlikely(!IsPrimaryRecoveryFinished())) {
+        return NULL;
+    }
+    if (unlikely(u_sess->attr.attr_common.IsInplaceUpgrade)) {
         return NULL;
     }
     uint32 hash_value = oid_hash((void *)&(part_oid), sizeof(Oid));
@@ -165,7 +168,7 @@ static bool IsPartOidStoreInGlobal(Oid part_oid)
     if (!g_instance.global_sysdbcache.hot_standby) {
         return false;
     }
-    if (unlikely(!g_instance.global_sysdbcache.recovery_finished)) {
+    if (unlikely(!IsPrimaryRecoveryFinished())) {
         return false;
     }
     if (g_instance.global_sysdbcache.StopInsertGSC()) {
@@ -262,7 +265,8 @@ void LocalPartDefCache::InvalidateAll(void)
             if (PartitionHasReferenceCountZero(part)) {
                 /* Delete this entry immediately */
                 PartitionClearPartition(part, false);
-            } else {
+                elt = DLGetHead(&bucket_entry->cc_bucket);
+            } else if (!list_member_ptr(rebuildList, part)) {
                 rebuildList = lappend(rebuildList, part);
             }
         }
@@ -344,6 +348,7 @@ void LocalPartDefCache::AtEOXact_PartitionCache(bool isCommit)
                     part->pd_createSubid = InvalidSubTransactionId;
                 } else {
                     PartitionClearPartition(part, false);
+                    elt = DLGetHead(&bucket_entry->cc_bucket);
                     continue;
                 }
             }
@@ -388,6 +393,7 @@ void LocalPartDefCache::AtEOSubXact_PartitionCache(bool isCommit, SubTransaction
                     part->pd_createSubid = parentSubid;
                 else {
                     PartitionClearPartition(part, false);
+                    elt = DLGetHead(&bucket_entry->cc_bucket);
                     continue;
                 }
             }

@@ -44,7 +44,6 @@
 #include "parser/parse_hint.h"
 #ifdef PGXC
 #include "access/htup.h"
-#include "catalog/dfsstore_ctlg.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
@@ -70,6 +69,7 @@
 
 THR_LOCAL bool skip_read_extern_fields = false;
 
+#define IS_DATANODE_BUT_NOT_SINGLENODE (IS_PGXC_DATANODE && !IS_SINGLE_NODE)
 /*
  * Macros to simplify reading of different kinds of fields.  Use these
  * wherever possible to reduce the chance for silly typos.	Note that these
@@ -174,6 +174,19 @@ THR_LOCAL bool skip_read_extern_fields = false;
             local_node->fldname[i] = atoi(token);                           \
         }                                                                   \
     } while (0)
+
+#define READ_INT_ARRAY_CAN_NULL(fldname, size)                              \
+    if (local_node->size > 0) {                                             \
+        READ_INT_ARRAY(fldname, size);                                      \
+    } else {                                                                \
+        token = pg_strtok(&length); /* skip :fldname */                     \
+        token = pg_strtok(&length); /* read <> */                           \
+        if (token == nullptr || token[0] != '<' || token[1] != '>') {       \
+            ereport(ERROR, (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),         \
+                errmsg("did not find '<>' at end of null array")));         \
+        }                                                                   \
+        local_node->fldname = nullptr;                                      \
+    }
 
 #define READ_DOUBLE_ARRAY(fldname, size)                                          \
     do {                                                                          \
@@ -291,6 +304,15 @@ THR_LOCAL bool skip_read_extern_fields = false;
         local_node->fldname = token[0];                        \
     } while (0);
 
+/* Read an enumerated-type field which is converted from an expression */
+#define READ_ENUM_EXPR(fldname, enumtype, expr)           \
+    do {                                                  \
+        token = pg_strtok(&length); /* skip :fldname */   \
+        token = pg_strtok(&length); /* get field value */ \
+        local_node->fldname = (enumtype)(expr);               \
+    } while (0);
+
+
 /* Read an enumerated-type field that was written as an integer code */
 #define READ_ENUM_FIELD(fldname, enumtype)                \
     do {                                                  \
@@ -396,29 +418,44 @@ THR_LOCAL bool skip_read_extern_fields = false;
         securec_check(reterrno, "\0", "\0");                                                   \
     } while (0)
 
+#define READ_NODE_ARRAY(fldname, size, itemtype)                                  \
+    do {                                                                          \
+        if ((size) <= 0) {                                                        \
+            READ_NODE_FIELD(fldname); /* must be null */                          \
+        } else {                                                                  \
+            local_node->fldname = (itemtype *)palloc0(sizeof(itemtype) * (size)); \
+            for (int i = 0; i < (size); i++) {                                    \
+                READ_NODE_FIELD(fldname[i]);                                      \
+            }                                                                     \
+        }                                                                         \
+    } while (0)
+
 /* Read a bitmapset field */
 #define READ_BITMAPSET_FIELD(fldname)               \
     token = pg_strtok(&length); /* skip :fldname */ \
     local_node->fldname = _readBitmapset()
 
-#define READ_TYPEINFO_FIELD(fldname)                                                                          \
-    do {                                                                                                      \
-        if (local_node->fldname >= FirstBootstrapObjectId) {                                                  \
-            IF_EXIST(exprtypename)                                                                            \
-            {                                                                                                 \
-                char* exprtypename = NULL;                                                                    \
-                char* exprtypenamespace = NULL;                                                               \
-                token = pg_strtok(&length);                                                                   \
-                token = pg_strtok(&length);                                                                   \
-                exprtypename = nullable_string(token, length);                                                \
-                token = pg_strtok(&length);                                                                   \
-                token = pg_strtok(&length);                                                                   \
-                exprtypenamespace = nullable_string(token, length);                                           \
-                local_node->fldname = get_typeoid(get_namespace_oid(exprtypenamespace, false), exprtypename); \
-                pfree_ext(exprtypename);                                                                      \
-                pfree_ext(exprtypenamespace);                                                                 \
-            }                                                                                                 \
-        }                                                                                                     \
+#define READ_TYPEINFO_FIELD(fldname)                                                                              \
+    do {                                                                                                          \
+        if (local_node->fldname >= FirstBootstrapObjectId) {                                                      \
+            IF_EXIST(exprtypename)                                                                                \
+            {                                                                                                     \
+                char* exprtypename = NULL;                                                                        \
+                char* exprtypenamespace = NULL;                                                                   \
+                token = pg_strtok(&length);                                                                       \
+                token = pg_strtok(&length);                                                                       \
+                exprtypename = nullable_string(token, length);                                                    \
+                token = pg_strtok(&length);                                                                       \
+                token = pg_strtok(&length);                                                                       \
+                exprtypenamespace = nullable_string(token, length);                                               \
+                /* No need to reset field on CN or singlenode, keep pg_strtok() for forward compatibility */      \
+                if (IS_DATANODE_BUT_NOT_SINGLENODE) {                                                             \
+                    local_node->fldname = get_typeoid(get_namespace_oid(exprtypenamespace, false), exprtypename); \
+                }                                                                                                 \
+                pfree_ext(exprtypename);                                                                          \
+                pfree_ext(exprtypenamespace);                                                                     \
+            }                                                                                                     \
+        }                                                                                                         \
     } while (0)
 
 #define READ_TYPEINFO(typePtr)                                                                \
@@ -493,9 +530,30 @@ THR_LOCAL bool skip_read_extern_fields = false;
                 token = pg_strtok(&length);                                                                 \
                 token = pg_strtok(&length);                                                                 \
                 funcnamespace = nullable_string(token, length);                                             \
-                if (IS_PGXC_DATANODE && !skip_read_extern_fields) {                                         \
-                    local_node->fldname =                                                                   \
-                        get_func_oid(funcname, get_namespace_oid(funcnamespace, false), (Expr*)local_node); \
+                bool notfound = false;                                                                      \
+                if (IS_DATANODE_BUT_NOT_SINGLENODE && !skip_read_extern_fields) {                           \
+                    Oid funcoid = InvalidOid;                                                               \
+                    do {                                                                                    \
+                        Oid nspid = get_namespace_oid(funcnamespace, true);                                 \
+                        if (!OidIsValid(nspid)) {                                                           \
+                            notfound = true;                                                                \
+                            break;                                                                          \
+                        }                                                                                   \
+                        funcoid = get_func_oid(funcname, nspid, (Expr*)local_node);                         \
+                    } while (0);                                                                            \
+                    if (notfound || !OidIsValid(funcoid)) {                                                 \
+                        ereport(ERROR,                                                                      \
+                            (errmodule(MOD_OPT), errcode(ERRCODE_UNDEFINED_OBJECT),                         \
+                                errmsg("Cannot identify function %s.%s while deserializing field.",         \
+                                    funcname, funcnamespace),                                               \
+                                errdetail("Function with oid %u or its namespace may be renamed",           \
+                                    local_node->fldname),                                                   \
+                                errhint("Please rebuild column defalt expression, views etc. that are"      \
+                                    " related to this renamed object."),                                    \
+                                errcause("Object renamed after recorded as nodetree."),                     \
+                                erraction("Rebuild relevant object.")));                                    \
+                    }                                                                                       \
+                    local_node->fldname = funcoid;                                                          \
                 }                                                                                           \
                 pfree_ext(funcname);                                                                        \
                 pfree_ext(funcnamespace);                                                                   \
@@ -525,7 +583,7 @@ THR_LOCAL bool skip_read_extern_fields = false;
             token = pg_strtok(&length);                                                         \
             token = pg_strtok(&length);                                                         \
             oprrightname = nullable_string(token, length);                                      \
-            if (IS_PGXC_DATANODE) {                                                             \
+            if (IS_DATANODE_BUT_NOT_SINGLENODE) {                                               \
                 namespaceId = get_namespace_oid(opnamespace, false);                            \
                 oprleft = get_typeoid(namespaceId, oprleftname);                                \
                 oprright = oprleft;                                                             \
@@ -568,7 +626,7 @@ THR_LOCAL bool skip_read_extern_fields = false;
                 token = pg_strtok(&length);                                                            \
                 token = pg_strtok(&length);                                                            \
                 oprrightname = nullable_string(token, length);                                         \
-                if (IS_PGXC_DATANODE) {                                                                \
+                if (IS_DATANODE_BUT_NOT_SINGLENODE) {                                                  \
                     namespaceId = get_namespace_oid(opnamespace, false);                               \
                     oprleft = get_typeoid(namespaceId, oprleftname);                                   \
                     oprright = oprleft;                                                                \
@@ -802,6 +860,9 @@ THR_LOCAL bool skip_read_extern_fields = false;
         /* Read Join */                       \
         _readJoin(&local_node->join);         \
                                               \
+        IF_EXIST(skip_mark_restore) {         \
+            READ_BOOL_FIELD(skip_mark_restore);\
+        }                                     \
         READ_NODE_FIELD(mergeclauses);        \
         LIST_LENGTH(mergeclauses);            \
         READ_OID_ARRAY_LEN(mergeFamilies);    \
@@ -1161,6 +1222,9 @@ static PlanCacheHint* _readPlanCacheHint(void)
 
     _readBaseHint(&(local_node->base));
     READ_BOOL_FIELD(chooseCustomPlan);
+    IF_EXIST(method) {
+        READ_ENUM_FIELD(method, GplanSelectionMethod);
+    }
 
     READ_DONE();
 }
@@ -1367,7 +1431,72 @@ static HintState* _readHintState()
     IF_EXIST(predpush_same_level_hint) {
         READ_NODE_FIELD(predpush_same_level_hint);
     }
+    IF_EXIST(from_sql_patch) {
+        READ_BOOL_FIELD(from_sql_patch);
+    }
     READ_DONE();
+}
+
+static RightRefState* _readRightRefState(Query* query)
+{
+    check_stack_depth();
+    RightRefState* local_node = (RightRefState*)palloc0(sizeof(RightRefState));
+    char* token = nullptr;
+    int length = 0;
+
+    READ_BOOL_FIELD(isSupported);
+    READ_BOOL_FIELD(isInsertHasRightRef);
+    READ_INT_FIELD(explicitAttrLen);
+    READ_INT_ARRAY_CAN_NULL(explicitAttrNos, explicitAttrLen);
+
+    READ_INT_FIELD(colCnt);
+    READ_NODE_ARRAY(constValues, local_node->colCnt, Const*);
+
+    /* ignore values, hasExecs, isNulls fields */
+
+    READ_BOOL_FIELD(isUpsert);
+    READ_BOOL_FIELD(isUpsertHasRightRef);
+    READ_INT_FIELD(usExplicitAttrLen);
+    READ_INT_ARRAY_CAN_NULL(usExplicitAttrNos, usExplicitAttrLen);
+
+    token = pg_strtok(&length);
+    if (token == nullptr || token[0] != '}') {
+        ereport(ERROR,
+                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmsg("did not find '}' at end of RightRefState node")));
+    }
+
+    READ_DONE();
+}
+
+static RightRefState* _readRightRefStateWrap(Query* query)
+{
+    char* token = nullptr;
+    int length = 0;
+    token = pg_strtok(&length); /* skip :fldname */
+    token = pg_strtok(&length, false);
+    if (length == 0) {
+        if (token && token[0] == '<' && token[1] == '>') {
+            token = pg_strtok(&length); /* skip <> */
+        }
+        return nullptr;
+    }
+
+    token = pg_strtok(&length); /* left brace */
+    if (token == nullptr || token[0] != '{') {
+        ereport(ERROR,
+                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmsg("did not find '{' at end of RightRefState node")));
+    }
+    token = pg_strtok(&length); /* read node name */
+    if (length != 13 && memcmp(token, "RIGHTREFSTATE", 13) != 0) {
+        ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
+                errmsg("_readRightRefStateWrap(): badly formatted node string \"%s\"...", token)));
+    }
+
+    if (token != nullptr) {
+        token = nullptr;
+    }
+
+    return _readRightRefState(query);
 }
 
 /*
@@ -1385,6 +1514,12 @@ static Query* _readQuery(void)
     READ_INT_FIELD(resultRelation);
     READ_BOOL_FIELD(hasAggs);
     READ_BOOL_FIELD(hasWindowFuncs);
+    IF_EXIST(hasTargetSRFs) {
+        READ_BOOL_FIELD(hasTargetSRFs);
+    }
+    IF_EXIST(is_flt_frame) {
+        READ_BOOL_FIELD(is_flt_frame);
+    }
     READ_BOOL_FIELD(hasSubLinks);
     READ_BOOL_FIELD(hasDistinctOn);
     READ_BOOL_FIELD(hasRecursive);
@@ -1395,6 +1530,9 @@ static Query* _readQuery(void)
     }
     IF_EXIST(hasSynonyms) {
         READ_BOOL_FIELD(hasSynonyms);
+    }
+    IF_EXIST(hasIgnore) {
+        READ_BOOL_FIELD(hasIgnore);
     }
     READ_NODE_FIELD(cteList);
     READ_NODE_FIELD(rtable);
@@ -1489,6 +1627,27 @@ static Query* _readQuery(void)
     {
         READ_BOOL_FIELD(unique_check);
     }
+    IF_EXIST(resultRelations) {
+        READ_NODE_FIELD(resultRelations);
+    } else if (local_node->resultRelation != 0) {
+        local_node->resultRelations = list_make1_int(local_node->resultRelation);
+    }
+
+    IF_EXIST(withCheckOptions) {
+        READ_NODE_FIELD(withCheckOptions);
+    }
+
+    IF_EXIST(isReplace) {
+        READ_BOOL_FIELD(isReplace);
+    }
+    
+    IF_EXIST(rightRefState) {
+        local_node->rightRefState = _readRightRefStateWrap(local_node);
+    }
+	
+    IF_EXIST(indexhintList) {
+        READ_NODE_FIELD(indexhintList);
+    }
 
     READ_DONE();
 }
@@ -1573,6 +1732,21 @@ static PLDebug_frame* _readPLDebug_frame(void)
 }
 
 /*
+ * _readWithCheckOption
+ */
+static WithCheckOption* _readWithCheckOption(void)
+{
+    READ_LOCALS(WithCheckOption);
+
+    READ_STRING_FIELD(viewname);
+    READ_NODE_FIELD(qual);
+    READ_BOOL_FIELD(cascaded);
+    READ_UINT_FIELD(rtindex);
+
+    READ_DONE();
+}
+
+/*
  * _readSortGroupClause
  */
 static SortGroupClause* _readSortGroupClause(void)
@@ -1634,11 +1808,17 @@ static RowMarkClause* _readRowMarkClause(void)
 
     READ_UINT_FIELD(rti);
     READ_BOOL_FIELD(forUpdate);
-    READ_BOOL_FIELD(noWait);
+
+    IF_EXIST(waitPolicy) {
+        READ_ENUM_FIELD(waitPolicy, LockWaitPolicy);
+    }
     IF_EXIST(waitSec) {
         READ_INT_FIELD(waitSec);
     }
-
+    /* convert noWait (true/false) to LockWaitPolicy (LockWaitError/LockWaitBlock) */
+    IF_EXIST(noWait) {
+        READ_ENUM_EXPR(waitPolicy, LockWaitPolicy, (strtobool(token) ? LockWaitError : LockWaitBlock));
+    }
     READ_BOOL_FIELD(pushedDown);
     IF_EXIST(strength) {
         READ_ENUM_FIELD(strength, LockClauseStrength);
@@ -1774,7 +1954,12 @@ static RangeVar* _readRangeVar(void)
     IF_EXIST(withVerExpr) {
         READ_BOOL_FIELD(withVerExpr);
     }
-
+    IF_EXIST(partitionNameList) {
+        READ_NODE_FIELD(partitionNameList);
+    }
+    IF_EXIST(indexhints) {
+        READ_NODE_FIELD(indexhints);
+    }
     READ_DONE();
 }
 
@@ -1790,7 +1975,28 @@ static IntoClause* _readIntoClause(void)
     READ_STRING_FIELD(tableSpaceName);
     READ_BOOL_FIELD(skipData);
     READ_CHAR_FIELD(relkind);
+    IF_EXIST(userVarList) {
+        READ_NODE_FIELD(userVarList);
+    }
+    IF_EXIST(copyOption) {
+        READ_NODE_FIELD(copyOption);
+    }
+    IF_EXIST(filename) {
+        READ_STRING_FIELD(filename);
+    }
+    IF_EXIST(is_outfile) {
+        READ_BOOL_FIELD(is_outfile);
+    }
 
+    IF_EXIST(tableElts) {
+        READ_NODE_FIELD(tableElts);
+    }
+    IF_EXIST(autoIncStart) {
+        READ_NODE_FIELD(autoIncStart);
+    }
+    IF_EXIST(onduplicate) {
+        READ_ENUM_FIELD(onduplicate, OnDuplicateAction);
+    }
     READ_DONE();
 }
 
@@ -1921,6 +2127,10 @@ static Param* _readParam(void)
     IF_EXIST(recordVarTypOid)
     {
         READ_OID_FIELD(recordVarTypOid);
+    }
+    IF_EXIST(tableOfIndexTypeList)
+    {
+        READ_NODE_FIELD(tableOfIndexTypeList);
     }
     READ_DONE();
 }
@@ -2088,6 +2298,31 @@ static ArrayRef* _readArrayRef(void)
 }
 
 /*
+* _readIndexHintDefinition
+*/
+static IndexHintDefinition* _readIndexHintDefinition(void)
+{
+    READ_LOCALS(IndexHintDefinition);
+    READ_NODE_FIELD(indexnames);
+    READ_ENUM_FIELD(index_type, IndexHintType);
+
+    READ_DONE();
+}
+
+/*
+* _readIndexHintDefinition
+*/
+static IndexHintRelationData* _readIndexHintRelationData(void)
+{
+    READ_LOCALS(IndexHintRelationData);
+    READ_OID_FIELD(relationOid);
+    READ_OID_FIELD(indexOid);
+    READ_ENUM_FIELD(index_type, IndexHintType);
+
+    READ_DONE();
+}
+
+/*
  * _readFuncExpr
  */
 static FuncExpr* _readFuncExpr(void)
@@ -2126,14 +2361,21 @@ static FuncExpr* _readFuncExpr(void)
             ereport(ERROR, (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmsg("NULL seqNamespace for nextval()")));
         }
 
-        if (!IS_PGXC_COORDINATOR && !skip_read_extern_fields) {
-            Oid seqid = get_valid_relname_relid(seqNamespace, seqName);
+        if (IS_DATANODE_BUT_NOT_SINGLENODE && !skip_read_extern_fields) {
 
+            Oid seqid = get_valid_relname_relid(seqNamespace, seqName, true);
+            Const* firstArg = (Const*)linitial(local_node->args);
             if (OidIsValid(seqid)) {
-                Const* firstArg = (Const*)linitial(local_node->args);
                 if (firstArg != NULL) {
                     firstArg->constvalue = ObjectIdGetDatum(seqid);
                 }
+            } else {
+                ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("Cannot identify sequence %s.%s while deserializing field.", seqNamespace, seqName),
+                    errdetail("Sequence with oid %u or its namespace may be renamed",
+                        DatumGetObjectId(firstArg->constvalue)),
+                    errhint("Please rebuild column defalt expression, views etc. that are related to this sequence"),
+                    errcause("Object renamed after recorded as nodetree."), erraction("Rebuild relevant object.")));
             }
         }
         pfree_ext(seqName);
@@ -2618,6 +2860,21 @@ static NullTest* _readNullTest(void)
 }
 
 /*
+ * _readSetVariableExpr
+ */
+static SetVariableExpr* _readSetVariableExpr(void)
+{
+    READ_LOCALS(SetVariableExpr);
+
+    READ_NODE_FIELD(value);
+    READ_STRING_FIELD(name);
+    READ_BOOL_FIELD(is_session);
+    READ_BOOL_FIELD(is_global);
+
+    READ_DONE();
+}
+
+/*
  * _readHashFilter
  */
 static HashFilter* _readHashFilter(void)
@@ -2693,6 +2950,9 @@ static SetToDefault* _readSetToDefault(void)
     READ_INT_FIELD(typeMod);
     READ_OID_FIELD(collation);
     READ_LOCATION_FIELD(location);
+    if (t_thrd.proc->workingVersionNum >= UNION_NULL_VERSION_NUM) {
+        READ_BOOL_FIELD(lrchild_unknown);
+    }
 
     READ_TYPEINFO_FIELD(typeId);
 
@@ -2727,6 +2987,12 @@ static TargetEntry* _readTargetEntry(void)
     READ_OID_FIELD(resorigtbl);
     READ_INT_FIELD(resorigcol);
     READ_BOOL_FIELD(resjunk);
+    IF_EXIST(rtindex) {
+        READ_UINT_FIELD(rtindex);
+    }
+    IF_EXIST(isStartWithPseudo) {
+        READ_BOOL_FIELD(isStartWithPseudo);
+    }
 
     READ_DONE();
 }
@@ -3073,6 +3339,13 @@ static RangeTblEntry* _readRangeTblEntry(void)
     IF_EXIST(extraUpdatedCols) {
         READ_BITMAPSET_FIELD(extraUpdatedCols);
     }
+    IF_EXIST(partitionOidList) {
+        READ_NODE_FIELD(partitionOidList);
+        READ_NODE_FIELD(subpartitionOidList);
+    } else if (OidIsValid(local_node->partitionOid)) {
+        local_node->partitionOidList = lappend_oid(local_node->partitionOidList, local_node->partitionOid);
+        local_node->subpartitionOidList = lappend_oid(local_node->subpartitionOidList, local_node->subpartitionOid);
+    }
 
     READ_DONE();
 }
@@ -3195,6 +3468,11 @@ static Agg* _readAgg(Agg* local_node)
     READ_INT_FIELD(numCols);
     READ_ATTR_ARRAY(grpColIdx, numCols);
     READ_OPERATOROID_ARRAY(grpOperators, numCols);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_OPERATOROID_ARRAY(grp_collations, numCols);
+    }
+#endif
 
     READ_LONG_FIELD(numGroups);
     READ_NODE_FIELD(groupingSets);
@@ -3225,9 +3503,19 @@ static WindowAgg* _readWindowAgg(WindowAgg* local_node)
     READ_INT_FIELD(partNumCols);
     READ_ATTR_ARRAY(partColIdx, partNumCols);
     READ_OPERATOROID_ARRAY(partOperators, partNumCols);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_OPERATOROID_ARRAY(part_collations, partNumCols);
+    }
+#endif
     READ_INT_FIELD(ordNumCols);
     READ_ATTR_ARRAY(ordColIdx, ordNumCols);
     READ_OPERATOROID_ARRAY(ordOperators, ordNumCols);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_OPERATOROID_ARRAY(ord_collations, ordNumCols);
+    }
+#endif
 
     READ_INT_FIELD(frameOptions);
     READ_NODE_FIELD(startOffset);
@@ -3315,6 +3603,9 @@ static PruningResult* _readPruningResult(PruningResult* local_node)
     IF_EXIST(isPbeSinlePartition) {
         READ_BOOL_FIELD(isPbeSinlePartition);
     }
+    IF_EXIST(ls_selectedPartitionnos) {
+        READ_NODE_FIELD(ls_selectedPartitionnos);
+    }
 
     READ_DONE();
 }
@@ -3328,6 +3619,12 @@ static SubPartitionPruningResult* _readSubPartitionPruningResult(SubPartitionPru
     READ_INT_FIELD(partSeq);
     READ_BITMAPSET_FIELD(bm_selectedSubPartitions);
     READ_NODE_FIELD(ls_selectedSubPartitions);
+    IF_EXIST(partitionno) {
+        READ_NODE_FIELD(partitionno);
+    }
+    IF_EXIST(ls_selectedSubPartitionnos) {
+        READ_NODE_FIELD(ls_selectedSubPartitionnos);
+    }
 
     READ_DONE();
 }
@@ -3372,6 +3669,9 @@ static Scan* _readScan(Scan* local_node)
     read_mem_info(&local_node->mem_info);
     IF_EXIST(scanBatchMode) {
         READ_BOOL_FIELD(scanBatchMode);
+    }
+    IF_EXIST(partition_iterator_elimination) {
+        READ_BOOL_FIELD(partition_iterator_elimination);
     }
     READ_DONE();
 }
@@ -3501,6 +3801,12 @@ static IndexOnlyScan* _readIndexOnlyScan(IndexOnlyScan* local_node)
     READ_NODE_FIELD(indexorderby);
     READ_NODE_FIELD(indextlist);
     READ_ENUM_FIELD(indexorderdir, ScanDirection);
+    IF_EXIST(selectivity) {
+        READ_FLOAT_FIELD(selectivity);
+    }
+    IF_EXIST(is_partial) {
+        READ_BOOL_FIELD(is_partial);
+    }
 
     READ_DONE();
 }
@@ -3540,6 +3846,13 @@ static BitmapIndexScan* _readBitmapIndexScan(BitmapIndexScan* local_node)
     IF_EXIST(is_ustore) {
          READ_BOOL_FIELD(is_ustore);
      }
+    IF_EXIST(selectivity) {
+        READ_FLOAT_FIELD(selectivity);
+    }
+    IF_EXIST(is_partial) {
+        READ_BOOL_FIELD(is_partial);
+    }
+
     READ_DONE();
 }
 
@@ -3632,6 +3945,12 @@ static IndexScan* _readIndexScan(IndexScan* local_node)
     IF_EXIST(is_ustore) {
         READ_BOOL_FIELD(is_ustore);
     }
+    IF_EXIST(selectivity) {
+        READ_FLOAT_FIELD(selectivity);
+    }
+    IF_EXIST(is_partial) {
+        READ_BOOL_FIELD(is_partial);
+    }
     READ_DONE();
 }
 
@@ -3680,51 +3999,6 @@ static CStoreIndexScan* _readCStoreIndexScan(CStoreIndexScan* local_node)
     READ_DONE();
 }
 
-static DfsIndexScan* _readDfsIndexScan(DfsIndexScan* local_node)
-{
-    READ_LOCALS_NULL(DfsIndexScan);
-    READ_TEMP_LOCALS();
-
-    // Read Scan
-    _readScan(&local_node->scan);
-
-    READ_OID_FIELD(indexid);
-#ifdef STREAMPLAN
-    // Note: The Oid shipped(in plan) is invalid here
-    // We need to get the Oid on this node
-    if (local_node->indexid >= FirstBootstrapObjectId) {
-        IF_EXIST(indexname) {
-            char *indexname, *indexnamespace;
-
-            token = pg_strtok(&length);
-            token = pg_strtok(&length);
-            indexname = nullable_string(token, length);
-            token = pg_strtok(&length);
-            token = pg_strtok(&length);
-            indexnamespace = nullable_string(token, length);
-            if (!IS_PGXC_COORDINATOR)
-                local_node->indexid = get_valid_relname_relid(indexnamespace, indexname);
-
-            pfree_ext(indexname);
-            pfree_ext(indexnamespace);
-        }
-    }
-#endif  // STREAMPLAN
-
-    READ_NODE_FIELD(indextlist);
-    READ_NODE_FIELD(indexqual);
-    READ_NODE_FIELD(indexqualorig);
-    READ_NODE_FIELD(indexorderby);
-    READ_NODE_FIELD(indexorderbyorig);
-    READ_ENUM_FIELD(indexorderdir, ScanDirection);
-    READ_ENUM_FIELD(relStoreLocation, RelstoreType);
-    READ_NODE_FIELD(cstorequal);
-    READ_NODE_FIELD(indexScantlist);
-    READ_NODE_FIELD(dfsScan);
-    READ_BOOL_FIELD(indexonly);
-    READ_DONE();
-}
-
 static Sort* _readSort(Sort* local_node)
 {
     READ_LOCALS_NULL(Sort);
@@ -3761,6 +4035,11 @@ static Unique* _readUnique(Unique* local_node)
     READ_INT_FIELD(numCols);
     READ_ATTR_ARRAY(uniqColIdx, numCols);
     READ_OPERATOROID_ARRAY(uniqOperators, numCols);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_OPERATOROID_ARRAY(uniq_collations, numCols);
+    }
+#endif
     READ_DONE();
 }
 
@@ -3852,7 +4131,9 @@ static ExecNodes* _readExecNodes(void)
     READ_NODE_FIELD(nodeList);
     Distribution* distribution = _readDistribution();
     ng_set_distribution(&local_node->distribution, distribution);
-    READ_CHAR_FIELD(baselocatortype);
+    IF_EXIST(baselocatortype) {
+        READ_CHAR_FIELD(baselocatortype);
+    }
     READ_NODE_FIELD(en_expr);
     READ_OID_FIELD(en_relid);
 
@@ -3924,6 +4205,20 @@ static ExecNodes* _readExecNodes(void)
     READ_DONE();
 }
 
+/*
+ * _readProjectSet
+ */
+static ProjectSet *_readProjectSet(ProjectSet* local_node)
+{
+    READ_LOCALS_NULL(ProjectSet);
+    READ_TEMP_LOCALS();
+
+    _readPlan(&local_node->plan);
+
+    length = 0;
+    READ_DONE();
+}
+
 static ModifyTable* _readModifyTable(ModifyTable* local_node)
 {
     READ_LOCALS_NULL(ModifyTable);
@@ -3942,6 +4237,9 @@ static ModifyTable* _readModifyTable(ModifyTable* local_node)
     READ_NODE_FIELD(rowMarks);
     READ_INT_FIELD(epqParam);
     READ_BOOL_FIELD(partKeyUpdated);
+    if (t_thrd.proc->workingVersionNum >= REPLACE_INTO_VERSION_NUM) {
+        READ_BOOL_FIELD(isReplace);
+    }
 #ifdef PGXC
     READ_NODE_FIELD(remote_plans);
     READ_NODE_FIELD(remote_insert_plans);
@@ -3982,7 +4280,10 @@ static ModifyTable* _readModifyTable(ModifyTable* local_node)
     IF_EXIST(upsertWhere) {
         READ_NODE_FIELD(upsertWhere);
     }
-
+    IF_EXIST(targetlists) {
+        READ_NODE_FIELD(targetlists);
+    }
+	
     READ_DONE();
 }
 
@@ -4112,6 +4413,11 @@ static Group* _readGroup(Group* local_node)
     READ_INT_FIELD(numCols);
     READ_ATTR_ARRAY(grpColIdx, numCols);
     READ_OPERATOROID_ARRAY(grpOperators, numCols);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_OPERATOROID_ARRAY(grp_collations, numCols);
+    }
+#endif
 
     READ_DONE();
 }
@@ -4125,6 +4431,9 @@ static Join* _readJoin(Join* local_node)
     _readPlan(&local_node->plan);
 
     READ_ENUM_FIELD(jointype, JoinType);
+    IF_EXIST(inner_unique) {
+        READ_BOOL_FIELD(inner_unique);
+    }
     READ_NODE_FIELD(joinqual);
     READ_BOOL_FIELD(optimizable);
     READ_NODE_FIELD(nulleqqual);
@@ -4156,7 +4465,22 @@ static Hash* _readHash(Hash* local_node)
 static HashJoin* _readHashJoin(HashJoin* local_node)
 {
     READ_LOCALS_NULL(HashJoin);
-    READ_HASHJOIN_FIELD();
+
+    READ_TEMP_LOCALS();
+    _readJoin(&local_node->join);
+    READ_NODE_FIELD(hashclauses);
+    READ_BOOL_FIELD(streamBothSides);
+    READ_BOOL_FIELD(transferFilterFlag);
+    READ_BOOL_FIELD(rebuildHashTable);
+    READ_BOOL_FIELD(isSonicHash);
+    read_mem_info(&local_node->mem_info);
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_NODE_FIELD(hash_collations);
+    }
+#endif
+    READ_DONE();
 }
 
 static MergeJoin* _readMergeJoin(MergeJoin* local_node)
@@ -4222,10 +4546,16 @@ static PlannedStmt* _readPlannedStmt(void)
     READ_UINT64_FIELD(queryId);
     READ_BOOL_FIELD(hasReturning);
     READ_BOOL_FIELD(hasModifyingCTE);
+    IF_EXIST(hasIgnore) {
+        READ_BOOL_FIELD(hasIgnore);
+    }
     READ_BOOL_FIELD(canSetTag);
     READ_BOOL_FIELD(transientPlan);
     IF_EXIST(dependsOnRole) {
         READ_BOOL_FIELD(dependsOnRole);
+    }
+    IF_EXIST(is_flt_frame) {
+        READ_BOOL_FIELD(is_flt_frame);
     }
     READ_NODE_FIELD(planTree);
     READ_NODE_FIELD(rtable);
@@ -4302,6 +4632,9 @@ static PlannedStmt* _readPlannedStmt(void)
     }
     READ_BOOL_FIELD(isRowTriggerShippable);
     READ_BOOL_FIELD(is_stream_plan);
+    IF_EXIST(cause_type) {
+        READ_UINT_FIELD(cause_type);
+    }
 
     READ_DONE();
 }
@@ -4324,11 +4657,17 @@ static PlanRowMark* _readPlanRowMark(void)
     READ_UINT_FIELD(prti);
     READ_UINT_FIELD(rowmarkId);
     READ_ENUM_FIELD(markType, RowMarkType);
-    READ_BOOL_FIELD(noWait);
     IF_EXIST(waitSec) {
         READ_INT_FIELD(waitSec);
     }
 
+    IF_EXIST(waitPolicy) {
+        READ_ENUM_FIELD(waitPolicy, LockWaitPolicy);
+    }
+    /* convert noWait (true/false) to LockWaitPolicy (LockWaitError/LockWaitBlock) */
+    IF_EXIST(noWait) {
+        READ_ENUM_EXPR(waitPolicy, LockWaitPolicy, (strtobool(token) ? LockWaitError : LockWaitBlock));
+    }
     READ_BOOL_FIELD(isParent);
     READ_INT_FIELD(numAttrs);
     READ_BITMAPSET_FIELD(bms_nodeids);
@@ -4357,6 +4696,11 @@ static SetOp* _readSetOp(SetOp* local_node)
     READ_INT_FIELD(numCols);
     READ_ATTR_ARRAY(dupColIdx, numCols);
     READ_OPERATOROID_ARRAY(dupOperators, numCols);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM) {
+        READ_OPERATOROID_ARRAY(dup_collations, numCols);
+    }
+#endif
     READ_INT_FIELD(flagColIdx);
     READ_INT_FIELD(firstFlag);
     READ_LONG_FIELD(numGroups);
@@ -4402,6 +4746,16 @@ static ForeignScan* _readForeignScan(ForeignScan* local_node)
     }
 
     READ_BOOL_FIELD(in_compute_pool);
+
+    IF_EXIST(operation) {
+        READ_ENUM_FIELD(operation, CmdType);
+        READ_UINT_FIELD(resultRelation);
+        READ_OID_FIELD(fs_server);
+        READ_BITMAPSET_FIELD(fs_relids);
+        READ_NODE_FIELD(fdw_scan_tlist);
+        READ_NODE_FIELD(fdw_recheck_quals);
+    }
+
     READ_DONE();
 }
 
@@ -4734,21 +5088,6 @@ static CStoreScan* _readCStoreScan(CStoreScan* local_node)
     READ_DONE();
 }
 
-static DfsScan* _readDfsScan(DfsScan* local_node)
-{
-    READ_LOCALS_NULL(DfsScan);
-    READ_TEMP_LOCALS();
-
-    // Read Scan
-    _readScan((Scan*)local_node);
-
-    READ_ENUM_FIELD(relStoreLocation, RelstoreType);
-    READ_NODE_FIELD(privateData);
-    READ_STRING_FIELD(storeFormat);
-
-    READ_DONE();
-}
-
 #ifdef ENABLE_MULTIPLE_NODES
 static TsStoreScan* _readTsStoreScan(TsStoreScan *local_node)
 {
@@ -4951,6 +5290,14 @@ static VecForeignScan* _readVecForeignScan(VecForeignScan* local_node)
     }
 
     READ_BOOL_FIELD(in_compute_pool);
+    IF_EXIST(operation) {
+        READ_ENUM_FIELD(operation, CmdType);
+        READ_UINT_FIELD(resultRelation);
+        READ_OID_FIELD(fs_server);
+        READ_BITMAPSET_FIELD(fs_relids);
+        READ_NODE_FIELD(fdw_scan_tlist);
+        READ_NODE_FIELD(fdw_recheck_quals);
+    }
     READ_DONE();
 }
 
@@ -5236,6 +5583,9 @@ static ColumnDef* _readColumnDef()
     READ_OID_FIELD(collOid);
     READ_NODE_FIELD(constraints);
     READ_NODE_FIELD(fdwoptions);
+    IF_EXIST(columnOptions) {
+        READ_NODE_FIELD(columnOptions);
+    }
     READ_NODE_FIELD(clientLogicColumnRef);
     if (local_node->storage == '0') {
         local_node->storage = 0;
@@ -5244,7 +5594,9 @@ static ColumnDef* _readColumnDef()
     IF_EXIST(generatedCol) {
         READ_CHAR_FIELD(generatedCol);
     }
-
+    IF_EXIST(update_default) {
+        READ_NODE_FIELD(update_default);
+    }
     READ_DONE();
 }
 
@@ -5294,6 +5646,10 @@ static TypeName* _readTypeName()
     {
         READ_LOCATION_FIELD(end_location);
     }
+    IF_EXIST(charset)
+    {
+        READ_INT_FIELD(charset);
+    }
 
     READ_TYPEINFO_FIELD(typeOid);
     READ_DONE();
@@ -5328,6 +5684,9 @@ static IndexStmt* _readIndexStmt()
 {
     READ_LOCALS(IndexStmt);
 
+    IF_EXIST(missing_ok) {
+        READ_BOOL_FIELD(missing_ok);
+    }
     READ_STRING_FIELD(schemaname);
     READ_STRING_FIELD(idxname);
     READ_NODE_FIELD(relation);
@@ -5345,6 +5704,9 @@ static IndexStmt* _readIndexStmt()
     READ_OID_FIELD(indexOid);
     READ_OID_FIELD(oldNode);
     READ_NODE_FIELD(partClause);
+    IF_EXIST(indexOptions) {
+        READ_NODE_FIELD(indexOptions);
+    }
     READ_BOOL_FIELD(isPartitioned);
     READ_BOOL_FIELD(unique);
     READ_BOOL_FIELD(primary);
@@ -5383,6 +5745,9 @@ static Constraint* _readConstraint()
     } else if (MATCH_TYPE("DEFAULT")) {
         local_node->contype = CONSTR_DEFAULT;
         READ_NODE_FIELD(raw_expr);
+        if (t_thrd.proc->workingVersionNum >= ON_UPDATE_TIMESTAMP_VERSION_NUM) {
+            READ_NODE_FIELD(update_expr);
+        }
         READ_STRING_FIELD(cooked_expr);
     } else if (MATCH_TYPE("CHECK")) {
         local_node->contype = CONSTR_CHECK;
@@ -5445,7 +5810,9 @@ static Constraint* _readConstraint()
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("_readConstraint(): badly contype \"%s\"...", token)));
     }
-
+    IF_EXIST(constraintOptions) {
+        READ_NODE_FIELD(constraintOptions);
+    }
     READ_DONE();
 }
 
@@ -5514,6 +5881,18 @@ static RangePartitionDefState* _readRangePartitionDefState()
     READ_STRING_FIELD(partitionName);
     READ_NODE_FIELD(boundary);
     READ_STRING_FIELD(tablespacename);
+    IF_EXIST(subPartitionDefState) {
+        READ_NODE_FIELD(subPartitionDefState);
+    }
+    IF_EXIST(partitionno) {
+        READ_NODE_FIELD(partitionno);
+    }
+    IF_EXIST(curStartVal) {
+        READ_NODE_FIELD(curStartVal);
+    }
+    IF_EXIST(partitionInitName) {
+        READ_NODE_FIELD(partitionInitName);
+    }
 
     READ_DONE();
 }
@@ -5525,6 +5904,12 @@ static ListPartitionDefState* _readListPartitionDefState()
     READ_STRING_FIELD(partitionName);
     READ_NODE_FIELD(boundary);
     READ_STRING_FIELD(tablespacename);
+    IF_EXIST(subPartitionDefState) {
+        READ_NODE_FIELD(subPartitionDefState);
+    }
+    IF_EXIST(partitionno) {
+        READ_NODE_FIELD(partitionno);
+    }
 
     READ_DONE();
 }
@@ -5536,6 +5921,12 @@ static HashPartitionDefState* _readHashPartitionDefState()
     READ_STRING_FIELD(partitionName);
     READ_NODE_FIELD(boundary);
     READ_STRING_FIELD(tablespacename);
+    IF_EXIST(subPartitionDefState) {
+        READ_NODE_FIELD(subPartitionDefState);
+    }
+    IF_EXIST(partitionno) {
+        READ_NODE_FIELD(partitionno);
+    }
 
     READ_DONE();
 }
@@ -5571,6 +5962,9 @@ static PartitionState* _readPartitionState()
     READ_ENUM_FIELD(rowMovement, RowMovementValue);
     READ_NODE_FIELD(subPartitionState);
     READ_NODE_FIELD(partitionNameList);
+    IF_EXIST(partitionsNum) {
+        READ_INT_FIELD(partitionsNum);
+    }
 
     if (local_node->partitionStrategy == '0') {
         local_node->partitionStrategy = 0;
@@ -5703,6 +6097,58 @@ static TdigestData* _readTdigestData()
     READ_DONE();
 }
 
+static AutoIncrement* _readAutoIncrement()
+{
+    READ_LOCALS(AutoIncrement);
+
+    READ_NODE_FIELD(expr);
+    READ_OID_FIELD(autoincin_funcid);
+    READ_OID_FIELD(autoincout_funcid);
+ 
+    READ_DONE();
+}
+
+static CharsetCollateOptions* _readCharsetcollateOptions()
+{
+    READ_LOCALS(CharsetCollateOptions);
+
+    READ_ENUM_FIELD(cctype, CharsetCollateType);
+    READ_INT_FIELD(charset);
+    READ_STRING_FIELD(collate);
+
+    READ_DONE();
+}
+
+static PrefixKey* _readPrefixKey()
+{
+    READ_LOCALS(PrefixKey);
+
+    READ_NODE_FIELD(arg);
+    READ_INT_FIELD(length);
+
+    READ_DONE();
+}
+
+static UserSetElem* _readUserSetElem()
+{
+    READ_LOCALS(UserSetElem);
+
+    READ_NODE_FIELD(name);
+    READ_NODE_FIELD(val);
+
+    READ_DONE();
+}
+
+static UserVar* _readUserVar()
+{
+    READ_LOCALS(UserVar);
+
+    READ_STRING_FIELD(name);
+    READ_NODE_FIELD(value);
+
+    READ_DONE();
+}
+
 /*
  * parseNodeString
  *
@@ -5726,6 +6172,8 @@ Node* parseNodeString(void)
 
     if (MATCH("QUERY", 5)) {
         return_value = _readQuery();
+    } else if (MATCH("WITHCHECKOPTION", 15)) {
+        return_value = _readWithCheckOption();
     } else if (MATCH("SORTGROUPCLAUSE", 15)) {
         return_value = _readSortGroupClause();
     } else if (MATCH("GROUPINGSET", 11)) {
@@ -5812,6 +6260,8 @@ Node* parseNodeString(void)
         return_value = _readXmlExpr();
     } else if (MATCH("NULLTEST", 8)) {
         return_value = _readNullTest();
+    } else if (MATCH("SETVARIABLEEXPR", 15)) {
+        return_value = _readSetVariableExpr();
     } else if (MATCH("HASHFILTER", 10)) {
         return_value = _readHashFilter();
     } else if (MATCH("BOOLEANTEST", 11)) {
@@ -5918,6 +6368,8 @@ Node* parseNodeString(void)
         return_value = _readCteScan(NULL);
     } else if (MATCH("WINDOWAGG", 9)) {
         return_value = _readWindowAgg(NULL);
+    } else if (MATCH("PROJECTSET", 10)) {
+        return_value = _readProjectSet(NULL);
     } else if (MATCH("MODIFYTABLE", 11)) {
         return_value = _readModifyTable(NULL);
     } else if (MATCH("MERGEWHENCLAUSE", 15)) {
@@ -5950,8 +6402,6 @@ Node* parseNodeString(void)
         return_value = _readBitmapAnd(NULL);
     } else if (MATCH("INDEXONLYSCAN", 13)) {
         return_value = _readIndexOnlyScan(NULL);
-    } else if (MATCH("DFSINDEXSCAN", 12)) {
-        return_value = _readDfsIndexScan(NULL);
     } else if (MATCH("CSTOREINDEXSCAN", 15)) {
         return_value = _readCStoreIndexScan(NULL);
     } else if (MATCH("CSTOREINDEXCTIDSCAN", 19)) {
@@ -5998,8 +6448,6 @@ Node* parseNodeString(void)
         return_value = _readVecResult(NULL);
     } else if (MATCH("CSTORESCAN", 10)) {
         return_value = _readCStoreScan(NULL);
-    } else if (MATCH("DFSSCAN", 7)) {
-        return_value = _readDfsScan(NULL);
 #ifdef ENABLE_MULTIPLE_NODES
     } else if (MATCH("TSSTORESCAN",11)) {
         return_value = _readTsStoreScan(NULL);
@@ -6162,6 +6610,20 @@ Node* parseNodeString(void)
         return_value = _readPLDebug_frame();
     } else if (MATCH("TdigestData", 11)) {
         return_value = _readTdigestData();
+    } else if (MATCH("AUTO_INCREMENT", 14)) {
+        return_value = _readAutoIncrement();
+    } else if (MATCH("PREFIXKEY", 9)) {
+        return_value = _readPrefixKey();
+    } else if (MATCH("INDEXHINT_RELATION_DATA", 23)) {
+        return_value = _readIndexHintRelationData();
+    } else if (MATCH("INDEXHINT_DEFINITION", 20)) {
+        return_value = _readIndexHintDefinition();
+    } else if (MATCH("USERSETELEM", 11)) {
+        return_value = _readUserSetElem();
+    } else if (MATCH("USERVAR", 7)) {
+        return_value = _readUserVar();
+    } else if (MATCH("CHARSETCOLLATE", 14)) {
+        return_value = _readCharsetcollateOptions();
     } else {
         ereport(ERROR,
             (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
@@ -6214,7 +6676,7 @@ static Datum readDatum(bool typbyval)
             token = pg_strtok(&tokenLength);
             s[i] = (char)atoi(token);
         }
-    } else if (length <= 0) {
+    } else if (length == 0) {
         res = (Datum)NULL;
     } else {
         s = (char*)palloc(length);

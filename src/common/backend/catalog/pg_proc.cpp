@@ -30,8 +30,10 @@
 #include "catalog/pg_proc.h"
 #include "catalog/gs_encrypted_proc.h"
 #include "catalog/pg_proc_fn.h"
+#include "catalog/pg_synonym.h"
 #include "catalog/pg_type.h"
 #include "client_logic/client_logic_proc.h"
+#include "client_logic/client_logic.h"
 #include "commands/defrem.h"
 #include "commands/user.h"
 #include "commands/trigger.h"
@@ -70,8 +72,13 @@
 #include "access/heapam.h"
 #include "postmaster/postmaster.h"
 #include "commands/dbcommands.h"
+#include "commands/tablecmds.h"
 #include "storage/lmgr.h"
 #include "libpq/md5.h"
+
+#ifdef ENABLE_MOT
+#include "storage/mot/jit_exec.h"
+#endif
 
 #define TEMPSEPARATOR '@'
 #define SEPARATOR '#'
@@ -152,7 +159,7 @@ static Acl* ProcAclDefault(Oid ownerId)
  * @in c: character.
  * @return: True or false.
  */
-static bool check_special_character(char c)
+bool check_special_character(char c)
 {
     switch (c) {
         case ' ':
@@ -1031,7 +1038,7 @@ static bool user_define_func_check(Oid languageId, const char* probin, char** ab
  * not "ArrayType *", to avoid importing array.h into pg_proc_fn.h.
  * ----------------------------------------------------------------
  */
-Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackageid, bool isOraStyle, bool replace, bool returnsSet,
+ObjectAddress ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackageid, bool isOraStyle, bool replace, bool returnsSet,
     Oid returnType, Oid proowner, Oid languageObjectId, Oid languageValidator, const char* prosrc, const char* probin,
     bool isAgg, bool isWindowFunc, bool security_definer, bool isLeakProof, bool isStrict, char volatility,
     oidvector* parameterTypes, Datum allParameterTypes, Datum parameterModes, Datum parameterNames,
@@ -1049,6 +1056,8 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
     bool anyrangeOutParam = false;
     bool internalInParam = false;
     bool internalOutParam = false;
+    bool fullEncryptedInParam = false;
+    bool fullEncryptedOutParam = false;
     Oid variadicType = InvalidOid;
     Acl* proacl = NULL;
     Relation rel;
@@ -1073,6 +1082,15 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
 	
     /* sanity checks */
     Assert(PointerIsValid(prosrc));
+
+    /* 
+     * Check function name to ensure that it doesn't conflict with existing synonym.
+     */
+    if (!IsInitdb && GetSynonymOid(procedureName, procNamespace, true) != InvalidOid) {
+        ereport(ERROR,
+                (errmsg("function name is already used by an existing synonym in schema \"%s\"",
+                    get_namespace_name(procNamespace))));
+    }
 
     parameterCount = parameterTypes->dim1;
     if (parameterCount < 0 || parameterCount > FUNC_MAX_ARGS)
@@ -1137,19 +1155,25 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
             case INTERNALOID:
                 internalInParam = true;
                 break;
+            case BYTEAWITHOUTORDERWITHEQUALCOLOID:
+            case BYTEAWITHOUTORDERCOLOID:
+            case BYTEAWITHOUTORDERWITHEQUALCOLARRAYOID:
+            case BYTEAWITHOUTORDERCOLARRAYOID:
+                fullEncryptedInParam = true;
+                break;
             default:
                 break;
         }
     }
 
     bool existOutParam = false;
-    if (allParameterTypes != PointerGetDatum(NULL)) {
+    if (allParameterTypes != PointerGetDatum(NULL) && paramModes != NULL) {
         for (i = 0; i < allParamCount; i++) {
+            if (paramModes[i] == PROARGMODE_IN || paramModes[i] == PROARGMODE_VARIADIC)
+                continue; /* ignore input-only params */
             if (paramModes[i] == PROARGMODE_OUT || paramModes[i] == PROARGMODE_INOUT) {
                 existOutParam = true;
             }
-            if (paramModes == NULL || paramModes[i] == PROARGMODE_IN || paramModes[i] == PROARGMODE_VARIADIC)
-                continue; /* ignore input-only params */
 
             switch (allParams[i]) {
                 case ANYARRAYOID:
@@ -1164,6 +1188,12 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
                     break;
                 case INTERNALOID:
                     internalOutParam = true;
+                    break;
+                case BYTEAWITHOUTORDERWITHEQUALCOLOID:
+                case BYTEAWITHOUTORDERCOLOID:
+                case BYTEAWITHOUTORDERWITHEQUALCOLARRAYOID:
+                case BYTEAWITHOUTORDERCOLARRAYOID:
+                    fullEncryptedOutParam = true;
                     break;
                 default:
                     break;
@@ -1180,6 +1210,11 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
      *
      * But when we are in inplace-upgrade, we can create function with polymorphic return type
      */
+    if (!u_sess->attr.attr_common.enable_full_encryption && !u_sess->attr.attr_common.IsInplaceUpgrade &&
+        (fullEncryptedInParam || fullEncryptedOutParam || is_enc_type(returnType))) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION), errmsg("cannot create function"),
+            errdetail("function does not support full encrypted type parameter when client encryption is disabled.")));
+    }
     if ((IsPolymorphicType(returnType) || genericOutParam) && !u_sess->attr.attr_common.IsInplaceUpgrade &&
         !genericInParam)
         ereport(ERROR,
@@ -1340,7 +1375,7 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
             values[Anum_pg_proc_allargtypes - 1] = PointerGetDatum(dummy);
             values[Anum_pg_proc_allargtypesext - 1] = PointerGetDatum(allParameterTypes);
         }
-    } else if (parameterTypes != PointerGetDatum(NULL)) {
+    } else if (parameterTypes != NULL) {
         values[Anum_pg_proc_allargtypes - 1] = values[Anum_pg_proc_proargtypes - 1];
         values[Anum_pg_proc_allargtypesext - 1] = values[Anum_pg_proc_proargtypesext - 1];
         nulls[Anum_pg_proc_allargtypesext - 1] = nulls[Anum_pg_proc_proargtypesext - 1];
@@ -1419,17 +1454,23 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
 
     /* A db do not overload a function by arguments.*/
     NameData* pkgname = NULL;
+    char* schemaName = get_namespace_name(procNamespace);
+    if (OidIsValid(propackageid)) {
+        pkgname = GetPackageName(propackageid);
+    }
+    if (pkgname == NULL) { 
+        name = list_make2(makeString(schemaName), makeString(pstrdup(procedureName)));
+    } else {
+        name = list_make3(makeString(schemaName), makeString(pstrdup(pkgname->data)), makeString(pstrdup(procedureName)));
+    }
+#ifndef ENABLE_MULTIPLE_NODES
+    if (pkgname == NULL) {
+        LockProcName(schemaName, NULL, procedureName);
+    } else {
+        LockProcName(schemaName, pkgname->data, procedureName);
+    }
+#endif
     if (isOraStyle && !package) {
-        if (OidIsValid(propackageid)) {
-            pkgname = GetPackageName(propackageid);
-        }
-        if (pkgname == NULL) { 
-            name = list_make2(makeString(get_namespace_name(procNamespace)), makeString(pstrdup(procedureName)));
-        } else {
-            name = list_make3(makeString(get_namespace_name(procNamespace)), makeString(pstrdup(pkgname->data)), makeString(pstrdup(procedureName)));
-        }
-        List* name = list_make2(makeString(get_namespace_name(procNamespace)), makeString(pstrdup(procedureName)));
-
         FuncCandidateList listfunc = FuncnameGetCandidates(name, -1, NULL, false, false, true);
         if (listfunc) {
             if (listfunc->next)
@@ -1605,6 +1646,17 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
 
         /* send invalid message for for relation holding replaced function as trigger */
         InvalidRelcacheForTriggerFunction(retval, ((Form_pg_proc)GETSTRUCT(tup))->prorettype);
+
+        /* rebuild view depend on this proc */
+        RebuildDependViewForProc(retval);
+
+#ifdef ENABLE_MOT
+        if (proIsProcedure && !package && JitExec::IsMotSPCodegenEnabled()) {
+            /* Notify MOT that current function is about to be modified */
+            JitExec::PurgeJitSourceCache(
+                retval, JitExec::JIT_PURGE_SCOPE_SP, JitExec::JIT_PURGE_REPLACE, procedureName);
+        }
+#endif
     }
 
     myself.classId = ProcedureRelationId;
@@ -1735,7 +1787,7 @@ Oid ProcedureCreate(const char* procedureName, Oid procNamespace, Oid propackage
     }
 
     pfree_ext(final_file_name);
-    return retval;
+    return myself;
 }
 
 /*
@@ -1911,7 +1963,7 @@ Datum fmgr_sql_validator(PG_FUNCTION_ARGS)
     ErrorContextCallback sqlerrcontext;
     bool haspolyarg = false;
     int i;
-
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
     bool replace = false;
     /*
      * 3 means the number of arguments of function fmgr_sql_validator, while 'is_replace' is the third one,
@@ -1997,7 +2049,7 @@ Datum fmgr_sql_validator(PG_FUNCTION_ARGS)
             foreach (lc, raw_parsetree_list) {
                 Node* parsetree = (Node*)lfirst(lc);
                 List* querytree_sublist = NIL;
-
+                t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(parsetree);
 #ifdef PGXC
                 /* Block CTAS in SQL functions */
                 if (IsA(parsetree, CreateTableAsStmt))
@@ -2041,6 +2093,7 @@ Datum fmgr_sql_validator(PG_FUNCTION_ARGS)
     }
 
     ReleaseSysCache(tuple);
+    t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
 
     PG_RETURN_VOID();
 }
@@ -2091,12 +2144,27 @@ bool function_parse_error_transpose(const char* prosrc)
         }
     }
 
-    /* We can get the original query text from the active portal (hack...) */
-    Assert(ActivePortal && ActivePortal->status == PORTAL_ACTIVE);
-    queryText = ActivePortal->sourceText;
+#ifdef ENABLE_MOT
+    /*
+     * When MOT JIT is active we need to be careful, because we might not have a portal yet.
+     * This can happen when we trigger compilation of a function during a PERPARE statement
+     * (and not through a CREATE FUNCTION command). In this case the portal does not exist
+     * yet, and we report the error relative to function body text.
+     */
+    if (ActivePortal == nullptr) {
+        newerrposition = match_prosrc_to_query(prosrc, prosrc, origerrposition);
+    } else {
+#endif
+        /* We can get the original query text from the active portal (hack...) */
+        Assert(ActivePortal && ActivePortal->status == PORTAL_ACTIVE);
+        queryText = ActivePortal->sourceText;
 
-    /* Try to locate the prosrc in the original text */
-    newerrposition = match_prosrc_to_query(prosrc, queryText, origerrposition);
+        /* Try to locate the prosrc in the original text */
+        newerrposition = match_prosrc_to_query(prosrc, queryText, origerrposition);
+#ifdef ENABLE_MOT
+    }
+#endif
+
     if (newerrposition > 0) {
         /* Successful, so fix error position to reference original query */
         errposition(newerrposition);
@@ -2258,6 +2326,9 @@ void delete_file_handle(const char* library_path)
     DynamicFileList* file_scanner = NULL;
     DynamicFileList* pre_file_scanner = file_list;
 
+    AutoMutexLock libraryLock(&file_list_lock);
+    libraryLock.lock();
+
     char* fullname = expand_dynamic_library_name(library_path);
     for (file_scanner = file_list; file_scanner != NULL; file_scanner = file_scanner->next) {
         if (strncmp(fullname, file_scanner->filename, strlen(fullname) + 1) == 0) {
@@ -2280,6 +2351,8 @@ void delete_file_handle(const char* library_path)
             pre_file_scanner = file_scanner;
         }
     }
+
+    libraryLock.unLock();
 }
 
 /*
@@ -2661,6 +2734,29 @@ static void CheckInParameterConflicts(CatCList* catlist, const char* procedureNa
             ereport(ERROR, (errcode(ERRCODE_DUPLICATE_FUNCTION),
                 errmsg("function \"%s\" already exists with same argument types", procedureName)));
         }
+    }
+}
+
+/*
+ * Due to procedure has no unique index on parameters, it maybe insert same data
+ * and this function prevent insert procedure with same funcname and funcargs,
+ */
+void LockProcName(char* schemaname, char* pkgname, const char* funcname)
+{
+    if (u_sess->attr.attr_common.upgrade_mode != 0) {
+        return;
+    }
+    Oid schemaOid = SchemaNameGetSchemaOid(schemaname, false);
+    if (IsPackageSchemaOid(schemaOid)) {
+        return;
+    }
+    if (pkgname != NULL) {
+        List* funcnameList = list_make2(makeString(pstrdup(pkgname)), makeString(pstrdup(funcname)));
+        uint32 hash_value = string_hash(NameListToQuotedString(funcnameList), NAMEDATALEN + NAMEDATALEN);
+        LockDatabaseObject(ProcedureRelationId, schemaOid, hash_value, ExclusiveLock);
+    } else {
+        uint32 hash_value = string_hash(funcname, NAMEDATALEN);
+        LockDatabaseObject(ProcedureRelationId, schemaOid, hash_value, ExclusiveLock);
     }
 }
 #endif

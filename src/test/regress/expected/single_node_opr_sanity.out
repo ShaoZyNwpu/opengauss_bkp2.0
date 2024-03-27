@@ -722,6 +722,8 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  3073 | pg_is_xlog_replay_paused
  3080 | pg_sequence_last_value
  3097 | varchar_transform
+ 3118 | standby_statement_history
+ 3119 | standby_statement_history
  3122 | oidvectorrecv_extend
  3123 | oidvectorsend_extend
  3124 | json_agg
@@ -888,6 +890,8 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  3587 | timestamptz_list_agg_transfn
  3589 | timestamptz_list_agg_noarg2_transfn
  3591 | pgxc_get_thread_wait_status
+ 3594 | event_trigger_in
+ 3595 | event_trigger_out
  3596 | pg_get_gtt_relstats
  3597 | pg_get_gtt_statistics
  3598 | pg_gtt_attached_pid
@@ -1408,10 +1412,19 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  5721 | get_local_active_session
  5722 | ledger_hist_check
  5723 | get_wait_event_info
+ 5724 | pg_event_trigger_dropped_objects
+ 5725 | pg_identify_object
+ 5726 | pg_event_trigger_table_rewrite_oid
+ 5727 | pg_event_trigger_table_rewrite_reason
+ 5728 | pg_get_object_address
  5730 | locktag_decode
  5731 | working_version_num
  5732 | statement_detail_decode
  5733 | dynamic_func_control
+ 5801 | pg_ddl_command_in
+ 5803 | pg_ddl_command_out
+ 5807 | pg_ddl_command_recv
+ 5809 | pg_ddl_command_send
  5812 | hash16in
  5813 | hash16out
  5814 | hash32in
@@ -1452,6 +1465,8 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  6202 | mot_local_memory_detail
  6203 | pg_start_backup
  6204 | pg_stop_backup
+ 6205 | mot_jit_detail
+ 6206 | mot_jit_profile
  6224 | gs_get_next_xid_csn
  6321 | pg_stat_file_recursive
  6322 | gs_decrypt
@@ -1527,6 +1542,7 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  7893 | gs_stat_ustore
  7998 | set_working_grand_version_num_manually
  8001 | get_paxos_replication_info
+ 8413 | pg_read_binary_file_blocks 
  8050 | datalength
  8413 | pg_read_binary_file_blocks
  8642 | gs_txid_oldestxmin
@@ -1535,6 +1551,7 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  8702 | array_intersect_distinct
  8703 | array_except
  8704 | array_except_distinct
+ 8852 | pg_event_trigger_ddl_commands
  9004 | smalldatetime_in
  9006 | smalldatetime_out
  9007 | smalldatetime_recv
@@ -1556,6 +1573,7 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  9031 | gs_set_obs_delete_location
  9032 | gs_get_global_barrier_status
  9033 | gs_get_local_barrier_status
+ 9040 | gs_xlog_keepers
  9034 | gs_get_global_barriers_status
  9035 | gs_set_obs_delete_location_with_slotname
  9037 | gs_set_standby_cluster_target_barrier_id
@@ -1586,8 +1604,19 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  9988 | tdigest_merge_to_one
  9989 | tdigest_merge
  9990 | percentile_of_value
+ 9998 | gs_stack
  9999 | pg_test_err_contain_err
 --?.*
+
+-- pg_catalog.function() should be visible.
+SELECT oid, proname
+FROM pg_proc
+where pronamespace = 11 AND
+      pg_function_is_visible(oid) = false
+order by 1,2;
+ oid | proname 
+-----+---------
+(0 rows)
 
 -- **************** pg_cast ****************
 -- Catch bogus values in pg_cast columns (other than cases detected by

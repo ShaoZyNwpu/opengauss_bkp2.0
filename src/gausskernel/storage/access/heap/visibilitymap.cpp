@@ -96,6 +96,7 @@
 #include "utils/inval.h"
 #include "commands/tablespace.h"
 #include "catalog/pg_hashbucket_fn.h"
+#include "catalog/pg_partition_fn.h"
 #include "utils/syscache.h"
 /* table for fast counting of set bits */
 static const uint8 number_of_ones[256] = {
@@ -239,6 +240,13 @@ void visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRe
 
                     /* caller is expected to set PD_ALL_VISIBLE first */
                     Assert(PageIsAllVisible(heapPage));
+                    if (ENABLE_DMS) {
+                        BufferDesc* buf_desc = GetBufferDescriptor(heapBuf - 1);
+                        if ((pg_atomic_read_u32(&buf_desc->state) & BM_DIRTY) == 0) {
+                            MarkBufferDirty(heapBuf);
+                        }
+                    }
+
                     PageSetLSN(heapPage, recptr);
                 }
             }
@@ -270,6 +278,10 @@ void visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRe
  */
 bool visibilitymap_test(Relation rel, BlockNumber heapBlk, Buffer *buf)
 {
+    if (ENABLE_DMS && !SS_PRIMARY_MODE) {
+        return false;
+    }
+
     BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
     uint32 mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
     uint8 mapBit = HEAPBLK_TO_MAPBIT(heapBlk);
@@ -285,7 +297,7 @@ bool visibilitymap_test(Relation rel, BlockNumber heapBlk, Buffer *buf)
         volatile BufferDesc *bufHdr = NULL;
 
         if (BufferIsLocal(*buf)) {
-            bufHdr = &(u_sess->storage_cxt.LocalBufferDescriptors[-(*buf) - 1]);
+            bufHdr = (BufferDesc *)&(u_sess->storage_cxt.LocalBufferDescriptors[-(*buf) - 1].bufferdesc);
         } else {
             bufHdr = GetBufferDescriptor(*buf - 1);
         }
@@ -369,6 +381,22 @@ BlockNumber visibilitymap_count(Relation rel, Partition part)
             result += visibilitymap_count_heap(buckRel);
             bucketCloseRelation(buckRel);
         }
+    } else if (RelationIsPartitioned(rel) && PointerIsValid(part)) {
+        Relation partRel = partitionGetRelation(rel, part);
+        if (RelationIsSubPartitioned(rel) && PartitionIsTablePartition(part)) {
+            List *subPartList = relationGetPartitionList(partRel, NoLock);
+            ListCell *lc = NULL;
+            foreach (lc, subPartList) {
+                Partition subPart = (Partition)lfirst(lc);
+                Relation subPartRel = partitionGetRelation(rel, subPart);
+                result += visibilitymap_count_heap(subPartRel);
+                releaseDummyRelation(&subPartRel);
+            }
+            releasePartitionList(partRel, &subPartList, NoLock);
+        } else {
+            result = visibilitymap_count_heap(partRel);
+        }
+        releaseDummyRelation(&partRel);
     } else {
         result = visibilitymap_count_heap(rel);
     }
@@ -596,6 +624,7 @@ static void vm_extend(Relation rel, BlockNumber vm_nblocks)
 {
     BlockNumber vm_nblocks_now;
     Page pg;
+    Page pg_ori = NULL;
 
     ADIO_RUN()
     {
@@ -603,7 +632,12 @@ static void vm_extend(Relation rel, BlockNumber vm_nblocks)
     }
     ADIO_ELSE()
     {
-        pg = (Page)palloc(BLCKSZ);
+        if (ENABLE_DSS) {
+            pg_ori = (Page)palloc(BLCKSZ + ALIGNOF_BUFFER);
+            pg = (Page)BUFFERALIGN(pg_ori);
+        } else {
+            pg = (Page)palloc(BLCKSZ);
+        }
     }
     ADIO_END();
 
@@ -642,7 +676,7 @@ static void vm_extend(Relation rel, BlockNumber vm_nblocks)
     /* Now extend the file */
     while (vm_nblocks_now < vm_nblocks) {
         if (IsSegmentFileNode(rel->rd_node)) {
-            Buffer buf = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+            Buffer buf = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, P_NEW, RBM_ZERO, NULL);
             ReleaseBuffer(buf);
 #ifdef USE_ASSERT_CHECKING
             BufferDesc *buf_desc = GetBufferDescriptor(buf - 1);
@@ -676,8 +710,13 @@ static void vm_extend(Relation rel, BlockNumber vm_nblocks)
     }
     ADIO_ELSE()
     {
-        pfree(pg);
-        pg = NULL;
+        if (ENABLE_DSS) {
+            pfree(pg_ori);
+            pg_ori = NULL;
+        } else {
+            pfree(pg);
+            pg = NULL;
+        }
     }
     ADIO_END();
 }

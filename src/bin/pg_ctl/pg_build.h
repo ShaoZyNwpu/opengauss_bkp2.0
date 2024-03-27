@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "replication/replicainternal.h"
+#include "tool_common.h"
 
 #define CONFIGRURE_FILE "postgresql.conf"
 #define CONFIGRURE_FILE_BAK "postgresql.conf.bak"
@@ -19,6 +20,8 @@
 #define CONFIG_PARAM2 "replconninfo2"
 #define CONFIG_CASCADE_STANDBY "cascade_standby"
 #define CONFIG_NODENAME "pgxc_node_name"
+#define CONFIG_REPL_AUTH_MODE "repl_auth_mode"
+#define CONFIG_REPL_UUID "repl_uuid"
 #define MAX_CONNINFO 8
 
 #define MAX_PARAM_LEN 1024
@@ -26,6 +29,7 @@
 #define INVALID_LINES_IDX (int)(~0)
 #define MAX_CONFIG_FILE_SIZE 0xFFFFF /* max file size for configurations = 1M */
 #define MAX_QUERY_LEN 512
+#define REPL_AUTH_MODE_UUID "uuid"
 
 extern char ssl_cert_file[];
 extern char ssl_key_file[];
@@ -44,7 +48,8 @@ extern char gaussdb_state_file[MAXPGPATH];
 void delete_datadir(const char* dirname);
 
 int find_gucoption(
-    const char** optlines, const char* opt_name, int* name_offset, int* name_len, int* value_offset, int* value_len);
+    const char** optlines, const char* opt_name, int* name_offset, int* name_len,
+    int* value_offset, int* value_len, unsigned char strip_char = ' ');
 
 void get_conninfo(const char* filename);
 

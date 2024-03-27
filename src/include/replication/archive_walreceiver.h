@@ -32,8 +32,8 @@
 #include "replication/slot.h"
 
 
-extern int32 pg_atoi(char* s, int size, int c);
-extern int32 pg_strtoint32(const char* s);
+extern int32 pg_atoi(char* s, int size, int c, bool can_ignore);
+extern int32 pg_strtoint32(const char* s, bool can_ignore);
 /* Prototypes for interface functions */
 
 extern bool archive_connect(char* conninfo, XLogRecPtr* startpoint, char* slotname, int channel_identifier);
@@ -53,6 +53,7 @@ extern void archive_disconnect(void);
 #define IS_CN_OBS_DISASTER_RECOVER_MODE \
     (IS_PGXC_COORDINATOR  && GetArchiveRecoverySlot())
 #define OBS_ARCHIVE_STATUS_FILE "obs_archive_start_end_record"
+#define OBS_LAST_CLEAN_RECORD "obs_last_clean_record"
 #define ARCHIVE_GLOBAL_BARRIER_LIST_PATH "global_barrier_records"
 #define FILE_TIME_INTERVAL 600000
 

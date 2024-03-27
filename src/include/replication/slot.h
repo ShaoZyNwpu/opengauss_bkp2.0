@@ -153,6 +153,11 @@ typedef struct ReplicationSlot {
     /* is somebody performing io on this slot? */
     LWLock  *io_in_progress_lock;
 
+    /* Condition variable signalled when active_pid changes */
+    pthread_mutex_t active_mutex;
+    pthread_cond_t active_cv;
+    pthread_condattr_t slotAttr;
+
     /* all the remaining data is only used for logical slots */
 
     /* ----
@@ -168,6 +173,7 @@ typedef struct ReplicationSlot {
     ArchiveConfig* archive_config;
     bool is_recovery;
     char* extra_content;
+    TimestampTz last_xmin_change_time;
 } ReplicationSlot;
 
 typedef struct ArchiveSlotConfig {
@@ -262,8 +268,8 @@ extern void ReplicationSlotsShmemInit(void);
 extern void ReplicationSlotCreate(const char* name, ReplicationSlotPersistency persistency, bool isDummyStandby,
     Oid databaseId, XLogRecPtr restart_lsn, char* extra_content = NULL, bool encrypted = false);
 extern void ReplicationSlotPersist(void);
-extern void ReplicationSlotDrop(const char* name, bool for_backup = false);
-extern void ReplicationSlotAcquire(const char* name, bool isDummyStandby, bool allowDrop = false);
+extern void ReplicationSlotDrop(const char* name, bool for_backup = false, bool nowait = true);
+extern void ReplicationSlotAcquire(const char* name, bool isDummyStandby, bool allowDrop = false, bool nowait = true);
 extern bool IsReplicationSlotActive(const char *name);
 extern bool IsLogicalReplicationSlot(const char *name);
 bool ReplicationSlotFind(const char* name);
@@ -274,7 +280,7 @@ extern void CreateSlotOnDisk(ReplicationSlot* slot);
 
 /* misc stuff */
 extern bool ReplicationSlotValidateName(const char* name, int elevel);
-extern void ValidateName(const char* name);
+extern void ValidateInputString(const char* inputString);
 extern void ReplicationSlotsComputeRequiredXmin(bool already_locked);
 extern void ReplicationSlotsComputeRequiredLSN(ReplicationSlotState* repl_slt_state);
 extern XLogRecPtr ReplicationSlotsComputeConfirmedLSN(void);
@@ -333,6 +339,11 @@ extern ArchiveTaskStatus* find_archive_task_status(int *idx);
 extern ArchiveTaskStatus* walreceiver_find_archive_task_status(unsigned int expected_pitr_task_status);
 extern void get_hadr_cn_info(char* keyCn, bool* isExitKey, char* deleteCn, bool* isExitDelete, 
     ArchiveSlotConfig *archive_conf);
-
+extern void ReplicationSlotNameForTablesync(Oid suboid, Oid relid, char *syncslotname, int szslot);
+extern void ReplicationSlotDropAtPubNode(char *slotname, bool missing_ok);
+extern void LogicalCleanSnapDirectory(bool rebuild);
+extern void CleanMyReplicationSlot();
+void GetReplslotPath(char *path);
+void ResetReplicationSlotsShmem();
 
 #endif /* SLOT_H */

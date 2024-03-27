@@ -29,6 +29,8 @@
 #include "executor/node/nodeTrainModel.h"
 #include "db4ai/db4ai_api.h"
 
+static TupleTableSlot* ExecTrainModel(PlanState* state);
+
 static bool ExecFetchTrainModel(void *callback_data, ModelTuple * tuple)
 {
     TrainModelState *pstate = (TrainModelState*)callback_data;
@@ -92,6 +94,7 @@ TrainModelState* ExecInitTrainModel(TrainModel* pnode, EState* estate, int eflag
     pstate->config = pnode;
     pstate->algorithm = palgo;
     pstate->finished = 0;
+    pstate->ss.ps.ExecProcNode = ExecTrainModel;
     
     // Tuple table initialization
     ExecInitScanTupleSlot(estate, &pstate->ss);
@@ -118,9 +121,9 @@ TrainModelState* ExecInitTrainModel(TrainModel* pnode, EState* estate, int eflag
     pstate->tuple.typbyval = (bool *)palloc(sizeof(bool) * pstate->tuple.ncolumns);
     pstate->tuple.typlen = (int16 *)palloc(sizeof(int16) * pstate->tuple.ncolumns);
     for (int c = 0; c < pstate->tuple.ncolumns; c++) {
-        pstate->tuple.typid[c] = tupdesc->attrs[c]->atttypid;
-        pstate->tuple.typbyval[c] = tupdesc->attrs[c]->attbyval;
-        pstate->tuple.typlen[c] = tupdesc->attrs[c]->attlen;
+        pstate->tuple.typid[c] = tupdesc->attrs[c].atttypid;
+        pstate->tuple.typbyval[c] = tupdesc->attrs[c].attbyval;
+        pstate->tuple.typlen[c] = tupdesc->attrs[c].attlen;
     }
 
     pstate->row_allocated = false;
@@ -140,8 +143,9 @@ TrainModelState* ExecInitTrainModel(TrainModel* pnode, EState* estate, int eflag
     return pstate;
 }
 
-TupleTableSlot* ExecTrainModel(TrainModelState* pstate)
+static TupleTableSlot* ExecTrainModel(PlanState* state)
 {
+    TrainModelState* pstate = castNode(TrainModelState, state);
     // check if already finished
     if (pstate->finished == pstate->config->configurations)
         return NULL;

@@ -48,9 +48,11 @@ typedef struct knl_instance_attr_common {
 #endif
     bool Logging_collector;
     bool allowSystemTableMods;
+    bool allow_create_sysobject;
     bool enable_thread_pool;
     bool enable_ffic_log;
     bool enable_global_plancache;
+    bool enable_cachedplan_mgr;
     bool enable_global_syscache;
     int max_files_per_process;
     int pgstat_track_activity_query_size;
@@ -101,6 +103,7 @@ typedef struct knl_instance_attr_common {
 #endif
     int cluster_run_mode;
     int stream_cluster_run_mode;
+    bool light_comm;
 } knl_instance_attr_common;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_COMMON_H_ */

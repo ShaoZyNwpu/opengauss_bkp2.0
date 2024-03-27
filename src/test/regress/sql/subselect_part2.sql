@@ -90,6 +90,11 @@ with q as (select max(f1) from int4_tbl group by f1 order by f1)
   select q from q;
 
 --
+-- check for over-optimization of whole-row Var referencing an Append plan
+--
+select (select q from (select 1,2,3 where f1 > 0 union all select 4,5,6.0 where f1 <= 0 ) q) from int4_tbl;
+
+--
 -- Test case for sublinks pushed down into subselects via join alias expansion
 --
 
@@ -338,9 +343,41 @@ SELECT 'z'
 FROM location_type
 WHERE 1=0);
 
+--
+-- Check EXISTS simplification with LIMIT
+--
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit null);
+explain (costs off)
+select * from int4_tbl o where not exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 1);
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 0);
+
 
 drop table if exists location_type cascade;
 drop table if exists item_inventory_plan cascade;
 drop table if exists item_inventory cascade;
 drop  view usview03;
 
+set rewrite_rule = 'remove_redundant_distinct_group_by';
+create table subselect_t1 (a int);
+create table subselect_t2 (a int, b int);
+insert into subselect_t1 values (1);
+insert into subselect_t1 values (2);
+insert into subselect_t1 values (-1);
+insert into subselect_t2 values (1, 1);
+insert into subselect_t2 values (2, 2);
+insert into subselect_t2 values (-1, -1);
+
+explain (costs off) select * from subselect_t1 where a in (select distinct a from subselect_t2);
+select * from subselect_t1 where a in (select distinct a from subselect_t2);
+
+explain (costs off) select * from subselect_t1 where a in (select a from subselect_t2 group by a);
+select * from subselect_t1 where a in (select a from subselect_t2 group by a);
+
+explain (costs off) select * from subselect_t1 where a in (select distinct on (abs(a)) a from subselect_t2);
+select * from subselect_t1 where a in (select distinct on (abs(a)) a from subselect_t2);
+reset rewrite_rule;

@@ -393,7 +393,7 @@ static bool checkProcess(int port)
     return procexist;
 }
 
-void gstrace_destory(int code, void *arg)
+void gstrace_destroy(int code, void *arg)
 {
     trace_context* pTrcCxt = getTraceContext();
 
@@ -500,7 +500,7 @@ int gstrace_init(int key)
         pTrcCxt->pTrcCfg->hash_trace_config_file, LENGTH_TRACE_CONFIG_HASH, hash_str, LENGTH_TRACE_CONFIG_HASH);
     securec_check(ret, "\0", "\0");
 
-    (void)on_exit(gstrace_destory, NULL);
+    (void)on_exit(gstrace_destroy, NULL);
 
     return TRACE_OK;
 }
@@ -565,6 +565,11 @@ trace_msg_code gstrace_start(int key, const char* mask, uint64_t bufferSize, con
     bufferSize = gsAlign(((bufferSize > MIN_BUF_SIZE) ? bufferSize : MIN_BUF_SIZE), SLOT_SIZE);
     bufferSize = bTrcToFile ? MIN_BUF_SIZE : roundToNearestPowerOfTwo(bufferSize);
 
+    /* check if database process exist. */
+    if (!checkProcess(key)) {
+        return TRACE_PROCESS_NOT_EXIST;
+    }
+
     if (attachTraceCfgSharedMem(key) != TRACE_OK) {
         /* Failed to attached to shared memory. */
         return TRACE_ATTACH_CFG_SHARE_MEMORY_ERR;
@@ -572,11 +577,6 @@ trace_msg_code gstrace_start(int key, const char* mask, uint64_t bufferSize, con
 
     if (pTrcCxt->pTrcCfg->bEnabled) {
         return TRACE_ALREADY_START;
-    }
-
-    /* check if database process exist. */
-    if (!checkProcess(key)) {
-        return TRACE_PROCESS_NOT_EXIST;
     }
 
     /* set the mask if it's passed in */
@@ -613,6 +613,11 @@ trace_msg_code gstrace_stop(int key)
 {
     char sBufMemName[TRC_SHARED_MEM_NAME_MAX] = {0};
     trace_context* pTrcCxt = getTraceContext();
+
+    /* check if database process exist. */
+    if (!checkProcess(key)) {
+        return TRACE_PROCESS_NOT_EXIST;
+    }
 
     if (attachTraceCfgSharedMem(key) != TRACE_OK) {
         return TRACE_ATTACH_CFG_SHARE_MEMORY_ERR;
@@ -1014,6 +1019,11 @@ trace_msg_code gstrace_dump(int key, const char* outPath)
     trace_context* pTrcCxt = getTraceContext();
     trace_msg_code ret;
 
+    /* check if database process exist. */
+    if (!checkProcess(key)) {
+        return TRACE_PROCESS_NOT_EXIST;
+    }
+
     if (attachTraceCfgSharedMem(key) != TRACE_OK) {
         return TRACE_ATTACH_CFG_SHARE_MEMORY_ERR;
     }
@@ -1158,7 +1168,7 @@ FILE* trace_fopen(const char* open_file, const char* mode)
     canonicalize_path(file_name);
 
     fp = fopen(file_name, mode);
-    if (chmod(file_name, S_IWUSR | S_IRUSR) != 0) {
+    if (fp != NULL && chmod(file_name, S_IWUSR | S_IRUSR) != 0) {
         fclose(fp);
         return NULL;
     }

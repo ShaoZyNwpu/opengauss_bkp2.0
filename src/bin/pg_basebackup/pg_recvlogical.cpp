@@ -388,7 +388,7 @@ static void BeginToText(const char* stream, uint32 *curPos, PQExpBuffer res)
     *curPos += sizeof(LSNupper);
     uint32 LSNlower = ntohl(*(uint32 *)(&stream[*curPos]));
     *curPos += sizeof(LSNlower);
-    appendPQExpBuffer(res, "commit_lsn: %X/%X", LSNupper, LSNlower);
+    appendPQExpBuffer(res, "first_lsn: %X/%X", LSNupper, LSNlower);
 
     if (stream[*curPos] == 'T') {
         *curPos += 1;
@@ -397,6 +397,12 @@ static void BeginToText(const char* stream, uint32 *curPos, PQExpBuffer res)
         appendPQExpBufferStr(res, " commit_time: ");
         appendBinaryPQExpBuffer(res, &stream[*curPos], timeLen);
         *curPos += timeLen;
+    }
+    if (stream[*curPos] == 'O') {
+        *curPos += 1;
+        uint32 originid = ntohl(*(uint32 *)(&stream[*curPos]));
+        *curPos += sizeof(uint32);
+        appendPQExpBuffer(res, " origin_id: %d", originid);
     }
 }
 
@@ -1221,7 +1227,7 @@ int main(int argc, char** argv)
         rc = snprintf_s(query,
             sizeof(query),
             sizeof(query) - 1,
-            "CREATE_REPLICATION_SLOT \"%s\" LOGICAL \"%s\"",
+            "CREATE_REPLICATION_SLOT \"%s\" LOGICAL %s",
             replication_slot,
             plugin);
         securec_check_ss_c(rc, "\0", "\0");

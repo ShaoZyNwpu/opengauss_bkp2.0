@@ -57,6 +57,24 @@
 
 static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerId);
 
+void CheckDefineOperatorPrivilege(Oid oprNamespace, const char* oprName)
+{
+    if ((oprNamespace == PG_CATALOG_NAMESPACE || oprNamespace == PG_PUBLIC_NAMESPACE) && !initialuser()) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("permission denied to create operator \"%s\"", oprName),
+            errhint("must be initial user to create an operator in %s schema.", get_namespace_name(oprNamespace))));
+    }
+
+    if (!IsInitdb && !u_sess->attr.attr_common.IsInplaceUpgrade &&
+        !g_instance.attr.attr_common.allow_create_sysobject &&
+        IsSysSchema(oprNamespace)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("permission denied to create operator \"%s\"", oprName),
+            errhint("not allowd to create an operator in %s schema when allow_create_sysobject is off.",
+            get_namespace_name(oprNamespace))));
+    }
+}
+
 /*
  * DefineOperator
  *		this function extracts all the information from the
@@ -65,7 +83,7 @@ static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerI
  *
  * 'parameters' is a list of DefElem
  */
-void DefineOperator(List* names, List* parameters)
+ObjectAddress DefineOperator(List* names, List* parameters)
 {
     char* oprName = NULL;
     Oid oprNamespace;
@@ -127,6 +145,8 @@ void DefineOperator(List* names, List* parameters)
         if (aclresult != ACLCHECK_OK)
             aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(oprNamespace));
     }
+
+    CheckDefineOperatorPrivilege(oprNamespace, oprName);
 
     /*
      * loop over the definition list and extract the information we need.
@@ -321,7 +341,7 @@ void DefineOperator(List* names, List* parameters)
     /*
      * now have OperatorCreate do all the work..
      */
-    OperatorCreate(oprName, /* operator name */
+    return OperatorCreate(oprName, /* operator name */
         oprNamespace,       /* namespace */
         typeId1,            /* left type id */
         typeId2,            /* right type id */
@@ -369,10 +389,11 @@ void AlterOperatorOwner_oid(Oid operOid, Oid newOwnerId)
 /*
  * change operator owner
  */
-void AlterOperatorOwner(List* name, TypeName* typeName1, TypeName* typeName2, Oid newOwnerId)
+ObjectAddress AlterOperatorOwner(List* name, TypeName* typeName1, TypeName* typeName2, Oid newOwnerId)
 {
     Oid operOid;
     Relation rel;
+    ObjectAddress address;
 
     rel = heap_open(OperatorRelationId, RowExclusiveLock);
 
@@ -381,6 +402,8 @@ void AlterOperatorOwner(List* name, TypeName* typeName1, TypeName* typeName2, Oi
     AlterOperatorOwner_internal(rel, operOid, newOwnerId);
 
     heap_close(rel, NoLock);
+    ObjectAddressSet(address, OperatorRelationId, operOid);
+    return address;
 }
 
 static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerId)
@@ -436,13 +459,14 @@ static void AlterOperatorOwner_internal(Relation rel, Oid operOid, Oid newOwnerI
 /*
  * Execute ALTER OPERATOR SET SCHEMA
  */
-void AlterOperatorNamespace(List* names, List* argtypes, const char* newschema)
+ObjectAddress AlterOperatorNamespace(List* names, List* argtypes, const char* newschema)
 {
     List* operatorName = names;
     TypeName* typeName1 = (TypeName*)linitial(argtypes);
     TypeName* typeName2 = (TypeName*)lsecond(argtypes);
     Oid operOid, nspOid;
     Relation rel;
+    ObjectAddress address;
 
     rel = heap_open(OperatorRelationId, RowExclusiveLock);
 
@@ -451,6 +475,13 @@ void AlterOperatorNamespace(List* names, List* argtypes, const char* newschema)
 
     /* get schema OID */
     nspOid = LookupCreationNamespace(newschema);
+
+    /* only super user can alter to public */
+    if (nspOid == PG_PUBLIC_NAMESPACE && !initialuser()) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("permission denied to alter %s", getObjectDescriptionOids(RelationGetRelid(rel), operOid)),
+            errhint("must be initial user to alter a operator to public schema.")));
+    }
 
     (void)AlterObjectNamespace(rel,
         OPEROID,
@@ -463,6 +494,8 @@ void AlterOperatorNamespace(List* names, List* argtypes, const char* newschema)
         ACL_KIND_OPER);
 
     heap_close(rel, RowExclusiveLock);
+    ObjectAddressSet(address, OperatorRelationId, operOid);
+    return address;
 }
 
 Oid AlterOperatorNamespace_oid(Oid operOid, Oid newNspOid)

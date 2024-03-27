@@ -62,14 +62,17 @@
  *		'nil' if the constant qualification is not satisfied.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecResult(ResultState* node)
+static TupleTableSlot* ExecResult(PlanState* state)
 {
+    ResultState* node = castNode(ResultState, state);
     TupleTableSlot* outer_tuple_slot = NULL;
     TupleTableSlot* result_slot = NULL;
     PlanState* outer_plan = NULL;
     ExprDoneCond is_done;
     ExprContext* econtext = node->ps.ps_ExprContext;
 
+    CHECK_FOR_INTERRUPTS();
+    
     /*
      * check constant qualifications like (2 > 1), if not already done
      */
@@ -89,6 +92,23 @@ TupleTableSlot* ExecResult(ResultState* node)
     }
 
     /*
+     * Reset per-tuple memory context to free any expression evaluation
+     * storage allocated in the previous tuple cycle.  Note this can't happen
+     * until we're done projecting out tuples from a scan tuple.
+     */
+    ResetExprContext(econtext);
+
+    /*
+     * Reset per-tuple memory context to free any expression evaluation
+     * storage allocated in the previous tuple cycle.  Note this can't happen
+     * until we're done projecting out tuples from a scan tuple.
+     */
+    if (!econtext->hasSetResultStore) {
+        /* return value one by one, just free early one */
+        ResetExprContext(econtext);
+    }
+
+    /*
      * Check to see if we're still projecting out tuples from a previous scan
      * tuple (because there is a function-returning-set in the projection
      * expressions).  If so, try to project another one.
@@ -102,12 +122,10 @@ TupleTableSlot* ExecResult(ResultState* node)
         node->ps.ps_TupFromTlist = false;
     }
 
-    /*
-     * Reset per-tuple memory context to free any expression evaluation
-     * storage allocated in the previous tuple cycle.  Note this can't happen
-     * until we're done projecting out tuples from a scan tuple.
-     */
-    ResetExprContext(econtext);
+    if (econtext->hasSetResultStore) {
+        /* return values all store in ResultStore, could not free early one */
+        
+    }
 
     /*
      * if rs_done is true then it means that we were asked to return a
@@ -208,6 +226,7 @@ ResultState* ExecInitResult(BaseResult* node, EState* estate, int eflags)
     ResultState* resstate = makeNode(ResultState);
     resstate->ps.plan = (Plan*)node;
     resstate->ps.state = estate;
+    resstate->ps.ExecProcNode = ExecResult;
 
     resstate->rs_done = false;
     resstate->rs_checkqual = (node->resconstantqual == NULL) ? false : true;
@@ -248,7 +267,7 @@ ResultState* ExecInitResult(BaseResult* node, EState* estate, int eflags)
      * no relations are involved in nodeResult, set the default
      * tableAm type to HEAP
      */
-    ExecAssignResultTypeFromTL(&resstate->ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&resstate->ps);
 
     ExecAssignProjectionInfo(&resstate->ps, NULL);
 

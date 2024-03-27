@@ -47,7 +47,7 @@ static void OperatorUpd(Oid baseId, Oid commId, Oid negId);
 static Oid get_other_operator(List* otherOp, Oid otherLeftTypeId, Oid otherRightTypeId, const char* operatorName,
     Oid operatorNamespace, Oid leftTypeId, Oid rightTypeId, bool isCommutator);
 
-static void makeOperatorDependencies(HeapTuple tuple);
+static ObjectAddress makeOperatorDependencies(HeapTuple tuple, bool isUpdate);
 
 /*
  * Check whether a proposed operator name is legal
@@ -234,7 +234,7 @@ static Oid OperatorShellMake(const char* operatorName, Oid operatorNamespace, Oi
     CatalogUpdateIndexes(pg_operator_desc, tup);
 
     /* Add dependencies for the entry */
-    makeOperatorDependencies(tup);
+    makeOperatorDependencies(tup, false);
 
     heap_freetuple_ext(tup);
 
@@ -289,7 +289,7 @@ static Oid OperatorShellMake(const char* operatorName, Oid operatorNamespace, Oi
  * Forward declaration is used only for this purpose, it is
  * not available to the user as it is for type definition.
  */
-void OperatorCreate(const char* operatorName, Oid operatorNamespace, Oid leftTypeId, Oid rightTypeId, Oid procedureId,
+ObjectAddress OperatorCreate(const char* operatorName, Oid operatorNamespace, Oid leftTypeId, Oid rightTypeId, Oid procedureId,
     List* commutatorName, List* negatorName, Oid restrictionId, Oid joinId, bool canMerge, bool canHash)
 {
     Relation pg_operator_desc;
@@ -306,6 +306,9 @@ void OperatorCreate(const char* operatorName, Oid operatorNamespace, Oid leftTyp
     TupleDesc tupDesc;
     int i;
     Oid oprowner = InvalidOid;
+    bool isUpdate = false;
+    ObjectAddress address;
+
     /*
      * isalter is true, change the owner of the objects as the owner of the
      * namespace, if the owner of the namespce has the same name as the namescpe
@@ -454,6 +457,7 @@ void OperatorCreate(const char* operatorName, Oid operatorNamespace, Oid leftTyp
      * If we are replacing an operator shell, update; else insert
      */
     if (operatorObjectId) {
+        isUpdate = true;
         tup = SearchSysCacheCopy1(OPEROID, ObjectIdGetDatum(operatorObjectId));
         if (!HeapTupleIsValid(tup))
             ereport(ERROR,
@@ -474,7 +478,7 @@ void OperatorCreate(const char* operatorName, Oid operatorNamespace, Oid leftTyp
     CatalogUpdateIndexes(pg_operator_desc, tup);
 
     /* Add dependencies for the entry */
-    makeOperatorDependencies(tup);
+    address = makeOperatorDependencies(tup, isUpdate);
 
     /* Post creation hook for new operator */
     InvokeObjectAccessHook(OAT_POST_CREATE, OperatorRelationId, operatorObjectId, 0, NULL);
@@ -497,6 +501,7 @@ void OperatorCreate(const char* operatorName, Oid operatorNamespace, Oid leftTyp
 
     if (OidIsValid(commutatorId) || OidIsValid(negatorId))
         OperatorUpd(operatorObjectId, commutatorId, negatorId);
+    return address;
 }
 
 /*
@@ -680,7 +685,7 @@ static void OperatorUpd(Oid baseId, Oid commId, Oid negId)
  * NB: the OidIsValid tests in this routine are necessary, in case
  * the given operator is a shell.
  */
-static void makeOperatorDependencies(HeapTuple tuple)
+static ObjectAddress makeOperatorDependencies(HeapTuple tuple, bool isUpdate)
 {
     Form_pg_operator oper = (Form_pg_operator)GETSTRUCT(tuple);
     ObjectAddress myself, referenced;
@@ -693,8 +698,10 @@ static void makeOperatorDependencies(HeapTuple tuple)
      * In case we are updating a shell, delete any existing entries, except
      * for extension membership which should remain the same.
      */
-    (void)deleteDependencyRecordsFor(myself.classId, myself.objectId, true);
-    deleteSharedDependencyRecordsFor(myself.classId, myself.objectId, 0);
+    if (isUpdate) {
+        (void)deleteDependencyRecordsFor(myself.classId, myself.objectId, true);
+        deleteSharedDependencyRecordsFor(myself.classId, myself.objectId, 0);
+    }
 
     /* Dependency on namespace */
     if (OidIsValid(oper->oprnamespace)) {
@@ -765,5 +772,6 @@ static void makeOperatorDependencies(HeapTuple tuple)
     recordDependencyOnOwner(OperatorRelationId, HeapTupleGetOid(tuple), oper->oprowner);
 
     /* Dependency on extension */
-    recordDependencyOnCurrentExtension(&myself, true);
+    recordDependencyOnCurrentExtension(&myself, isUpdate);
+    return myself;
 }

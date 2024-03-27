@@ -86,6 +86,14 @@
             return false;                              \
     } while (0)
 
+/* Check whether a field is null */
+#define CHECK_ANY_NULL(fildname)                                \
+    do {                                                        \
+        if (a->fildname == nullptr || b->fildname == nullptr) { \
+            return false;                                       \
+        }                                                       \
+    } while (0)
+
 /* Compare a parse location field (this is a no-op, per note above) */
 #define COMPARE_LOCATION_FIELD(fldname) ((void)0)
 
@@ -120,6 +128,8 @@ static bool _equalRangeVar(const RangeVar* a, const RangeVar* b)
     COMPARE_SCALAR_FIELD(isbucket);
     COMPARE_NODE_FIELD(buckets);
     COMPARE_SCALAR_FIELD(withVerExpr);
+    COMPARE_NODE_FIELD(partitionNameList);
+    COMPARE_NODE_FIELD(indexhints);
 
     return true;
 }
@@ -135,7 +145,16 @@ static bool _equalIntoClause(const IntoClause* a, const IntoClause* b)
     COMPARE_SCALAR_FIELD(skipData);
     COMPARE_SCALAR_FIELD(ivm);
     COMPARE_SCALAR_FIELD(relkind);
+    COMPARE_NODE_FIELD(userVarList);
+    COMPARE_NODE_FIELD(copyOption);
+    COMPARE_STRING_FIELD(filename);
+    COMPARE_SCALAR_FIELD(is_outfile);
 
+    if (t_thrd.proc->workingVersionNum >= CREATE_TABLE_AS_VERSION_NUM) {
+        COMPARE_NODE_FIELD(tableElts);
+        COMPARE_NODE_FIELD(autoIncStart);
+        COMPARE_SCALAR_FIELD(onduplicate);
+    }
     return true;
 }
 
@@ -480,6 +499,7 @@ static bool _equalCaseExpr(const CaseExpr* a, const CaseExpr* b)
     COMPARE_NODE_FIELD(args);
     COMPARE_NODE_FIELD(defresult);
     COMPARE_LOCATION_FIELD(location);
+    COMPARE_SCALAR_FIELD(fromDecode);
 
     return true;
 }
@@ -585,6 +605,16 @@ static bool _equalNullTest(const NullTest* a, const NullTest* b)
     return true;
 }
 
+static bool _equalSetVariableExpr(const SetVariableExpr *a, const SetVariableExpr *b)
+{
+    COMPARE_STRING_FIELD(name);
+    COMPARE_NODE_FIELD(value);
+    COMPARE_SCALAR_FIELD(is_session);
+    COMPARE_SCALAR_FIELD(is_global);
+
+    return true;
+}
+
 static bool _equalHashFilter(const HashFilter* a, const HashFilter* b)
 {
     COMPARE_NODE_FIELD(arg);
@@ -630,6 +660,9 @@ static bool _equalSetToDefault(const SetToDefault* a, const SetToDefault* b)
     COMPARE_SCALAR_FIELD(typeMod);
     COMPARE_SCALAR_FIELD(collation);
     COMPARE_LOCATION_FIELD(location);
+    if (t_thrd.proc->workingVersionNum >= UNION_NULL_VERSION_NUM) {
+        COMPARE_SCALAR_FIELD(lrchild_unknown);        
+    }
 
     return true;
 }
@@ -652,6 +685,8 @@ static bool _equalTargetEntry(const TargetEntry* a, const TargetEntry* b)
     COMPARE_SCALAR_FIELD(resorigtbl);
     COMPARE_SCALAR_FIELD(resorigcol);
     COMPARE_SCALAR_FIELD(resjunk);
+    COMPARE_SCALAR_FIELD(rtindex);
+    COMPARE_SCALAR_FIELD(isStartWithPseudo);
 
     return true;
 }
@@ -825,6 +860,54 @@ static bool _equalPlaceHolderInfo(const PlaceHolderInfo* a, const PlaceHolderInf
     return true;
 }
 
+static bool _equalRightRefState(const RightRefState* a, const RightRefState* b)
+{
+    if (a == b) {
+        return true;
+    }
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    
+    COMPARE_SCALAR_FIELD(isSupported);
+    COMPARE_SCALAR_FIELD(isInsertHasRightRef);
+    COMPARE_SCALAR_FIELD(explicitAttrLen);
+    COMPARE_SCALAR_FIELD(colCnt);
+    COMPARE_SCALAR_FIELD(isUpsert);
+    COMPARE_SCALAR_FIELD(isUpsertHasRightRef);
+    COMPARE_SCALAR_FIELD(usExplicitAttrLen);
+
+    /* ignore values, hasExecs, isNulls fields */
+
+    if (a->explicitAttrNos != b->explicitAttrNos) {
+        CHECK_ANY_NULL(explicitAttrNos);
+        if (a->explicitAttrLen > 0) {
+            COMPARE_POINTER_FIELD(explicitAttrNos, a->explicitAttrLen);
+        }
+    }
+
+    if (a->usExplicitAttrNos != b->usExplicitAttrNos) {
+        CHECK_ANY_NULL(usExplicitAttrNos);
+        if (a->usExplicitAttrLen > 0) {
+            COMPARE_POINTER_FIELD(usExplicitAttrNos, a->usExplicitAttrLen);
+        }
+    }
+
+    if (a->constValues != b->constValues) {
+        CHECK_ANY_NULL(constValues);
+        if (a->colCnt > 0) {
+            for (int i = 0; i < a->colCnt; ++i) {
+                if (a->constValues[i] != b->constValues[i]) {
+                    CHECK_ANY_NULL(constValues[i]);
+                    COMPARE_NODE_FIELD(constValues[i]);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 /*
  * Stuff from parsenodes.h
  */
@@ -838,6 +921,8 @@ static bool _equalQuery(const Query* a, const Query* b)
     COMPARE_SCALAR_FIELD(resultRelation);
     COMPARE_SCALAR_FIELD(hasAggs);
     COMPARE_SCALAR_FIELD(hasWindowFuncs);
+    COMPARE_SCALAR_FIELD(hasTargetSRFs);
+    COMPARE_SCALAR_FIELD(is_flt_frame);
     COMPARE_SCALAR_FIELD(hasSubLinks);
     COMPARE_SCALAR_FIELD(hasDistinctOn);
     COMPARE_SCALAR_FIELD(hasRecursive);
@@ -845,6 +930,7 @@ static bool _equalQuery(const Query* a, const Query* b)
     COMPARE_SCALAR_FIELD(hasForUpdate);
     COMPARE_SCALAR_FIELD(hasRowSecurity);
     COMPARE_SCALAR_FIELD(hasSynonyms);
+    COMPARE_SCALAR_FIELD(hasIgnore);
     COMPARE_NODE_FIELD(cteList);
     COMPARE_NODE_FIELD(rtable);
     COMPARE_NODE_FIELD(jointree);
@@ -880,7 +966,17 @@ static bool _equalQuery(const Query* a, const Query* b)
     COMPARE_SCALAR_FIELD(is_from_full_join_rewrite);
     COMPARE_SCALAR_FIELD(can_push);
     COMPARE_SCALAR_FIELD(unique_check);
+    COMPARE_NODE_FIELD(resultRelations);
+    COMPARE_NODE_FIELD(withCheckOptions);
+    if (t_thrd.proc->workingVersionNum >= REPLACE_INTO_VERSION_NUM) {
+        COMPARE_SCALAR_FIELD(isReplace);
+    }
 
+    if (!_equalRightRefState(a->rightRefState, b->rightRefState)) {
+        return false;
+    }
+    
+    COMPARE_NODE_FIELD(indexhintList);
     return true;
 }
 
@@ -891,7 +987,12 @@ static bool _equalInsertStmt(const InsertStmt* a, const InsertStmt* b)
     COMPARE_NODE_FIELD(selectStmt);
     COMPARE_NODE_FIELD(returningList);
     COMPARE_NODE_FIELD(withClause);
-    COMPARE_NODE_FIELD(upsertClause);
+    if (t_thrd.proc->workingVersionNum >= REPLACE_INTO_VERSION_NUM) {
+        COMPARE_NODE_FIELD(targetList);
+        COMPARE_SCALAR_FIELD(isReplace);
+    }
+    COMPARE_NODE_FIELD(upsertClause);   
+    COMPARE_SCALAR_FIELD(hasIgnore);
 
     return true;
 }
@@ -904,6 +1005,8 @@ static bool _equalDeleteStmt(const DeleteStmt* a, const DeleteStmt* b)
     COMPARE_NODE_FIELD(returningList);
     COMPARE_NODE_FIELD(withClause);
     COMPARE_NODE_FIELD(limitClause);
+    COMPARE_NODE_FIELD(sortClause);
+    COMPARE_NODE_FIELD(relations);
 
     return true;
 }
@@ -916,7 +1019,10 @@ static bool _equalUpdateStmt(const UpdateStmt* a, const UpdateStmt* b)
     COMPARE_NODE_FIELD(fromClause);
     COMPARE_NODE_FIELD(returningList);
     COMPARE_NODE_FIELD(withClause);
-
+    COMPARE_SCALAR_FIELD(hasIgnore);
+    COMPARE_NODE_FIELD(sortClause);
+    COMPARE_NODE_FIELD(limitClause);
+    COMPARE_NODE_FIELD(relationClause);
     return true;
 }
 
@@ -1007,6 +1113,8 @@ static bool _equalAlterTableCmd(const AlterTableCmd* a, const AlterTableCmd* b)
     COMPARE_STRING_FIELD(target_partition_tablespace);
     COMPARE_NODE_FIELD(bucket_list);
     COMPARE_SCALAR_FIELD(alterGPI);
+    COMPARE_SCALAR_FIELD(is_first);
+    COMPARE_STRING_FIELD(after_name);
 
     return true;
 }
@@ -1152,9 +1260,11 @@ static bool _equalCreateStmt(const CreateStmt* a, const CreateStmt* b)
     COMPARE_NODE_FIELD(distributeby);
     COMPARE_NODE_FIELD(subcluster);
 #endif
+    COMPARE_NODE_FIELD(tableOptions);
     COMPARE_STRING_FIELD(internalData);
     COMPARE_NODE_FIELD(uuids);
     COMPARE_SCALAR_FIELD(relkind);
+    COMPARE_NODE_FIELD(autoIncStart);
 
     return true;
 }
@@ -1166,6 +1276,8 @@ static bool _equalRangePartitionDefState(const RangePartitionDefState* a, const 
     COMPARE_STRING_FIELD(tablespacename);
     COMPARE_SCALAR_FIELD(curStartVal);
     COMPARE_STRING_FIELD(partitionInitName);
+    COMPARE_NODE_FIELD(subPartitionDefState);
+    COMPARE_SCALAR_FIELD(partitionno);
 
     return true;
 }
@@ -1175,6 +1287,8 @@ static bool _equalListPartitionDefState(const ListPartitionDefState* a, const Li
     COMPARE_STRING_FIELD(partitionName);
     COMPARE_NODE_FIELD(boundary);
     COMPARE_STRING_FIELD(tablespacename);
+    COMPARE_NODE_FIELD(subPartitionDefState);
+    COMPARE_SCALAR_FIELD(partitionno);
 
     return true;
 }
@@ -1184,6 +1298,8 @@ static bool _equalHashPartitionDefState(const HashPartitionDefState* a, const Ha
     COMPARE_STRING_FIELD(partitionName);
     COMPARE_NODE_FIELD(boundary);
     COMPARE_STRING_FIELD(tablespacename);
+    COMPARE_NODE_FIELD(subPartitionDefState);
+    COMPARE_SCALAR_FIELD(partitionno);
 
     return true;
 }
@@ -1243,6 +1359,7 @@ static bool _equalPartitionState(const PartitionState* a, const PartitionState* 
     COMPARE_SCALAR_FIELD(rowMovement);
     COMPARE_NODE_FIELD(subPartitionState);
     COMPARE_NODE_FIELD(partitionNameList);
+    COMPARE_SCALAR_FIELD(partitionsNum);
     return true;
 }
 
@@ -1377,6 +1494,7 @@ static bool _equalFetchStmt(const FetchStmt* a, const FetchStmt* b)
 
 static bool _equalIndexStmt(const IndexStmt* a, const IndexStmt* b)
 {
+    COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_STRING_FIELD(schemaname);
     COMPARE_STRING_FIELD(idxname);
     COMPARE_NODE_FIELD(relation);
@@ -1392,6 +1510,7 @@ static bool _equalIndexStmt(const IndexStmt* a, const IndexStmt* b)
     COMPARE_SCALAR_FIELD(indexOid);
     COMPARE_SCALAR_FIELD(oldNode);
     COMPARE_NODE_FIELD(partClause);
+    COMPARE_NODE_FIELD(indexOptions);
     COMPARE_SCALAR_FIELD(isPartitioned);
     COMPARE_SCALAR_FIELD(unique);
     COMPARE_SCALAR_FIELD(primary);
@@ -1411,6 +1530,9 @@ static bool _equalCreateFunctionStmt(const CreateFunctionStmt* a, const CreateFu
     COMPARE_NODE_FIELD(returnType);
     COMPARE_NODE_FIELD(options);
     COMPARE_NODE_FIELD(withClause);
+    if (t_thrd.proc->workingVersionNum >= CREATE_FUNCTION_DEFINER_VERSION) {
+        COMPARE_STRING_FIELD(definer);
+    }
 
     return true;
 }
@@ -1440,6 +1562,14 @@ static bool _equalDoStmt(const DoStmt* a, const DoStmt* b)
     return true;
 }
 
+static bool _equalRenameCell(const RenameCell *a, const RenameCell *b)
+{
+    COMPARE_NODE_FIELD(original_name);
+    COMPARE_NODE_FIELD(modify_name);
+
+    return true;
+}
+
 static bool _equalRenameStmt(const RenameStmt* a, const RenameStmt* b)
 {
     COMPARE_SCALAR_FIELD(renameType);
@@ -1449,8 +1579,11 @@ static bool _equalRenameStmt(const RenameStmt* a, const RenameStmt* b)
     COMPARE_NODE_FIELD(objarg);
     COMPARE_STRING_FIELD(subname);
     COMPARE_STRING_FIELD(newname);
+    COMPARE_STRING_FIELD(newschema);
     COMPARE_SCALAR_FIELD(behavior);
     COMPARE_SCALAR_FIELD(missing_ok);
+    COMPARE_NODE_FIELD(renameTargetList);
+    COMPARE_SCALAR_FIELD(renameTableflag);
 
     return true;
 }
@@ -1577,6 +1710,9 @@ static bool _equalViewStmt(const ViewStmt* a, const ViewStmt* b)
     COMPARE_SCALAR_FIELD(ivm);
     COMPARE_NODE_FIELD(options);
     COMPARE_SCALAR_FIELD(relkind);
+    COMPARE_STRING_FIELD(definer);
+    COMPARE_SCALAR_FIELD(is_alter);
+    COMPARE_SCALAR_FIELD(withCheckOption);
 
     return true;
 }
@@ -1652,6 +1788,7 @@ static bool _equalAlterOpFamilyStmt(const AlterOpFamilyStmt* a, const AlterOpFam
 static bool _equalCreatedbStmt(const CreatedbStmt* a, const CreatedbStmt* b)
 {
     COMPARE_STRING_FIELD(dbname);
+    COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_NODE_FIELD(options);
 
     return true;
@@ -1772,6 +1909,15 @@ static bool _equalVariableSetStmt(const VariableSetStmt* a, const VariableSetStm
     COMPARE_STRING_FIELD(name);
     COMPARE_NODE_FIELD(args);
     COMPARE_SCALAR_FIELD(is_local);
+    COMPARE_NODE_FIELD(defined_args);
+    COMPARE_SCALAR_FIELD(is_multiset);
+
+    return true;
+}
+
+static bool _equalVariableMultiSetStmt(const VariableMultiSetStmt* a, const VariableMultiSetStmt* b)
+{
+    COMPARE_NODE_FIELD(args);
 
     return true;
 }
@@ -1780,6 +1926,8 @@ static bool _equalVariableShowStmt(const VariableShowStmt* a, const VariableShow
 {
     COMPARE_STRING_FIELD(name);
     COMPARE_STRING_FIELD(likename);
+    COMPARE_SCALAR_FIELD(offset);
+    COMPARE_SCALAR_FIELD(count);
 
     return true;
 }
@@ -1941,6 +2089,8 @@ static bool _equalAlterSchemaStmt(const AlterSchemaStmt* a, const AlterSchemaStm
     COMPARE_STRING_FIELD(schemaname);
     COMPARE_STRING_FIELD(authid);
     COMPARE_SCALAR_FIELD(hasBlockChain);
+    COMPARE_SCALAR_FIELD(charset);
+    COMPARE_STRING_FIELD(collate);
 
     return true;
 }
@@ -1988,6 +2138,28 @@ static bool _equalCreateWeakPasswordDictionaryStmt(const CreateWeakPasswordDicti
 
 static bool _equalDropWeakPasswordDictionaryStmt(const DropWeakPasswordDictionaryStmt* a, const DropWeakPasswordDictionaryStmt* b)
 {
+    return true;
+}
+
+static bool _equalIndexHintDefinition (const IndexHintDefinition* a, const IndexHintDefinition* b)
+{
+    COMPARE_NODE_FIELD(indexnames);
+    COMPARE_SCALAR_FIELD(index_type);
+    return true;
+}
+
+static bool _equalIndexHintRelationData (const IndexHintRelationData* a, const IndexHintRelationData* b)
+{
+    COMPARE_SCALAR_FIELD(relationOid);
+    COMPARE_SCALAR_FIELD(indexOid);
+    COMPARE_SCALAR_FIELD(index_type);
+    return true;
+}
+
+static bool _equalFunctionSources(const FunctionSources* a, const FunctionSources* b)
+{
+    COMPARE_STRING_FIELD(headerSrc);
+    COMPARE_STRING_FIELD(bodySrc);
     return true;
 }
 
@@ -2102,7 +2274,32 @@ static bool _equalCreateTrigStmt(const CreateTrigStmt* a, const CreateTrigStmt* 
     COMPARE_SCALAR_FIELD(deferrable);
     COMPARE_SCALAR_FIELD(initdeferred);
     COMPARE_NODE_FIELD(constrrel);
+    COMPARE_NODE_FIELD(funcSource);
+    COMPARE_STRING_FIELD(definer);
+    COMPARE_SCALAR_FIELD(if_not_exists);
+    COMPARE_STRING_FIELD(trgordername);
+    COMPARE_SCALAR_FIELD(is_follows);
 
+    return true;
+}
+
+static bool
+_equalCreateEventTrigStmt(const CreateEventTrigStmt *a, const CreateEventTrigStmt *b)
+{
+    COMPARE_STRING_FIELD(trigname);
+    COMPARE_SCALAR_FIELD(eventname);
+    COMPARE_NODE_FIELD(funcname);
+    COMPARE_NODE_FIELD(whenclause);
+ 
+    return true;
+}
+ 
+static bool
+_equalAlterEventTrigStmt(const AlterEventTrigStmt *a, const AlterEventTrigStmt *b)
+{
+    COMPARE_STRING_FIELD(trigname);
+    COMPARE_SCALAR_FIELD(tgenabled);
+ 
     return true;
 }
 
@@ -2121,6 +2318,7 @@ static bool _equalCreatePLangStmt(const CreatePLangStmt* a, const CreatePLangStm
 static bool _equalCreateRoleStmt(const CreateRoleStmt* a, const CreateRoleStmt* b)
 {
     COMPARE_SCALAR_FIELD(stmt_type);
+    COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_STRING_FIELD(role);
     COMPARE_NODE_FIELD(options);
 
@@ -2130,6 +2328,7 @@ static bool _equalCreateRoleStmt(const CreateRoleStmt* a, const CreateRoleStmt* 
 static bool _equalAlterRoleStmt(const AlterRoleStmt* a, const AlterRoleStmt* b)
 {
     COMPARE_STRING_FIELD(role);
+    COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_NODE_FIELD(options);
     COMPARE_SCALAR_FIELD(action);
     COMPARE_SCALAR_FIELD(lockstatus);
@@ -2159,6 +2358,8 @@ static bool _equalLockStmt(const LockStmt* a, const LockStmt* b)
     COMPARE_NODE_FIELD(relations);
     COMPARE_SCALAR_FIELD(mode);
     COMPARE_SCALAR_FIELD(nowait);
+    COMPARE_SCALAR_FIELD(cancelable);
+    COMPARE_SCALAR_FIELD(isLockTables);
     if (t_thrd.proc->workingVersionNum >= WAIT_N_TUPLE_LOCK_VERSION_NUM) {
         COMPARE_SCALAR_FIELD(waitSec);
     }
@@ -2181,6 +2382,7 @@ static bool _equalReindexStmt(const ReindexStmt* a, const ReindexStmt* b)
     COMPARE_STRING_FIELD(name);
     COMPARE_SCALAR_FIELD(do_system);
     COMPARE_SCALAR_FIELD(do_user);
+    COMPARE_SCALAR_FIELD(concurrent);
 
     return true;
 }
@@ -2188,9 +2390,13 @@ static bool _equalReindexStmt(const ReindexStmt* a, const ReindexStmt* b)
 static bool _equalCreateSchemaStmt(const CreateSchemaStmt* a, const CreateSchemaStmt* b)
 {
     COMPARE_STRING_FIELD(schemaname);
+    COMPARE_SCALAR_FIELD(missing_ok);
     COMPARE_STRING_FIELD(authid);
     COMPARE_SCALAR_FIELD(hasBlockChain);
     COMPARE_NODE_FIELD(schemaElts);
+    COMPARE_NODE_FIELD(uuids);
+    COMPARE_SCALAR_FIELD(charset);
+    COMPARE_STRING_FIELD(collate);
 
     return true;
 }
@@ -2267,12 +2473,15 @@ static bool _equalAlterTSDictionaryStmt(const AlterTSDictionaryStmt* a, const Al
 
 static bool _equalAlterTSConfigurationStmt(const AlterTSConfigurationStmt* a, const AlterTSConfigurationStmt* b)
 {
+    COMPARE_SCALAR_FIELD(kind);
     COMPARE_NODE_FIELD(cfgname);
     COMPARE_NODE_FIELD(tokentype);
     COMPARE_NODE_FIELD(dicts);
+    COMPARE_NODE_FIELD(cfoptions);
     COMPARE_SCALAR_FIELD(override);
     COMPARE_SCALAR_FIELD(replace);
     COMPARE_SCALAR_FIELD(missing_ok);
+    COMPARE_SCALAR_FIELD(is_reset);
 
     return true;
 }
@@ -2381,6 +2590,8 @@ static bool _equalTypeName(const TypeName* a, const TypeName* b)
     COMPARE_NODE_FIELD(arrayBounds);
     COMPARE_LOCATION_FIELD(location);
     COMPARE_LOCATION_FIELD(end_location);
+    COMPARE_SCALAR_FIELD(pct_rowtype);
+    COMPARE_SCALAR_FIELD(charset);
 
     return true;
 }
@@ -2536,6 +2747,22 @@ static bool _equalIndexElem(const IndexElem* a, const IndexElem* b)
     return true;
 }
 
+static bool _equalUserSetElem(const UserSetElem *a, const UserSetElem *b)
+{
+    COMPARE_NODE_FIELD(name);
+    COMPARE_NODE_FIELD(val);
+
+    return true;
+}
+
+static bool _equalUserVar(const UserVar *a, const UserVar *b)
+{
+    COMPARE_STRING_FIELD(name);
+    COMPARE_NODE_FIELD(value);
+
+    return true;
+}
+
 static bool _equalColumnDef(const ColumnDef* a, const ColumnDef* b)
 {
     COMPARE_STRING_FIELD(colname);
@@ -2556,7 +2783,8 @@ static bool _equalColumnDef(const ColumnDef* a, const ColumnDef* b)
     COMPARE_SCALAR_FIELD(collOid);
     COMPARE_NODE_FIELD(constraints);
     COMPARE_NODE_FIELD(fdwoptions);
-
+    COMPARE_NODE_FIELD(columnOptions);
+    COMPARE_NODE_FIELD(update_default);
     return true;
 }
 
@@ -2588,6 +2816,8 @@ static bool _equalConstraint(const Constraint* a, const Constraint* b)
     COMPARE_SCALAR_FIELD(old_pktable_oid);
     COMPARE_SCALAR_FIELD(skip_validation);
     COMPARE_SCALAR_FIELD(initially_valid);
+    COMPARE_NODE_FIELD(constraintOptions);
+    COMPARE_NODE_FIELD(update_expr);
 
     return true;
 }
@@ -2608,7 +2838,9 @@ static bool _equalLockingClause(const LockingClause* a, const LockingClause* b)
 {
     COMPARE_NODE_FIELD(lockedRels);
     COMPARE_SCALAR_FIELD(forUpdate);
-    COMPARE_SCALAR_FIELD(noWait);
+    if (t_thrd.proc->workingVersionNum >= SKIP_LOCKED_VERSION_NUM) {
+        COMPARE_SCALAR_FIELD(waitPolicy);
+    }
     if (t_thrd.proc->workingVersionNum >= ENHANCED_TUPLE_LOCK_VERSION_NUM) {
         COMPARE_SCALAR_FIELD(strength);
     }
@@ -2680,6 +2912,8 @@ static bool _equalRangeTblEntry(const RangeTblEntry* a, const RangeTblEntry* b)
     COMPARE_SCALAR_FIELD(sublink_pull_up);
     COMPARE_SCALAR_FIELD(is_ustore);
     COMPARE_SCALAR_FIELD(pulled_from_subquery);
+    COMPARE_NODE_FIELD(partitionOidList);
+    COMPARE_NODE_FIELD(subpartitionOidList);
 
     return true;
 }
@@ -2718,6 +2952,15 @@ static bool EqualTimeCapsuleClause(const TimeCapsuleClause* a, const TimeCapsule
     return true;
 }
 
+static bool _equalWithCheckOption(const WithCheckOption* a, const WithCheckOption* b)
+{
+    COMPARE_STRING_FIELD(viewname);
+    COMPARE_NODE_FIELD(qual);
+    COMPARE_SCALAR_FIELD(cascaded);
+    COMPARE_SCALAR_FIELD(rtindex);
+
+    return true;
+}
 
 static bool _equalSortGroupClause(const SortGroupClause* a, const SortGroupClause* b)
 {
@@ -2759,7 +3002,9 @@ static bool _equalRowMarkClause(const RowMarkClause* a, const RowMarkClause* b)
 {
     COMPARE_SCALAR_FIELD(rti);
     COMPARE_SCALAR_FIELD(forUpdate);
-    COMPARE_SCALAR_FIELD(noWait);
+    if (t_thrd.proc->workingVersionNum >= SKIP_LOCKED_VERSION_NUM) {
+        COMPARE_SCALAR_FIELD(waitPolicy);
+    }
     if (t_thrd.proc->workingVersionNum >= WAIT_N_TUPLE_LOCK_VERSION_NUM) {
         COMPARE_SCALAR_FIELD(waitSec);
     }
@@ -2933,6 +3178,9 @@ static bool _equalAlterSubscriptionStmt(const AlterSubscriptionStmt *a, const Al
 {
     COMPARE_STRING_FIELD(subname);
     COMPARE_NODE_FIELD(options);
+    if (t_thrd.proc->workingVersionNum >= PUBLICATION_INITIAL_DATA_VERSION_NAME) {
+        COMPARE_SCALAR_FIELD(refresh);
+    }
 
     return true;
 }
@@ -3211,6 +3459,73 @@ static bool _equalShutDown(const ShutdownStmt* a, const ShutdownStmt* b)
     return true;
 }
 
+static bool _equalAutoIncrement(const AutoIncrement* a, const AutoIncrement* b)
+{
+    COMPARE_NODE_FIELD(expr);
+    COMPARE_SCALAR_FIELD(autoincin_funcid);
+    COMPARE_SCALAR_FIELD(autoincout_funcid);
+    return true;
+}
+
+static bool _equalCharsetcollateOptions(const CharsetCollateOptions* a, const CharsetCollateOptions* b)
+{
+    COMPARE_SCALAR_FIELD(cctype);
+    COMPARE_SCALAR_FIELD(charset);
+    COMPARE_STRING_FIELD(collate);
+    return true;
+}
+
+static bool _equalPrefixKey(const PrefixKey* a, const PrefixKey* b)
+{
+    COMPARE_NODE_FIELD(arg);
+    COMPARE_SCALAR_FIELD(length);
+    return true;
+}
+
+static bool node_equal_create_event_info(const CreateEventStmt* a, const CreateEventStmt* b)
+{
+    COMPARE_NODE_FIELD(event_name);
+    COMPARE_NODE_FIELD(start_time_expr);
+    COMPARE_NODE_FIELD(end_time_expr);
+    COMPARE_NODE_FIELD(interval_time);
+    COMPARE_STRING_FIELD(def_name);
+    COMPARE_STRING_FIELD(event_comment_str);
+    COMPARE_STRING_FIELD(event_query_str);
+    COMPARE_SCALAR_FIELD(complete_preserve);
+    COMPARE_SCALAR_FIELD(if_not_exists);
+    COMPARE_SCALAR_FIELD(event_status);
+    return true;
+}
+
+static bool node_equal_alter_event_info(const AlterEventStmt* a, const AlterEventStmt* b)
+{
+    COMPARE_NODE_FIELD(def_name);
+    COMPARE_NODE_FIELD(event_name);
+    COMPARE_NODE_FIELD(start_time_expr);
+    COMPARE_NODE_FIELD(end_time_expr);
+    COMPARE_NODE_FIELD(interval_time);
+    COMPARE_NODE_FIELD(complete_preserve);
+    COMPARE_NODE_FIELD(event_status);
+    COMPARE_NODE_FIELD(event_comment_str);
+    COMPARE_NODE_FIELD(event_query_str);
+    COMPARE_NODE_FIELD(new_name);
+    return true;
+}
+
+static bool node_equal_drop_event_info(const DropEventStmt* a, const DropEventStmt* b)
+{
+    COMPARE_NODE_FIELD(event_name);
+    COMPARE_SCALAR_FIELD(missing_ok);
+    return true;
+}
+
+static bool node_equal_show_event_info(const ShowEventStmt* a, const ShowEventStmt* b)
+{
+    COMPARE_NODE_FIELD(from_clause);
+    COMPARE_STRING_FIELD(where_clause);
+    return true;
+}
+
 /*
  * equal
  *	  returns whether two nodes are equal
@@ -3354,6 +3669,9 @@ bool equal(const void* a, const void* b)
             break;
         case T_NullTest:
             retval = _equalNullTest((NullTest*)a, (NullTest*)b);
+            break;
+        case T_SetVariableExpr:
+            retval = _equalSetVariableExpr((SetVariableExpr*)a, (SetVariableExpr*)b);
             break;
         case T_HashFilter:
             retval = _equalHashFilter((HashFilter*)a, (HashFilter*)b);
@@ -3580,6 +3898,9 @@ bool equal(const void* a, const void* b)
         case T_DoStmt:
             retval = _equalDoStmt((DoStmt*)a, (DoStmt*)b);
             break;
+        case T_RenameCell:
+            retval = _equalRenameCell((RenameCell*)a, (RenameCell*)b);
+            break;
         case T_RenameStmt:
             retval = _equalRenameStmt((RenameStmt*)a, (RenameStmt*)b);
             break;
@@ -3680,6 +4001,9 @@ bool equal(const void* a, const void* b)
             break;
         case T_VariableSetStmt:
             retval = _equalVariableSetStmt((VariableSetStmt*)a, (VariableSetStmt*)b);
+            break;
+        case T_VariableMultiSetStmt:
+            retval = _equalVariableMultiSetStmt((VariableMultiSetStmt*)a, (VariableMultiSetStmt*)b);
             break;
         case T_VariableShowStmt:
             retval = _equalVariableShowStmt((VariableShowStmt*)a, (VariableShowStmt*)b);
@@ -3785,6 +4109,12 @@ bool equal(const void* a, const void* b)
             break;
         case T_CreateTrigStmt:
             retval = _equalCreateTrigStmt((CreateTrigStmt*)a, (CreateTrigStmt*)b);
+            break;
+        case T_CreateEventTrigStmt:
+            retval = _equalCreateEventTrigStmt((CreateEventTrigStmt*)a, (CreateEventTrigStmt*)b);
+            break;
+        case T_AlterEventTrigStmt:
+            retval = _equalAlterEventTrigStmt((AlterEventTrigStmt*)a, (AlterEventTrigStmt*)b);
             break;
         case T_CreatePLangStmt:
             retval = _equalCreatePLangStmt((CreatePLangStmt*)a, (CreatePLangStmt*)b);
@@ -3999,6 +4329,9 @@ bool equal(const void* a, const void* b)
         case T_TimeCapsuleClause:
             retval = EqualTimeCapsuleClause((TimeCapsuleClause*)a, (TimeCapsuleClause*)b);
             break;
+        case T_WithCheckOption:
+            retval = _equalWithCheckOption((WithCheckOption*)a, (WithCheckOption*)b);
+            break;
         case T_SortGroupClause:
             retval = _equalSortGroupClause((SortGroupClause*)a, (SortGroupClause*)b);
             break;
@@ -4069,6 +4402,12 @@ bool equal(const void* a, const void* b)
         case T_AlterPublicationStmt:
             retval = _equalAlterPublicationStmt((AlterPublicationStmt *)a, (AlterPublicationStmt *)b);
             break;
+        case T_UserSetElem:
+            retval = _equalUserSetElem((UserSetElem *)a, (UserSetElem *)b);
+            break;
+        case T_UserVar:
+            retval = _equalUserVar((UserVar *)a, (UserVar *)b);
+            break;
         case T_CreateSubscriptionStmt:
             retval = _equalCreateSubscriptionStmt((CreateSubscriptionStmt *)a, (CreateSubscriptionStmt *)b);
             break;
@@ -4077,6 +4416,36 @@ bool equal(const void* a, const void* b)
             break;
         case T_DropSubscriptionStmt:
             retval = _equalDropSubscriptionStmt((DropSubscriptionStmt *)a, (DropSubscriptionStmt *)b);
+            break;
+        case T_AutoIncrement:
+            retval = _equalAutoIncrement((const AutoIncrement *)a, (const AutoIncrement *)b);
+            break;
+        case T_CharsetCollateOptions:
+            retval = _equalCharsetcollateOptions((const CharsetCollateOptions *)a,
+                                                 (const CharsetCollateOptions *)b);
+            break;
+        case T_PrefixKey:
+            retval = _equalPrefixKey((PrefixKey *)a, (PrefixKey *)b);
+            break;
+        case T_CreateEventStmt:
+            retval = node_equal_create_event_info((const CreateEventStmt *)a, (const CreateEventStmt *)b);
+            break;
+        case T_AlterEventStmt:
+            retval = node_equal_alter_event_info((const AlterEventStmt *)a, (const AlterEventStmt *)b);
+            break;
+        case T_DropEventStmt:
+            retval = node_equal_drop_event_info((const DropEventStmt *)a, (const DropEventStmt *)b);
+            break;
+        case T_ShowEventStmt:
+            retval = node_equal_show_event_info((const ShowEventStmt *)a, (const ShowEventStmt *)b);
+        case T_IndexHintDefinition:
+            retval = _equalIndexHintDefinition((IndexHintDefinition *)a, (IndexHintDefinition *)b);
+            break;
+        case T_IndexHintRelationData:
+            retval = _equalIndexHintRelationData((IndexHintRelationData *)a, (IndexHintRelationData *)b);
+            break;
+        case T_FunctionSources:
+            retval = _equalFunctionSources((const FunctionSources *)a, (const FunctionSources *)b);
             break;
 
         default:

@@ -214,6 +214,7 @@ static const PQconninfoOption PQconninfoOptions[] = {
     {"keepalives_idle", NULL, NULL, NULL, "TCP-Keepalives-Idle", "", 10, 0},
     {"keepalives_interval", NULL, NULL, NULL, "TCP-Keepalives-Interval", "", 10, 0},
     {"keepalives_count", NULL, NULL, NULL, "TCP-Keepalives-Count", "", 10, 0},
+    {"tcp_user_timeout", NULL, NULL, NULL, "TCP-User-Timeout", "", 10, 0},
     {"rw_timeout", NULL, NULL, NULL, "Read write timeout", "", 10, 0},
 
     /*
@@ -915,6 +916,8 @@ static void fillPGconn(PGconn* conn, PQconninfoOption* connOptions)
     conn->keepalives_interval = (tmp != NULL) ? strdup(tmp) : NULL;
     tmp = conninfo_getval(connOptions, "keepalives_count");
     conn->keepalives_count = (tmp != NULL) ? strdup(tmp) : NULL;
+    tmp = conninfo_getval(connOptions, "tcp_user_timeout");
+    conn->tcp_user_timeout = (tmp != NULL) ? strdup(tmp) : NULL;
     tmp = conninfo_getval(connOptions, "rw_timeout");
     conn->rw_timeout = (tmp != NULL) ? strdup(tmp) : NULL;
     tmp = conninfo_getval(connOptions, "sslmode");
@@ -962,7 +965,11 @@ static void fillPGconn(PGconn* conn, PQconninfoOption* connOptions)
     }
 #ifdef HAVE_CE
     tmp = conninfo_getval(connOptions, "enable_ce");
-    conn->client_logic->enable_client_encryption = (tmp != NULL) ? true : false;
+    if (tmp != NULL && strcmp(tmp, "1") == 0) {
+        conn->client_logic->enable_client_encryption = true;
+    } else {
+        conn->client_logic->enable_client_encryption = false;
+    }
 #endif
 }
 
@@ -1580,6 +1587,40 @@ static int setKeepalivesWin32(PGconn* conn)
 #endif /* SIO_KEEPALIVE_VALS */
 #endif /* WIN32 */
 
+/*
+ * Set the TCP user timeout.
+ */
+static int setTCPUserTimeout(PGconn *conn)
+{
+    int timeout;
+
+    if (conn->tcp_user_timeout == NULL) {
+        return 1;
+    }
+
+    if (!parse_int_param(conn->tcp_user_timeout, &timeout, conn, "tcp_user_timeout")) {
+        return 0;
+    }
+
+    if (timeout < 0) {
+        timeout = 0;
+    }
+
+#ifdef TCP_USER_TIMEOUT
+    if (setsockopt(conn->sock, IPPROTO_TCP, TCP_USER_TIMEOUT, (char *) &timeout, sizeof(timeout)) < 0) {
+        char sebuf[256];
+
+        appendPQExpBuffer(&conn->errorMessage,
+                          libpq_gettext("setsockopt(%s) failed: %s\n"),
+                          "TCP_USER_TIMEOUT",
+                          SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+        return 0;
+    }
+#endif
+
+    return 1;
+}
+
 /* ----------
  * connectDBStart -
  *		Begin the process of making a connection to the backend.
@@ -2107,6 +2148,9 @@ keep_going: /* We will come back to here until there is
                         err = 1;
 #endif /* SIO_KEEPALIVE_VALS */
 #endif /* WIN32 */
+                    else if (!setTCPUserTimeout(conn)) {
+                        err = 1;
+                    }
 
                     if (err) {
                         closesocket(conn->sock);
@@ -2180,8 +2224,8 @@ keep_going: /* We will come back to here until there is
 
 #ifdef ENABLE_LITE_MODE
                 /* For replication connection request under lite mode, client ip bind is forced */
-                if ((bind_addr == NULL || strcmp(bind_addr, "0.0.0.0") == 0) &&
-                    conn->replication != NULL && strcmp(conn->pglocalhost, "0.0.0.0") != 0) {
+                if ((bind_addr == NULL || strcmp(bind_addr, "0.0.0.0") == 0) && conn->replication != NULL &&
+                    conn->pglocalhost != NULL && strcmp(conn->pglocalhost, "0.0.0.0") != 0) {
                     comm_client_bind = true;
                     bind_addr = conn->pglocalhost;
                 }
@@ -2610,6 +2654,18 @@ keep_going: /* We will come back to here until there is
              */
             pollres = pqsecure_open_client(conn);
             if (pollres == PGRES_POLLING_OK) {
+                /*
+                 * At this point we should have no data already buffered.
+                 * If we do, it was received before we performed the SSL
+                 * handshake, so it wasn't encrypted and indeed may have
+                 * been injected by a man-in-the-middle.
+                 */
+                if (conn->inCursor != conn->inEnd) {
+                    appendPQExpBufferStr(&conn->errorMessage,
+                        libpq_gettext("received unencrypted data after SSL response\n"));
+                    goto error_return;
+                }
+
                 /* SSL handshake done, ready to send startup packet */
                 conn->status = CONNECTION_MADE;
                 return PGRES_POLLING_WRITING;
@@ -3396,6 +3452,7 @@ void freePGconn(PGconn* conn)
     libpq_free(conn->keepalives_idle);
     libpq_free(conn->keepalives_interval);
     libpq_free(conn->keepalives_count);
+    libpq_free(conn->tcp_user_timeout);
     libpq_free(conn->rw_timeout);
     libpq_free(conn->sslmode);
     libpq_free(conn->sslcert);
@@ -4851,6 +4908,7 @@ static PQconninfoOption* conninfo_parse(const char* conninfo, PQExpBuffer errorM
         PQconninfoFree(options);
         return NULL;
     }
+    size_t bufLen = strlen(buf);
     cp = buf;
 
     while (*cp) {
@@ -4882,6 +4940,7 @@ static PQconninfoOption* conninfo_parse(const char* conninfo, PQExpBuffer errorM
             printfPQExpBuffer(
                 errorMessage, libpq_gettext("missing \"=\" after \"%s\" in connection info string\n"), pname);
             PQconninfoFree(options);
+            check_memset_s(memset_s(buf, bufLen, 0, bufLen));
             libpq_free(buf);
             return NULL;
         }
@@ -4920,6 +4979,7 @@ static PQconninfoOption* conninfo_parse(const char* conninfo, PQExpBuffer errorM
                     printfPQExpBuffer(
                         errorMessage, libpq_gettext("unterminated quoted string in connection info string\n"));
                     PQconninfoFree(options);
+                    check_memset_s(memset_s(buf, bufLen, 0, bufLen));
                     libpq_free(buf);
                     return NULL;
                 }
@@ -4943,12 +5003,14 @@ static PQconninfoOption* conninfo_parse(const char* conninfo, PQExpBuffer errorM
          */
         if (conninfo_storeval(options, pname, pval, errorMessage, false, false) == NULL) {
             PQconninfoFree(options);
+            check_memset_s(memset_s(buf, bufLen, 0, bufLen));
             libpq_free(buf);
             return NULL;
         }
     }
 
     /* Done with the modifiable input string */
+    check_memset_s(memset_s(buf, bufLen, 0, bufLen));
     libpq_free(buf);
 
     /*

@@ -6,7 +6,7 @@
  * You may obtain a copy of Mulan PSL v2 at:
  *
  *          http://license.coscl.org.cn/MulanPSL2
- *resource_manager_context
+ *
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
@@ -27,9 +27,16 @@
 #include "storage/buf/buf.h"
 #include "storage/lock/lwlock.h"
 #include "catalog/pg_control.h"
+#include "ddes/dms/ss_aio.h"
 
 #define ENABLE_INCRE_CKPT g_instance.attr.attr_storage.enableIncrementalCheckpoint
 #define NEED_CONSIDER_USECOUNT u_sess->attr.attr_storage.enable_candidate_buf_usage_count
+
+#define INIT_CANDIDATE_LIST(L, list, size, xx_head, xx_tail) \
+    ((L).cand_buf_list = (list), \
+        (L).cand_list_size = (size), \
+        (L).head = (xx_head), \
+        (L).tail = (xx_tail))
 
 typedef struct PGPROC PGPROC;
 typedef struct BufferDesc BufferDesc;
@@ -41,6 +48,22 @@ typedef struct ThrdDwCxt {
     volatile int dw_page_idx;      /* -1 means data files have been flushed. */
     bool is_new_relfilenode;
 } ThrdDwCxt;
+
+typedef enum CandListType {
+    CAND_LIST_NORMAL,
+    CAND_LIST_NVM,
+    CAND_LIST_SEG
+} CandListType;
+
+typedef struct CandidateList {
+    Buffer *cand_buf_list;
+    volatile int cand_list_size;
+    pg_atomic_uint64 head;
+    pg_atomic_uint64 tail;
+    volatile int buf_id_start;
+    int32 next_scan_loc;
+    int32 next_scan_ratio_loc;
+} CandidateList;
 
 typedef struct PageWriterProc {
     PGPROC* proc;
@@ -56,23 +79,14 @@ typedef struct PageWriterProc {
     CkptSortItem *dirty_buf_list;
     uint32 dirty_list_size;
 
-    volatile int buf_id_start;     /* buffer id start loc */
-    int32 next_scan_normal_loc;
-
     /* thread candidate list, main thread store the segment buffer information */
-    Buffer *cand_buf_list;   /* thread candidate buffer list */
-    volatile int cand_list_size;    /* thread candidate list max size, */
-    pg_atomic_uint64 head;
-    pg_atomic_uint64 tail;
+    CandidateList normal_list;
+    CandidateList nvm_list;
+    CandidateList seg_list;
 
-    /* thread seg buffer information */
-    Buffer *seg_cand_buf_list;
-    volatile int seg_cand_list_size;
-    pg_atomic_uint64 seg_head;
-    pg_atomic_uint64 seg_tail;
-
-    volatile int seg_id_start;     /* buffer id start loc */
-    int32 next_scan_seg_loc;
+    /* auxiluary structs for implementing AIO in DSS */
+    DSSAioCxt aio_cxt;
+    char *aio_buf;
 } PageWriterProc;
 
 typedef struct PageWriterProcs {
@@ -153,7 +167,6 @@ extern uint64 get_dirty_page_queue_rec_lsn();
 extern XLogRecPtr ckpt_get_min_rec_lsn(void);
 extern uint64 get_loc_for_lsn(XLogRecPtr target_lsn);
 extern uint64 get_time_ms();
-extern uint64 get_time_us();
 
 const int PAGEWRITER_VIEW_COL_NUM = 8;
 const int INCRE_CKPT_VIEW_COL_NUM = 7;
@@ -163,11 +176,10 @@ extern const incre_ckpt_view_col g_ckpt_view_col[INCRE_CKPT_VIEW_COL_NUM];
 extern const incre_ckpt_view_col g_pagewriter_view_col[PAGEWRITER_VIEW_COL_NUM];
 extern const incre_ckpt_view_col g_pagewirter_view_two_col[CANDIDATE_VIEW_COL_NUM];
 
-extern bool candidate_buf_pop(int *buf_id, int thread_id);
-extern bool seg_candidate_buf_pop(int *buf_id, int thread_id);
+extern bool candidate_buf_pop(CandidateList *list, int *buf_id);
 extern void candidate_buf_init(void);
 
-extern uint32 get_curr_candidate_nums(bool segment);
+extern uint32 get_curr_candidate_nums(CandListType type);
 extern void PgwrAbsorbFsyncRequests(void);
 extern Size PageWriterShmemSize(void);
 extern void PageWriterSyncShmemInit(void);
@@ -177,5 +189,7 @@ extern bool PgwrForwardSyncRequest(const FileTag *ftag, SyncRequestType type);
 extern void PageWriterSyncWithAbsorption(void);
 extern long getPidOutput(double pid_input, double pid_target);
 extern void adpat_create_dirty_page_rate();
+void crps_create_ctxs(knl_thread_role role);
+void crps_destory_ctxs();
 
 #endif /* _PAGEWRITER_H */

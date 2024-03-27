@@ -36,6 +36,7 @@ extern THR_LOCAL PGDLLIMPORT set_join_pathlist_hook_type set_join_pathlist_hook;
 extern RelOptInfo* make_one_rel(PlannerInfo* root, List* joinlist);
 extern RelOptInfo* standard_join_search(PlannerInfo* root, int levels_needed, List* initial_rels);
 
+extern void set_base_rel_sizes(PlannerInfo* root, bool onlyRelatinalTable = false);
 extern void set_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, RangeTblEntry* rte);
 
 #ifdef OPTIMIZER_DEBUG
@@ -64,7 +65,7 @@ extern bool relation_has_unique_index_for(
     PlannerInfo* root, RelOptInfo* rel, List* restrictlist, List* exprlist, List* oprlist);
 extern bool eclass_member_matches_indexcol(
     EquivalenceClass* ec, EquivalenceMember* em, IndexOptInfo* index, int indexcol);
-extern bool match_index_to_operand(Node* operand, int indexcol, IndexOptInfo* index);
+extern bool match_index_to_operand(Node* operand, int indexcol, IndexOptInfo* index, bool match_prefixkey = false);
 extern void expand_indexqual_conditions(
     IndexOptInfo* index, List* indexclauses, List* indexclausecols, List** indexquals_p, List** indexqualcols_p);
 extern void check_partial_indexes(PlannerInfo* root, RelOptInfo* rel);
@@ -77,13 +78,6 @@ inline bool CheckIndexPathUseGPI(IndexPath* ipath)
 {
     return ipath->indexinfo->isGlobal;
 }
-
-
-/*
- * orindxpath.c
- *	  additional routines for indexable OR clauses
- */
-extern bool create_or_index_quals(PlannerInfo* root, RelOptInfo* rel);
 
 /*
  * tidpath.h
@@ -141,7 +135,7 @@ extern bool have_relevant_eclass_joinclause(PlannerInfo* root, RelOptInfo* rel1,
 extern bool has_relevant_eclass_joinclause(PlannerInfo* root, RelOptInfo* rel1);
 extern bool eclass_useful_for_merging(EquivalenceClass* eclass, RelOptInfo* rel);
 extern bool is_redundant_derived_clause(RestrictInfo* rinfo, List* clauselist);
-
+extern PathKey* make_canonical_pathkey(PlannerInfo* root, EquivalenceClass* eclass, Oid opfamily, int strategy, bool nulls_first);
 /*
  * pathkeys.c
  *	  utilities for matching and building path keys
@@ -188,8 +182,7 @@ extern EquivalenceClass* get_expr_eqClass(PlannerInfo* root, Expr* expr);
 extern void delete_eq_member(PlannerInfo* root, List* tlist, List* collectiveGroupExpr);
 extern bool CheckPathUseGlobalPartIndex(Path* path);
 
-extern void standard_qp_init(PlannerInfo *root, void *extra, List *tlist,
-                 List *activeWindows, List *groupClause);
+extern void standard_qp_init(PlannerInfo *root, void *extra, List *tlist, List *activeWindows, List *groupClause);
 extern void standard_qp_callback(PlannerInfo *root, void *extra);
 
 #endif /* PATHS_H */

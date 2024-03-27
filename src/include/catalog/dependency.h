@@ -18,7 +18,6 @@
 #define DEPENDENCY_H
 
 #include "catalog/objectaddress.h"
-#include "catalog/dfsstore_ctlg.h"
 #include "catalog/pg_directory.h"
 
 
@@ -214,6 +213,7 @@ typedef enum ObjectClass {
     OCLASS_PUBLICATION,      /* pg_publication */
     OCLASS_PUBLICATION_REL,  /* pg_publication_rel */
     OCLASS_SUBSCRIPTION,     /* pg_subscription */
+    OCLASS_EVENT_TRIGGER,       /* pg_event_trigger */
 	MAX_OCLASS               /* MUST BE LAST */
 } ObjectClass;
 
@@ -222,6 +222,7 @@ typedef enum ObjectClass {
 #define PERFORM_DELETION_INVALID            0x0000
 #define PERFORM_DELETION_INTERNAL			0x0001
 #define PERFORM_DELETION_CONCURRENTLY		0x0002
+#define PERFORM_DELETION_CONCURRENTLY_LOCK  0x0020    /* normal drop with concurrent lock mode */
 
 /* ObjectAddressExtra flag bits */
 #define DEPFLAG_ORIGINAL 0x0001  /* an original deletion target */
@@ -265,6 +266,8 @@ extern ObjectAddresses *new_object_addresses(const int maxRefs = 32);
 extern void add_exact_object_address(const ObjectAddress *object,
                                      ObjectAddresses *addrs);
 
+extern void add_type_object_address(List *typOidList, ObjectAddresses* objects);
+
 extern bool object_address_present(const ObjectAddress *object,
                                    const ObjectAddresses *addrs);
 
@@ -287,6 +290,8 @@ extern void recordMultipleDependencies(const ObjectAddress *depender,
 extern void recordDependencyOnCurrentExtension(const ObjectAddress *object,
                                                bool isReplace);
 
+extern void checkMembershipInCurrentExtension(const ObjectAddress *object);
+
 extern void recordPinnedDependency(const ObjectAddress *object);
 
 extern bool IsPackageDependType(Oid typOid, Oid pkgOid, bool isRefCur = false);
@@ -308,6 +313,9 @@ extern long changeDependencyFor(Oid classId,
                                 Oid oldRefObjectId,
                                 Oid newRefObjectId);
 
+extern void changeDependenciesOf(Oid classId, Oid oldObjectId, Oid newObjectId);
+extern void changeDependenciesOn(Oid refClassId, Oid oldRefObjectId, Oid newRefObjectId);
+
 extern Oid	getExtensionOfObject(Oid classId, Oid objectId);
 
 extern bool sequenceIsOwned(Oid seqId, Oid *tableId, int32 *colId);
@@ -319,6 +327,9 @@ extern List *getOwnedSequences(Oid relid, List *attrList = NULL);
 extern Oid	get_constraint_index(Oid constraintId);
 
 extern Oid	get_index_constraint(Oid indexId);
+
+/* use for reindex concurrently */
+extern List *get_index_ref_constraints(Oid indexId);
 
 /* in pg_shdepend.c */
 extern void recordSharedDependencyOn(ObjectAddress *depender,

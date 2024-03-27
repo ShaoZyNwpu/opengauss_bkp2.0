@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 #include "knl/knl_variable.h"
+#include "port/pg_bitutils.h"
 
 #include "access/hash.h"
 
@@ -49,35 +50,18 @@
 
 #define HAS_MULTIPLE_ONES(x) ((bitmapword)RIGHTMOST_ONE(x) != (x))
 
-/*
- * Lookup tables to avoid need for bit-by-bit groveling
- *
- * rightmost_one_pos[x] gives the bit number (0-7) of the rightmost one bit
- * in a nonzero byte value x.  The entry for x=0 is never used.
- *
- * number_of_ones[x] gives the number of one-bits (0-8) in a byte value x.
- *
- * We could make these tables larger and reduce the number of iterations
- * in the functions that use them, but bytewise shifts and masks are
- * especially fast on many machines, so working a byte at a time seems best.
- */
-static const uint8 rightmost_one_pos[256] = {0, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3,
-    0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1,
-    0, 6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2,
-    0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 7, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1,
-    0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
-    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1,
-    0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2,
-    0, 1, 0};
-
-static const uint8 number_of_ones[256] = {0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3,
-    3, 4, 3, 4, 4, 5, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
-    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4,
-    4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4,
-    3, 4, 4, 5, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4,
-    4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6, 3, 4, 4, 5, 4, 5, 5, 6,
-    4, 5, 5, 6, 5, 6, 6, 7, 3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7, 4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7,
-    7, 8};
+/* Select appropriate bit-twiddling functions for bitmap word size */
+#if BITS_PER_BITMAPWORD == 32
+#define bmw_leftmost_one_pos(w) pg_leftmost_one_pos32(w)
+#define bmw_rightmost_one_pos(w) pg_rightmost_one_pos32(w)
+#define bmw_popcount(w) pg_popcount32(w)
+#elif BITS_PER_BITMAPWORD == 64
+#define bmw_leftmost_one_pos(w) pg_leftmost_one_pos64(w)
+#define bmw_rightmost_one_pos(w) pg_rightmost_one_pos64(w)
+#define bmw_popcount(w) pg_popcount64(w)
+#else
+#error "invalid BITS_PER_BITMAPWORD"
+#endif
 
 /*
  * bms_copy - make a palloc'd copy of a bitmapset
@@ -478,11 +462,7 @@ int bms_singleton_member(const Bitmapset* a)
                     (errmodule(MOD_CACHE), errcode(ERRCODE_DATA_EXCEPTION), errmsg("bitmapset has multiple members")));
             }
             result = wordnum * BITS_PER_BITMAPWORD;
-            while ((w & 255) == 0) {
-                w >>= 8;
-                result += 8;
-            }
-            result += rightmost_one_pos[w & 255];
+            result += bmw_rightmost_one_pos(w);
         }
     }
     if (result < 0) {
@@ -507,11 +487,9 @@ int bms_num_members(const Bitmapset* a)
     for (wordnum = 0; wordnum < nwords; wordnum++) {
         bitmapword w = a->words[wordnum];
 
-        /* we assume here that bitmapword is an unsigned type */
-        while (w != 0) {
-            result += number_of_ones[w & 255];
-            w >>= 8;
-        }
+		/* No need to count the bits in a zero word */
+        if (w != 0)
+            result += bmw_popcount(w);
     }
     return result;
 }
@@ -795,11 +773,7 @@ int bms_first_member(Bitmapset* a)
             a->words[wordnum] &= ~w;
 
             result = wordnum * BITS_PER_BITMAPWORD;
-            while ((w & 255) == 0) {
-                w >>= 8;
-                result += 8;
-            }
-            result += rightmost_one_pos[w & 255];
+            result += bmw_rightmost_one_pos(w);
             return result;
         }
     }
@@ -880,11 +854,7 @@ int bms_next_member(const Bitmapset* a, int prevbit)
             int result;
 
             result = wordnum * BITS_PER_BITMAPWORD;
-            while ((w & 255) == 0) {
-                w >>= 8;
-                result += 8;
-            }
-            result += rightmost_one_pos[w & 255];
+            result += bmw_rightmost_one_pos(w);
             return result;
         }
 
@@ -893,3 +863,91 @@ int bms_next_member(const Bitmapset* a, int prevbit)
     }
     return -2;
 }
+
+#ifndef ENABLE_MULTIPLE_NODES
+/*
+ * bms_get_singleton_member
+ *
+ * Test whether the given set is a singleton.
+ * If so, set *member to the value of its sole member, and return true.
+ * If not, return false, without changing *member.
+ *
+ * This is more convenient and faster than calling bms_membership() and then
+ * bms_singleton_member(), if we don't care about distinguishing empty sets
+ * from multiple-member sets.
+ */
+bool bms_get_singleton_member(const Bitmapset *a, int *member)
+{
+    int result = -1;
+    int nwords;
+    int wordnum;
+
+    if (a == NULL)
+        return false;
+    nwords = a->nwords;
+    for (wordnum = 0; wordnum < nwords; wordnum++) {
+        bitmapword w = a->words[wordnum];
+
+        if (w != 0) {
+            if (result >= 0 || HAS_MULTIPLE_ONES(w))
+                return false;
+            result = wordnum * BITS_PER_BITMAPWORD;
+            while ((w & BYTE_VALUE) == 0) {
+                w >>= BYTE_NUMBER;
+                result += BYTE_NUMBER;
+            }
+            result += bmw_rightmost_one_pos(w);
+        }
+    }
+    if (result < 0) {
+        return false;
+    }
+    *member = result;
+    return true;
+}
+
+/*
+ * bms_member_index
+ *		determine 0-based index of member x in the bitmap
+ *
+ * Returns (-1) when x is not a member.
+ */
+int bms_member_index(const Bitmapset *a, int x)
+{
+    int bitnum;
+    int wordnum;
+    int result = 0;
+    bitmapword mask;
+
+    /* return -1 if not a member of the bitmap */
+    if (!bms_is_member(x, a))
+        return -1;
+
+    wordnum = WORDNUM(x);
+    bitnum = BITNUM(x);
+
+    /* count bits in preceding words */
+    for (int i = 0; i < wordnum; i++) {
+        bitmapword w = a->words[i];
+
+        /* No need to count the bits in a zero word */
+        if (w != 0) {
+            result += bmw_popcount(w);
+            w >>= BYTE_NUMBER;
+        }
+    }
+
+    /*
+     * Now add bits of the last word, but only those before the item. We can
+     * do that by applying a mask and then using popcount again. To get
+     * 0-based index, we want to count only preceding bits, not the item
+     * itself, so we subtract 1.
+     */
+    mask = ((bitmapword)1 << bitnum) - 1;
+    bitmapword tmp = a->words[wordnum] & mask;
+    result += bmw_popcount(tmp);
+    tmp >>= BYTE_NUMBER;
+
+    return result;
+}
+#endif

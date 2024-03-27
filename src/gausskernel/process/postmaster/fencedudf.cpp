@@ -65,8 +65,10 @@
 #include "utils/fmgrtab.h"
 #include "utils/postinit.h"
 #include "utils/relmapper.h"
+#include "utils/knl_localsysdbcache.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
+#include "commands/user.h"
 #include "dynloader.h"
 #include "catalog/pg_type.h"
 #include "utils/memutils.h"
@@ -161,10 +163,10 @@ void FencedUDFMasterMain(int argc, char* argv[]);
 extern void* internal_load_library(const char* libname);
 
 
-void StartUDFMaster()
+pid_t StartUDFMaster()
 {
-    pid_t fencedWorkPid = 0;
-    switch ((fencedWorkPid = fork_process())) {
+    pid_t fencedMasterPid = 0;
+    switch ((fencedMasterPid = fork_process())) {
         case -1: {
             int errsv = errno;
             ereport(WARNING,
@@ -185,6 +187,7 @@ void StartUDFMaster()
             break;
         }
     }
+    return fencedMasterPid;
 }
 /*
  * @Description: The main function of UDF RPC server.
@@ -205,6 +208,7 @@ void FencedUDFMasterMain(int argc, char* argv[])
     gs_signal_setmask(&t_thrd.libpq_cxt.BlockSig, NULL);
     gs_signal_block_sigusr2();
 
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGHUP, SIG_IGN);           /* reread config file and have
                                                   * children do same */
     (void)gspqsignal(SIGINT, SIGQUITUDFMaster);  /* send SIGTERM and shut down */
@@ -231,6 +235,15 @@ void FencedUDFMasterMain(int argc, char* argv[])
     InitProcess();
     t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "fencedMaster",
         THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_AI));
+#endif
+
+#if defined(USE_ASSERT_CHECKING) && !defined(ENABLE_MEMORY_CHECK)
+    /*
+     * ignore lsc check in UDF, because UDF call exit() to abort process,
+     * it will execute object destruction function,
+     * call proc_exit() to abort UDF will be better.
+     */
+    CloseLSCCheck();
 #endif
 
     /*
@@ -289,7 +302,10 @@ void UDFMasterServerLoop()
          */
         gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
         (void)gs_signal_unblock_sigusr2();
-
+        sigrelse(SIGINT);
+        sigrelse(SIGQUIT);
+        sigrelse(SIGTERM);
+        
         /* must set timeout each time; some OSes change it! */
         struct timeval timeout;
 
@@ -1749,10 +1765,10 @@ static void FindOrInsertUDFHashTab(FunctionCallInfoData* fcinfo)
             } else {
                 char pathbuf[MAXPGPATH];
                 get_lib_path(my_exec_path, pathbuf);
-#ifdef ENABLE_PYTHON2
-                join_path_components(pathbuf, pathbuf, "postgresql/plpython2.so");
+#ifdef ENABLE_PYTHON3
+                join_path_components(pathbuf, pathbuf, "plpython3.so");
 #else
-                join_path_components(pathbuf, pathbuf, "postgresql/plpython3.so");
+                join_path_components(pathbuf, pathbuf, "plpython2.so");
 #endif
                 char *libpl_location = strdup(pathbuf);
                 void *libpl_handler = internal_load_library(libpl_location);
@@ -2559,6 +2575,16 @@ char* get_obsfile_local(char* pathname, const char* basename, const char* extens
     pfree_ext(tmp_path);
     /* get OBSInfo */
     obsinfo = parse_obsinfo(pathname, tmp.data);
+
+    /* check if ak/sk contains invalid character */
+    if (isStrHasInvalidCharacter(obsinfo->accesskey) || isStrHasInvalidCharacter(obsinfo->secretkey)) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("OBS Path Keys cannot contain characters except numbers, alphabetic characters and "
+                    "specified special characters."),
+            errcause("OBS Path Keys contain invalid characters."),
+            erraction("Use valid characters in OBS Path Keys.")));
+    }
+
     resetStringInfo(&tmp);
 
     /* get the tmp path */

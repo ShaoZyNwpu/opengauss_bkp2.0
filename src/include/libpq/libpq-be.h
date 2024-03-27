@@ -65,12 +65,15 @@ typedef struct {
 #endif /* ENABLE_SSPI */
 
 #include "datatype/timestamp.h"
+#include "lib/stringinfo.h"
 #include "libpq/hba.h"
 #include "libpq/pqcomm.h"
 #include "libpq/sha2.h"
 #include "libcomm/libcomm.h"
+#include "tcop/dest.h"
 
-typedef enum CAC_state { CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY, CAC_WAITBACKUP } CAC_state;
+typedef enum CAC_state { CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY, CAC_WAITBACKUP, CAC_OOM
+    } CAC_state;
 
 /*
  * GSSAPI specific state information
@@ -85,6 +88,27 @@ typedef struct {
 #endif
 } pg_gssinfo;
 #endif
+
+/*
+ * ProtocolExtensionConfig
+ *
+ * 	All the callbacks implementing a specific wire protocol
+ */
+typedef struct ProtocolExtensionConfig {
+    bool    server_handshake_first;
+    void    (*fn_init)(void);
+    int     (*fn_start)(struct Port *port);
+    void    (*fn_authenticate)(struct Port *port);
+    void    (*fn_send_message)(ErrorData *edata);
+    void    (*fn_send_cancel_key)(int32 pid, int32 key);
+    void    (*fn_comm_reset)(void);
+    void    (*fn_send_ready_for_query)(CommandDest dest);
+    int	    (*fn_read_command)(StringInfo inBuf);
+    DestReceiver*   (*fn_printtup_create_DR)(CommandDest dest);
+    void    (*fn_set_DR_params)(DestReceiver* self, List* target_list);
+    int     (*fn_process_command)(StringInfo inBuf);
+    void    (*fn_report_param_status)(const char *name, char *val);
+} ProtocolExtensionConfig;
 
 /*
  * This is used by the postmaster in its communication with frontends.	It
@@ -119,6 +143,8 @@ typedef struct Port {
     gsocket gs_sock;
 
     CAC_state canAcceptConnections; /* postmaster connection status */
+
+    ProtocolExtensionConfig *protocol_config;	/* wire protocol functions */
 
     /*
      * Information that needs to be saved from the startup packet and passed
@@ -161,9 +187,11 @@ typedef struct Port {
     int default_keepalives_idle;
     int default_keepalives_interval;
     int default_keepalives_count;
+    int default_tcp_user_timeout;
     int keepalives_idle;
     int keepalives_interval;
     int keepalives_count;
+    int tcp_user_timeout;
 
 #if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
 
@@ -222,10 +250,12 @@ extern THR_LOCAL ProtocolVersion FrontendProtocol;
 extern int pq_getkeepalivesidle(Port* port);
 extern int pq_getkeepalivesinterval(Port* port);
 extern int pq_getkeepalivescount(Port* port);
+extern int pq_gettcpusertimeout(Port *port);
 
 extern int pq_setkeepalivesidle(int idle, Port* port);
 extern int pq_setkeepalivesinterval(int interval, Port* port);
 extern int pq_setkeepalivescount(int count, Port* port);
+extern int pq_settcpusertimeout(int timeout, Port *port);
 
 extern CAC_state canAcceptConnections(bool isSession);
 

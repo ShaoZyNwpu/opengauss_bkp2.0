@@ -780,7 +780,9 @@ static void print_aligned_text(const printTableContent* cont, FILE* fout)
 
             more_col_wrapping = col_count;
             curr_nl_line = 0;
-            check_memset_s(memset_s(header_done, col_count * sizeof(bool), false, col_count * sizeof(bool)));
+            if (col_count > 0) {
+                check_memset_s(memset_s(header_done, col_count * sizeof(bool), false, col_count * sizeof(bool)));
+            }
             while (more_col_wrapping) {
                 if (opt_border == 2) {
                     fputs(dformat->leftvrule, fout);
@@ -809,7 +811,7 @@ static void print_aligned_text(const printTableContent* cont, FILE* fout)
                     if (opt_border != 0 || format->wrap_right_border)
                         fputs(!header_done[i] ? format->header_nl_right : " ", fout);
 
-                    if (opt_border != 0 && i < col_count - 1)
+                    if (opt_border != 0 && col_count > 0 && i < col_count - 1)
                         fputs(dformat->midvrule, fout);
                 }
                 curr_nl_line++;
@@ -1310,7 +1312,7 @@ static void print_html_text(const printTableContent* cont, FILE* fout)
     }
 
     if (cont->opt->start_table) {
-        fprintf(fout, "<table border=\"%d\"", opt_border);
+        fprintf(fout, "<table border=\"%d\"", (int)opt_border);
         if (opt_table_attr != NULL)
             fprintf(fout, " %s", opt_table_attr);
         fputs(">\n", fout);
@@ -1390,7 +1392,7 @@ static void print_html_vertical(const printTableContent* cont, FILE* fout)
         return;
     }
     if (cont->opt->start_table) {
-        fprintf(fout, "<table border=\"%d\"", opt_border);
+        fprintf(fout, "<table border=\"%d\"", (int)opt_border);
         if (opt_table_attr != NULL)
             fprintf(fout, " %s", opt_table_attr);
         fputs(">\n", fout);
@@ -1951,12 +1953,13 @@ void printTableInit(
     content->ncolumns = ncolumns;
     content->nrows = nrows;
 
-    content->headers = (const char**)pg_local_calloc(ncolumns + 1, sizeof(*content->headers));
-
-    if (ncolumns * nrows + 1 <= 0) {
+    int64 res = (int64)ncolumns * (int64)nrows + 1L;
+    if (res >= (int64)PG_INT32_MAX) {
         fprintf(stderr, _("Error: Integer overflow when select execution.\n"));
         exit(EXIT_FAILURE);
     }
+
+    content->headers = (const char**)pg_local_calloc(ncolumns + 1, sizeof(*content->headers));
     content->cells = (const char**)pg_local_calloc(ncolumns * nrows + 1, sizeof(*content->cells));
 
     content->cellmustfree = NULL;

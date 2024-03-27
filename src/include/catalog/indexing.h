@@ -37,6 +37,11 @@ extern void CatalogIndexInsert(CatalogIndexState indstate,
 				   HeapTuple heapTuple);
 extern void CatalogUpdateIndexes(Relation heapRel, HeapTuple heapTuple);
 
+extern void CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup);
+
+extern Oid CatalogTupleInsert(Relation heapRel, HeapTuple tup);
+
+extern void CatalogTupleDelete(Relation heapRel, ItemPointer tid);
 
 /*
  * These macros are just to keep the C compiler from spitting up on the
@@ -119,6 +124,8 @@ DECLARE_UNIQUE_INDEX(pg_class_relname_nsp_index, 2663, on pg_class using btree(r
 #define ClassNameNspIndexId  2663
 DECLARE_INDEX(pg_class_tblspc_relfilenode_index, 9981, on pg_class using btree(reltablespace oid_ops, relfilenode oid_ops));
 #define ClassTblspcRelfilenodeIndexId  9981
+DECLARE_UNIQUE_INDEX(pg_collation_enc_def_index, 3147, on pg_collation using btree(collencoding int4_ops, collisdef bool_ops));
+#define CollationEncDefIndexId 3147
 DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164, on pg_collation using btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops));
 #define CollationNameEncNspIndexId 3164
 DECLARE_UNIQUE_INDEX(pg_collation_oid_index, 3085, on pg_collation using btree(oid oid_ops));
@@ -174,6 +181,13 @@ DECLARE_UNIQUE_INDEX(pg_enum_typid_label_index, 3503, on pg_enum using btree(enu
 DECLARE_UNIQUE_INDEX(pg_enum_typid_sortorder_index, 3534, on pg_enum using btree(enumtypid oid_ops, enumsortorder float4_ops));
 #define EnumTypIdSortOrderIndexId 3534
 
+DECLARE_UNIQUE_INDEX(pg_set_oid_index, 3517, on pg_set using btree(oid oid_ops));
+#define SetOidIndexId	3517
+DECLARE_UNIQUE_INDEX(pg_set_typid_label_index, 3518, on pg_set using btree(settypid oid_ops, setlabel text_ops));
+#define SetTypIdLabelIndexId 3518
+DECLARE_UNIQUE_INDEX(pg_set_typid_order_index, 3519, on pg_set using btree(settypid oid_ops, setsortorder int1_ops));
+#define SetTypIdOrderIndexId 3519
+
 /* This following index is not used for a cache and is not unique */
 DECLARE_INDEX(pg_index_indrelid_index, 2678, on pg_index using btree(indrelid oid_ops));
 #define IndexIndrelidIndexId  2678
@@ -223,8 +237,6 @@ DECLARE_UNIQUE_INDEX(pg_pltemplate_name_index, 1137, on pg_pltemplate using btre
 DECLARE_UNIQUE_INDEX(pg_proc_oid_index, 2690, on pg_proc using btree(oid oid_ops));
 #define ProcedureOidIndexId  2690
 
-DECLARE_INDEX(pg_proc_proname_args_nsp_index, 2691, on pg_proc using btree(proname name_ops, proargtypes oidvector_ops, pronamespace oid_ops, propackageid oid_ops));
-#define ProcedureNameArgsNspIndexId  2691
 DECLARE_INDEX(pg_proc_proname_all_args_nsp_index, 9666, on pg_proc using btree(proname name_ops, allargtypes oidvector_ops, pronamespace oid_ops, propackageid oid_ops));
 #define ProcedureNameAllArgsNspIndexId  9666
 
@@ -263,6 +275,8 @@ DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698, on pg_tablespace using b
 /* This following index is not used for a cache and is not unique */
 DECLARE_INDEX(pg_trigger_tgconstraint_index, 2699, on pg_trigger using btree(tgconstraint oid_ops));
 #define TriggerConstraintIndexId  2699
+DECLARE_INDEX(pg_trigger_tgname_index, 2700, on pg_trigger using btree(tgname name_ops));
+#define TriggerNameIndexId  2700
 DECLARE_UNIQUE_INDEX(pg_trigger_tgrelid_tgname_index, 2701, on pg_trigger using btree(tgrelid oid_ops, tgname name_ops));
 #define TriggerRelidNameIndexId  2701
 DECLARE_UNIQUE_INDEX(pg_trigger_oid_index, 2702, on pg_trigger using btree(oid oid_ops));
@@ -651,6 +665,18 @@ DECLARE_UNIQUE_INDEX(pg_replication_origin_roident_index, 6136, on pg_replicatio
 DECLARE_UNIQUE_INDEX(pg_replication_origin_roname_index, 6137, on pg_replication_origin using btree(roname text_pattern_ops));
 #define ReplicationOriginNameIndex 6137
 
+DECLARE_UNIQUE_INDEX(gs_sql_patch_patch_name_index, 9053, on gs_sql_patch using btree(patch_name name_ops));
+#define GsSqlPatchPatchNameIndex 9053
+
+DECLARE_INDEX(gs_sql_patch_unique_sql_id_index, 9054, on gs_sql_patch using btree(unique_sql_id int8_ops));
+#define GsSqlPatchUniqueSqlIdIndex 9054
+
+DECLARE_UNIQUE_INDEX(pg_subscription_rel_srrelid_srsubid_index, 6138, on pg_subscription_rel using btree(srrelid oid_ops, srsubid oid_ops));
+#define SubscriptionRelSrrelidSrsubidIndexId 6138
+DECLARE_UNIQUE_INDEX(pg_event_trigger_evtname_index, 3486, on pg_event_trigger using btree(evtname name_ops));
+#define EventTriggerNameIndexId  3486
+DECLARE_UNIQUE_INDEX(pg_event_trigger_oid_index, 3487, on pg_event_trigger using btree(oid oid_ops));
+#define EventTriggerOidIndexId  3487
 
 /* last step of initialization script: build the indexes declared above */
 BUILD_INDICES

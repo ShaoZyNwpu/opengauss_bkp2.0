@@ -38,10 +38,10 @@
 
 #include "postgres.h"
 #include "knl/knl_variable.h"
-#include "access/dfs/dfs_insert.h"
 #include "access/xact.h"
 #include "access/tableam.h"
 #include "catalog/heap.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_partition_fn.h"
 #include "catalog/storage_gtt.h"
@@ -82,7 +82,6 @@
 #include "utils/portal.h"
 #include "utils/snapmgr.h"
 #include "vecexecutor/vecmergeinto.h"
-#include "access/dfs/dfs_insert.h"
 #include "access/heapam.h"
 #include "access/ustore/knl_uheap.h"
 #include "access/ustore/knl_whitebox_test.h"
@@ -101,6 +100,7 @@ static void RecoredGeneratedExpr(ResultRelInfo *resultRelInfo, EState *estate, C
 #define DatumGetItemPointer(X) ((ItemPointer)DatumGetPointer(X))
 #endif
 
+static TupleTableSlot* ExecModifyTable(PlanState* state);
 extern CopyFromManager initCopyFromManager(MemoryContext parent, Relation heapRel, bool isInsertSelect);
 extern void deinitCopyFromManager(CopyFromManager mgr);
 extern void FlushInsertSelectBulk(
@@ -108,6 +108,7 @@ extern void FlushInsertSelectBulk(
 extern void FlushErrorInfo(Relation rel, EState* estate, ErrorCacheEntry* cache);
 extern void HeapInsertCStore(Relation relation, ResultRelInfo* resultRelInfo, HeapTuple tup, int option);
 extern void HeapDeleteCStore(Relation relation, ItemPointer tid, Oid tableOid, Snapshot snapshot);
+extern Oid pg_get_serial_sequence_oid(text* tablename, text* columnname);
 #ifdef ENABLE_MULTIPLE_NODES
 extern void HeapInsertTsStore(Relation relation, ResultRelInfo* resultRelInfo, HeapTuple tup, int option);
 #endif   /* ENABLE_MULTIPLE_NODES */
@@ -122,6 +123,10 @@ static bool has_dummy_targetlist(Plan* plan)
         case T_RowToVec:
         case T_Stream:
         case T_VecStream:
+        case T_Limit:
+        case T_VecLimit:
+        case T_Sort:
+        case T_VecSort:
             is_dummy = true;
             break;
         default:
@@ -150,7 +155,11 @@ static void CheckPlanOutput(Plan* subPlan, Relation resultRel)
         case T_VecToRow:
         case T_RowToVec:
         case T_PartIterator:
-        case T_VecPartIterator: {
+        case T_VecPartIterator: 
+        case T_Limit:
+        case T_VecLimit:
+        case T_Sort:
+        case T_VecSort: {
 #ifdef ENABLE_MULTIPLE_NODES
             if (!IS_PGXC_COORDINATOR) {
                 break;
@@ -209,7 +218,7 @@ void ExecCheckPlanOutput(Relation resultRel, List* targetList)
                     errmodule(MOD_EXECUTOR),
                     errmsg("table row type and query-specified row type do not match"),
                     errdetail("Query has too many columns.")));
-        attr = result_desc->attrs[attno++];
+        attr = &result_desc->attrs[attno++];
 
         if (!attr->attisdropped) {
             /* Normal case: demand type match */
@@ -288,7 +297,7 @@ static void ExecCheckTIDVisible(Relation        targetrel, EState* estate, Relat
             errmsg("failed to fetch conflicting tuple for DUPLICATE KEY UPDATE")));
     }
 
-    tableam_tuple_check_visible(targetrel, estate->es_snapshot, &tuple, buffer);
+    tableam_tuple_check_visible(targetrel, estate->es_snapshot, tuple, buffer);
     tableam_tops_destroy_tuple(targetrel, tuple);
     ReleaseBuffer(buffer);
 }
@@ -408,9 +417,192 @@ void ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo, EState *estate, Tu
     (void)MemoryContextSwitchTo(oldContext);
 }
 
+static bool GetUpdateExprCol(TupleDesc tupdesc, int atti)
+{
+    if (!tupdesc->constr)
+        return false;
+
+    if (tupdesc->constr->num_defval == 0)
+        return false;
+
+    return tupdesc->constr->has_on_update[atti];
+}
+
+static void RecoredUpdateExpr(ResultRelInfo *resultRelInfo, EState *estate, CmdType cmdtype)
+{
+    TupleDesc tupdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
+    int natts = tupdesc->natts;
+    MemoryContext oldContext;
+
+    Assert(tupdesc->constr && tupdesc->constr->has_on_update);
+
+    /*
+     * If first time through for this result relation, build expression
+     * nodetrees for rel's stored generation expressions.  Keep them in the
+     * per-query memory context so they'll survive throughout the query.
+     */
+    if (resultRelInfo->ri_UpdatedExprs == NULL) {
+        oldContext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+        resultRelInfo->ri_UpdatedExprs = (ExprState **)palloc(natts * sizeof(ExprState *));
+        resultRelInfo->ri_NumUpdatedNeeded = 0;
+
+        for (int i = 0; i < natts; i++) {
+            if (GetUpdateExprCol(tupdesc, i)) {
+                Expr *expr;
+
+                expr = (Expr *)build_column_default(resultRelInfo->ri_RelationDesc, i + 1, false, true);
+                if (expr == NULL)
+                    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("no update expression found for column number %d of table \"%s\"", i + 1,
+                        RelationGetRelationName(resultRelInfo->ri_RelationDesc))));
+
+                resultRelInfo->ri_UpdatedExprs[i] = ExecPrepareExpr(expr, estate);
+                resultRelInfo->ri_NumUpdatedNeeded++;
+            }
+        }
+
+        (void)MemoryContextSwitchTo(oldContext);
+    }
+}
+
+/*
+ * Compute stored updated columns for a tuple
+ */
+bool ExecComputeStoredUpdateExpr(ResultRelInfo *resultRelInfo, EState *estate, TupleTableSlot *slot, Tuple tuple,
+    CmdType cmdtype, ItemPointer otid, Oid oldPartitionOid, int2 bucketid)
+{
+    Relation rel = resultRelInfo->ri_RelationDesc;
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    uint32 natts = (uint32)tupdesc->natts;
+    MemoryContext oldContext;
+    Datum *values;
+    bool *nulls;
+    bool *replaces;
+    Tuple newtuple;
+    FmgrInfo eqproc;
+    Oid opfuncoid = InvalidOid;
+    bool match = false;
+    bool update_fix_result = true;
+    int temp_id = -1;
+    int attnum;
+    uint32 updated_colnum_resno;
+    Bitmapset* updatedCols = GetUpdatedColumns(resultRelInfo, estate);
+
+    /* use pertuple memory for trigger tuple */
+    oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+    HeapTuple oldtup = GetTupleForTrigger(estate, NULL, resultRelInfo, oldPartitionOid, bucketid, otid, LockTupleShared, NULL);
+    MemoryContextSwitchTo(oldContext);
+
+    RecoredUpdateExpr(resultRelInfo, estate, cmdtype);
+
+    /*
+     * If no generated columns have been affected by this change, then skip
+     * the rest.
+     */
+    if (resultRelInfo->ri_NumUpdatedNeeded == 0)
+        return true;
+
+    /* compare update operator whether the newtuple is equal to the oldtuple, 
+     * if equal, so update don't fix the default column value  */
+    Datum* oldvalues = (Datum*)palloc(natts * sizeof(Datum));
+    bool* oldnulls = (bool*)palloc(natts * sizeof(bool));
+    heap_deform_tuple(oldtup, tupdesc, oldvalues, oldnulls);
+    temp_id = -1;
+    attnum = bms_next_member(updatedCols, temp_id);
+    updated_colnum_resno = attnum + FirstLowInvalidHeapAttributeNumber;
+    temp_id = attnum;
+    for (int32 i = 0; i < (int32)natts; i++) {
+        if (updated_colnum_resno  == (uint32)(i + 1)) {
+            if (slot->tts_isnull[i] && oldnulls[i]) {
+                match = true;
+            } else if (slot->tts_isnull[i] && !oldnulls[i]) {
+                match = false;
+            } else if (!slot->tts_isnull[i] && oldnulls[i]) {
+                match = false;
+            } else {
+                Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+                opfuncoid = OpernameGetOprid(list_make1(makeString("=")), attr->atttypid, attr->atttypid);
+                if (OidIsValid(opfuncoid)) {
+                    RegProcedure oprcode = get_opcode(opfuncoid);
+                    fmgr_info(oprcode, &eqproc);
+                    match = DatumGetBool(FunctionCall2Coll(&eqproc, DEFAULT_COLLATION_OID, slot->tts_values[i], oldvalues[i]));
+                } else {
+                    Oid typoutput = 0;
+                    bool typisvarlena = false;
+                    getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
+                    char *value_old = DatumGetCString(OidOutputFunctionCall(typoutput, oldvalues[i]));
+                    char *value_new = DatumGetCString(OidOutputFunctionCall(typoutput, slot->tts_values[i]));
+                    if (pg_strcasecmp(value_old, value_new) == 0) {
+                        match = true;
+                    } else {
+                        match = false;
+                    }
+                }
+            }
+            update_fix_result = update_fix_result && match;
+            attnum = bms_next_member(updatedCols, temp_id);
+            if (attnum >= 0) {
+                updated_colnum_resno = attnum + FirstLowInvalidHeapAttributeNumber;
+                temp_id = attnum;
+            }
+        }
+    }
+    pfree_ext(oldvalues);
+    pfree_ext(oldnulls);
+
+    if (update_fix_result)
+        return true;
+
+    oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+    values = (Datum *)palloc(sizeof(*values) * natts);
+    nulls = (bool *)palloc(sizeof(*nulls) * natts);
+    replaces = (bool *)palloc0(sizeof(*replaces) * natts);
+    temp_id = -1;
+    attnum = bms_next_member(updatedCols, temp_id);
+    updated_colnum_resno = attnum + FirstLowInvalidHeapAttributeNumber;
+    temp_id = attnum;
+    for (uint32 i = 0; i < natts; i++) {
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+        if (updated_colnum_resno == (i + 1)) {
+            attnum = bms_next_member(updatedCols, temp_id);
+            if (attnum >= 0) {
+                updated_colnum_resno = attnum + FirstLowInvalidHeapAttributeNumber;
+                temp_id = attnum;
+            }
+            continue;
+        }
+        if (GetUpdateExprCol(tupdesc, i) && resultRelInfo->ri_UpdatedExprs[i]) {
+            ExprContext *econtext;
+            Datum val;
+            bool isnull = false;
+
+            econtext = GetPerTupleExprContext(estate);
+            econtext->ecxt_scantuple = slot;
+
+            val = ExecEvalExpr(resultRelInfo->ri_UpdatedExprs[i], econtext, &isnull, NULL);
+
+            /*
+            * We must make a copy of val as we have no guarantees about where
+            * memory for a pass-by-reference Datum is located.
+            */
+            if (!isnull)
+                val = datumCopy(val, attr->attbyval, attr->attlen);
+
+            values[i] = val;
+            nulls[i] = isnull;
+            replaces[i] = true;
+        }
+    }
+
+    newtuple = tableam_tops_modify_tuple(tuple, tupdesc, values, nulls, replaces);
+    (void)ExecStoreTuple(newtuple, slot, InvalidBuffer, false);
+    (void)MemoryContextSwitchTo(oldContext);
+    return false;
+}
+
 static bool ExecConflictUpdate(ModifyTableState* mtstate, ResultRelInfo* resultRelInfo, ConflictInfoData* conflictInfo,
     TupleTableSlot* planSlot, TupleTableSlot* excludedSlot, EState* estate, Relation targetRel,
-    Oid oldPartitionOid, int2 bucketid, bool canSetTag, TupleTableSlot** returning)
+    Oid oldPartitionOid, int2 bucketid, bool canSetTag, TupleTableSlot** returning, char* partExprKeyStr)
 {
     ExprContext* econtext = mtstate->ps.ps_ExprContext;
     Relation    relation = targetRel;
@@ -421,7 +613,7 @@ static bool ExecConflictUpdate(ModifyTableState* mtstate, ResultRelInfo* resultR
     ItemPointer conflictTid = &conflictInfo->conflictTid;
     Tuple tuple = tableam_tops_new_tuple(targetRel, conflictTid);
     test = tableam_tuple_lock(relation, tuple, &buffer,
-                              estate->es_output_cid, LockTupleExclusive, false, &tmfd,
+                              estate->es_output_cid, LockTupleExclusive, LockWaitBlock, &tmfd,
                               false, false, false, GetActiveSnapshot(), &conflictInfo->conflictTid, 
                               false, true, conflictInfo->conflictXid);
 
@@ -465,7 +657,7 @@ checktest:
             }
 #endif
             test = tableam_tuple_lock(relation, tuple, &buffer,
-                                      estate->es_output_cid, LockTupleExclusive, false, &tmfd, 
+                                      estate->es_output_cid, LockTupleExclusive, LockWaitBlock, &tmfd, 
                                       true, false, false, estate->es_snapshot, &conflictInfo->conflictTid, 
                                       false, true, conflictInfo->conflictXid);
 
@@ -527,9 +719,10 @@ checktest:
     ExecProject(resultRelInfo->ri_updateProj, NULL);
     /* Evaluate where qual if exists, add to count if filtered */
     if (ExecQual(upsertState->us_updateWhere, econtext, false)) {
+        TM_Result out_result;
         *returning = ExecUpdate(conflictTid, oldPartitionOid, bucketid, NULL,
             upsertState->us_updateproj, planSlot, &mtstate->mt_epqstate,
-            mtstate, canSetTag, ((ModifyTable*)mtstate->ps.plan)->partKeyUpdated);
+            mtstate, canSetTag, ((ModifyTable*)mtstate->ps.plan)->partKeyUpdated, &out_result, partExprKeyStr);
     } else {
         InstrCountFiltered1(&mtstate->ps, 1);
     }
@@ -551,25 +744,46 @@ static inline void ReleaseResourcesForUpsertGPI(bool isgpi, Relation parentRel, 
     }
 }
 
-void CheckPartitionOidForSpecifiedPartition(RangeTblEntry *rte, Oid partitionid)
+bool CheckPartitionOidForSpecifiedPartition(RangeTblEntry *rte, Oid partitionid, bool canIgnore = false)
 {
-    if (rte->isContainPartition && rte->partitionOid != partitionid) {
-        ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND),
+    int level = canIgnore ? WARNING : ERROR;
+    if (rte->isContainPartition) {
+        ListCell *cell = NULL;
+        foreach(cell, rte->partitionOidList) {
+            if (lfirst_oid(cell) == partitionid) {
+                return true;
+            }
+        }
+        ereport(level, (errcode(ERRCODE_NO_DATA_FOUND),
                         (errmsg("inserted partition key does not map to the table partition"), errdetail("N/A."),
                          errcause("The value is incorrect."), erraction("Use the correct value."))));
+        return false;
     }
+    return true;
 }
 
-void CheckSubpartitionOidForSpecifiedSubpartition(RangeTblEntry *rte, Oid partitionid, Oid subPartitionId)
+bool CheckSubpartitionOidForSpecifiedSubpartition(RangeTblEntry *rte, Oid partitionid, Oid subPartitionId,
+                                                  bool canIgnore = false)
 {
-    if (rte->isContainSubPartition && (rte->partitionOid != partitionid || rte->subpartitionOid != subPartitionId)) {
-        ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND),
+    int level = canIgnore ? WARNING : ERROR;
+    if (rte->isContainSubPartition) {
+        ListCell *partCell = NULL;
+        ListCell *subpartCell = NULL;
+        forboth(partCell, rte->partitionOidList, subpartCell, rte->subpartitionOidList) {
+            if (lfirst_oid(partCell) == partitionid &&
+                (lfirst_oid(subpartCell) == subPartitionId || !OidIsValid(lfirst_oid(subpartCell)))) {
+                return true;
+            }
+        }
+        ereport(level, (errcode(ERRCODE_NO_DATA_FOUND),
                         (errmsg("inserted subpartition key does not map to the table subpartition"), errdetail("N/A."),
                          errcause("The value is incorrect."), erraction("Use the correct value."))));
+        return false;
     }
+    return true;
 }
 
-static void ReportErrorForSpecifiedPartitionOfUpsert(char *partition, char *table)
+static void ReportErrorForSpecifiedPartitionOfUpsert(const char *partition, const char *table)
 {
     ereport(ERROR,
             (errcode(ERRCODE_NO_DATA_FOUND),
@@ -584,25 +798,43 @@ static void ReportErrorForSpecifiedPartitionOfUpsert(char *partition, char *tabl
 static void CheckPartitionOidForUpsertSpecifiedPartition(RangeTblEntry *rte, Relation resultRelationDesc,
                                                          Oid targetPartOid)
 {
-    if (RelationIsSubPartitioned(resultRelationDesc)) {
-        Oid parentOid = partid_get_parentid(targetPartOid);
-        if (rte->isContainPartition && rte->partitionOid != parentOid) {
-            char *partition = "partition";
-            char *table = "subpartition";
-            ReportErrorForSpecifiedPartitionOfUpsert(partition, table);
-        }
-        if (rte->isContainSubPartition && (rte->partitionOid != parentOid || rte->subpartitionOid != targetPartOid)) {
-            char *partition = "subpartition";
-            char *table = "subpartition";
-            ReportErrorForSpecifiedPartitionOfUpsert(partition, table);
-        }
+    Oid partitionOid;
+    Oid subpartitionOid;
+    ListCell *partCell = NULL;
+    ListCell *subpartCell = NULL;
+    const char *table = NULL;
+    const char *partition = NULL;
+
+    if (rte->isContainSubPartition) {
+        partition = (rte->subpartitionOidList->length == 1) ? "subpartition" : "partition";
+    } else if (rte->isContainPartition) {
+        partition = "partition";
     } else {
-        if (rte->isContainPartition && rte->partitionOid != targetPartOid) {
-            char *partition = "partition";
-            char *table = "partition";
-            ReportErrorForSpecifiedPartitionOfUpsert(partition, table);
+        /* partition is not specified */
+        return;
+    }
+
+    if (RelationIsSubPartitioned(resultRelationDesc)) {
+        table = "subpartition";
+        partitionOid = partid_get_parentid(targetPartOid);
+        subpartitionOid = targetPartOid;
+    } else {
+        table = "partition";
+        partitionOid = targetPartOid;
+        subpartitionOid = InvalidOid;
+    }
+
+    forboth(partCell, rte->partitionOidList, subpartCell, rte->subpartitionOidList) {
+        if (!OidIsValid(lfirst_oid(subpartCell))) {
+            if (lfirst_oid(partCell) == partitionOid) {
+                return;
+            }
+        } else if (lfirst_oid(subpartCell) == subpartitionOid && lfirst_oid(partCell) == partitionOid) {
+            return;
         }
     }
+    /* targetPartOid is not in specified partition list */
+    ReportErrorForSpecifiedPartitionOfUpsert(partition, table);
 }
 
 static void ConstraintsForExecUpsert(Relation resultRelationDesc)
@@ -629,7 +861,7 @@ static void ConstraintsForExecUpsert(Relation resultRelationDesc)
 }
 
 static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableSlot* planSlot, EState* estate,
-    bool canSetTag, Tuple tuple, TupleTableSlot** returning, bool* updated, Oid* targetPartOid)
+    bool canSetTag, Tuple tuple, TupleTableSlot** returning, bool* updated, Oid* targetPartOid, char* partExprKeyStr)
 {
     Oid newid = InvalidOid;
     bool        specConflict = false;
@@ -659,22 +891,30 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
 
     RangeTblEntry *rte = exec_rt_fetch(resultRelInfo->ri_RangeTableIndex, estate);
     if (RelationIsPartitioned(resultRelationDesc)) {
-        partitionid = heapTupleGetPartitionId(resultRelationDesc, tuple);
-        searchFakeReationForPartitionOid(estate->esfRelations,
+        int partitionno = INVALID_PARTITION_NO;
+        partitionid = heapTupleGetPartitionId(resultRelationDesc, tuple, &partitionno, false, false, !partExprKeyStr);
+        bool res = trySearchFakeReationForPartitionOid(&estate->esfRelations,
             estate->es_query_cxt,
             resultRelationDesc,
             partitionid,
-            heaprel,
-            partition,
+            partitionno,
+            &heaprel,
+            &partition,
             RowExclusiveLock);
+        if (!res) {
+            return InvalidOid;
+        }
         CheckPartitionOidForSpecifiedPartition(rte, partitionid);
 
         if (RelationIsSubPartitioned(resultRelationDesc)) {
-            subPartitionId = heapTupleGetPartitionId(heaprel, tuple);
+            int subpartitionno = INVALID_PARTITION_NO;
+            bool subpartExprKeyIsNull = PartExprKeyIsNull(heaprel, NULL, NULL);
+            subPartitionId = heapTupleGetPartitionId(heaprel, tuple, &subpartitionno, false, false, subpartExprKeyIsNull);
             searchFakeReationForPartitionOid(estate->esfRelations,
                 estate->es_query_cxt,
                 heaprel,
                 subPartitionId,
+                subpartitionno,
                 subPartRel,
                 subPart,
                 RowExclusiveLock);
@@ -729,7 +969,7 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
             *returning = NULL;
 
             if (ExecConflictUpdate(state, resultRelInfo, &conflictInfo, planSlot, slot,
-                    estate, targetrel, *targetPartOid, bucketid, canSetTag, returning)) {
+                    estate, targetrel, *targetPartOid, bucketid, canSetTag, returning, partExprKeyStr)) {
                 InstrCountFiltered2(&state->ps, 1);
                 *updated = true;
                 ReleaseResourcesForUpsertGPI(isgpi, resultRelationDesc, bucketRel, &partition_relation, part);
@@ -765,6 +1005,21 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
      * then abort the tuple and try to find the conflict tuple again
      */
     if (specConflict) {
+        /* delete index tuples and mark them as dead */
+        ExecIndexTuplesState exec_index_tuples_state;
+        exec_index_tuples_state.estate = estate;
+        exec_index_tuples_state.targetPartRel = heaprel;
+        exec_index_tuples_state.p = partition;
+        exec_index_tuples_state.conflict = NULL;
+        exec_index_tuples_state.rollbackIndex = true;
+
+        UpsertAction oldAction = state->mt_upsert->us_action;
+        state->mt_upsert->us_action = UPSERT_NONE;
+        tableam_tops_exec_delete_index_tuples(slot, heaprel, state,
+                                              &item, exec_index_tuples_state, NULL);
+        state->mt_upsert->us_action = oldAction;
+
+        /* rollback heap/uheap tuple */
         tableam_tuple_abort_speculative(targetrel, tuple);
 
         list_free(recheckIndexes);
@@ -774,7 +1029,7 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
     /* try to insert tuple into mlog-table. */
     if (targetrel != NULL && targetrel->rd_mlogoid != InvalidOid) {
         /* judge whether need to insert into mlog-table */
-        if (targetrel->rd_tam_type == TAM_USTORE) {
+        if (targetrel->rd_tam_ops == TableAmUstore) {
             tuple = (Tuple)UHeapToHeap(targetrel->rd_att, (UHeapTuple)tuple);
         }
         insert_into_mlog_table(targetrel, targetrel->rd_mlogoid, (HeapTuple)tuple,
@@ -784,6 +1039,7 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
     return newid;
 }
 
+extern Datum ComputePartKeyExprTuple(Relation rel, EState *estate, TupleTableSlot *slot, Relation partRel, char* partExprKeyStr);
 /* ----------------------------------------------------------------
  *		ExecInsert
  *
@@ -795,7 +1051,7 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
  */
 template <bool useHeapMultiInsert>
 TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, TupleTableSlot* planSlot, EState* estate,
-    bool canSetTag, int options, List** partitionList)
+    bool canSetTag, int options, List** partitionList, char* partExprKeyStr)
 {
     Tuple tuple = NULL;
     ResultRelInfo* result_rel_info = NULL;
@@ -853,7 +1109,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
      */
     if (rel_isblockchain) {
         MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-        tuple = set_user_tuple_hash((HeapTuple)tuple, result_relation_desc);
+        tuple = set_user_tuple_hash((HeapTuple)tuple, result_relation_desc, slot);
         (void)MemoryContextSwitchTo(old_context);
     }
 
@@ -903,10 +1159,16 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
 #ifdef ENABLE_MOT
         if (result_rel_info->ri_FdwRoutine->GetFdwType && result_rel_info->ri_FdwRoutine->GetFdwType() == MOT_ORC) {
             if (result_relation_desc->rd_att->constr) {
-                if (state->mt_insert_constr_slot == NULL) {
-                    ExecConstraints(result_rel_info, slot, estate);
-                } else {
-                    ExecConstraints(result_rel_info, state->mt_insert_constr_slot, estate);
+                TupleTableSlot *tmp_slot = state->mt_insert_constr_slot == NULL ? slot : state->mt_insert_constr_slot;
+                if (!ExecConstraints(result_rel_info, tmp_slot, estate)) {
+                    if (u_sess->utils_cxt.sql_ignore_strategy_val == SQL_OVERWRITE_NULL) {
+                        tuple = ReplaceTupleNullCol(RelationGetDescr(result_relation_desc), tmp_slot);
+                        /* Double check constraints in case that new val in column with not null constraints
+                         * violated check constraints */
+                        ExecConstraints(result_rel_info, tmp_slot, estate);
+                    } else {
+                        return NULL;
+                    }
                 }
             }
         }
@@ -941,10 +1203,18 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
             bucket_id = computeTupleBucketId(result_relation_desc, (HeapTuple)tuple);
         }
         if (result_relation_desc->rd_att->constr) {
-            if (state->mt_insert_constr_slot == NULL)
-                ExecConstraints(result_rel_info, slot, estate);
-            else
-                ExecConstraints(result_rel_info, state->mt_insert_constr_slot, estate);
+            TupleTableSlot *tmp_slot = state->mt_insert_constr_slot == NULL ? slot : state->mt_insert_constr_slot;
+            if (!ExecConstraints(result_rel_info, tmp_slot, estate, true)) {
+                if (u_sess->utils_cxt.sql_ignore_strategy_val == SQL_OVERWRITE_NULL) {
+                    tuple = ReplaceTupleNullCol(RelationGetDescr(result_relation_desc), tmp_slot);
+                    /* Double check constraints in case that new val in column with not null constraints
+                     * violated check constraints */
+                    ExecConstraints(result_rel_info, tmp_slot, estate, true);
+                } else {
+                    return NULL;
+                }
+            }
+            tuple = ExecAutoIncrement(result_relation_desc, estate, slot, tuple);
         }
 
 #ifdef PGXC
@@ -960,7 +1230,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
         } else
 #endif
             if (useHeapMultiInsert) {
-                TupleTableSlot* tmp_slot = MakeSingleTupleTableSlot(slot->tts_tupleDescriptor, false, result_relation_desc->rd_tam_type);
+                TupleTableSlot* tmp_slot = MakeSingleTupleTableSlot(slot->tts_tupleDescriptor, false, result_relation_desc->rd_tam_ops);
 
                 bool is_partition_rel = result_relation_desc->rd_rel->parttype == PARTTYPE_PARTITIONED_RELATION;
                 Oid targetOid = InvalidOid;
@@ -968,7 +1238,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                     if (RelationIsSubPartitioned(result_relation_desc)) {
                         targetOid = heapTupleGetSubPartitionId(result_relation_desc, tuple);
                     } else {
-                        targetOid = heapTupleGetPartitionId(result_relation_desc, tuple);
+                        targetOid = heapTupleGetPartitionId(result_relation_desc, tuple, NULL, false, false, !partExprKeyStr);
                     }
                 } else {
                     targetOid = RelationGetRelid(result_relation_desc);
@@ -1022,10 +1292,10 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                 tuple = tableam_tops_form_tuple(slot->tts_tupleDescriptor,
                                                 slot->tts_values, 
                                                 slot->tts_isnull, 
-                                                RelationGetTupleType(result_relation_desc));
+                                                result_relation_desc->rd_tam_ops);
                 if (rel_isblockchain) {
                     MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-                    tuple = set_user_tuple_hash((HeapTuple)tuple, result_relation_desc);
+                    tuple = set_user_tuple_hash((HeapTuple)tuple, result_relation_desc, NULL);
                     (void)MemoryContextSwitchTo(old_context);
                 }
                 if (tuple != NULL) {
@@ -1041,7 +1311,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                                 errmsg("The tuple to be inserted into the table cannot be NULL")));
                 }
                 new_id =
-                    ExecUpsert(state, slot, planSlot, estate, canSetTag, tuple, &returning, &updated, &partition_id);
+                    ExecUpsert(state, slot, planSlot, estate, canSetTag, tuple, &returning, &updated, &partition_id, partExprKeyStr);
                 if (updated) {
                     return returning;
                 }
@@ -1058,26 +1328,32 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                  */
                 new_id = InvalidOid;
                 RangeTblEntry *rte = exec_rt_fetch(result_rel_info->ri_RangeTableIndex, estate);
+                bool isgpi = false;
+                ConflictInfoData conflictInfo;
+                Oid conflictPartOid = InvalidOid;
+                int2 conflictBucketid = InvalidBktId;
+
                 switch (result_relation_desc->rd_rel->parttype) {
                     case PARTTYPE_NON_PARTITIONED_RELATION:
                     case PARTTYPE_VALUE_PARTITIONED_RELATION: {
                         if (RelationIsCUFormat(result_relation_desc)) {
                             HeapInsertCStore(result_relation_desc, estate->es_result_relation_info, (HeapTuple)tuple,
                                 0);
-                        } else if (RelationIsPAXFormat(result_relation_desc)) {
-                            /* here the insert including both none-partitioned and value-partitioned relations */
-                            DfsInsertInter* insert = CreateDfsInsert(result_relation_desc, false);
-                            insert->BeginBatchInsert(TUPLE_SORT, estate->es_result_relation_info);
-                            insert->TupleInsert(slot->tts_values, slot->tts_isnull, 0);
-                            insert->SetEndFlag();
-                            insert->TupleInsert(NULL, NULL, 0);
-                            insert->Destroy();
-                            delete insert;
                         } else {
                             target_rel = result_relation_desc;
                             if (bucket_id != InvalidBktId) {
                                 searchHBucketFakeRelation(estate->esfRelations, estate->es_query_cxt,
                                     result_relation_desc, bucket_id, target_rel);
+                            }
+                            // check unique constraints first if SQL has keyword IGNORE
+                            if (estate->es_plannedstmt && estate->es_plannedstmt->hasIgnore &&
+                                !ExecCheckIndexConstraints(slot, estate, target_rel, partition, &isgpi,
+                                                           bucket_id, &conflictInfo, &conflictPartOid,
+                                                           &conflictBucketid)) {
+                                ereport(WARNING,
+                                        (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                                RelationGetRelationName(target_rel))));
+                                return NULL;
                             }
                             new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
 
@@ -1091,11 +1367,30 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
 
                     case PARTTYPE_PARTITIONED_RELATION: {
                         /* get partititon oid for insert the record */
-                        partition_id = heapTupleGetPartitionId(result_relation_desc, tuple);
-                        CheckPartitionOidForSpecifiedPartition(rte, partition_id);
+                        int partitionno = INVALID_PARTITION_NO;
+                        if (partExprKeyStr) {
+                            Datum newval = ComputePartKeyExprTuple(result_relation_desc, estate, slot, NULL, partExprKeyStr);
+                            partition_id = heapTupleGetPartitionId(result_relation_desc, (void *)newval, &partitionno,
+                                false, estate->es_plannedstmt->hasIgnore, false);
+                        } else {
+                            partition_id = heapTupleGetPartitionId(result_relation_desc, tuple, &partitionno, false,
+                                estate->es_plannedstmt->hasIgnore, true);
+                        }
+                        /* if cannot find valid partition oid and sql has keyword ignore, return and don't insert */
+                        if (estate->es_plannedstmt->hasIgnore && partition_id == InvalidOid) {
+                            return NULL;
+                        }
+                        bool partitionCheckPassed = CheckPartitionOidForSpecifiedPartition(
+                            rte, partition_id, estate->es_plannedstmt->hasIgnore);
+                        if (!partitionCheckPassed) {
+                            return NULL;
+                        }
 
-                        searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt,
-                            result_relation_desc, partition_id, heap_rel, partition, RowExclusiveLock);
+                        bool res = trySearchFakeReationForPartitionOid(&estate->esfRelations, estate->es_query_cxt,
+                            result_relation_desc, partition_id, partitionno, &heap_rel, &partition, RowExclusiveLock);
+                        if (!res) {
+                            return NULL;
+                        }
                         if (RelationIsColStore(result_relation_desc)) {
                             HeapInsertCStore(heap_rel, estate->es_result_relation_info, (HeapTuple)tuple, 0);
 #ifdef ENABLE_MULTIPLE_NODES
@@ -1106,6 +1401,15 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
 #endif   /* ENABLE_MULTIPLE_NODES */
                         } else {
                             target_rel = heap_rel;
+                            /* check unique constraints first if SQL has keyword IGNORE */
+                            if (estate->es_plannedstmt && estate->es_plannedstmt->hasIgnore &&
+                                !ExecCheckIndexConstraints(slot, estate, target_rel, partition, &isgpi, bucket_id,
+                                                           &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+                                ereport(WARNING,
+                                        (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                                RelationGetRelationName(target_rel))));
+                                return NULL;
+                            }
                             tableam_tops_update_tuple_with_oid(heap_rel, tuple, slot);
                                 if (bucket_id != InvalidBktId) {
                                     searchHBucketFakeRelation(
@@ -1122,31 +1426,79 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                     case PARTTYPE_SUBPARTITIONED_RELATION: {
                         Oid partitionId = InvalidOid;
                         Oid subPartitionId = InvalidOid;
+                        int partitionno = INVALID_PARTITION_NO;
+                        int subpartitionno = INVALID_PARTITION_NO;
                         Relation partRel = NULL;
                         Partition part = NULL;
                         Relation subPartRel = NULL;
                         Partition subPart = NULL;
 
                         /* get partititon oid for insert the record */
-                        partitionId = heapTupleGetPartitionId(result_relation_desc, tuple);
-                        CheckPartitionOidForSpecifiedPartition(rte, partitionId);
+                        if (partExprKeyStr) {
+                            Datum newval = ComputePartKeyExprTuple(result_relation_desc, estate, slot, NULL, partExprKeyStr);
+                            partitionId = heapTupleGetPartitionId(result_relation_desc, (void *)newval, &partitionno,
+                                false, estate->es_plannedstmt->hasIgnore, false);
+                        } else {
+                            partitionId = heapTupleGetPartitionId(result_relation_desc, tuple, &partitionno, false,
+                                estate->es_plannedstmt->hasIgnore, true);
+                        }
 
-                        searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt,
-                                                         result_relation_desc, partitionId, partRel, part,
-                                                         RowExclusiveLock);
+                        if (estate->es_plannedstmt->hasIgnore && partitionId == InvalidOid) {
+                            return NULL;
+                        }
+                        bool partitionCheckPassed =
+                            CheckPartitionOidForSpecifiedPartition(rte, partitionId, estate->es_plannedstmt->hasIgnore);
+                        if (!partitionCheckPassed) {
+                            return NULL;
+                        }
+
+                        bool res = trySearchFakeReationForPartitionOid(&estate->esfRelations, estate->es_query_cxt,
+                            result_relation_desc, partitionId, partitionno, &partRel, &part, RowExclusiveLock);
+                        if (!res) {
+                            return NULL;
+                        }
 
                         /* get subpartititon oid for insert the record */
-                        subPartitionId = heapTupleGetPartitionId(partRel, tuple);
-                        CheckSubpartitionOidForSpecifiedSubpartition(rte, partitionId, subPartitionId);
+                        char* subpartExprKeyStr = NULL;
+                        bool subpartExprKeyIsNull = PartExprKeyIsNull(partRel, NULL, &subpartExprKeyStr);
+                        if (!subpartExprKeyIsNull) {
+                            Datum newsubval = ComputePartKeyExprTuple(result_relation_desc, estate, slot, partRel, subpartExprKeyStr);
+                            subPartitionId = heapTupleGetPartitionId(partRel, (void *)newsubval, &subpartitionno, false,
+                                estate->es_plannedstmt->hasIgnore, false);
+                        } else {
+                            subPartitionId = heapTupleGetPartitionId(partRel, tuple, &subpartitionno, false,
+                                estate->es_plannedstmt->hasIgnore, true);
+                        }
+                        if (estate->es_plannedstmt->hasIgnore && subPartitionId == InvalidOid) {
+                            return NULL;
+                        }
+                        bool subpartitionCheckPassed = CheckSubpartitionOidForSpecifiedSubpartition(
+                            rte, partitionId, subPartitionId, estate->es_plannedstmt->hasIgnore);
+                        if (!subpartitionCheckPassed) {
+                            return NULL;
+                        }
 
-                        searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, partRel,
-                                                         subPartitionId, subPartRel, subPart, RowExclusiveLock);
+                        res = trySearchFakeReationForPartitionOid(&estate->esfRelations, estate->es_query_cxt,
+                            partRel, subPartitionId, subpartitionno, &subPartRel, &subPart, RowExclusiveLock);
+                        if (!res) {
+                            partitionClose(result_relation_desc, part, RowExclusiveLock);
+                            return NULL;
+                        }
 
                         partition_id = subPartitionId;
                         heap_rel = subPartRel;
                         partition = subPart;
 
                         target_rel = heap_rel;
+                        // check unique constraints first if SQL has keyword IGNORE
+                        if (estate->es_plannedstmt && estate->es_plannedstmt->hasIgnore &&
+                            !ExecCheckIndexConstraints(slot, estate, target_rel, partition, &isgpi, bucket_id,
+                                                       &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+                            ereport(WARNING,
+                                    (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                            RelationGetRelationName(result_relation_desc))));
+                            return NULL;
+                        }
                         tableam_tops_update_tuple_with_oid(heap_rel, tuple, slot);
                         if (bucket_id != InvalidBktId) {
                             searchHBucketFakeRelation(estate->esfRelations, estate->es_query_cxt, heap_rel, bucket_id,
@@ -1168,18 +1520,39 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                                         RelationGetRelationName(result_relation_desc)))));
                     } break;
                 }
-
                 /*
                  * insert index entries for tuple
                  */
                 pTSelf = tableam_tops_get_t_self(result_relation_desc, tuple);
-                if (result_rel_info->ri_NumIndices > 0 && !RelationIsColStore(result_relation_desc))
-                    recheck_indexes = ExecInsertIndexTuples(slot,
+                if (result_rel_info->ri_NumIndices > 0 && !RelationIsColStore(result_relation_desc)) {
+                    if (state->isReplace) {
+                        bool specConflict = false;
+                        recheck_indexes = ExecInsertIndexTuples(slot,
                         pTSelf,
                         estate,
                         RELATION_IS_PARTITIONED(result_relation_desc) ? heap_rel : NULL,
                         RELATION_IS_PARTITIONED(result_relation_desc) ? partition : NULL,
-                        bucket_id, NULL, NULL);
+                        bucket_id, &specConflict, NULL);
+                        if (specConflict) {
+                            state->isConflict = true;
+                            tableam_tuple_abort_speculative(target_rel, tuple);
+                            list_free(recheck_indexes);
+                            return slot;
+                        } else {
+                            state->isConflict = false;
+                        }
+                    } else {
+                        recheck_indexes = ExecInsertIndexTuples(slot,
+                            pTSelf,
+                            estate,
+                            RELATION_IS_PARTITIONED(result_relation_desc) ? heap_rel : NULL,
+                            RELATION_IS_PARTITIONED(result_relation_desc) ? partition : NULL,
+                            bucket_id, NULL, NULL);
+                    }
+                } else {
+                    state->isConflict = false;
+                }
+
             }
     }
     if (pTSelf == NULL) {
@@ -1221,7 +1594,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
     /* try to insert tuple into mlog-table. */
     if (target_rel != NULL && target_rel->rd_mlogoid != InvalidOid) {
         /* judge whether need to insert into mlog-table */
-        if (target_rel->rd_tam_type == TAM_USTORE) {
+        if (target_rel->rd_tam_ops == TableAmUstore) {
             tuple = (Tuple)UHeapToHeap(target_rel->rd_att, (UHeapTuple)tuple);
         }
         insert_into_mlog_table(target_rel, target_rel->rd_mlogoid, (HeapTuple)tuple,
@@ -1229,6 +1602,10 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
     }
 
     list_free_ext(recheck_indexes);
+
+    /* Check any WITH CHECK OPTION constraints */
+    if (result_rel_info->ri_WithCheckOptions != NIL)
+        ExecWithCheckOptions(result_rel_info, slot, estate);
 
     /* Process RETURNING if present */
     if (result_rel_info->ri_projectReturning)
@@ -1302,7 +1679,7 @@ TupleTableSlot* ExecDelete(ItemPointer tupleid, Oid deletePartitionOid, int2 buc
             oldtuple,
 #endif
             tupleid);
-        if (!dodelete) /* "do nothing" */
+        if (!dodelete && !node->isReplace) /* "do nothing" */
             return NULL;
     }
 
@@ -1342,7 +1719,7 @@ TupleTableSlot* ExecDelete(ItemPointer tupleid, Oid deletePartitionOid, int2 buc
             return NULL;
         }
 
-        if (slot->tts_isempty) {
+        if (TTS_EMPTY(slot)) {
             (void)ExecStoreAllNullTuple(slot);
         }
     } else {
@@ -1373,6 +1750,7 @@ ldelete:
                     estate->es_query_cxt,
                     result_relation_desc,
                     deletePartitionOid,
+                    INVALID_PARTITION_NO,
                     part_relation,
                     partition,
                     RowExclusiveLock);
@@ -1400,7 +1778,8 @@ ldelete:
                 estate->es_snapshot,
                 true /* wait for commit */,
                 &oldslot,
-                &tmfd);
+                &tmfd,
+                node->isReplace);
 
             switch (result) {
                 case TM_SelfUpdated:
@@ -1438,6 +1817,7 @@ ldelete:
                         isPartitionedRelation(result_relation_desc->rd_rel) ? part_relation : NULL;
                     exec_index_tuples_state.p = isPartitionedRelation(result_relation_desc->rd_rel) ? partition : NULL;
                     exec_index_tuples_state.conflict = NULL;
+                    exec_index_tuples_state.rollbackIndex = false;
                     tableam_tops_exec_delete_index_tuples(oldslot, fake_relation, node,
                         tupleid, exec_index_tuples_state, modifiedIdxAttrs);
                     if (oldslot) {
@@ -1586,9 +1966,9 @@ end:;
                 if (slot->tts_tupleDescriptor != RelationGetDescr(result_relation_desc)) {
                     ExecSetSlotDescriptor(slot, RelationGetDescr(result_relation_desc));
                 }
-                slot->tts_tupslotTableAm =  result_relation_desc->rd_tam_type;
+                slot->tts_tam_ops = result_relation_desc->rd_tam_ops;
                 if (oldtuple != NULL) {
-                    Assert(slot->tts_tupslotTableAm != TAM_USTORE);
+                    Assert(!TTS_TABLEAM_IS_USTORE(slot));
                     del_tuple.t_data = oldtuple;
                     del_tuple.t_len = HeapTupleHeaderGetDatumLength(oldtuple);
                     ItemPointerSetInvalid(&(del_tuple.t_self));
@@ -1629,6 +2009,33 @@ end:;
     return NULL;
 }
 
+/*
+ * check whether the tuple still match the merge condition after the tuple has been updated by other transaction.
+ * [in] node, executor node
+ * [in] epq_slot, the tuple slot after recheck on the updated tuple
+ * [in] mergeMatchedActionStates, update action state
+ * [in] fake_relation, heap table relation
+ * [in/out] slot, in: origin tuple slot, out: slot after merge projection
+ * [out] tuple, if the updated tuple still match the merge condition, return the new projected tuple
+ * [return value] true for match, false for not match.
+ */
+static bool MatchMergeCondition(ModifyTableState* node, TupleTableSlot* epq_slot, List* mergeMatchedActionStates,
+    Relation fake_relation, AttrNumber junkAttno, TupleTableSlot** slot, Tuple *tuple)
+{
+    /* resultRelInfo->ri_mergeState is always not null */
+    *slot = ExecMergeProjQual(node, mergeMatchedActionStates, node->ps.ps_ExprContext, epq_slot, *slot, node->ps.state);
+    if (*slot != NULL) {
+        bool is_null = false;
+        /* Check after epq, whether the ctid is null. null means the updated row does not match */
+        (void)ExecGetJunkAttribute(epq_slot, junkAttno, &is_null);
+        if (!is_null) {
+            *tuple = tableam_tslot_get_tuple_from_slot(fake_relation, *slot);
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ----------------------------------------------------------------
  *		ExecUpdate
  *
@@ -1652,7 +2059,7 @@ end:;
 TupleTableSlot* ExecUpdate(ItemPointer tupleid,
     Oid oldPartitionOid, /* when update a partitioned table , give a partitionOid to find the tuple */
     int2 bucketid, HeapTupleHeader oldtuple, TupleTableSlot* slot, TupleTableSlot* planSlot, EPQState* epqstate,
-    ModifyTableState* node, bool canSetTag, bool partKeyUpdate)
+    ModifyTableState* node, bool canSetTag, bool partKeyUpdate, TM_Result* out_result, char* partExprKeyStr)
 {
     EState* estate = node->ps.state;
     Tuple tuple = NULL;
@@ -1666,16 +2073,24 @@ TupleTableSlot* ExecUpdate(ItemPointer tupleid,
     Relation fake_part_rel = NULL;
     Relation parent_relation = NULL;
     Oid new_partId = InvalidOid;
+    int partitionno = INVALID_PARTITION_NO;
     uint64 res_hash;
     uint64 hash_del = 0;
     bool is_record = false;
+    /*
+     * flag to tell whether violate unique constraint for update indices
+     */
+    bool isgpi = false;
+    ConflictInfoData conflictInfo;
+    Oid conflictPartOid = InvalidOid;
+    int2 conflictBucketid = InvalidBktId;
 #ifdef PGXC
     RemoteQueryState* result_remote_rel = NULL;
 #endif
     bool allow_update_self = (node->mt_upsert != NULL &&
         node->mt_upsert->us_action != UPSERT_NONE) ? true : false;
 
-
+    *out_result = TM_Ok;
     /*
      * get information on the (current) result relation
      */
@@ -1729,7 +2144,7 @@ TupleTableSlot* ExecUpdate(ItemPointer tupleid,
 #endif
         result_rel_info->ri_TrigDesc && result_rel_info->ri_TrigDesc->trig_update_before_row) {
 #ifdef PGXC
-        slot = ExecBRUpdateTriggers(estate, epqstate, result_rel_info, oldPartitionOid, 
+        slot = ExecBRUpdateTriggers(estate, epqstate, result_rel_info, oldPartitionOid,
             bucketid, oldtuple, tupleid, slot);
 #else
         slot = ExecBRUpdateTriggers(estate, epqstate, result_rel_info, tupleid, slot);
@@ -1786,10 +2201,16 @@ TupleTableSlot* ExecUpdate(ItemPointer tupleid,
 #ifdef ENABLE_MOT
         if (result_rel_info->ri_FdwRoutine->GetFdwType && result_rel_info->ri_FdwRoutine->GetFdwType() == MOT_ORC) {
             if (result_relation_desc->rd_att->constr) {
-                if (node->mt_insert_constr_slot == NULL) {
-                    ExecConstraints(result_rel_info, slot, estate);
-                } else {
-                    ExecConstraints(result_rel_info, node->mt_insert_constr_slot, estate);
+                TupleTableSlot *tmp_slot = node->mt_insert_constr_slot == NULL ? slot : node->mt_insert_constr_slot;
+                if (!ExecConstraints(result_rel_info, tmp_slot, estate)) {
+                    if (u_sess->utils_cxt.sql_ignore_strategy_val == SQL_OVERWRITE_NULL) {
+                        tuple = ReplaceTupleNullCol(RelationGetDescr(result_relation_desc), tmp_slot);
+                        /* Double check constraints in case that new val in column with not null constraints
+                         * violated check constraints */
+                        ExecConstraints(result_rel_info, tmp_slot, estate);
+                    } else {
+                        return NULL;
+                    }
                 }
             }
         }
@@ -1808,14 +2229,6 @@ TupleTableSlot* ExecUpdate(ItemPointer tupleid,
         LockTupleMode lockmode;
 
         /*
-         * Compute stored generated columns
-         */
-        if (result_relation_desc->rd_att->constr && result_relation_desc->rd_att->constr->has_generated_stored) {
-            ExecComputeStoredGenerated(result_rel_info, estate, slot, tuple, CMD_UPDATE);
-            tuple = slot->tts_tuple;
-        }
-
-        /*
          * Check the constraints of the tuple
          *
          * If we generate a new candidate tuple after EvalPlanQual testing, we
@@ -1826,11 +2239,35 @@ TupleTableSlot* ExecUpdate(ItemPointer tupleid,
          */
         Assert(RELATION_HAS_BUCKET(result_relation_desc) == (bucketid != InvalidBktId));
 lreplace:
+
+        /* acquire Form_pg_attrdef ad_on_update */
+        if (result_relation_desc->rd_att->constr && result_relation_desc->rd_att->constr->has_on_update) {
+            bool update_fix_result =  ExecComputeStoredUpdateExpr(result_rel_info, estate, slot, tuple, CMD_UPDATE, tupleid, oldPartitionOid, bucketid);
+            if (!update_fix_result) {
+                tuple = slot->tts_tuple;
+            }
+        }
+
+        /*
+         * Compute stored generated columns
+         */
+        if (result_relation_desc->rd_att->constr && result_relation_desc->rd_att->constr->has_generated_stored) {
+            ExecComputeStoredGenerated(result_rel_info, estate, slot, tuple, CMD_UPDATE);
+            tuple = slot->tts_tuple;
+        }
+
         if (result_relation_desc->rd_att->constr) {
-            if (node->mt_update_constr_slot == NULL)
-                ExecConstraints(result_rel_info, slot, estate);
-            else
-                ExecConstraints(result_rel_info, node->mt_update_constr_slot, estate);
+            TupleTableSlot *tmp_slot = node->mt_update_constr_slot == NULL ? slot : node->mt_update_constr_slot;
+            if (!ExecConstraints(result_rel_info, tmp_slot, estate)) {
+                if (u_sess->utils_cxt.sql_ignore_strategy_val == SQL_OVERWRITE_NULL) {
+                    tuple = ReplaceTupleNullCol(RelationGetDescr(result_relation_desc), tmp_slot);
+                    /* Double check constraints in case that new val in column with not null constraints
+                     * violated check constraints */
+                    ExecConstraints(result_rel_info, tmp_slot, estate);
+                } else {
+                    return NULL;
+                }
+            }
         }
 
 #ifdef PGXC
@@ -1860,6 +2297,24 @@ lreplace:
                     }
 
                     /*
+                     * check constraints first if SQL has keyword IGNORE
+                     * 
+                     * Note: we need to exclude the case of UPSERT_UPDATE, so that upsert could be successfully finished.
+                     */
+                    if (node->mt_upsert->us_action != UPSERT_UPDATE && estate->es_plannedstmt &&
+                        estate->es_plannedstmt->hasIgnore &&
+                        !ExecCheckIndexConstraints(slot, estate, result_relation_desc, partition, &isgpi, bucketid,
+                                                   &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+                        // check whether the conflicted info is the update tuple. If not, report warning and return.
+                        if (!ItemPointerEquals(&conflictInfo.conflictTid, tupleid)) {
+                            ereport(WARNING,
+                                    (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                            RelationGetRelationName(result_relation_desc))));
+                            return NULL;
+                        }
+                    }
+
+                    /*
                      * If target relation is under blockchain schema,
                      * we should get the target tuple hash before updating.
                      * And then append new row hash for insertion.
@@ -1867,7 +2322,7 @@ lreplace:
                     if (result_relation_desc->rd_isblockchain) {
                         MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
                         hash_del = get_user_tupleid_hash(fake_relation, tupleid);
-                        tuple = set_user_tuple_hash((HeapTuple)tuple, fake_relation);
+                        tuple = set_user_tuple_hash((HeapTuple)tuple, fake_relation, slot);
                         (void)MemoryContextSwitchTo(old_context);
                     }
 
@@ -1877,6 +2332,7 @@ lreplace:
                         estate->es_crosscheck_snapshot, estate->es_snapshot, true, // wait for commit
                         &oldslot, &tmfd, &update_indexes, &modifiedIdxAttrs, allow_update_self,
                         allowInplaceUpdate, &lockmode);
+                    *out_result = result;
                     switch (result) {
                         case TM_SelfUpdated:
                         case TM_SelfModified:
@@ -1916,7 +2372,6 @@ lreplace:
                                         tupleid, node->delete_delta_rel);
                                 }
                             }
-
                             break;
 
                         case TM_Updated: {
@@ -1959,14 +2414,8 @@ lreplace:
                                  * from plan slot.
                                  */
                                 if (node->operation == CMD_MERGE) {
-                                    List* mergeMatchedActionStates = NIL;
-
-                                    /* resultRelInfo->ri_mergeState is always not null */
-                                    mergeMatchedActionStates = result_rel_info->ri_mergeState->matchedActionStates;
-                                    slot = ExecMergeProjQual(
-                                        node, mergeMatchedActionStates, node->ps.ps_ExprContext, epq_slot, slot, estate);
-                                    if (slot != NULL) {
-                                        tuple = tableam_tslot_get_tuple_from_slot(fake_relation, slot);
+                                    if (MatchMergeCondition(node, epq_slot, result_rel_info->ri_mergeState->matchedActionStates,
+                                        fake_relation, result_rel_info->ri_junkFilter->jf_junkAttNo, &slot, &tuple)) {
                                         goto lreplace;
                                     }
                                 } else {
@@ -2017,6 +2466,7 @@ lreplace:
                         exec_index_tuples_state.targetPartRel = NULL;
                         exec_index_tuples_state.p = NULL;
                         exec_index_tuples_state.conflict = NULL;
+                        exec_index_tuples_state.rollbackIndex = false;
                         recheck_indexes = tableam_tops_exec_update_index_tuples(slot, oldslot, fake_relation,
                             node, tuple, tupleid, exec_index_tuples_state, bucketid, modifiedIdxAttrs);
                     }
@@ -2030,23 +2480,44 @@ lreplace:
                 bool row_movement = false;
                 bool need_create_file = false;
                 int seqNum = -1;
-                if (!partKeyUpdate) {
+                bool can_ignore = estate->es_plannedstmt->hasIgnore;
+                Datum newval = 0;
+                if (partExprKeyStr) {
+                    newval = ComputePartKeyExprTuple(result_relation_desc, estate, slot, NULL, partExprKeyStr);
+                }
+                if (!partExprKeyStr && !partKeyUpdate) {
                     row_movement = false;
                     new_partId = oldPartitionOid;
                 } else {
-                    partitionRoutingForTuple(result_relation_desc, tuple, u_sess->exec_cxt.route);
+                    if (partExprKeyStr) {
+                        partitionRoutingForTuple(result_relation_desc, (void*)newval, u_sess->exec_cxt.route, can_ignore, false);
+                    } else {
+                        partitionRoutingForTuple(result_relation_desc, tuple, u_sess->exec_cxt.route, can_ignore, true);
+                    }
 
                     if (u_sess->exec_cxt.route->fileExist) {
                         new_partId = u_sess->exec_cxt.route->partitionId;
+                        partitionno = GetCurrentPartitionNo(new_partId);
                         if (RelationIsSubPartitioned(result_relation_desc)) {
-                            Partition part = partitionOpen(result_relation_desc, new_partId, RowExclusiveLock);
+                            Partition part = PartitionOpenWithPartitionno(result_relation_desc, new_partId,
+                                partitionno, RowExclusiveLock);
                             Relation partRel = partitionGetRelation(result_relation_desc, part);
+                            char* subpartExprKeyStr = NULL;
+                            Datum newsubval = 0;
+                            bool subpartExprKeyIsNull = PartExprKeyIsNull(partRel, NULL, &subpartExprKeyStr);
+                            if (!subpartExprKeyIsNull) {
+                                newsubval = ComputePartKeyExprTuple(result_relation_desc, estate, slot, partRel, subpartExprKeyStr);
+                                partitionRoutingForTuple(partRel, (void*)newsubval, u_sess->exec_cxt.route, can_ignore, false);
+                            } else {
+                                partitionRoutingForTuple(partRel, tuple, u_sess->exec_cxt.route, can_ignore, true);
+                            }
 
-                            partitionRoutingForTuple(partRel, tuple, u_sess->exec_cxt.route);
                             if (u_sess->exec_cxt.route->fileExist) {
                                 new_partId = u_sess->exec_cxt.route->partitionId;
+                                partitionno = GetCurrentSubPartitionNo(new_partId);
                             } else {
-                                ereport(ERROR, (errmodule(MOD_EXECUTOR),
+                                int level = can_ignore ? WARNING : ERROR;
+                                ereport(level, (errmodule(MOD_EXECUTOR),
                                                 (errcode(ERRCODE_PARTITION_ERROR),
                                                  errmsg("fail to update partitioned table \"%s\"",
                                                         RelationGetRelationName(result_relation_desc)),
@@ -2055,6 +2526,9 @@ lreplace:
 
                             releaseDummyRelation(&partRel);
                             partitionClose(result_relation_desc, part, NoLock);
+                            if (!u_sess->exec_cxt.route->fileExist && can_ignore) {
+                                return NULL;
+                            }
                         }
 
                         if (oldPartitionOid == new_partId) {
@@ -2076,6 +2550,12 @@ lreplace:
                          * it can not be a range area 
                          */
                         if (u_sess->exec_cxt.route->partArea != PART_AREA_INTERVAL) {
+                            if (can_ignore) {
+                                ereport(WARNING, (errmsg("fail to update partitioned table \"%s\".new tuple does not "
+                                                         "map to any table partition.",
+                                                         RelationGetRelationName(result_relation_desc))));
+                                return NULL;
+                            }
                             ereport(ERROR,
                                 (errmodule(MOD_EXECUTOR),
                                     (errcode(ERRCODE_PARTITION_ERROR),
@@ -2105,6 +2585,7 @@ lreplace:
                         estate->es_query_cxt,
                         result_relation_desc,
                         new_partId,
+                        partitionno,
                         fake_part_rel,
                         partition,
                         RowExclusiveLock);
@@ -2128,10 +2609,26 @@ lreplace:
                                 estate->esfRelations, estate->es_query_cxt, fake_relation, bucketid, fake_relation);
                         }
 
+                        /*
+                         * check constraints first if SQL has keyword IGNORE
+                         */
+                        if (can_ignore &&
+                            !ExecCheckIndexConstraints(slot, estate, fake_relation, partition, &isgpi, bucketid,
+                                                       &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+                            // check whether the conflicted info is the update tuple. If not, report warning and return.
+                            bool is_same_pointer = ItemPointerEquals(&conflictInfo.conflictTid, tupleid);
+                            if (!is_same_pointer || oldPartitionOid != conflictPartOid) {
+                                ereport(WARNING,
+                                        (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                                RelationGetRelationName(result_relation_desc))));
+                                return NULL;
+                            }
+                        }
+
                         if (result_relation_desc->rd_isblockchain) {
                             MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
                             hash_del = get_user_tupleid_hash(fake_relation, tupleid);
-                            tuple = set_user_tuple_hash((HeapTuple)tuple, fake_relation);
+                            tuple = set_user_tuple_hash((HeapTuple)tuple, fake_relation, slot);
                             (void)MemoryContextSwitchTo(old_context);
                         }
 
@@ -2151,6 +2648,7 @@ lreplace:
                             allow_update_self,
                             allowInplaceUpdate,
                             &lockmode);
+                        *out_result = result;
                         switch (result) {
                             case TM_SelfUpdated:
                             case TM_SelfModified:
@@ -2221,14 +2719,8 @@ lreplace:
                                      * projected from plan slot.
                                      */
                                     if (node->operation == CMD_MERGE) {
-                                        List *mergeMatchedActionStates = NIL;
-
-                                        /* resultRelInfo->ri_mergeState is always not null */
-                                        mergeMatchedActionStates = result_rel_info->ri_mergeState->matchedActionStates;
-                                        slot = ExecMergeProjQual(node, mergeMatchedActionStates,
-                                            node->ps.ps_ExprContext, epq_slot, slot, estate);
-                                        if (slot != NULL) {
-                                            tuple = tableam_tslot_get_tuple_from_slot(fake_relation, slot);
+                                        if (MatchMergeCondition(node, epq_slot, result_rel_info->ri_mergeState->matchedActionStates,
+                                            fake_relation, result_rel_info->ri_junkFilter->jf_junkAttNo, &slot, &tuple)) {
                                             goto lreplace;
                                         }
                                     } else {
@@ -2275,6 +2767,7 @@ lreplace:
                             exec_index_tuples_state.targetPartRel = fake_part_rel;
                             exec_index_tuples_state.p = partition;
                             exec_index_tuples_state.conflict = NULL;
+                            exec_index_tuples_state.rollbackIndex = false;
                             recheck_indexes = tableam_tops_exec_update_index_tuples(slot, oldslot, fake_relation,
                                 node, tuple, tupleid, exec_index_tuples_state, bucketid, modifiedIdxAttrs);
                         }
@@ -2286,26 +2779,68 @@ lreplace:
                     /* partition table, row movement */
                         /* partition table, row movement, heap */
 
+                        /* init old_partition vars and new inserted partition vars first */
+                        Partition old_partition = NULL;
+                        Relation old_fake_relation = NULL;
+                        TupleTableSlot* oldslot = NULL;
+                        uint64 hash_del = 0;
+
+                        searchFakeReationForPartitionOid(estate->esfRelations,
+                                                         estate->es_query_cxt,
+                                                         result_relation_desc,
+                                                         oldPartitionOid,
+                                                         partitionno,
+                                                         old_fake_relation,
+                                                         old_partition,
+                                                         RowExclusiveLock);
+
+                        if (bucketid != InvalidBktId) {
+                            searchHBucketFakeRelation(
+                                estate->esfRelations, estate->es_query_cxt, old_fake_relation, bucketid, old_fake_relation);
+                        }
+
+                        Partition insert_partition = NULL;
+                        Relation fake_insert_relation = NULL;
+
+                        if (need_create_file) {
+                            new_partId = AddNewIntervalPartition(result_relation_desc, tuple, &partitionno);
+                        }
+
+                        searchFakeReationForPartitionOid(estate->esfRelations,
+                                                         estate->es_query_cxt,
+                                                         result_relation_desc,
+                                                         new_partId,
+                                                         partitionno,
+                                                         fake_part_rel,
+                                                         insert_partition,
+                                                         RowExclusiveLock);
+                        fake_insert_relation = fake_part_rel;
+                        if (bucketid != InvalidBktId) {
+                            searchHBucketFakeRelation(estate->esfRelations,
+                                                      estate->es_query_cxt,
+                                                      fake_insert_relation,
+                                                      bucketid,
+                                                      fake_insert_relation);
+                        }
+
+                        /*
+                         * check constraints first if SQL has keyword IGNORE
+                         */
+                        if (can_ignore &&
+                            !ExecCheckIndexConstraints(slot, estate, fake_insert_relation, insert_partition, &isgpi,
+                                                       bucketid, &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+                            // check whether the conflicted info is the update tuple. If not, report warning and return.
+                            bool is_same_pointer = ItemPointerEquals(&conflictInfo.conflictTid, tupleid);
+                            if (!is_same_pointer || oldPartitionOid != conflictPartOid) {
+                                ereport(WARNING,
+                                        (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                                RelationGetRelationName(result_relation_desc))));
+                                return NULL;
+                            }
+                        }
+
                         /* delete the old tuple */
                         {
-                            Partition old_partition = NULL;
-                            Relation old_fake_relation = NULL;
-                            TupleTableSlot* oldslot = NULL;
-                            uint64 hash_del = 0;
-
-                            searchFakeReationForPartitionOid(estate->esfRelations,
-                                estate->es_query_cxt,
-                                result_relation_desc,
-                                oldPartitionOid,
-                                old_fake_relation,
-                                old_partition,
-                                RowExclusiveLock);
-
-                            if (bucketid != InvalidBktId) {
-                                searchHBucketFakeRelation(
-                                    estate->esfRelations, estate->es_query_cxt, old_fake_relation, bucketid, old_fake_relation);
-                            }
-
 ldelete:
                             /* Record updating behevior into user chain table */
                             if (result_relation_desc->rd_isblockchain) {
@@ -2321,7 +2856,7 @@ ldelete:
                                 &oldslot,
                                 &tmfd,
                                 allow_update_self);
-
+                            *out_result = result;
                             switch (result) {
                                 case TM_SelfUpdated:
                                 case TM_SelfModified:
@@ -2363,6 +2898,7 @@ ldelete:
                                     exec_index_tuples_state.targetPartRel = old_fake_relation;
                                     exec_index_tuples_state.p = old_partition;
                                     exec_index_tuples_state.conflict = NULL;
+                                    exec_index_tuples_state.rollbackIndex = false;
                                     tableam_tops_exec_delete_index_tuples(oldslot, old_fake_relation, node,
                                                 tupleid, exec_index_tuples_state, modifiedIdxAttrs);
                                     if (oldslot) {
@@ -2419,15 +2955,8 @@ ldelete:
                                          * needs slot to be projected from plan slot.
                                          */
                                         if (node->operation == CMD_MERGE) {
-                                            List* mergeMatchedActionStates = NIL;
-
-                                            /* resultRelInfo->ri_mergeState is always not null */
-                                            mergeMatchedActionStates =
-                                                result_rel_info->ri_mergeState->matchedActionStates;
-                                            slot = ExecMergeProjQual(node, mergeMatchedActionStates,
-                                                node->ps.ps_ExprContext, epq_slot, slot, estate);
-                                            if (slot != NULL) {
-                                                tuple = tableam_tslot_get_tuple_from_slot(old_fake_relation, slot);
+                                            if (MatchMergeCondition(node, epq_slot, result_rel_info->ri_mergeState->matchedActionStates,
+                                                old_fake_relation, result_rel_info->ri_junkFilter->jf_junkAttNo, &slot, &tuple)) {
                                                 goto ldelete;
                                             }
                                         } else {
@@ -2485,18 +3014,22 @@ ldelete:
                         {
                             Partition insert_partition = NULL;
                             Relation fake_insert_relation = NULL;
-
                             if (need_create_file) {
-                                new_partId = AddNewIntervalPartition(result_relation_desc, tuple);
+                                new_partId = AddNewIntervalPartition(result_relation_desc, tuple, &partitionno);
                             }
 
-                            searchFakeReationForPartitionOid(estate->esfRelations,
+                            bool res = trySearchFakeReationForPartitionOid(&estate->esfRelations,
                                 estate->es_query_cxt,
                                 result_relation_desc,
                                 new_partId,
-                                fake_part_rel,
-                                insert_partition,
+                                partitionno,
+                                &fake_part_rel,
+                                &insert_partition,
                                 RowExclusiveLock);
+                            if (!res) {
+                                return NULL;
+                            }
+
                             fake_insert_relation = fake_part_rel;
                             if (bucketid != InvalidBktId) {
                                 searchHBucketFakeRelation(estate->esfRelations,
@@ -2507,7 +3040,7 @@ ldelete:
                             }
                             if (result_relation_desc->rd_isblockchain) {
                                 MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-                                tuple = set_user_tuple_hash((HeapTuple)tuple, fake_insert_relation);
+                                tuple = set_user_tuple_hash((HeapTuple)tuple, fake_insert_relation, slot);
                                 (void)MemoryContextSwitchTo(old_context);
                             }
 
@@ -2543,7 +3076,7 @@ ldelete:
         insert_into_mlog_table(result_relation_desc, result_relation_desc->rd_mlogoid,
                                NULL, tupleid, tmfd.xmin, 'D');
         /* 2. insert new tuple */
-        if (result_relation_desc->rd_tam_type == TAM_USTORE) {
+        if (result_relation_desc->rd_tam_ops == TableAmUstore) {
             tuple = (Tuple)UHeapToHeap(result_relation_desc->rd_att, (UHeapTuple)tuple);
         }
         insert_into_mlog_table(result_relation_desc, result_relation_desc->rd_mlogoid,
@@ -2584,6 +3117,10 @@ ldelete:
 
     list_free_ext(recheck_indexes);
 
+    /* Check any WITH CHECK OPTION constraints */
+    if (result_rel_info->ri_WithCheckOptions != NIL)
+        ExecWithCheckOptions(result_rel_info, slot, estate);
+
     /* Process RETURNING if present */
     if (result_rel_info->ri_projectReturning)
 #ifdef PGXC
@@ -2604,18 +3141,26 @@ ldelete:
  */
 static void fireBSTriggers(ModifyTableState* node)
 {
+    ResultRelInfo* resultRelInfo = node->resultRelInfo;
+    int resultRelationNum = node->mt_ResultTupleSlots ? list_length(node->mt_ResultTupleSlots) : 1;
     switch (node->operation) {
         case CMD_INSERT:
-            ExecBSInsertTriggers(node->ps.state, node->resultRelInfo);
+            ExecBSInsertTriggers(node->ps.state, resultRelInfo);
             if (node->mt_upsert->us_action == UPSERT_UPDATE) {
-                ExecBSUpdateTriggers(node->ps.state, node->resultRelInfo);
+                ExecBSUpdateTriggers(node->ps.state, resultRelInfo);
             }
             break;
         case CMD_UPDATE:
-            ExecBSUpdateTriggers(node->ps.state, node->resultRelInfo);
+            for (int i = 0; i < resultRelationNum; i++) {
+                ExecBSUpdateTriggers(node->ps.state, resultRelInfo);
+                resultRelInfo++;
+            }
             break;
         case CMD_DELETE:
-            ExecBSDeleteTriggers(node->ps.state, node->resultRelInfo);
+            for (int i = 0; i < resultRelationNum; i++) {
+                ExecBSDeleteTriggers(node->ps.state, resultRelInfo);
+                resultRelInfo++;
+            }
             break;
         case CMD_MERGE:
             break;
@@ -2634,18 +3179,26 @@ static void fireBSTriggers(ModifyTableState* node)
  */
 static void fireASTriggers(ModifyTableState* node)
 {
+    ResultRelInfo* resultRelInfo = node->resultRelInfo;
+    int resultRelationNum = node->mt_ResultTupleSlots ? list_length(node->mt_ResultTupleSlots) : 1;
     switch (node->operation) {
         case CMD_INSERT:
             if (node->mt_upsert->us_action == UPSERT_UPDATE) {
-               ExecASUpdateTriggers(node->ps.state, node->resultRelInfo);
+                ExecASUpdateTriggers(node->ps.state, resultRelInfo);
             }
-            ExecASInsertTriggers(node->ps.state, node->resultRelInfo);
+            ExecASInsertTriggers(node->ps.state, resultRelInfo);
             break;
         case CMD_UPDATE:
-            ExecASUpdateTriggers(node->ps.state, node->resultRelInfo);
+            for (int i = 0; i < resultRelationNum; i++) {
+                ExecASUpdateTriggers(node->ps.state, resultRelInfo);
+                resultRelInfo++;
+            }
             break;
         case CMD_DELETE:
-            ExecASDeleteTriggers(node->ps.state, node->resultRelInfo);
+            for (int i = 0; i < resultRelationNum; i++) {
+                ExecASDeleteTriggers(node->ps.state, resultRelInfo);
+                resultRelInfo++;
+            }
             break;
         case CMD_MERGE:
             break;
@@ -2703,6 +3256,121 @@ uint64 GetDeleteLimitCount(ExprContext* econtext, PlanState* scan, Limit *limitP
     return (uint64)iCount;
 }
 
+static TupleTableSlot* ExecReplace(EState* estate, ModifyTableState* node, TupleTableSlot* slot, TupleTableSlot* plan_slot, int2 bucketid, int hi_options, List* partition_list, char* partExprKeyStr)
+{
+    Form_pg_attribute att_tup;
+    Oid seqOid = InvalidOid;
+    Relation rel = estate->es_result_relation_info->ri_RelationDesc;
+    TupleTableSlot* (*ExecInsert)(
+        ModifyTableState* state, TupleTableSlot*, TupleTableSlot*, EState*, bool, int, List**, char*) = NULL;
+
+    ExecInsert = ExecInsertT<false>;
+
+    /* REPLACE INTO not support sequence, check columns to report ERROR */
+    for (int attrno=1; attrno<=rel->rd_att->natts; ++attrno) {
+        att_tup = &rel->rd_att->attrs[attrno-1];
+        errno_t rc;
+        char *nspname = get_namespace_name(rel->rd_rel->relnamespace);
+        char tableName[NAMEDATALEN*2+2] = {0};
+        text *tbname;
+        text *attname;
+        rc = memset_s(tableName, NAMEDATALEN*2, 0, NAMEDATALEN*2);
+        securec_check(rc, "\0", "\0");
+
+        if (nspname != NULL) {
+            const char *sym = ".";
+            int nspnameLen = strlen(nspname);
+            int symLen = strlen(sym);
+            int tbnameLen = strlen(rel->rd_rel->relname.data);
+            rc = memcpy_s(&tableName[0], NAMEDATALEN*2+2, nspname, nspnameLen);
+            securec_check(rc, "\0","\0");
+            rc = memcpy_s(&tableName[nspnameLen], NAMEDATALEN*2+2, sym, symLen);
+            securec_check(rc, "\0","\0");
+            rc = memcpy_s(&tableName[nspnameLen+symLen], NAMEDATALEN*2+2, rel->rd_rel->relname.data, tbnameLen);
+            securec_check(rc, "\0","\0");
+            tableName[nspnameLen+symLen+tbnameLen] = 0;
+            tbname = cstring_to_text(&tableName[0]);
+        } else {
+            tbname = cstring_to_text(rel->rd_rel->relname.data);
+        }
+
+        attname = cstring_to_text(att_tup->attname.data);
+        seqOid = pg_get_serial_sequence_oid(tbname, attname);
+
+        if (OidIsValid(seqOid))
+            elog(ERROR, "REPLACE can not work on sequence!");
+    }
+    
+    /* set flag to start loop */
+    node->isConflict = true;
+
+    /* we assume there is conflict by default, try to delete the conflict tuple then insert new one */
+    while (node->isConflict) {
+        ConflictInfoData conflictInfo;
+        Oid conflictPartOid = InvalidOid;
+        int2 conflictBucketid = InvalidBktId;
+        bool isgpi = false;
+        Oid partitionid = InvalidOid;
+        int partitionno = INVALID_PARTITION_NO;
+        Oid subPartitionId = InvalidOid;
+        int subpartitionno = INVALID_PARTITION_NO;
+        Relation targetrel = NULL;
+        Relation heaprel = NULL;
+        Relation subPartRel = NULL;
+        Partition partition = NULL;
+        Partition subPart = NULL;
+        Tuple tuple = NULL;
+        ResultRelInfo* resultRelInfo = NULL;
+
+        slot = plan_slot;
+        resultRelInfo = estate->es_result_relation_info;
+        targetrel = resultRelInfo->ri_RelationDesc;
+        heaprel = targetrel;
+        tuple = tableam_tslot_get_tuple_from_slot(targetrel, slot);
+        if (RelationIsPartitioned(targetrel)) {
+            partitionid = heapTupleGetPartitionId(targetrel, tuple, &partitionno, false, false, !partExprKeyStr);
+            searchFakeReationForPartitionOid(estate->esfRelations,
+                                             estate->es_query_cxt,
+                                             targetrel,
+                                             partitionid,
+                                             partitionno,
+                                             heaprel,
+                                             partition,
+                                             RowExclusiveLock);
+
+            if (RelationIsSubPartitioned(targetrel)) {
+                bool subpartExprKeyIsNull = PartExprKeyIsNull(heaprel, NULL, NULL);
+                subPartitionId = heapTupleGetPartitionId(heaprel, tuple, &subpartitionno, false, false, subpartExprKeyIsNull);
+                searchFakeReationForPartitionOid(estate->esfRelations,
+                                                 estate->es_query_cxt,
+                                                 heaprel,
+                                                 subPartitionId,
+                                                 subpartitionno,
+                                                 subPartRel,
+                                                 subPart,
+                                                 RowExclusiveLock);
+                partitionid = subPartitionId;
+                heaprel = subPartRel;
+                partition = subPart;
+            }
+        }
+
+        targetrel = heaprel;
+        if (!ExecCheckIndexConstraints(plan_slot, estate, targetrel,
+                                       partition, &isgpi, bucketid, &conflictInfo,
+                                       &conflictPartOid, &conflictBucketid)) {
+
+            ExecDelete(&(&conflictInfo)->conflictTid, conflictPartOid,
+                       conflictBucketid, NULL, plan_slot, &node->mt_epqstate,
+                       node, node->canSetTag);
+            InstrCountFiltered2(&node->ps, 1);
+        } else {
+            slot = ExecInsert(node, slot, plan_slot, estate, node->canSetTag, hi_options, &partition_list, partExprKeyStr);
+        }
+    }
+    return slot;
+}
+
 /* ----------------------------------------------------------------
  *	   ExecModifyTable
  *
@@ -2710,13 +3378,15 @@ uint64 GetDeleteLimitCount(ExprContext* econtext, PlanState* scan, Limit *limitP
  *		if needed.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecModifyTable(ModifyTableState* node)
+static TupleTableSlot* ExecModifyTable(PlanState* state)
 {
+    ModifyTableState* node = castNode(ModifyTableState, state);
     EState* estate = node->ps.state;
     CmdType operation = node->operation;
     ResultRelInfo* saved_result_rel_info = NULL;
     ResultRelInfo* result_rel_info = NULL;
     PlanState* subPlanState = NULL;
+    char* partExprKeyStr = NULL;
 #ifdef PGXC
     PlanState* remote_rel_state = NULL;
     PlanState* insert_remote_rel_state = NULL;
@@ -2730,18 +3400,19 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
     ItemPointer tuple_id = NULL;
     ItemPointerData tuple_ctid;
     HeapTupleHeader old_tuple = NULL;
-    AttrNumber part_oid_num = InvalidAttrNumber;
-    AttrNumber bucket_Id_num = InvalidAttrNumber;
     Oid old_partition_oid = InvalidOid;
     bool part_key_updated = ((ModifyTable*)node->ps.plan)->partKeyUpdated;
     TupleTableSlot* (*ExecInsert)(
-        ModifyTableState* state, TupleTableSlot*, TupleTableSlot*, EState*, bool, int, List**) = NULL;
+        ModifyTableState* state, TupleTableSlot*, TupleTableSlot*, EState*, bool, int, List**, char*) = NULL;
     bool use_heap_multi_insert = false;
     int hi_options = 0;
     /* indicates whether it is the first time to insert, delete, update or not. */
     bool is_first_modified = true;
     int2 bucketid = InvalidBktId;
     List *partition_list = NIL;
+    int resultRelationNum = node->mt_ResultTupleSlots ? list_length(node->mt_ResultTupleSlots) : 1;
+
+    CHECK_FOR_INTERRUPTS();
     
     /*
      * This should NOT get called during EvalPlanQual; we should have passed a
@@ -2779,7 +3450,7 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
     WHITEBOX_TEST_STUB("ExecModifyTable_Begin", WhiteboxDefaultErrorEmit);
 
     /* Preload local variables */
-    result_rel_info = node->resultRelInfo + node->mt_whichplan;
+    result_rel_info = node->resultRelInfo + estate->result_rel_index;
     subPlanState = node->mt_plans[node->mt_whichplan];
 #ifdef PGXC
     /* Initialize remote plan state */
@@ -2788,10 +3459,6 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
     update_remote_rel_state = node->mt_update_remoterels[node->mt_whichplan];
     delete_remote_rel_state = node->mt_delete_remoterels[node->mt_whichplan];
 #endif
-    junk_filter = result_rel_info->ri_junkFilter;
-
-    part_oid_num = result_rel_info->ri_partOidAttNum;
-    bucket_Id_num = result_rel_info->ri_bucketIdAttNum;
     /*
      * es_result_relation_info must point to the currently active result
      * relation while we are within this ModifyTable node.	Even though
@@ -2813,7 +3480,7 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
 #endif
 
     if (operation == CMD_INSERT) {
-        if (node->ps.type == T_ModifyTableState || node->mt_upsert->us_action != UPSERT_NONE ||
+        if (node->ps.type == T_ModifyTableState || node->mt_upsert->us_action != UPSERT_NONE || node->isReplace ||
             (result_rel_info->ri_TrigDesc != NULL && (result_rel_info->ri_TrigDesc->trig_insert_before_row ||
                                                        result_rel_info->ri_TrigDesc->trig_insert_instead_row)))
             ExecInsert = ExecInsertT<false>;
@@ -2845,24 +3512,27 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
 
     subPlanState->state->es_skip_early_free = true;
     subPlanState->state->es_skip_early_deinit_consumer = true;
-
     /*
      * Fetch rows from subplan(s), and execute the required table modification
      * for each row.
      */
     for (;;) {
+        result_rel_info = node->resultRelInfo + estate->result_rel_index;
+        estate->es_result_relation_info = result_rel_info;
+        junk_filter = result_rel_info->ri_junkFilter;
+        partExprKeyStr = node->partExprKeyStrArray[estate->result_rel_index];
         if (estate->deleteLimitCount != 0 && estate->es_processed == estate->deleteLimitCount) {
             break;
         }
         /*
-         * Reset the per-output-tuple exprcontext.	This is needed because
+         * Reset the per-output-tuple exprcontext. This is needed because
          * triggers expect to use that context as workspace.  It's a bit ugly
          * to do this below the top level of the plan, however.  We might need
          * to rethink this later.
          */
         ResetPerTupleExprContext(estate);
         t_thrd.xact_cxt.ActiveLobRelid = result_rel_info->ri_RelationDesc->rd_id;
-        plan_slot = ExecProcNode(subPlanState);
+        plan_slot = FetchPlanSlot(subPlanState, node->mt_ProjInfos);
         t_thrd.xact_cxt.ActiveLobRelid = InvalidOid;
         if (TupIsNull(plan_slot)) {
             record_first_time();
@@ -2873,8 +3543,8 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
 
             /* advance to next subplan if any */
             node->mt_whichplan++;
+            Assert(estate->result_rel_index == 0);
             if (node->mt_whichplan < node->mt_nplans) {
-                result_rel_info++;
                 subPlanState = node->mt_plans[node->mt_whichplan];
 #ifdef PGXC
                 /* Move to next remote plan */
@@ -2913,9 +3583,10 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
             }
         }
 
-        EvalPlanQualSetSlot(&node->mt_epqstate, plan_slot);
+        if (estate->result_rel_index == 0)
+            EvalPlanQualSetSlot(&node->mt_epqstate, plan_slot);
         slot = plan_slot;
-        slot->tts_tupleDescriptor->tdTableAmType = result_rel_info->ri_RelationDesc->rd_tam_type;
+        slot->tts_tupleDescriptor->td_tam_ops = result_rel_info->ri_RelationDesc->rd_tam_ops;
 
         if (operation == CMD_MERGE) {
             if (junk_filter == NULL) {
@@ -2923,7 +3594,7 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
                         (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
                          errmsg("junkfilter should not be NULL")));
             }
-            ExecMerge(node, estate, slot, junk_filter, result_rel_info);
+            ExecMerge(node, estate, slot, junk_filter, result_rel_info, partExprKeyStr);
             continue;
         }
 
@@ -2939,14 +3610,15 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
                 relkind = result_rel_info->ri_RelationDesc->rd_rel->relkind;
                 if (relkind == RELKIND_RELATION || RELKIND_IS_SEQUENCE(relkind)) {
                     datum = ExecGetJunkAttribute(slot, junk_filter->jf_junkAttNo, &isNull);
-                    /* shouldn't ever get a null result... */
+                    /* when mutil result relations doing left join, maybe exists NULL ctid. */
                     if (isNull) {
-                        ereport(ERROR,
-                            (errmodule(MOD_EXECUTOR),
-                                (errcode(ERRCODE_NULL_JUNK_ATTRIBUTE),
-                                    errmsg("ctid is NULL when do operation %d, junk attribute number is %d",
-                                        operation,
-                                        junk_filter->jf_junkAttNo))));
+                        if (estate->result_rel_index == resultRelationNum - 1) {
+                            estate->result_rel_index = 0;
+                        } else {
+                            estate->result_rel_index++;
+                        }
+
+                        continue;
                     }
 
                     tuple_id = (ItemPointer)DatumGetPointer(datum);
@@ -2957,7 +3629,7 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
                         Datum tableOiddatum;
                         bool tableOidisnull = false;
 
-                        tableOiddatum = ExecGetJunkAttribute(slot, part_oid_num, &tableOidisnull);
+                        tableOiddatum = ExecGetJunkAttribute(slot, result_rel_info->ri_partOidAttNum, &tableOidisnull);
 
                         if (tableOidisnull) {
                             ereport(ERROR,
@@ -2973,7 +3645,8 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
                         Datum bucketIddatum;
                         bool bucketIdisnull = false;
 
-                        bucketIddatum = ExecGetJunkAttribute(slot, bucket_Id_num, &bucketIdisnull);
+                        bucketIddatum = ExecGetJunkAttribute(slot, result_rel_info->ri_bucketIdAttNum,
+                                                             &bucketIdisnull);
 
                         if (bucketIdisnull) {
                             ereport(ERROR,
@@ -3040,9 +3713,14 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
 #endif
         switch (operation) {
             case CMD_INSERT:
-                slot = ExecInsert(node, slot, plan_slot, estate, node->canSetTag, hi_options, &partition_list);
+                if (!node->isReplace) {
+                    slot = ExecInsert(node, slot, plan_slot, estate, node->canSetTag, hi_options, &partition_list, partExprKeyStr);
+                } else {
+                    slot = ExecReplace(estate, node, slot, plan_slot, bucketid, hi_options, partition_list, partExprKeyStr);
+                }
                 break;
-            case CMD_UPDATE:
+            case CMD_UPDATE: {
+                TM_Result out_result;
                 slot = ExecUpdate(tuple_id,
                     old_partition_oid,
                     bucketid,
@@ -3052,8 +3730,10 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
                     &node->mt_epqstate,
                     node,
                     node->canSetTag,
-                    part_key_updated);
-                break;
+                    part_key_updated,
+                    &out_result,
+                    partExprKeyStr);
+                } break;
             case CMD_DELETE:
                 slot = ExecDelete(
                     tuple_id, old_partition_oid, bucketid, old_tuple, plan_slot, &node->mt_epqstate, node, node->canSetTag);
@@ -3068,6 +3748,12 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
         }
 
         record_first_time();
+
+        if (estate->result_rel_index == resultRelationNum - 1) {
+            estate->result_rel_index = 0;
+        } else {
+            estate->result_rel_index++;
+        }
 
         /*
          * If we got a RETURNING result, return it to caller.  We'll continue
@@ -3105,6 +3791,42 @@ TupleTableSlot* ExecModifyTable(ModifyTableState* node)
     return NULL;
 }
 
+static void InitMultipleModify(ModifyTableState* node, PlanState* subnode, uint32 resultRelationNum)
+{
+    bool hasoid = false;
+    ListCell* l1 = NULL;
+    ListCell* l2 = NULL;
+    List* targetlists = ((ModifyTable*)(node->ps.plan))->targetlists;
+    EState* estate = node->ps.state;
+
+    if (resultRelationNum == 1) {
+        return;
+    }
+    
+    node->mt_ProjInfos = (ProjectionInfo**)palloc0((uint32)resultRelationNum * sizeof(ProjectionInfo*));
+    node->targetlists = (List*)ExecInitExpr((Expr*)targetlists, (PlanState*)node);
+
+    int i = 0;
+    forboth (l1, node->targetlists, l2, targetlists) {
+        List* targetExprList = (List*)lfirst(l1);
+        List* targetList = (List*)lfirst(l2);
+
+        if (!ExecContextForcesOids((PlanState*)node, &hasoid)) {
+            hasoid = false;
+        }
+        estate->es_result_relation_info++;
+
+        TupleTableSlot *slot = ExecAllocTableSlot(&estate->es_tupleTable);
+        TupleDesc tupDesc = ExecTypeFromTL(targetList, hasoid, false);
+        ExecSetSlotDescriptor(slot, tupDesc);
+        node->mt_ResultTupleSlots = lappend(node->mt_ResultTupleSlots, slot);
+        /* Use the targetlist of the subplan to build mt_ProjInfos. It will be use for FetchMultipleModifySlot. */
+        ProjectionInfo* projInfo = ExecBuildProjectionInfo(targetExprList, subnode->ps_ExprContext, slot, NULL);
+        node->mt_ProjInfos[i] = projInfo;
+        i++;
+    }
+}
+
 /* ----------------------------------------------------------------
  *		ExecInitModifyTable
  * ----------------------------------------------------------------
@@ -3124,6 +3846,7 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
 #ifdef PGXC
     PlanState* saved_remote_rel_info = NULL;
 #endif
+    int resultRelationNum = list_length((List*)linitial(node->resultRelations));
 
     /* check for unsupported flags */
     Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
@@ -3167,6 +3890,7 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
     mt_state->ps.plan = (Plan*)node;
     mt_state->ps.state = estate;
     mt_state->ps.targetlist = NIL; /* not actually used */
+    mt_state->ps.ExecProcNode = ExecModifyTable;
 
     mt_state->operation = operation;
     mt_state->canSetTag = node->canSetTag;
@@ -3191,9 +3915,8 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
     upsertState->us_updateproj = NULL;
     upsertState->us_updateWhere = NIL;
     mt_state->mt_upsert = upsertState;
+    mt_state->isReplace = node->isReplace;
 
-    /* set up epqstate with dummy subplan data for the moment */
-    EvalPlanQualInit(&mt_state->mt_epqstate, estate, NULL, NIL, node->epqParam);
     mt_state->fireBSTriggers = true;
 
     /*
@@ -3223,35 +3946,17 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
     i = 0;
     foreach (l, node->plans) {
         sub_plan = (Plan*)lfirst(l);
-
+        sub_plan->rightRefState = node->plan.rightRefState;
+        
         /*
          * Verify result relation is a valid target for the current operation
          */
-        CheckValidResultRel(result_rel_info->ri_RelationDesc, operation);
-
-        /*
-         * If there are indices on the result relation, open them and save
-         * descriptors in the result relation info, so that we can add new
-         * index entries for the tuples we add/update.	We need not do this
-         * for a DELETE, however, since deletion doesn't affect indexes. Also,
-         * inside an EvalPlanQual operation, the indexes might be open
-         * already, since we share the resultrel state with the original
-         * query.
-         */
-
-        if (result_rel_info->ri_RelationDesc->rd_rel->relhasindex &&
-            result_rel_info->ri_IndexRelationDescs == NULL) {
-#ifdef ENABLE_MOT
-            if (result_rel_info->ri_FdwRoutine == NULL || result_rel_info->ri_FdwRoutine->GetFdwType == NULL ||
-                result_rel_info->ri_FdwRoutine->GetFdwType() != MOT_ORC) {
-#endif
-                ExecOpenIndices(result_rel_info, node->upsertAction != UPSERT_NONE);
-#ifdef ENABLE_MOT
-            }
-#endif
+        for (int ri = 0; ri < resultRelationNum; ri++) {
+            CheckValidResultRel(result_rel_info->ri_RelationDesc, operation);
+            result_rel_info++;
         }
+        result_rel_info = mt_state->resultRelInfo;
 
-        init_gtt_storage(operation, result_rel_info);
         /* Now init the plan for this result rel */
         estate->es_result_relation_info = result_rel_info;
         if (sub_plan->type == T_Limit && operation == CMD_DELETE && IsLimitDML((Limit*)sub_plan)) {
@@ -3265,6 +3970,36 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         } else {
             mt_state->mt_plans[i] = ExecInitNode(sub_plan, estate, eflags);
         }
+        InitMultipleModify(mt_state, mt_state->mt_plans[i], (uint32)resultRelationNum);
+        estate->es_result_relation_info = result_rel_info;
+        /*
+         * If there are indices on the result relation, open them and save
+         * descriptors in the result relation info, so that we can add new
+         * index entries for the tuples we add/update.	We need not do this
+         * for a DELETE, however, since deletion doesn't affect indexes. Also,
+         * inside an EvalPlanQual operation, the indexes might be open
+         * already, since we share the resultrel state with the original
+         * query.
+         */
+        for (int ri = 0; ri < resultRelationNum; ri++) {
+            if (result_rel_info->ri_RelationDesc->rd_rel->relhasindex &&
+                result_rel_info->ri_IndexRelationDescs == NULL) {
+#ifdef ENABLE_MOT
+                if (result_rel_info->ri_FdwRoutine == NULL || result_rel_info->ri_FdwRoutine->GetFdwType == NULL ||
+                    result_rel_info->ri_FdwRoutine->GetFdwType() != MOT_ORC) {
+#endif
+                    if (RelationIsUstoreFormat(result_rel_info->ri_RelationDesc) || operation != CMD_DELETE) {
+                        ExecOpenIndices(result_rel_info, (node->upsertAction != UPSERT_NONE || node->isReplace ||
+                                        (estate->es_plannedstmt && estate->es_plannedstmt->hasIgnore)));
+                    }
+#ifdef ENABLE_MOT
+                }
+#endif
+            }
+            result_rel_info++;
+        }
+        result_rel_info = mt_state->resultRelInfo;
+        init_gtt_storage(operation, result_rel_info);
 
         if (operation == CMD_MERGE && RelationInClusterResizing(estate->es_result_relation_info->ri_RelationDesc)) {
             ereport(ERROR,
@@ -3298,7 +4033,6 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
 #endif
         }
 
-        result_rel_info++;
         i++;
     }
 
@@ -3329,11 +4063,44 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         i++;
     }
 #endif
+    /* set up epqstate with dummy subplan data for the moment */
+    EvalPlanQualInit(&mt_state->mt_epqstate, estate, NULL, NIL, node->epqParam);
 
     estate->es_result_relation_info = saved_result_rel_info;
 #ifdef PGXC
     estate->es_result_remoterel = saved_remote_rel_info;
 #endif
+
+    /*
+     * Initialize any WITH CHECK OPTION constraints if needed.
+     */
+    result_rel_info = mt_state->resultRelInfo;
+    i = 0;
+
+    /*
+     * length of node->withCheckOptionLists must be 1 because inherited
+     * table is not supported yet.
+     */
+    Assert(node->withCheckOptionLists == NULL || list_length(node->withCheckOptionLists) == 1);
+
+    for (int ri = 0; node->withCheckOptionLists != NULL && ri < resultRelationNum; ri++) {
+        List* wcoList = NIL;
+        List* wcoExprs = NIL;
+        ListCell* ll = NULL;
+
+        foreach(ll, (List*)linitial(node->withCheckOptionLists)) {
+            WithCheckOption* wco = (WithCheckOption*)lfirst(ll);
+            if (wco->rtindex == result_rel_info->ri_RangeTableIndex) {
+                ExprState* wcoExpr = ExecInitExpr((Expr*)wco->qual, mt_state->mt_plans[i]);
+                wcoExprs = lappend(wcoExprs, wcoExpr);
+                wcoList = lappend(wcoList, wco);
+            }
+        }
+
+        result_rel_info->ri_WithCheckOptions = wcoList;
+        result_rel_info->ri_WithCheckOptionExprs = wcoExprs;
+        result_rel_info++;
+    }
 
     /*
      * Initialize RETURNING projections if needed.
@@ -3346,7 +4113,8 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
          * Initialize result tuple slot and assign its rowtype using the first
          * RETURNING list.	We assume the rest will look the same.
          */
-        tup_desc = ExecTypeFromTL((List*)linitial(node->returningLists), false, false, mt_state->resultRelInfo->ri_RelationDesc->rd_tam_type);
+        tup_desc = ExecTypeFromTL((List *)linitial(node->returningLists), false, false,
+                                  mt_state->resultRelInfo->ri_RelationDesc->rd_tam_ops);
 
         /* Set up a slot for the output of the RETURNING projection(s) */
         ExecInitResultTupleSlot(estate, &mt_state->ps);
@@ -3368,7 +4136,6 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
             rliststate = (List*)ExecInitExpr((Expr*)rlist, &mt_state->ps);
             result_rel_info->ri_projectReturning =
                 ExecBuildProjectionInfo(rliststate, econtext, slot, result_rel_info->ri_RelationDesc->rd_att);
-            result_rel_info++;
         }
     } else {
         /*
@@ -3386,7 +4153,7 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
      * If needed, Initialize target list, projection and qual for DUPLICATE KEY UPDATE
      */
     result_rel_info = mt_state->resultRelInfo;
-    if (node->upsertAction == UPSERT_UPDATE) {
+    if (node->upsertAction == UPSERT_UPDATE ||node->isReplace) {
         ExprContext* econtext = NULL;
         ExprState* setexpr = NULL;
         TupleDesc tupDesc;
@@ -3400,10 +4167,11 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         }
 
         econtext = mt_state->ps.ps_ExprContext;
+        ATTACH_RIGHT_REF_STATE(&(mt_state->ps));
 
         /* initialize slot for the existing tuple */
         upsertState->us_existing =
-            ExecInitExtraTupleSlot(mt_state->ps.state, result_rel_info->ri_RelationDesc->rd_tam_type);
+            ExecInitExtraTupleSlot(mt_state->ps.state, result_rel_info->ri_RelationDesc->rd_tam_ops);
         ExecSetSlotDescriptor(upsertState->us_existing, result_rel_info->ri_RelationDesc->rd_att);
 
         upsertState->us_excludedtlist = node->exclRelTlist;
@@ -3411,7 +4179,7 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         /* create target slot for UPDATE SET projection */
         tupDesc = ExecTypeFromTL((List*)node->updateTlist, result_rel_info->ri_RelationDesc->rd_rel->relhasoids);
         upsertState->us_updateproj =
-            ExecInitExtraTupleSlot(mt_state->ps.state, result_rel_info->ri_RelationDesc->rd_tam_type);
+            ExecInitExtraTupleSlot(mt_state->ps.state, result_rel_info->ri_RelationDesc->rd_tam_ops);
         ExecSetSlotDescriptor(upsertState->us_updateproj, tupDesc);
 
         /* build UPDATE SET expression and projection state */
@@ -3419,7 +4187,8 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         result_rel_info->ri_updateProj =
         ExecBuildProjectionInfo((List*)setexpr, econtext,
             upsertState->us_updateproj, result_rel_info->ri_RelationDesc->rd_att);
-
+        result_rel_info->ri_updateProj->isUpsertHasRightRef = 
+                IS_ENABLE_RIGHT_REF(econtext->rightRefState) && econtext->rightRefState->isUpsertHasRightRef;
         /* initialize expression state to evaluate update where clause if exists */
         if (node->upsertWhere) {
             upsertState->us_updateWhere = (List*)ExecInitExpr((Expr*)node->upsertWhere, &mt_state->ps);
@@ -3533,88 +4302,22 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         if (junk_filter_needed) {
             result_rel_info = mt_state->resultRelInfo;
             for (i = 0; i < nplans; i++) {
-                JunkFilter* j = NULL;
-
                 sub_plan = mt_state->mt_plans[i]->plan;
-                if (operation == CMD_INSERT || operation == CMD_UPDATE) {
-                    CheckPlanOutput(sub_plan, result_rel_info->ri_RelationDesc);
-                }
-
-                j = ExecInitJunkFilter(sub_plan->targetlist,
-                    result_rel_info->ri_RelationDesc->rd_att->tdhasoid,
-                    ExecInitExtraTupleSlot(estate, result_rel_info->ri_RelationDesc->rd_tam_type));
-
-                if (operation == CMD_UPDATE || operation == CMD_DELETE || operation == CMD_MERGE) {
-                    /* For UPDATE/DELETE, find the appropriate junk attr now */
-                    char relkind;
-
-                    relkind = result_rel_info->ri_RelationDesc->rd_rel->relkind;
-                    if (relkind == RELKIND_RELATION) {
-                        j->jf_junkAttNo = ExecFindJunkAttribute(j, "ctid");
-                        if (!AttributeNumberIsValid(j->jf_junkAttNo)) {
-                            ereport(ERROR,
-                                (errmodule(MOD_EXECUTOR),
-                                    (errcode(ERRCODE_INVALID_ATTRIBUTE), errmsg("could not find junk ctid column"))));
+                if (resultRelationNum > 1) {
+                    foreach (l, node->targetlists) {
+                        List* targetlist = (List*)lfirst(l);
+                        if (operation == CMD_UPDATE) {
+                            ExecCheckPlanOutput(result_rel_info->ri_RelationDesc, targetlist);
                         }
-
-                        /* if the table is partitioned table ,give a paritionOidJunkOid junk */
-                        if (RELATION_IS_PARTITIONED(result_rel_info->ri_RelationDesc) ||
-                            RelationIsCUFormat(result_rel_info->ri_RelationDesc)) {
-                            AttrNumber tableOidAttNum = ExecFindJunkAttribute(j, "tableoid");
-
-                            if (!AttributeNumberIsValid(tableOidAttNum)) {
-                                ereport(ERROR,
-                                    (errmodule(MOD_EXECUTOR),
-                                        (errcode(ERRCODE_INVALID_ATTRIBUTE),
-                                            errmsg("could not find junk tableoid column for partition table."))));
-                            }
-
-                            result_rel_info->ri_partOidAttNum = tableOidAttNum;
-                            j->jf_xc_part_id = result_rel_info->ri_partOidAttNum;
-                        }
-
-                        if (RELATION_HAS_BUCKET(result_rel_info->ri_RelationDesc)) {
-                            AttrNumber bucketIdAttNum = ExecFindJunkAttribute(j, "tablebucketid");
-
-                            if (!AttributeNumberIsValid(bucketIdAttNum)) {
-                                ereport(ERROR,
-                                    (errmodule(MOD_EXECUTOR),
-                                        (errcode(ERRCODE_INVALID_ATTRIBUTE),
-                                            errmsg("could not find junk bucketid column for bucketed table."))));
-                            }
-
-                            result_rel_info->ri_bucketIdAttNum = bucketIdAttNum;
-                            j->jf_xc_bucket_id = result_rel_info->ri_bucketIdAttNum;
-                        }
-#ifdef PGXC
-                        if (IS_PGXC_COORDINATOR && RelationGetLocInfo(result_rel_info->ri_RelationDesc)) {
-                            /*
-                             * We may or may not need these attributes depending upon
-                             * the exact kind of trigger. We defer the check; instead throw
-                             * error only at the point when we need but don't find one.
-                             */
-                            j->jf_xc_node_id = ExecFindJunkAttribute(j, "xc_node_id");
-                            j->jf_xc_wholerow = ExecFindJunkAttribute(j, "wholerow");
-                            j->jf_primary_keys = ExecFindJunkPrimaryKeys(sub_plan->targetlist);
-                        } else if (IS_PGXC_DATANODE && !IS_SINGLE_NODE) {
-                            j->jf_xc_node_id = ExecFindJunkAttribute(j, "xc_node_id");
-                        }
-#endif
-                    } else if (relkind == RELKIND_FOREIGN_TABLE || relkind == RELKIND_STREAM) {
-                        /* FDW must fetch any junk attrs it wants */
-                    } else {
-                        j->jf_junkAttNo = ExecFindJunkAttribute(j, "wholerow");
-                        if (!AttributeNumberIsValid(j->jf_junkAttNo)) {
-                            ereport(ERROR,
-                                (errmodule(MOD_EXECUTOR),
-                                    (errcode(ERRCODE_INVALID_ATTRIBUTE),
-                                        errmsg("could not find junk wholerow column"))));
-                        }
+                        ExecInitJunkAttr(estate, operation, targetlist, result_rel_info);
+                        result_rel_info++;
                     }
+                } else {
+                    if (operation == CMD_UPDATE) {
+                        CheckPlanOutput(sub_plan, result_rel_info->ri_RelationDesc);
+                    }
+                    ExecInitJunkAttr(estate, operation, sub_plan->targetlist, result_rel_info);
                 }
-
-                result_rel_info->ri_junkFilter = j;
-                result_rel_info++;
             }
         } else {
             if (operation == CMD_INSERT) {
@@ -3630,7 +4333,7 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
      */
     if (estate->es_trig_tuple_slot == NULL) {
         result_rel_info = mt_state->resultRelInfo;
-        estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(estate, result_rel_info->ri_RelationDesc->rd_tam_type);
+        estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(estate, result_rel_info->ri_RelationDesc->rd_tam_ops);
     }
 
     /*
@@ -3646,7 +4349,24 @@ ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int efl
         !(IS_PGXC_COORDINATOR && u_sess->exec_cxt.under_stream_runtime))
         estate->es_auxmodifytables = lcons(mt_state, estate->es_auxmodifytables);
 
+    mt_state->partExprKeyStrArray = (char**)palloc0(resultRelationNum * sizeof(char*));
+    for (int relIndex = 0; relIndex < resultRelationNum; relIndex++) {
+        char* partExprKeyStr = NULL;
+        ResultRelInfo* currentRelInfo = mt_state->resultRelInfo + relIndex;
+        if (RelationIsPartitioned(currentRelInfo->ri_RelationDesc))
+            PartExprKeyIsNull(currentRelInfo->ri_RelationDesc, NULL, &partExprKeyStr);
+        mt_state->partExprKeyStrArray[relIndex] = partExprKeyStr;
+    }
+
     return mt_state;
+}
+
+static void ExecClearMultipleModifyTuple(List* slots)
+{
+    foreach_cell (l, slots) {
+        TupleTableSlot* slot = (TupleTableSlot*)lfirst(l);
+        (void)ExecClearTuple(slot);
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -3705,6 +4425,7 @@ void ExecEndModifyTable(ModifyTableState* node)
      * clean out the tuple table
      */
     (void)ExecClearTuple(node->ps.ps_ResultTupleSlot);
+    ExecClearMultipleModifyTuple(node->mt_ResultTupleSlots);
 
     /*
      * Terminate EPQ execution if active

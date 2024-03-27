@@ -157,7 +157,6 @@ extern int DataNodeCopyInBinaryForAll(const char* msg_buf, int len, PGXCNodeHand
 
 extern int ExecCountSlotsRemoteQuery(RemoteQuery* node);
 extern RemoteQueryState* ExecInitRemoteQuery(RemoteQuery* node, EState* estate, int eflags, bool row_plan = true);
-extern TupleTableSlot* ExecRemoteQuery(RemoteQueryState* step);
 extern void ExecEndRemoteQuery(RemoteQueryState* step, bool pre_end = false);
 extern void FreeParallelFunctionState(ParallelFunctionState* state);
 extern void StrategyFuncSum(ParallelFunctionState* state);
@@ -261,7 +260,8 @@ StringInfo* SendExplainToDNs(ExplainState*, RemoteQuery*, int*, const char*);
 bool CheckPrepared(RemoteQuery* rq, Oid nodeoid);
 void FindExecNodesInPBE(RemoteQueryState* planstate, ExecNodes* exec_nodes, RemoteQueryExecType exec_type);
 extern PGXCNodeHandle* GetRegisteredTransactionNodes(bool write);
-#endif
+extern bool check_errmsg_for_receive_buffer(RemoteQueryState* combiner, int tapenum,
+                                            bool* has_checked, int* has_err_idx);
 
 #ifdef ENABLE_UT
 #include "workload/cpwlm.h"
@@ -272,5 +272,5 @@ extern PGXCNodeAllHandles* make_cp_conn(ComputePoolConfig** configs, int cnum, i
 extern List* get_dnlist_for_hdfs(int fnum);
 extern void ReloadTransactionNodes(void);
 extern void PgFdwRemoteReply(StringInfo msg);
-
+#endif
 #endif

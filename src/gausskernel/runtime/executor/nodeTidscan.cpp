@@ -44,6 +44,7 @@
     ((node) != NULL && IsA((node), Var) && ((Var*)(node))->varattno == SelfItemPointerAttributeNumber && \
         ((Var*)(node))->varlevelsup == 0)
 
+static TupleTableSlot* ExecTidScan(PlanState* state);
 static void TidListCreate(TidScanState* tidstate, bool isBucket);
 static int ItemptrComparator(const void* a, const void* b);
 static TupleTableSlot* TidNext(TidScanState* node);
@@ -293,6 +294,8 @@ static TupleTableSlot* HbktTidFetchTuple(TidScanState* node, bool bBackward)
 
         /* Reset the tidPtr */
         node->tss_TidPtr = -1;
+
+        CHECK_FOR_INTERRUPTS();
     }
 
     return ExecClearTuple(slot);
@@ -316,7 +319,7 @@ bool HeapFetchRowVersion(TidScanState* node, Relation relation,
     tuple->t_data = &(node->tss_ctbuf_hdr);
     Assert(tid != NULL);
     tuple->t_self = *tid;
-    if (heap_fetch(relation, scanSnap, tuple, &buffer, false, NULL)) {
+    if (heap_fetch(relation, scanSnap, tuple, &buffer, false, NULL, &node->ss.ps.state->have_current_xact_date)) {
         /*
          * store the scanned tuple in the scan tuple slot of the scan
          * state.  Eventually we will only do this and not return a tuple.
@@ -466,8 +469,9 @@ static bool TidRecheck(TidScanState* node, TupleTableSlot* slot)
  *		  -- tidPtr is -1.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecTidScan(TidScanState* node)
+static TupleTableSlot* ExecTidScan(PlanState* state)
 {
+    TidScanState* node = castNode(TidScanState, state);
     return ExecScan(&node->ss, (ExecScanAccessMtd)TidNext, (ExecScanRecheckMtd)TidRecheck);
 }
 
@@ -483,7 +487,7 @@ void ExecReScanTidScan(TidScanState* node)
     node->tss_NumTids = 0;
     node->tss_TidPtr = -1;
 
-    if (node->ss.isPartTbl) {
+    if (node->ss.isPartTbl && !(((Scan *)node->ss.ps.plan)->partition_iterator_elimination)) {
         scan_handler_tbl_end_tidscan((TableScanDesc)(node->ss.ss_currentScanDesc));
 
         if (PointerIsValid(node->ss.partitions)) {
@@ -583,6 +587,7 @@ TidScanState* ExecInitTidScan(TidScan* node, EState* estate, int eflags)
     tidstate->ss.isPartTbl = node->scan.isPartTbl;
     tidstate->ss.currentSlot = 0;
     tidstate->ss.partScanDirection = node->scan.partScanDirection;
+    tidstate->ss.ps.ExecProcNode = ExecTidScan;
 	
     tidstate->tss_htup.tupTableType = HEAP_TUPLE;
     /*
@@ -620,8 +625,8 @@ TidScanState* ExecInitTidScan(TidScan* node, EState* estate, int eflags)
     /*
      * tuple table initialization
      */
-    ExecInitResultTupleSlot(estate, &tidstate->ss.ps, current_relation->rd_tam_type);
-    ExecInitScanTupleSlot(estate, &tidstate->ss, current_relation->rd_tam_type);
+    ExecInitResultTupleSlot(estate, &tidstate->ss.ps, current_relation->rd_tam_ops);
+    ExecInitScanTupleSlot(estate, &tidstate->ss, current_relation->rd_tam_ops);
 
     /* deal with partitioned table branch */
     if (node->scan.isPartTbl) {
@@ -635,21 +640,24 @@ TidScanState* ExecInitTidScan(TidScan* node, EState* estate, int eflags)
             ExecInitPartitionForTidScan(tidstate, estate);
 
             /* make dummy table realtion with the first partition for scan */
-            partition = (Partition)list_nth(tidstate->ss.partitions, 0);
-            partitiontrel = partitionGetRelation(current_relation, partition);
+            if (tidstate->ss.partitions != NIL) {
+                partition = (Partition)list_nth(tidstate->ss.partitions, 0);
+                partitiontrel = partitionGetRelation(current_relation, partition);
 
-            if (RelationIsSubPartitioned(current_relation)) {
-                List *currentSubpartList = (List *)list_nth(tidstate->ss.subpartitions, 0);
-                Partition currentSubPart = (Partition)list_nth(currentSubpartList, 0);
-                Relation currentSubPartitionRel = partitionGetRelation(partitiontrel, currentSubPart);
+                if (RelationIsSubPartitioned(current_relation)) {
+                    List *currentSubpartList = (List *)list_nth(tidstate->ss.subpartitions, 0);
+                    Partition currentSubPart = (Partition)list_nth(currentSubpartList, 0);
+                    Relation currentSubPartitionRel = partitionGetRelation(partitiontrel, currentSubPart);
 
-                releaseDummyRelation(&partitiontrel);
-                tidstate->ss.ss_currentPartition = currentSubPartitionRel;
-                tidstate->ss.ss_currentScanDesc =
-                    scan_handler_tbl_begin_tidscan(currentSubPartitionRel, (ScanState *)tidstate);
-            } else {
-                tidstate->ss.ss_currentPartition = partitiontrel;
-                tidstate->ss.ss_currentScanDesc = scan_handler_tbl_begin_tidscan(partitiontrel, (ScanState *)tidstate);
+                    releaseDummyRelation(&partitiontrel);
+                    tidstate->ss.ss_currentPartition = currentSubPartitionRel;
+                    tidstate->ss.ss_currentScanDesc =
+                        scan_handler_tbl_begin_tidscan(currentSubPartitionRel, (ScanState *)tidstate);
+                } else {
+                    tidstate->ss.ss_currentPartition = partitiontrel;
+                    tidstate->ss.ss_currentScanDesc =
+                        scan_handler_tbl_begin_tidscan(partitiontrel, (ScanState *)tidstate);
+                }
             }
         }
     } else {
@@ -666,11 +674,11 @@ TidScanState* ExecInitTidScan(TidScan* node, EState* estate, int eflags)
      */
     ExecAssignResultTypeFromTL(
             &tidstate->ss.ps,
-            tidstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor->tdTableAmType);
+            tidstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     ExecAssignScanProjectionInfo(&tidstate->ss);
 
-    Assert(tidstate->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->tdTableAmType != TAM_INVALID);
+    Assert(tidstate->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     /*
      * all done.
@@ -761,42 +769,59 @@ static void ExecInitPartitionForTidScan(TidScanState* tidstate, EState* estate)
         LOCKMODE lock = NoLock;
         Partition table_partition = NULL;
         bool relistarget = false;
-        ListCell* cell = NULL;
-        List* part_seqs = plan->scan.pruningInfo->ls_rangeSelectedPartitions;
 
         relistarget = ExecRelationIsTargetRelation(estate, plan->scan.scanrelid);
         lock = (relistarget ? RowExclusiveLock : AccessShareLock);
         tidstate->ss.lockMode = lock;
 
-        if (plan->scan.pruningInfo->ls_rangeSelectedPartitions != NULL) {
-            plan->scan.itrs = plan->scan.pruningInfo->ls_rangeSelectedPartitions->length;
+        PruningResult* pruningResult = NULL;
+        if (plan->scan.pruningInfo->expr != NULL) {
+            pruningResult = GetPartitionInfo(plan->scan.pruningInfo, estate, current_relation);
         } else {
-            plan->scan.itrs = 0;
+            pruningResult = plan->scan.pruningInfo;
+        }
+        if (pruningResult->ls_rangeSelectedPartitions != NULL) {
+            tidstate->ss.part_id = pruningResult->ls_rangeSelectedPartitions->length;
+        } else {
+            tidstate->ss.part_id = 0;
         }
 
-        foreach (cell, part_seqs) {
+        ListCell* cell1 = NULL;
+        ListCell* cell2 = NULL;
+        List* part_seqs = pruningResult->ls_rangeSelectedPartitions;
+        List* partitionnos = pruningResult->ls_selectedPartitionnos;
+        Assert(list_length(part_seqs) == list_length(partitionnos));
+
+        forboth (cell1, part_seqs, cell2, partitionnos) {
             Oid table_partitionid = InvalidOid;
-            int part_seq = lfirst_int(cell);
+            int part_seq = lfirst_int(cell1);
+            int partitionno = lfirst_int(cell2);
             /* add table partition to list */
-            table_partitionid = getPartitionOidFromSequence(current_relation, part_seq);
-            table_partition = partitionOpen(current_relation, table_partitionid, lock);
+            table_partitionid =
+                getPartitionOidFromSequence(current_relation, part_seq, partitionno);
+            table_partition = PartitionOpenWithPartitionno(current_relation, table_partitionid, partitionno, lock);
             tidstate->ss.partitions = lappend(tidstate->ss.partitions, table_partition);
-            if (plan->scan.pruningInfo->ls_selectedSubPartitions != NIL) {
+            if (pruningResult->ls_selectedSubPartitions != NIL) {
                 Relation partRelation = partitionGetRelation(current_relation, table_partition);
                 SubPartitionPruningResult* subPartPruningResult =
-                    GetSubPartitionPruningResult(plan->scan.pruningInfo->ls_selectedSubPartitions, part_seq);
+                    GetSubPartitionPruningResult(pruningResult->ls_selectedSubPartitions, part_seq, partitionno);
                 if (subPartPruningResult == NULL) {
                     continue;
                 }
                 List *subpartSeqs = subPartPruningResult->ls_selectedSubPartitions;
+                List *subpartitionnos = subPartPruningResult->ls_selectedSubPartitionnos;
+                Assert(list_length(subpartSeqs) == list_length(subpartitionnos));
                 List *subpartition = NIL;
-                ListCell *lc = NULL;
-                foreach (lc, subpartSeqs) {
+                ListCell *lc1 = NULL;
+                ListCell *lc2 = NULL;
+                forboth (lc1, subpartSeqs, lc2, subpartitionnos) {
                     Oid subpartitionid = InvalidOid;
-                    int subpartSeq = lfirst_int(lc);
+                    int subpartSeq = lfirst_int(lc1);
+                    int subpartitionno = lfirst_int(lc2);
 
-                    subpartitionid = getPartitionOidFromSequence(partRelation, subpartSeq);
-                    Partition subpart = partitionOpen(partRelation, subpartitionid, lock);
+                    subpartitionid = getPartitionOidFromSequence(partRelation, subpartSeq, subpartitionno);
+                    Partition subpart =
+                        PartitionOpenWithPartitionno(partRelation, subpartitionid, subpartitionno, lock);
                     subpartition = lappend(subpartition, subpart);
                 }
                 releaseDummyRelation(&(partRelation));

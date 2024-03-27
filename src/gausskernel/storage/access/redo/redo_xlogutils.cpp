@@ -52,7 +52,7 @@
 #include "commands/dbcommands.h"
 #include "access/twophase.h"
 #include "access/redo_common.h"
-#include "access/extreme_rto/page_redo.h"
+#include "ddes/dms/ss_dms_bufmgr.h"
 
 THR_LOCAL RedoParseManager *g_parseManager = NULL;
 THR_LOCAL RedoBufferManager *g_bufferManager = NULL;
@@ -128,7 +128,8 @@ bool DoLsnCheck(const RedoBufferInfo *bufferinfo, bool willInit, XLogRecPtr last
                                     "lsn in current page %lu, page info:%u/%u/%u forknum %d lsn %lu blknum:%u",
                                     lastLsn, pageCurLsn, blockinfo->rnode.spcNode, blockinfo->rnode.dbNode,
                                     blockinfo->rnode.relNode, blockinfo->forknum, lsn, blockinfo->blkno)));
-        } else if (pageCurLsn == InvalidXLogRecPtr && PageIsEmpty(page) && PageUpperIsInitNew(page)) {
+        } else if ((pageCurLsn == InvalidXLogRecPtr && PageIsEmpty(page) && PageUpperIsInitNew(page)) ||
+            (g_instance.roach_cxt.isRoachRestore)) {
             return XLogLsnCheckLogInvalidPage(bufferinfo, LSN_CHECK_ERROR, pblk);
         } else {
             int elevel = PANIC;
@@ -269,10 +270,10 @@ XLogRedoAction XLogCheckBlockDataRedoAction(XLogBlockDataParse *datadecode, Redo
                     bool notSkip = DoLsnCheck(bufferinfo, willinit, XLogBlockDataGetLastBlockLSN(datadecode), 
                         (bufferinfo->blockinfo.pblk.relNode != InvalidOid) ? &bufferinfo->blockinfo.pblk : NULL,
                         &needRepair);
-                    if (needRepair) {
+                    if (needRepair && g_instance.pid_cxt.PageRepairPID != 0) {
                         XLogRecPtr pageCurLsn = PageGetLSN(bufferinfo->pageinfo.page);
                         UnlockReleaseBuffer(bufferinfo->buf);
-                        extreme_rto::RecordBadBlockAndPushToRemote(datadecode, LSN_CHECK_FAIL, pageCurLsn,
+                        ExtremeRecordBadBlockAndPushToRemote(datadecode, LSN_CHECK_FAIL, pageCurLsn,
                             bufferinfo->blockinfo.pblk);
                         bufferinfo->buf = InvalidBuffer;
                         bufferinfo->pageinfo = {0};
@@ -758,27 +759,11 @@ void XLogRecSetUndoBlockState(XLogReaderState *record, uint32 blockid, XLogRecPa
             zoneId = blockundo->undoExtendParse.zoneId;
             break;
         }
-        case XLOG_UNDO_CLEAN: {
-            UndoRecPtr tailPtr = ((undo::XlogUndoClean *)xlrec)->tail;
-            blockundo->undoCleanParse.zoneId = UNDO_PTR_GET_ZONE_ID(tailPtr);
-            blockundo->undoCleanParse.tailOffset = UNDO_PTR_GET_OFFSET(tailPtr);
-            blockundo->undoCleanParse.cleanLsn = record->EndRecPtr;
-            zoneId = blockundo->undoCleanParse.zoneId;
-            break;
-        }
-        case XLOG_SLOT_CLEAN: {
-            UndoRecPtr tailPtr = ((undo::XlogUndoClean *)xlrec)->tail;
-            blockundo->undoCleanParse.zoneId = UNDO_PTR_GET_ZONE_ID(tailPtr);
-            blockundo->undoCleanParse.tailOffset = UNDO_PTR_GET_OFFSET(tailPtr);
-            blockundo->undoCleanParse.cleanLsn = record->EndRecPtr;
-            zoneId = blockundo->undoCleanParse.zoneId;
-            break;
-        }
         default:
             ereport(PANIC, (errmsg("XLogRecSetUndoBlockState: unknown op code %u", (uint8)info)));
     }
 
-    RelFileNode rnode = { DEFAULTTABLESPACE_OID, UNDO_DB_OID, (Oid)zoneId, InvalidBktId };
+    RelFileNode rnode = { DEFAULTTABLESPACE_OID, UNDO_DB_OID, (Oid)zoneId, InvalidBktId, 0};
     RelFileNodeForkNum filenode = RelFileNodeForkNumFill(&rnode, InvalidBackendId, UNDO_FORKNUM, InvalidBlockNumber);
     XLogRecSetBlockCommonState(record, BLOCK_DATA_UNDO_TYPE, filenode, undostate);
 }
@@ -789,7 +774,7 @@ void XLogRecSetRollbackFinishBlockState(XLogReaderState *record, uint32 blockid,
     undo::XlogRollbackFinish *xlrec = (undo::XlogRollbackFinish *)XLogRecGetData(record);
 
     RelFileNode rnode = {
-        DEFAULTTABLESPACE_OID, UNDO_DB_OID, (Oid)(UNDO_PTR_GET_ZONE_ID(xlrec->slotPtr)), InvalidBktId
+        DEFAULTTABLESPACE_OID, UNDO_DB_OID, (Oid)(UNDO_PTR_GET_ZONE_ID(xlrec->slotPtr)), InvalidBktId, 0
     };
     RelFileNodeForkNum filenode = RelFileNodeForkNumFill(&rnode, InvalidBackendId, UNDO_FORKNUM, InvalidBlockNumber);
     XLogRecSetBlockCommonState(record, BLOCK_DATA_UNDO_TYPE, filenode, undostate);
@@ -816,15 +801,17 @@ void XLogUpdateCopyedBlockState(XLogRecParseState *recordblockstate, XLogBlockPa
     recordblockstate->blockparse.blockhead.relNode = relid;
     recordblockstate->blockparse.blockhead.blkno = blkno;
     recordblockstate->blockparse.blockhead.forknum = forknum;
-    recordblockstate->blockparse.blockhead.bucketNode = bucketNode;
+    recordblockstate->blockparse.blockhead.bucketNode = (int2)bucketNode;
 }
 
-void XLogRecSetBlockDdlState(XLogBlockDdlParse *blockddlstate, uint32 blockddltype, char *mainData, int rels)
+void XLogRecSetBlockDdlState(XLogBlockDdlParse *blockddlstate, uint32 blockddltype, char *mainData,
+                             int rels, bool compress)
 {
     Assert(blockddlstate != NULL);
     blockddlstate->blockddltype = blockddltype;
     blockddlstate->rels = rels;
     blockddlstate->mainData = mainData;
+    blockddlstate->compress = compress;
 }
 
 void XLogRecSetBlockCLogState(XLogBlockCLogParse *blockclogstate, TransactionId topxid, uint16 status, uint16 xidnum,
@@ -924,38 +911,6 @@ void XLogRecSetSegNewPageInfo(XLogBlockSegNewPage *state, char *mainData, Size l
     Assert(state != NULL);
     state->mainData = mainData;
     state->dataLen = len;
-}
-
-
-static inline bool AtomicCompareExchangeBuffer(volatile Buffer *ptr, Buffer *expected, Buffer newval)
-{
-    bool ret = false;
-    Buffer current;
-    current = __sync_val_compare_and_swap(ptr, *expected, newval);
-    ret = (current == *expected);
-    *expected = current;
-    return ret;
-}
-
-static inline Buffer AtomicReadBuffer(volatile Buffer *ptr)
-{
-    return *ptr;
-}
-
-static inline void AtomicWriteBuffer(volatile Buffer* ptr, Buffer val)
-{
-    *ptr = val;
-}
-
-static inline Buffer AtomicExchangeBuffer(volatile Buffer *ptr, Buffer newval)
-{
-    Buffer old;
-    while (true) {
-        old = AtomicReadBuffer(ptr);
-        if (AtomicCompareExchangeBuffer(ptr, &old, newval))
-            break;
-    }
-    return old;
 }
 
 /* add for batch redo mem manager */
@@ -1176,6 +1131,10 @@ void XLogRedoBufferSetState(RedoBufferManager *buffermanager, RedoMemSlot *buffe
 void XLogParseBufferInit(RedoParseManager *parsemanager, int buffernum, RefOperate *refOperate,
                          InterruptFunc interruptOperte)
 {
+    if (SS_IN_ONDEMAND_RECOVERY) {
+        return OndemandXLogParseBufferInit(parsemanager, buffernum, refOperate, interruptOperte);
+    }
+
     void *allocdata = NULL;
     allocdata = XLogMemCtlInit(&(parsemanager->memctl), (sizeof(XLogRecParseState) + sizeof(ParseBufferDesc)),
                                buffernum);
@@ -1190,6 +1149,11 @@ void XLogParseBufferInit(RedoParseManager *parsemanager, int buffernum, RefOpera
 
 void XLogParseBufferDestory(RedoParseManager *parsemanager)
 {
+    if (SS_IN_ONDEMAND_RECOVERY) {
+        OndemandXLogParseBufferDestory(parsemanager);
+        return;
+    }
+
     g_parseManager = NULL;
     if (parsemanager->parsebuffers != NULL) {
         pfree(parsemanager->parsebuffers);
@@ -1201,6 +1165,10 @@ void XLogParseBufferDestory(RedoParseManager *parsemanager)
 XLogRecParseState *XLogParseBufferAllocList(RedoParseManager *parsemanager, XLogRecParseState *blkstatehead,
                                             void *record)
 {
+    if (SS_IN_ONDEMAND_RECOVERY) {
+        return OndemandXLogParseBufferAllocList(parsemanager, blkstatehead, record);
+    }
+
     RedoMemManager *memctl = &(parsemanager->memctl);
     RedoMemSlot *allocslot = NULL;
     ParseBufferDesc *descstate = NULL;
@@ -1246,11 +1214,16 @@ XLogRecParseState *XLogParseBufferCopy(XLogRecParseState *srcState)
     securec_check(rc, "\0", "\0");
 
     newState->isFullSync = srcState->isFullSync;
+    newState->distributeStatus = srcState->distributeStatus;
     return newState;
 }
 
 void XLogParseBufferRelease(XLogRecParseState *recordstate)
 {
+    if (SS_IN_ONDEMAND_RECOVERY) {
+        OndemandXLogParseBufferRelease(recordstate);
+        return;
+    }
     RedoMemManager *memctl = &(recordstate->manager->memctl);
     ParseBufferDesc *descstate = NULL;
 
@@ -1526,14 +1499,16 @@ void XLogBlockDdlDoSmgrAction(XLogBlockHead *blockhead, void *blockrecbody, Redo
             xlog_block_smgr_redo_truncate(rnode, blockhead->blkno, blockhead->end_ptr);
             break;
         case BLOCK_DDL_DROP_RELNODE: {
+            bool compress = blockddlrec->compress;
             ColFileNodeRel *xnodes = (ColFileNodeRel *)blockddlrec->mainData;
             for (int i = 0; i < blockddlrec->rels; ++i) {
-                ColFileNodeRel *colFileNodeRel = xnodes + i;
                 ColFileNode colFileNode;
-                ColFileNodeCopy(&colFileNode, colFileNodeRel);
-                if (IS_COMPRESS_DELETE_FORK(colFileNode.forknum)) {
-                    SET_OPT_BY_NEGATIVE_FORK(colFileNode.filenode, colFileNode.forknum);
-                    colFileNode.forknum = MAIN_FORKNUM;
+                if (compress) {
+                    ColFileNode *colFileNodeRel = ((ColFileNode *)(void *)xnodes) + i;
+                    ColFileNodeFullCopy(&colFileNode, colFileNodeRel);
+                } else {
+                    ColFileNodeRel *colFileNodeRel = xnodes + i;
+                    ColFileNodeCopy(&colFileNode, colFileNodeRel);
                 }
                 if (!IsValidColForkNum(colFileNode.forknum)) {
                     XlogDropRowReation(colFileNode.filenode);
@@ -1634,7 +1609,7 @@ XLogRedoAction XLogBlockGetOperatorBuffer(XLogBlockHead *blockhead, void *blockr
                                                       XLogBlockDataGetLastBlockLSN(blockdatarec), willinit, readmethod);
     } else if (block_valid == BLOCK_DATA_VM_TYPE || block_valid == BLOCK_DATA_FSM_TYPE) {
         redoaction = XLogReadBufferForRedoBlockExtend(&bufferinfo->blockinfo, RBM_ZERO_ON_ERROR, false, bufferinfo,
-                                                      xlogLsn, true, InvalidXLogRecPtr, readmethod);
+                                                      xlogLsn, InvalidXLogRecPtr, true, readmethod);
     } else if (block_valid == BLOCK_DATA_DDL_TYPE || block_valid == BLOCK_DATA_UNDO_TYPE) {
         redoaction = NO_BLK;
     }
@@ -1689,6 +1664,9 @@ void ExtremeRtoFlushBuffer(RedoBufferInfo *bufferinfo, bool updateFsm)
     if (updateFsm) {
         freespace = PageGetHeapFreeSpace(bufferinfo->pageinfo.page);
     }
+
+    SSMarkBufferDirtyForERTO(bufferinfo);
+
     if (ParseStateWithoutCache()) {
         /* flush the block */
         if ((bufferinfo->pageinfo.page != NULL) && bufferinfo->dirtyflag) {
@@ -1699,7 +1677,9 @@ void ExtremeRtoFlushBuffer(RedoBufferInfo *bufferinfo, bool updateFsm)
     } else {
         if (bufferinfo->pageinfo.page != NULL) {
             BufferDesc *bufDesc = GetBufferDescriptor(bufferinfo->buf - 1);
-            if (bufferinfo->dirtyflag || XLByteLT(bufDesc->lsn_on_disk, PageGetLSN(bufferinfo->pageinfo.page))) {
+            /* backends may mark buffer dirty already */
+            if (!(bufDesc->state & BM_DIRTY) &&
+                (bufferinfo->dirtyflag || XLByteLT(bufDesc->extra->lsn_on_disk, PageGetLSN(bufferinfo->pageinfo.page)))) {
                 MarkBufferDirty(bufferinfo->buf);
                 if (!bufferinfo->dirtyflag && bufferinfo->blockinfo.forknum == MAIN_FORKNUM) {
                     int mode = WARNING;
@@ -1707,14 +1687,15 @@ void ExtremeRtoFlushBuffer(RedoBufferInfo *bufferinfo, bool updateFsm)
                     mode = PANIC;
 #endif
                     const uint32 shiftSz = 32;
-                    ereport(mode, (errmsg("extreme_rto not mark dirty:lsn %X/%X, lsn_disk %X/%X, \
-                                          lsn_page %X/%X, page %u/%u/%u %u",
-                                          (uint32)(bufferinfo->lsn >> shiftSz), (uint32)(bufferinfo->lsn), 
-                                          (uint32)(bufDesc->lsn_on_disk >> shiftSz), (uint32)(bufDesc->lsn_on_disk), 
-                                          (uint32)(PageGetLSN(bufferinfo->pageinfo.page) >> shiftSz), 
-                                          (uint32)(PageGetLSN(bufferinfo->pageinfo.page)), 
-                                          bufferinfo->blockinfo.rnode.spcNode, bufferinfo->blockinfo.rnode.dbNode,
-                                          bufferinfo->blockinfo.rnode.relNode, bufferinfo->blockinfo.blkno)));
+                    ereport(mode, (errmsg("extreme_rto not mark dirty:lsn %X/%X, lsn_disk %X/%X, "
+                                        "lsn_page %X/%X, page %u/%u/%u %u",
+                                        (uint32)(bufferinfo->lsn >> shiftSz), (uint32)(bufferinfo->lsn),
+                                        (uint32)(bufDesc->extra->lsn_on_disk >> shiftSz),
+                                        (uint32)(bufDesc->extra->lsn_on_disk),
+                                        (uint32)(PageGetLSN(bufferinfo->pageinfo.page) >> shiftSz),
+                                        (uint32)(PageGetLSN(bufferinfo->pageinfo.page)), 
+                                        bufferinfo->blockinfo.rnode.spcNode, bufferinfo->blockinfo.rnode.dbNode,
+                                        bufferinfo->blockinfo.rnode.relNode, bufferinfo->blockinfo.blkno)));
                 }
 #ifdef USE_ASSERT_CHECKING
                 bufDesc->lsn_dirty = PageGetLSN(bufferinfo->pageinfo.page);
@@ -1725,6 +1706,7 @@ void ExtremeRtoFlushBuffer(RedoBufferInfo *bufferinfo, bool updateFsm)
         }
     }
 
+    SSMarkBufferDirtyForERTO(bufferinfo);
     if (updateFsm) {
         UpdateFsm(&bufferinfo->blockinfo, freespace);
     }
@@ -1770,10 +1752,12 @@ bool XLogBlockRedoForExtremeRTO(XLogRecParseState *redoblocktate, RedoBufferInfo
         ereport(PANIC, (errmsg("XLogBlockRedoForExtremeRTO: redobuffer checkfailed")));
     }
     if (block_valid <= BLOCK_DATA_FSM_TYPE) {
-        GetRedoStartTime(redoCost);
-        Assert(block_valid == g_xlogExtRtoRedoTable[block_valid].block_valid);
-        g_xlogExtRtoRedoTable[block_valid].xlog_redoextrto(blockhead, blockrecbody, bufferinfo);
-        CountRedoTime(redoCost);
+        if (redoaction != BLK_DONE) {
+            GetRedoStartTime(redoCost);
+            Assert(block_valid == g_xlogExtRtoRedoTable[block_valid].block_valid);
+            g_xlogExtRtoRedoTable[block_valid].xlog_redoextrto(blockhead, blockrecbody, bufferinfo);
+            CountRedoTime(redoCost);
+        }
 #ifdef USE_ASSERT_CHECKING
         if (block_valid != BLOCK_DATA_UNDO_TYPE && !bufferinfo->pageinfo.ignorecheck) {
             DoRecordCheck(redoblocktate, PageGetLSN(bufferinfo->pageinfo.page), true);
@@ -1785,6 +1769,33 @@ bool XLogBlockRedoForExtremeRTO(XLogRecParseState *redoblocktate, RedoBufferInfo
                                  (uint32)(blockhead->end_ptr >> 32), (uint32)(blockhead->end_ptr))));
     }
     return false;
+}
+
+void XlogBlockRedoForOndemandExtremeRTOQuery(XLogRecParseState *redoBlockState, RedoBufferInfo *bufferInfo)
+{
+
+    XLogBlockHead *blockHead = &redoBlockState->blockparse.blockhead;
+    void *blockrecBody = &redoBlockState->blockparse.extra_rec;
+    uint16 blockValid = XLogBlockHeadGetValidInfo(blockHead);
+
+    bool checkValid = XLogBlockRefreshRedoBufferInfo(blockHead, bufferInfo);
+    if (!checkValid) {
+        ereport(PANIC, (errmsg("XLogBlockRedoForOndemandExtremeRTOQuery: redobuffer checkfailed")));
+    }
+    if (blockValid <= BLOCK_DATA_FSM_TYPE) {
+        Assert(blockValid == g_xlogExtRtoRedoTable[blockValid].block_valid);
+        g_xlogExtRtoRedoTable[blockValid].xlog_redoextrto(blockHead, blockrecBody, bufferInfo);
+#ifdef USE_ASSERT_CHECKING
+        if (blockValid != BLOCK_DATA_UNDO_TYPE) {
+            DoRecordCheck(redoBlockState, PageGetLSN(bufferInfo->pageinfo.page), true);
+        }
+#endif
+    } else {
+        ereport(WARNING, (errmsg("XLogBlockRedoForOndemandExtremeRTOQuery: unsuport type %u, lsn %X/%X",
+                                 (uint32)blockValid,
+                                 (uint32)(blockHead->end_ptr >> 32),
+                                 (uint32)(blockHead->end_ptr))));
+    }
 }
 
 static const XLogParseBlock g_xlogParseBlockTable[RM_MAX_ID + 1] = {

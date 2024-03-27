@@ -19,9 +19,13 @@
 #include "access/xact.h"
 #include "access/transam.h"
 #include "access/tableam.h"
+#include "access/tuptoaster.h"
 #include "access/sysattr.h"
 #include "access/ustore/knl_utuple.h"
+#include "access/ustore/knl_uvisibility.h"
 #include "access/ustore/knl_whitebox_test.h"
+#include "access/tuptoaster.h"
+#include "utils/typcache.h"
 
 #define TUPLE_IS_HEAP_TUPLE(tup) (((HeapTuple)tup)->tupTableType == HEAP_TUPLE)
 #define TUPLE_IS_UHEAP_TUPLE(tup) (((UHeapTuple)tup)->tupTableType == UHEAP_TUPLE)
@@ -56,7 +60,7 @@ void CheckTupleValidity(Relation rel, UHeapTuple utuple)
 uint32 UHeapCalcTupleDataSize(TupleDesc tuple_desc, Datum *values, const bool *is_nulls, uint32 hoff,
     bool enableReverseBitmap, bool enableReserve)
 {
-    Form_pg_attribute *attrs = tuple_desc->attrs;
+    FormData_pg_attribute *attrs = tuple_desc->attrs;
     int attrNum = tuple_desc->natts;
     int size = hoff;
 
@@ -65,7 +69,7 @@ uint32 UHeapCalcTupleDataSize(TupleDesc tuple_desc, Datum *values, const bool *i
     Assert(enableReverseBitmap || (enableReverseBitmap == false && enableReserve == false));
 
     for (int i = 0; i < attrNum; ++i) {
-        Form_pg_attribute attr = attrs[i];
+        Form_pg_attribute attr = &attrs[i];
         Datum val = values[i];
 
         if (is_nulls[i] && (!enableReserve || !attr->attbyval || ATT_IS_DROPPED(attr))) {
@@ -121,7 +125,7 @@ void UHeapFillDiskTuple(TupleDesc tupleDesc, Datum *values, const bool *isnull, 
     Assert(!enableReserve || enableReverseBitmap);
     Assert(enableReverseBitmap || (enableReverseBitmap == false && enableReserve == false));
 
-    Form_pg_attribute *att = tupleDesc->attrs;
+    FormData_pg_attribute *att = tupleDesc->attrs;
     char *data = (char *)diskTuple->data;
 
     if (hasnull) {
@@ -166,11 +170,11 @@ void UHeapFillDiskTuple(TupleDesc tupleDesc, Datum *values, const bool *isnull, 
             }
 
             if (isnull[i]) {
-                if (!enableReserve || !att[i]->attbyval || ATT_IS_DROPPED(att[i])) {
+                if (!enableReserve || !att[i].attbyval || ATT_IS_DROPPED(&att[i])) {
                     ;
                 } else {
-                    Assert(att[i]->attlen > 0);
-                    data += att[i]->attlen;
+                    Assert(att[i].attlen > 0);
+                    data += att[i].attlen;
                     *bitPReserve |= bitmaskReserve;
                 }
 
@@ -187,13 +191,13 @@ void UHeapFillDiskTuple(TupleDesc tupleDesc, Datum *values, const bool *isnull, 
             *bitP |= bitmask;
         }
 
-        if (att[i]->attbyval) {
+        if (att[i].attbyval) {
             /* pass-by-value
              * Not aligned
              */
-            store_att_byval(data, values[i], att[i]->attlen);
-            attrLength = att[i]->attlen;
-        } else if (att[i]->attlen == LEN_VARLENA) {
+            store_att_byval(data, values[i], att[i].attlen);
+            attrLength = att[i].attlen;
+        } else if (att[i].attlen == LEN_VARLENA) {
             /* varlena */
             Pointer val = DatumGetPointer(values[i]);
 
@@ -209,29 +213,29 @@ void UHeapFillDiskTuple(TupleDesc tupleDesc, Datum *values, const bool *isnull, 
                 Assert(attrLength <= MaxPossibleUHeapTupleSize);
                 rc = memcpy_s(data, remainingLen, val, attrLength);
                 securec_check(rc, "\0", "\0");
-            } else if (att[i]->attstorage != 'p' && VARATT_CAN_MAKE_SHORT(val)) {
+            } else if (att[i].attstorage != 'p' && VARATT_CAN_MAKE_SHORT(val)) {
                 attrLength = VARATT_CONVERTED_SHORT_SIZE(val);
                 SET_VARSIZE_SHORT(data, attrLength);
                 Assert(attrLength <= MaxPossibleUHeapTupleSize);
                 rc = memcpy_s(data + 1, remainingLen, VARDATA(val), attrLength - 1);
                 securec_check(rc, "\0", "\0");
             } else {
-                data = (char *)att_align_nominal(data, att[i]->attalign);
+                data = (char *)att_align_nominal(data, att[i].attalign);
                 attrLength = VARSIZE(val);
                 rc = memcpy_s(data, remainingLen, val, attrLength);
                 securec_check(rc, "\0", "\0");
             }
-        } else if (att[i]->attlen == LEN_CSTRING) {
+        } else if (att[i].attlen == LEN_CSTRING) {
             diskTuple->flag |= HEAP_HASVARWIDTH;
-            Assert(att[i]->attalign == 'c');
+            Assert(att[i].attalign == 'c');
             attrLength = strlen(DatumGetCString(values[i])) + 1;
             Assert(attrLength <= MaxPossibleUHeapTupleSize);
             rc = memcpy_s(data, remainingLen, DatumGetPointer(values[i]), attrLength);
             securec_check(rc, "\0", "\0");
         } else {
-            data = (char *)att_align_nominal(data, att[i]->attalign);
-            Assert(att[i]->attlen > 0);
-            attrLength = att[i]->attlen;
+            data = (char *)att_align_nominal(data, att[i].attalign);
+            Assert(att[i].attlen > 0);
+            attrLength = att[i].attlen;
             rc = memcpy_s(data, remainingLen, DatumGetPointer(values[i]), attrLength);
             securec_check(rc, "\0", "\0");
         }
@@ -303,7 +307,7 @@ void UHeapCopyDiskTupleNoNull(TupleDesc tupleDesc, const bool *destNull, UHeapTu
     uint32 bitmask = HIGHBIT;
     bits8 *bitPReserve = NULL;
     uint32 bitmaskReserve = 0;
-    Form_pg_attribute *att = tupleDesc->attrs;
+    FormData_pg_attribute *att = tupleDesc->attrs;
 
     int tupleAttrs = UHeapTupleHeaderGetNatts(srcDtup);
     bitPReserve = (bits8*)((char *)destDtup->data  + (tupleAttrs / ISNULL_ATTRS_PER_BYTE));
@@ -325,13 +329,13 @@ void UHeapCopyDiskTupleNoNull(TupleDesc tupleDesc, const bool *destNull, UHeapTu
             *bitP |= bitmask;
         }
 
-        if (att[i]->attbyval) {
+        if (att[i].attbyval) {
             /* attribute passed by value */
             if (destNull[i]) {
-                srcOff += att[i]->attlen;
+                srcOff += att[i].attlen;
                 if (enableReserve) {
-                    Assert(att[i]->attlen > 0);
-                    data += att[i]->attlen;
+                    Assert(att[i].attlen > 0);
+                    data += att[i].attlen;
                     *bitPReserve |= bitmaskReserve;
                 }
 
@@ -344,16 +348,16 @@ void UHeapCopyDiskTupleNoNull(TupleDesc tupleDesc, const bool *destNull, UHeapTu
 
                 continue;
             }
-            attrLength = att[i]->attlen;
-            store_att_byval(data, *((Datum *)((char *)srcTupPtr + srcOff)), att[i]->attlen);
-        } else if (att[i]->attlen == LEN_VARLENA) {
+            attrLength = att[i].attlen;
+            store_att_byval(data, *((Datum *)((char *)srcTupPtr + srcOff)), att[i].attlen);
+        } else if (att[i].attlen == LEN_VARLENA) {
             /* varlena */
-            srcOff = att_align_pointer(srcOff, att[i]->attalign, -1, srcTupPtr + srcOff);
+            srcOff = att_align_pointer(srcOff, att[i].attalign, -1, srcTupPtr + srcOff);
             attrLength = VARSIZE_ANY(srcTupPtr + srcOff);
 
             if (!destNull[i]) {
                 Pointer val = (Pointer) (srcTupPtr + srcOff);
-                data = UHeapCopyDtupleVarlena(val, data, attrLength, remainingLen, att[i]);
+                data = UHeapCopyDtupleVarlena(val, data, attrLength, remainingLen, &att[i]);
             } else {
                 if (bitmaskReserve != HIGHBIT) {
                     bitmaskReserve <<= 1;
@@ -362,14 +366,14 @@ void UHeapCopyDiskTupleNoNull(TupleDesc tupleDesc, const bool *destNull, UHeapTu
                     bitmaskReserve = 1;
                 }
             }
-        } else if (att[i]->attlen == LEN_CSTRING) {
+        } else if (att[i].attlen == LEN_CSTRING) {
             /* null terminated cstring */
-            srcOff = att_align_nominal(srcOff, att[i]->attalign);
-            Assert(att[i]->attalign == 'c');
+            srcOff = att_align_nominal(srcOff, att[i].attalign);
+            Assert(att[i].attalign == 'c');
             attrLength = (uint32)strlen(srcTupPtr + srcOff) + 1;
             Assert(attrLength <= MaxPossibleUHeapTupleSize);
             if (!destNull[i]) {
-                data = (char *)att_align_nominal(data, att[i]->attalign);
+                data = (char *)att_align_nominal(data, att[i].attalign);
                 rc = memcpy_s(data, remainingLen, (srcTupPtr + srcOff), attrLength);
                 securec_check(rc, "\0", "\0");
             } else {
@@ -382,12 +386,12 @@ void UHeapCopyDiskTupleNoNull(TupleDesc tupleDesc, const bool *destNull, UHeapTu
             }
         } else {
             /* fixed length */
-            srcOff = att_align_nominal(srcOff, att[i]->attalign);
-            Assert(att[i]->attlen > 0);
-            attrLength = att[i]->attlen;
+            srcOff = att_align_nominal(srcOff, att[i].attalign);
+            Assert(att[i].attlen > 0);
+            attrLength = att[i].attlen;
 
             if (!destNull[i]) {
-                data = (char *)att_align_nominal(data, att[i]->attalign);
+                data = (char *)att_align_nominal(data, att[i].attalign);
                 rc = memcpy_s(data, remainingLen, (srcTupPtr + srcOff), attrLength);
                 securec_check(rc, "\0", "\0");
             } else {
@@ -433,7 +437,7 @@ void UHeapCopyDiskTupleWithNulls(TupleDesc tupleDesc, const bool *destNull, UHea
     uint32 bitmask = HIGHBIT;
     bits8 *bitPReserve = NULL;
     uint32 bitmaskReserve = 0;
-    Form_pg_attribute *att = tupleDesc->attrs;
+    FormData_pg_attribute *att = tupleDesc->attrs;
 
     int srcnullcount = 0;
 
@@ -456,9 +460,9 @@ void UHeapCopyDiskTupleWithNulls(TupleDesc tupleDesc, const bool *destNull, UHea
         if (att_isnull(i, srcBp)) {
             if (enableReverseBitmap) {
                 if (!att_isnull(tupleAttrs + srcnullcount, srcBp)) {
-                    Assert(att[i]->attlen > 0);
-                    data += att[i]->attlen;
-                    srcOff += att[i]->attlen;
+                    Assert(att[i].attlen > 0);
+                    data += att[i].attlen;
+                    srcOff += att[i].attlen;
                     *bitPReserve |= bitmaskReserve;
                 }
             }
@@ -477,13 +481,13 @@ void UHeapCopyDiskTupleWithNulls(TupleDesc tupleDesc, const bool *destNull, UHea
         if (!destNull[i])
             *bitP |= bitmask;
 
-        if (att[i]->attbyval) {
+        if (att[i].attbyval) {
             /* attribute is passed by value */
             if (destNull[i]) {
-                srcOff += att[i]->attlen;
+                srcOff += att[i].attlen;
                 if (enableReserve) {
-                    Assert(att[i]->attlen > 0);
-                    data += att[i]->attlen;
+                    Assert(att[i].attlen > 0);
+                    data += att[i].attlen;
                     *bitPReserve |= bitmaskReserve;
                 }
 
@@ -496,16 +500,16 @@ void UHeapCopyDiskTupleWithNulls(TupleDesc tupleDesc, const bool *destNull, UHea
 
                 continue;
             }
-            attrLength = att[i]->attlen;
-            store_att_byval(data, *((Datum *)((char *)srcTupPtr + srcOff)), att[i]->attlen);
-        } else if (att[i]->attlen == LEN_VARLENA) {
+            attrLength = att[i].attlen;
+            store_att_byval(data, *((Datum *)((char *)srcTupPtr + srcOff)), att[i].attlen);
+        } else if (att[i].attlen == LEN_VARLENA) {
             /* varlena */
-            srcOff = att_align_pointer(srcOff, att[i]->attalign, -1, srcTupPtr + srcOff);
+            srcOff = att_align_pointer(srcOff, att[i].attalign, -1, srcTupPtr + srcOff);
             attrLength = VARSIZE_ANY(srcTupPtr + srcOff);
 
             if (!destNull[i]) {
                 Pointer val = (Pointer) (srcTupPtr + srcOff);
-                data = UHeapCopyDtupleVarlena(val, data, attrLength, remainingLen, att[i]);
+                data = UHeapCopyDtupleVarlena(val, data, attrLength, remainingLen, &att[i]);
             } else {
                 if (bitmaskReserve != HIGHBIT) {
                     bitmaskReserve <<= 1;
@@ -514,14 +518,14 @@ void UHeapCopyDiskTupleWithNulls(TupleDesc tupleDesc, const bool *destNull, UHea
                     bitmaskReserve = 1;
                 }
             }
-        } else if (att[i]->attlen == LEN_CSTRING) {
+        } else if (att[i].attlen == LEN_CSTRING) {
             /* null terminated cstring */
-            srcOff = att_align_nominal(srcOff, att[i]->attalign);
-            Assert(att[i]->attalign == 'c');
+            srcOff = att_align_nominal(srcOff, att[i].attalign);
+            Assert(att[i].attalign == 'c');
             attrLength = (uint32)strlen(srcTupPtr + srcOff) + 1;
             Assert(attrLength <= MaxPossibleUHeapTupleSize);
             if (!destNull[i]) {
-                data = (char *)att_align_nominal(data, att[i]->attalign);
+                data = (char *)att_align_nominal(data, att[i].attalign);
                 rc = memcpy_s(data, remainingLen, (srcTupPtr + srcOff), attrLength);
                 securec_check(rc, "\0", "\0");
             } else {
@@ -534,11 +538,11 @@ void UHeapCopyDiskTupleWithNulls(TupleDesc tupleDesc, const bool *destNull, UHea
             }
         } else {
             /* fixed length */
-            srcOff = att_align_nominal(srcOff, att[i]->attalign);
-            Assert(att[i]->attlen > 0);
-            attrLength = att[i]->attlen;
+            srcOff = att_align_nominal(srcOff, att[i].attalign);
+            Assert(att[i].attlen > 0);
+            attrLength = att[i].attlen;
             if (!destNull[i]) {
-                data = (char *)att_align_nominal(data, att[i]->attalign);
+                data = (char *)att_align_nominal(data, att[i].attalign);
                 rc = memcpy_s(data, remainingLen, (srcTupPtr + srcOff), attrLength);
                 securec_check(rc, "\0", "\0");
             } else {
@@ -567,13 +571,15 @@ UHeapTuple UHeapFormTuple(TupleDesc tuple_desc, Datum *values, bool *is_nulls)
     bool enableReverseBitmap = NAttrsReserveSpace(attrNum);
     bool enableReserve = u_sess->attr.attr_storage.reserve_space_for_nullable_atts;
     UHeapDiskTupleData *diskTuple = NULL;
+    FormData_pg_attribute *att = tuple_desc->attrs;
     int nullcount = 0;
 
     enableReserve = enableReserve && enableReverseBitmap;
 
     if (attrNum > MaxTupleAttributeNumber) {
         ereport(ERROR, (errcode(ERRCODE_TOO_MANY_COLUMNS),
-            errmsg("number of columns (%d) exceeds limit (%d)", attrNum, MaxTupleAttributeNumber)));
+                        errmsg("number of columns (%d) exceeds limit (%d), AM type (%d), type id (%u)", attrNum,
+                               MaxTupleAttributeNumber, GetTableAmType(tuple_desc->td_tam_ops), tuple_desc->tdtypeid)));
     }
 
     WHITEBOX_TEST_STUB(UHEAP_FORM_TUPLE_FAILED, WhiteboxDefaultErrorEmit);
@@ -582,6 +588,14 @@ UHeapTuple UHeapFormTuple(TupleDesc tuple_desc, Datum *values, bool *is_nulls)
     for (i = 0; i < attrNum; i++) {
         if (is_nulls[i]) {
             nullcount++;
+        } else if (att[i].attlen == -1 && att[i].attalign == 'd' && att[i].attndims == 0 &&
+            !VARATT_IS_EXTENDED(DatumGetPointer(values[i]))) {
+            values[i] = toast_flatten_tuple_attribute(values[i], att[i].atttypid, att[i].atttypmod);
+        } else if (att[i].attlen == -1 && att[i].attalign == 'i' &&
+            VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(values[i])) &&
+            !(att[i].atttypid == CLOBOID || att[i].atttypid == BLOBOID)) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("only suport type(clob/blob) for more than 1G toast")));
         }
     }
     diskTupleSize = SizeOfUHeapDiskTupleData;
@@ -620,7 +634,7 @@ UHeapTuple UHeapFormTuple(TupleDesc tuple_desc, Datum *values, bool *is_nulls)
     }
 
     uheapTuplePtr->disk_tuple_size = diskTupleSize;
-
+    FastVerifyUTuple(uheapTuplePtr->disk_tuple, InvalidBuffer);
     return uheapTuplePtr;
 }
 
@@ -659,7 +673,7 @@ UHeapTuple UHeapModifyTuple(UHeapTuple tuple, TupleDesc tupleDesc, Datum *replVa
     /*
      * create a new tuple from the values and isnull arrays
      */
-    newTuple = (UHeapTuple)tableam_tops_form_tuple(tupleDesc, values, isnull, UHEAP_TUPLE);
+    newTuple = (UHeapTuple)tableam_tops_form_tuple(tupleDesc, values, isnull, TableAmUstore);
 
     pfree(values);
     pfree(isnull);
@@ -689,7 +703,7 @@ void SlotDeformUTuple(TupleTableSlot *slot, UHeapTuple tuple, long *offp, int na
     Datum *values = slot->tts_values;
     bool *isNulls = slot->tts_isnull;
     UHeapDiskTuple tup = tuple->disk_tuple;
-    Form_pg_attribute *att = tupleDesc->attrs;
+    FormData_pg_attribute *att = tupleDesc->attrs;
     bool hasnulls = UHeapDiskTupHasNulls(tup);
     char *tp = (char *) tup;
     bits8 *bp = tup->data;                 /* ptr to null bitmap in tuple */
@@ -713,7 +727,7 @@ void SlotDeformUTuple(TupleTableSlot *slot, UHeapTuple tuple, long *offp, int na
     }
 
     for (; attnum < nattsAvailable; attnum++) {
-        Form_pg_attribute thisatt = att[attnum];
+        Form_pg_attribute thisatt = &att[attnum];
 
         if (hasnulls && att_isnull(attnum, bp)) {
             /* Skip attribute length in case the tuple was stored with
@@ -741,7 +755,7 @@ void SlotDeformUTuple(TupleTableSlot *slot, UHeapTuple tuple, long *offp, int na
         }
 
         values[attnum] = fetchatt(thisatt, tp + off);
-        off = att_addlength_pointer(off, thisatt->attlen, tp + off);        
+        off = att_addlength_pointer(off, thisatt->attlen, tp + off);
     }
 
     /*
@@ -771,7 +785,7 @@ void UHeapDeformTupleGuts(UHeapTuple utuple, TupleDesc rowDesc, Datum *values, b
 
     UHeapDiskTuple diskTuple = utuple->disk_tuple;
     bool hasnulls = UHeapDiskTupHasNulls(diskTuple);
-    Form_pg_attribute *att = rowDesc->attrs;
+    FormData_pg_attribute *att = rowDesc->attrs;
     int natts; /* number of atts to extract */
     int attnum;
     bits8 *bp = diskTuple->data;
@@ -785,7 +799,7 @@ void UHeapDeformTupleGuts(UHeapTuple utuple, TupleDesc rowDesc, Datum *values, b
 
     natts = Min(tupleAttrs, unatts);
     for (attnum = 0; attnum < natts; attnum++) {
-        Form_pg_attribute thisatt = att[attnum];
+        Form_pg_attribute thisatt = &att[attnum];
 
         if (hasnulls && att_isnull(attnum, bp)) {
             /* Skip attribute length in case the tuple was stored with
@@ -817,7 +831,6 @@ void UHeapDeformTupleGuts(UHeapTuple utuple, TupleDesc rowDesc, Datum *values, b
         }
 
         values[attnum] = fetchatt(thisatt, tupPtr + off);
-
         off = att_addlength_pointer(off, thisatt->attlen, tupPtr + off);
     }
 
@@ -871,39 +884,6 @@ HeapTuple UHeapToHeap(TupleDesc tuple_desc, UHeapTuple uheaptuple)
 }
 
 /*
- * This is similar to heap version's SetHintBits but handles Inplace tuples instead.
- */
-void UHeapTupleSetHintBits(UHeapDiskTuple tuple, Buffer buffer, uint16 infomask, TransactionId xid)
-{
-    // The following scenario may use local snapshot, so do not set hint bits.
-    // Notice: we don't support two or more bits within infomask.
-    //
-    Assert(infomask > 0);
-    Assert((infomask & (infomask - 1)) == 0);
-    if ((t_thrd.xact_cxt.useLocalSnapshot && !(infomask & UHEAP_XID_COMMITTED)) || RecoveryInProgress() ||
-        g_instance.attr.attr_storage.IsRoachStandbyCluster) {
-        ereport(DEBUG2, (errmsg("ignore setting tuple hint bits when local snapshot is used.")));
-        return;
-    }
-
-    if (XACT_READ_UNCOMMITTED == u_sess->utils_cxt.XactIsoLevel && !(infomask & UHEAP_XID_COMMITTED)) {
-        ereport(DEBUG2, (errmsg("ignore setting tuple hint bits when XACT_READ_UNCOMMITTED is used.")));
-        return;
-    }
-
-    if (TransactionIdIsValid(xid)) {
-        /* NB: xid must be known committed here! */
-        XLogRecPtr commitLSN = TransactionIdGetCommitLSN(xid);
-        if (BufferIsPermanent(buffer) && XLogNeedsFlush(commitLSN) && XLByteLT(BufferGetLSNAtomic(buffer), commitLSN)) {
-            /* not flushed and no LSN interlock, so don't set hint */
-            return;
-        }
-    }
-
-    MarkBufferDirtyHint(buffer, true);
-}
-
-/*
  * UHeapGetSysAttr
  * Fetch the value of a system attribute for a tuple.
  */
@@ -923,6 +903,62 @@ Datum UHeapGetSysAttr(UHeapTuple uhtup, Buffer buf, int attnum, TupleDesc tupleD
             result = PointerGetDatum(&(uhtup->ctid));
             break;
         case MinTransactionIdAttributeNumber:
+            {
+                UHeapTupleTransInfo uinfo;
+                bool releaseBuf = false;
+                OffsetNumber offnum = ItemPointerGetOffsetNumber(&uhtup->ctid);
+                OffsetNumber blockno = ItemPointerGetBlockNumber(&uhtup->ctid);
+
+                /*
+                 * For xmin we may need to fetch the information from the undo
+                 * record, so ensure we have a valid buffer.
+                 *
+                 * ZBORKED: It does not seem acceptable to call
+                 * relation_open() here. This is a very low-level function
+                 * which has no business touching the relcache.
+                 */
+                if (!BufferIsValid(buf)) {
+                    Relation rel = relation_open(uhtup->table_oid, NoLock);
+                    buf = ReadBuffer(rel, blockno);
+                    relation_close(rel, NoLock);
+                    releaseBuf = true;
+                }
+
+                TransactionId lastXid = InvalidTransactionId;
+                UndoRecPtr urp = INVALID_UNDO_REC_PTR;
+                UndoTraversalState state = UHeapTupleGetTransInfo(buf, offnum, &uinfo, NULL, &lastXid, &urp);
+                if (releaseBuf) {
+                    ReleaseBuffer(buf);
+                }
+
+                if (state == UNDO_TRAVERSAL_ABORT) {
+                    int zoneId = (int)UNDO_PTR_GET_ZONE_ID(urp);
+                    undo::UndoZone *uzone = undo::UndoZoneGroup::GetUndoZone(zoneId, false);
+                    ereport(ERROR, (errmodule(MOD_UNDO), errmsg(
+                        "snapshot too old! the undo record has been force discard. "
+                        "Reason: Need fetch transInfo. "
+                        "LogInfo: undo state %d, tuple flag %u. "
+                        "TDInfo: tdxid %lu, tdid %d, undoptr %lu. "
+                        "TransInfo: xid %lu, oid %u, tid(%u, %u), lastXid %lu"
+                        "globalRecycleXid %lu, globalFrozenXid %lu."
+                        "ZoneInfo: urp: %lu, zid %d, insertUrecPtr %lu, forceDiscardUrecPtr %lu, "
+                        "discardUrecPtr %lu, recycleXid %lu. ",
+                        state, PtrGetVal(PtrGetVal(uhtup, disk_tuple), flag),
+                        uinfo.xid, uinfo.td_slot, uinfo.urec_add,
+                        GetTopTransactionIdIfAny(), PtrGetVal(uhtup, table_oid), blockno, offnum, lastXid,
+                        pg_atomic_read_u64(&g_instance.undo_cxt.globalRecycleXid),
+                        pg_atomic_read_u64(&g_instance.undo_cxt.globalFrozenXid),
+                        urp, zoneId, PtrGetVal(uzone, GetInsertURecPtr()), PtrGetVal(uzone, GetForceDiscardURecPtr()),
+                        PtrGetVal(uzone, GetDiscardURecPtr()), PtrGetVal(uzone, GetRecycleXid()))));
+                }
+
+                if (!TransactionIdIsValid(uinfo.xid) || TransactionIdOlderThanAllUndo(uinfo.xid)) {
+                    uinfo.xid = FrozenTransactionId;
+                }
+
+                result = TransactionIdGetDatum(uinfo.xid);
+            }
+            break;
         case MaxTransactionIdAttributeNumber:
         case MinCommandIdAttributeNumber:
         case MaxCommandIdAttributeNumber:
@@ -1069,6 +1105,7 @@ void UHeapCopyTupleWithBuffer(UHeapTuple srcTup, UHeapTuple destTup)
     errno_t rc = memcpy_s((char *)destTup->disk_tuple, destTup->disk_tuple_size, (char *)srcTup->disk_tuple,
         srcTup->disk_tuple_size);
     securec_check(rc, "\0", "\0");
+    FastVerifyUTuple(destTup->disk_tuple, InvalidBuffer);
 }
 
 /*
@@ -1146,12 +1183,13 @@ bool UHeapAttIsNull(UHeapTuple tup, int attnum, TupleDesc tupleDesc)
 Datum UHeapNoCacheGetAttr(UHeapTuple tuple, uint32 attnum, TupleDesc tupleDesc)
 {
     UHeapDiskTuple tup = tuple->disk_tuple;
-    Form_pg_attribute *att = tupleDesc->attrs;
+    FormData_pg_attribute *att = tupleDesc->attrs;
     char *tp = (char *)tup; /* ptr to data part of tuple */
     bits8 *bp = tup->data;  /* ptr to null bitmap in tuple */
     bool slow = false;      /* do we have to walk attrs? */
     int off;                /* current offset within data */
     int hoff = tup->t_hoff; /* header length on tuple data */
+    bool hasnulls = UHeapDiskTupHasNulls(tup);
 
     /* ----------------
      * Three cases:
@@ -1207,7 +1245,7 @@ Datum UHeapNoCacheGetAttr(UHeapTuple tuple, uint32 attnum, TupleDesc tupleDesc)
          */
         if (UHeapDiskTupHasVarWidth(tup)) {
             for (uint32 j = 0; j <= attnum; j++) {
-                if (att[j]->attlen <= 0) {
+                if (att[j].attlen <= 0) {
                     slow = true;
                     break;
                 }
@@ -1228,26 +1266,26 @@ Datum UHeapNoCacheGetAttr(UHeapTuple tuple, uint32 attnum, TupleDesc tupleDesc)
          * fixed-width columns, in hope of avoiding future visits to this
          * routine.
          */
-        att[0]->attcacheoff = 0;
+        att[0].attcacheoff = 0;
 
         /* we might have set some offsets in the slow path previously */
-        while (j < natts && att[j]->attcacheoff > 0)
+        while (j < natts && att[j].attcacheoff > 0)
             j++;
 
-        off = att[j - 1]->attcacheoff + att[j - 1]->attlen;
+        off = att[j - 1].attcacheoff + att[j - 1].attlen;
 
         for (; j < natts; j++) {
-            if (att[j]->attlen <= 0)
+            if (att[j].attlen <= 0)
                 break;
 
-            att[j]->attcacheoff = off;
+            att[j].attcacheoff = off;
 
-            off += att[j]->attlen;
+            off += att[j].attlen;
         }
 
         Assert(j > attnum);
 
-        off = att[attnum]->attcacheoff + hoff;
+        off = att[attnum].attcacheoff + hoff;
     } else {
         bool usecache = true;
 
@@ -1265,14 +1303,13 @@ Datum UHeapNoCacheGetAttr(UHeapTuple tuple, uint32 attnum, TupleDesc tupleDesc)
         int nullcount = 0;
         int tupleAttrs = UHeapTupleHeaderGetNatts(tup);
         bool enableReverseBitmap = NAttrsReserveSpace(tupleAttrs);
-        for (uint32 i = 0;; i++) { /* loop exit is at "break" */
-            int attrLen = att[i]->attlen;
-
+        for (uint32 i = 0; i <= attnum; i++) { /* loop exit is at "break" */
             Assert(i < (uint32)tupleDesc->natts);
+            int attrLen = att[i].attlen;
 
-            if (UHeapDiskTupHasNulls(tup) && att_isnull(i, bp)) {
+            if (hasnulls && att_isnull(i, bp)) {
                 if (enableReverseBitmap && !att_isnull(tupleAttrs + nullcount, bp))
-                    off += att[i]->attlen;
+                    off += att[i].attlen;
 
                 nullcount++;
 
@@ -1280,26 +1317,26 @@ Datum UHeapNoCacheGetAttr(UHeapTuple tuple, uint32 attnum, TupleDesc tupleDesc)
                 continue; /* this cannot be the target att */
             }
 
-            if (att[i]->attlen == LEN_VARLENA) {
-                off = att_align_pointer(off, att[i]->attalign, -1, tp + off);
+            if (att[i].attlen == LEN_VARLENA) {
+                off = att_align_pointer(off, att[i].attalign, -1, tp + off);
                 attrLen = VARSIZE_ANY(tp + off);
-            } else if (!att[i]->attbyval) {
-                off = att_align_nominal(off, att[i]->attalign);
+            } else if (!att[i].attbyval) {
+                off = att_align_nominal(off, att[i].attalign);
             } else if (usecache) {
-                att[i]->attcacheoff = off - hoff;
+                att[i].attcacheoff = off - hoff;
             }
 
-            if (i == attnum)
+            if (i == (uint32)attnum)
                 break;
 
-            off = att_addlength_pointer(off, att[i]->attlen, tp + off);
+            off = att_addlength_pointer(off, att[i].attlen, tp + off);
 
-            if (usecache && att[i]->attlen <= 0)
+            if (usecache && att[i].attlen <= 0)
                 usecache = false;
         }
     }
 
-    return fetchatt(att[attnum], tp + off);
+    return fetchatt(&att[attnum], tp + off);
 }
 
 
@@ -1314,8 +1351,8 @@ HeapTuple UHeapCopyHeapTuple(TupleTableSlot *slot)
 {
     HeapTuple tuple;
 
-    Assert(!slot->tts_isempty);
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(!TTS_EMPTY(slot));
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     UHeapSlotGetAllAttrs(slot);
 
@@ -1342,20 +1379,20 @@ void UHeapSlotClear(TupleTableSlot *slot)
      * sanity checks
      */
     Assert(slot != NULL);
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     /*
      * Free any old physical tuple belonging to the slot.
      */
-    if (slot->tts_shouldFree && (UHeapTuple)slot->tts_tuple != NULL) {
+    if (TTS_SHOULDFREE(slot) && (UHeapTuple)slot->tts_tuple != NULL) {
         UHeapFreeTuple(slot->tts_tuple);
         slot->tts_tuple = NULL;
-        slot->tts_shouldFree = false;
+        slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
     }
 
-    if (slot->tts_shouldFreeMin) {
+    if (TTS_SHOULDFREEMIN(slot)) {
         heap_free_minimal_tuple(slot->tts_mintuple);
-        slot->tts_shouldFreeMin = false;
+        slot->tts_flags &= ~TTS_FLAG_SHOULDFREEMIN;
     }
 }
 
@@ -1369,7 +1406,7 @@ void UHeapSlotClear(TupleTableSlot *slot)
  */
 void UHeapSlotGetSomeAttrs(TupleTableSlot *slot, int attnum)
 {
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     /* Quick out if we have 'em all already */
     if (slot->tts_nvalid >= attnum) {
@@ -1381,7 +1418,7 @@ void UHeapSlotGetSomeAttrs(TupleTableSlot *slot, int attnum)
 
 void UHeapSlotFormBatch(TupleTableSlot* slot, VectorBatch* batch, int cur_rows, int attnum)
 {
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     /* Quick out if we have all already */
     if (slot->tts_nvalid >= attnum) {
@@ -1393,7 +1430,7 @@ void UHeapSlotFormBatch(TupleTableSlot* slot, VectorBatch* batch, int cur_rows, 
     bool isNull = slot->tts_isnull;
     UHeapDiskTuple diskTuple = utuple->disk_tuple;
     bool hasNull = UHeapDiskTupHasNulls(diskTuple);
-    Form_pg_attribute* att = rowDesc->attrs;
+    FormData_pg_attribute* att = rowDesc->attrs;
     int attno;
     bits8* bp = diskTuple->data;
     long off = diskTuple->t_hoff;
@@ -1406,7 +1443,7 @@ void UHeapSlotFormBatch(TupleTableSlot* slot, VectorBatch* batch, int cur_rows, 
 
     int natts = Min(tupleAttrs, attnum);
     for (attno = 0; attno < natts; attno++) {
-        Form_pg_attribute thisatt = att[attno];
+        Form_pg_attribute thisatt = &att[attno];
         ScalarVector* pVector = &batch->m_arr[attno];
 
         if (hasNull && att_isnull(attno, bp)) {
@@ -1477,7 +1514,7 @@ bool UHeapSlotAttIsNull(const TupleTableSlot *slot, int attnum)
     TupleDesc tupleDesc = slot->tts_tupleDescriptor;
     UHeapTuple uhtup = (UHeapTuple)slot->tts_tuple;
 
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     /*
      * system attributes are handled by heap_attisnull
@@ -1534,7 +1571,7 @@ bool UHeapSlotAttIsNull(const TupleTableSlot *slot, int attnum)
  */
 void UHeapSlotGetAllAttrs(TupleTableSlot *slot)
 {
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     /* Quick out if we have 'em all already */
     if (slot->tts_nvalid == slot->tts_tupleDescriptor->natts) {
@@ -1602,7 +1639,7 @@ Datum UHeapSlotGetAttr(TupleTableSlot *slot, int attnum, bool *isnull)
      * This case should not happen in normal use, but it could happen if we
      * are executing a plan cached before the column was dropped.
      */
-    if (tupleDesc->attrs[attnum - 1]->attisdropped) {
+    if (tupleDesc->attrs[attnum - 1].attisdropped) {
         *isnull = true;
         return (Datum)0;
     }
@@ -1671,9 +1708,9 @@ MinimalTuple UHeapSlotCopyMinimalTuple(TupleTableSlot *slot)
      * sanity checks.
      */
     Assert(slot != NULL);
-    Assert(!slot->tts_isempty);
+    Assert(!TTS_EMPTY(slot));
     Assert(slot->tts_tupleDescriptor != NULL);
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     UHeapSlotGetAllAttrs(slot);
 
@@ -1696,7 +1733,7 @@ MinimalTuple UHeapSlotGetMinimalTuple(TupleTableSlot *slot)
      * sanity checks
      */
     Assert(slot != NULL);
-    Assert(!slot->tts_isempty);
+    Assert(!TTS_EMPTY(slot));
 
     /*
      * If we have a minimal physical tuple (local or not) then just return it.
@@ -1713,7 +1750,7 @@ MinimalTuple UHeapSlotGetMinimalTuple(TupleTableSlot *slot)
      */
     MemoryContext oldContext = MemoryContextSwitchTo(slot->tts_mcxt);
     slot->tts_mintuple = UHeapSlotCopyMinimalTuple(slot);
-    slot->tts_shouldFreeMin = true;
+    slot->tts_flags |= TTS_FLAG_SHOULDFREEMIN;
     MemoryContextSwitchTo(oldContext);
 
     /*
@@ -1741,16 +1778,16 @@ void UHeapSlotStoreMinimalTuple(MinimalTuple mtup, TupleTableSlot *slot, bool sh
     Assert(mtup != NULL);
     Assert(slot != NULL);
     Assert(slot->tts_tupleDescriptor != NULL);
-    Assert(slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
 
     /*
      * Free any old physical tuple belonging to the slot.
      */
-    if (slot->tts_shouldFree && (UHeapTuple)slot->tts_tuple != NULL) {
+    if (TTS_SHOULDFREE(slot) && (UHeapTuple)slot->tts_tuple != NULL) {
         UHeapFreeTuple(slot->tts_tuple);
         slot->tts_tuple = NULL;
     }
-    if (slot->tts_shouldFreeMin) {
+    if (TTS_SHOULDFREEMIN(slot)) {
         heap_free_minimal_tuple(slot->tts_mintuple);
     }
 
@@ -1765,9 +1802,14 @@ void UHeapSlotStoreMinimalTuple(MinimalTuple mtup, TupleTableSlot *slot, bool sh
     /*
      * Store the new tuple into the specified slot.
      */
-    slot->tts_isempty = false;
-    slot->tts_shouldFree = false;
-    slot->tts_shouldFreeMin = shouldFree;
+    slot->tts_flags &= ~TTS_FLAG_EMPTY;
+    slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+    if (shouldFree) {
+        slot->tts_flags |= TTS_FLAG_SHOULDFREEMIN;
+    } else {
+        slot->tts_flags &= ~TTS_FLAG_SHOULDFREEMIN;
+    }
+
     slot->tts_tuple = &slot->tts_minhdr;
     slot->tts_mintuple = mtup;
 
@@ -1776,7 +1818,7 @@ void UHeapSlotStoreMinimalTuple(MinimalTuple mtup, TupleTableSlot *slot, bool sh
     slot->tts_minhdr.t_data = (HeapTupleHeader)((char *)mtup - MINIMAL_TUPLE_OFFSET);
 
     /* This slot now contains a HEAP_TUPLE so make sure to let callers know how to read it */
-    slot->tts_tupslotTableAm = TAM_HEAP;
+    slot->tts_tam_ops = TableAmHeap;
 
     /* no need to set t_self or t_tableOid since we won't allow access */
     /* Mark extracted state invalid */
@@ -1796,12 +1838,12 @@ void UHeapSlotStoreUHeapTuple(UHeapTuple utuple, TupleTableSlot *slot, bool shou
      * sanity checks
      */
     Assert(utuple != NULL && utuple->tupTableType == UHEAP_TUPLE);
-    Assert(slot != NULL && slot->tts_tupslotTableAm == TAM_USTORE);
+    Assert(slot != NULL && TTS_TABLEAM_IS_USTORE(slot));
     Assert(slot->tts_tupleDescriptor != NULL);
 
-    if (slot->tts_shouldFreeMin) {
+    if (TTS_SHOULDFREEMIN(slot)) {
         heap_free_minimal_tuple(slot->tts_mintuple);
-        slot->tts_shouldFreeMin = false;
+        slot->tts_flags &= ~TTS_FLAG_SHOULDFREEMIN;
     }
 
     UHeapSlotClear(slot);
@@ -1809,12 +1851,59 @@ void UHeapSlotStoreUHeapTuple(UHeapTuple utuple, TupleTableSlot *slot, bool shou
     /*
      * Store the new tuple into the specified slot.
      */
-    slot->tts_isempty = false;
-    slot->tts_shouldFree = shouldFree;
-    slot->tts_shouldFreeMin = false;
+    slot->tts_flags &= ~TTS_FLAG_EMPTY;
+    if (shouldFree)
+        slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+    else
+        slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+    slot->tts_flags &= ~TTS_FLAG_SHOULDFREEMIN;
     slot->tts_tuple = utuple;
     slot->tts_mintuple = NULL;
 
     /* Mark extracted state invalid */
     slot->tts_nvalid = 0;
 }
+
+/*
+ * Make the contents of the uheap table's slot contents solely depend on the slot(make them a local copy),
+ * and not on underlying external resources like another memory context, buffers etc.
+ *
+ * @pram slot: slot to be materialized.
+ */
+Tuple UHeapMaterialize(TupleTableSlot *slot)
+{
+    Assert(!TTS_EMPTY(slot));
+    Assert(TTS_TABLEAM_IS_USTORE(slot));
+    Assert(slot->tts_tupleDescriptor != NULL);
+    /*
+     * If we have a regular physical tuple, and it's locally palloc'd, we have
+     * nothing to do.
+     */
+    if (slot->tts_tuple && TTS_SHOULDFREE(slot)) {
+        return slot->tts_tuple;
+    }
+
+    /*
+     * Otherwise, copy or build a physical tuple, and store it into the slot.
+     *
+     * We may be called in a context that is shorter-lived than the tuple
+     * slot, but we have to ensure that the materialized tuple will survive
+     * anyway.
+     */
+    MemoryContext old_context = MemoryContextSwitchTo(slot->tts_mcxt);
+    if (slot->tts_tuple != NULL) {
+        slot->tts_tuple = UHeapCopyTuple((UHeapTuple)slot->tts_tuple);
+    } else {
+        slot->tts_tuple = UHeapFormTuple(slot->tts_tupleDescriptor, slot->tts_values, slot->tts_isnull);
+    }
+    slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+    MemoryContextSwitchTo(old_context);
+
+    /*
+     * Have to deform from scratch, otherwise tts_values[] entries could point
+     * into the non-materialized tuple (which might be gone when accessed).
+     */
+    slot->tts_nvalid = 0;
+    return slot->tts_tuple;
+}
+

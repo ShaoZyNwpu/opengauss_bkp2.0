@@ -45,6 +45,7 @@
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 #include "postmaster/barrier_creator.h"
+#include "postmaster/barrier_preparse.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
 
@@ -99,7 +100,7 @@ Datum pg_start_backup(PG_FUNCTION_ARGS)
                  errmsg("a non-exclusive backup is already in progress in this session")));
 
     backupidstr = text_to_cstring(backupid);
-    dir = AllocateDir("pg_tblspc");
+    dir = AllocateDir(TBLSPCDIR);
     if (!dir) {
         ereport(ERROR, (errmsg("could not open directory \"%s\": %m", "pg_tblspc")));
     }
@@ -110,6 +111,8 @@ Datum pg_start_backup(PG_FUNCTION_ARGS)
         startpoint = do_pg_start_backup(backupidstr, fast, NULL, dir, NULL, NULL, false, true);
         RegisterAbortExclusiveBackup();
     }
+
+    (void)FreeDir(dir);
 
     errorno = snprintf_s(startxlogstr, sizeof(startxlogstr), sizeof(startxlogstr) - 1, "%X/%X",
                          (uint32)(startpoint >> 32), (uint32)startpoint);
@@ -178,7 +181,7 @@ Datum pg_start_backup_v2(PG_FUNCTION_ARGS)
                 errmsg("a non-exclusive backup is already in progress in this session")));
 
     backupidstr = text_to_cstring(backupid);
-    dir = AllocateDir("pg_tblspc");
+    dir = AllocateDir(TBLSPCDIR);
     if (!dir) {
         ereport(ERROR, (errmsg("could not open directory \"%s\": %m", "pg_tblspc")));
     }
@@ -206,6 +209,8 @@ Datum pg_start_backup_v2(PG_FUNCTION_ARGS)
             u_sess->proc_cxt.TblspcMapFile = NULL;
         }
     }
+
+    (void)FreeDir(dir);
 
     errorno = snprintf_s(startxlogstr, sizeof(startxlogstr), sizeof(startxlogstr) - 1, "%X/%X",
                          (uint32)(startpoint >> 32), (uint32)startpoint);
@@ -679,7 +684,7 @@ Datum pg_xlogfile_name_offset(PG_FUNCTION_ARGS)
      * Construct a tuple descriptor for the result row.  This must match this
      * function's pg_proc entry!
      */
-    resultTupleDesc = CreateTemplateTupleDesc(2, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(2, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "file_name", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "file_offset", INT4OID, -1, 0);
 
@@ -966,7 +971,7 @@ Datum pg_disable_delay_ddl_recycle(PG_FUNCTION_ARGS)
     /*
      * Construct a tuple descriptor for the result row.
      */
-    resultTupleDesc = CreateTemplateTupleDesc(2, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(2, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "ddl_delay_start_lsn", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "ddl_delay_end_lsn", TEXTOID, -1, 0);
 
@@ -991,7 +996,7 @@ Datum gs_roach_enable_delay_ddl_recycle(PG_FUNCTION_ARGS)
     char location[MAXFNAMELEN];
     errno_t rc = EOK;
 
-    (void)ValidateName(NameStr(*name));
+    ValidateInputString(NameStr(*name));
 
     pg_check_xlog_func_permission();
 
@@ -1018,7 +1023,7 @@ Datum gs_roach_disable_delay_ddl_recycle(PG_FUNCTION_ARGS)
     HeapTuple resultHeapTuple;
     Datum result;
 
-    (void)ValidateName(NameStr(*name));
+    ValidateInputString(NameStr(*name));
 
     pg_check_xlog_func_permission();
 
@@ -1032,7 +1037,7 @@ Datum gs_roach_disable_delay_ddl_recycle(PG_FUNCTION_ARGS)
     securec_check_ss(rc, "\0", "\0");
 
     /* Construct a tuple descriptor for the result row. */
-    resultTupleDesc = CreateTemplateTupleDesc(2, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(2, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "ddl_delay_start_lsn", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "ddl_delay_end_lsn", TEXTOID, -1, 0);
 
@@ -1101,7 +1106,7 @@ Datum pg_resume_bkp_flag(PG_FUNCTION_ARGS)
     /*
      * Construct a tuple descriptor for the result row.
      */
-    resultTupleDesc = CreateTemplateTupleDesc(4, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(4, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "start_backup_flag", BOOLOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "to_delay", BOOLOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)3, "ddl_delay_recycle_ptr", TEXTOID, -1, 0);
@@ -1264,7 +1269,7 @@ Datum gs_set_obs_delete_location(PG_FUNCTION_ARGS)
     errorno = snprintf_s(xlogfilename, MAXFNAMELEN, MAXFNAMELEN - 1, "%08X%08X%08X_%02u", DEFAULT_TIMELINE_ID,
                          (uint32)((xlogsegno) / XLogSegmentsPerXLogId), (uint32)((xlogsegno) % XLogSegmentsPerXLogId),
                          (uint32)((locationpoint / OBS_XLOG_SLICE_BLOCK_SIZE) & OBS_XLOG_SLICE_NUM_MAX));
-    securec_check_ss(errorno, "", "");    
+    securec_check_ss(errorno, "", "");
 
     PG_RETURN_TEXT_P(cstring_to_text(xlogfilename));
 #else
@@ -1355,7 +1360,7 @@ Datum gs_get_global_barrier_status(PG_FUNCTION_ARGS)
     /*
      * Construct a tuple descriptor for the result row.
      */
-    resultTupleDesc = CreateTemplateTupleDesc(PG_GET_GLOBAL_BARRIER_STATUS_COLS, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(PG_GET_GLOBAL_BARRIER_STATUS_COLS, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "global_barrier_id", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "global_achive_barrier_id", TEXTOID, -1, 0);
     resultTupleDesc = BlessTupleDesc(resultTupleDesc);
@@ -1527,7 +1532,7 @@ Datum gs_get_local_barrier_status(PG_FUNCTION_ARGS)
     // archive_LSN max archive xlog LSN 
     // flush_LSN max flush xlog LSN 
 
-    if (IS_OBS_DISASTER_RECOVER_MODE || IS_CN_OBS_DISASTER_RECOVER_MODE || IS_DISASTER_RECOVER_MODE) {
+    if (IS_OBS_DISASTER_RECOVER_MODE || IS_CN_OBS_DISASTER_RECOVER_MODE || IS_MULTI_DISASTER_RECOVER_MODE) {
         SpinLockAcquire(&walrcv->mutex);
         rc = strncpy_s((char *)barrierId, MAX_BARRIER_ID_LENGTH,
                        (char *)walrcv->lastRecoveredBarrierId, MAX_BARRIER_ID_LENGTH - 1);
@@ -1553,7 +1558,7 @@ Datum gs_get_local_barrier_status(PG_FUNCTION_ARGS)
     /*
      * Construct a tuple descriptor for the result row.
      */
-    resultTupleDesc = CreateTemplateTupleDesc(PG_GET_LOCAL_BARRIER_STATUS_COLS, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(PG_GET_LOCAL_BARRIER_STATUS_COLS, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "barrier_id", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "barrier_lsn", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)3, "archive_lsn", TEXTOID, -1, 0);
@@ -2020,7 +2025,7 @@ Datum gs_streaming_dr_in_switchover(PG_FUNCTION_ARGS)
     if (!g_instance.streaming_dr_cxt.isInSwitchover) {
         ereport(LOG, (errmsg("Streaming disaster recovery is not in switchover.")));
         PG_RETURN_BOOL(false);
-    }    
+    }
 
 #ifdef ENABLE_MULTIPLE_NODES
     char barrier_id[MAX_BARRIER_ID_LENGTH];
@@ -2041,12 +2046,22 @@ Datum gs_streaming_dr_in_switchover(PG_FUNCTION_ARGS)
 Datum gs_streaming_dr_service_truncation_check(PG_FUNCTION_ARGS)
 {
 #ifndef ENABLE_LITE_MODE
-    XLogRecPtr switchoverLsn = g_instance.streaming_dr_cxt.switchoverBarrierLsn;
-    XLogRecPtr flushLsn = InvalidXLogRecPtr;
-    bool isInteractionCompleted = false;
-    int hadrWalSndNum = 0;
-    int InteractionCompletedNum = 0;
-    const uint32 shiftSize = 32;
+    int dr_sender_num = 0;
+
+    for (int i = 1; i < MAX_REPLNODE_NUM; i++) {
+        ReplConnInfo *replConnInfo = NULL;
+        replConnInfo = t_thrd.postmaster_cxt.ReplConnArray[i];
+
+        /* Number of DR replconninfo */
+        if (replConnInfo != NULL && replConnInfo->isCrossRegion) {
+            dr_sender_num++;
+        }
+    }
+    if (IS_PGXC_COORDINATOR) {
+        g_instance.streaming_dr_cxt.hadrWalSndNum = dr_sender_num;
+    } else {
+        g_instance.streaming_dr_cxt.hadrWalSndNum = dr_sender_num > 0 ? 1 : 0;
+    }
 
     for (int i = 0; i < g_instance.attr.attr_storage.max_wal_senders; i++) {
         /* use volatile pointer to prevent code rearrangement */
@@ -2056,24 +2071,20 @@ Datum gs_streaming_dr_service_truncation_check(PG_FUNCTION_ARGS)
         }
 
         if (walsnd->is_cross_cluster) {
-            hadrWalSndNum++;
             SpinLockAcquire(&walsnd->mutex);
-            flushLsn = walsnd->flush;
-            isInteractionCompleted = walsnd->isInteractionCompleted;
-            SpinLockRelease(&walsnd->mutex);
-            if (isInteractionCompleted && 
-                XLByteEQ(switchoverLsn, flushLsn)) {
-                InteractionCompletedNum++;
-            } else {
-                ereport(LOG,
-                        (errmsg("walsnd %d, the switchover Lsn is %X/%X, the hadr receiver flush Lsn is %X/%X",
-                        i, (uint32)(switchoverLsn >> shiftSize), (uint32)switchoverLsn,
-                        (uint32)(flushLsn >> shiftSize), (uint32)flushLsn)));
+            if (walsnd->interactiveState == SDRS_DEFAULT) {
+                walsnd->interactiveState = SDRS_INTERACTION_BEGIN;
             }
+            SpinLockRelease(&walsnd->mutex);
         }
     }
 
-    if (hadrWalSndNum != 0 && hadrWalSndNum == InteractionCompletedNum) {
+    ereport(LOG, (errmsg("Checking streaming dr switchover service truncation."
+        "hadrWalSndNum: %d, interactionCompletedNum: %d",
+        g_instance.streaming_dr_cxt.hadrWalSndNum, g_instance.streaming_dr_cxt.interactionCompletedNum)));
+
+    if (g_instance.streaming_dr_cxt.hadrWalSndNum != 0 &&
+        g_instance.streaming_dr_cxt.hadrWalSndNum == g_instance.streaming_dr_cxt.interactionCompletedNum) {
         PG_RETURN_BOOL(true);
     } else {
         PG_RETURN_BOOL(false);
@@ -2117,9 +2128,7 @@ Datum gs_streaming_dr_get_switchover_barrier(PG_FUNCTION_ARGS)
     }
     if (t_thrd.xlog_cxt.is_hadr_main_standby || IS_PGXC_COORDINATOR) {
         g_instance.streaming_dr_cxt.isInSwitchover = true;
-        if (g_instance.streaming_dr_cxt.isInteractionCompleted &&
-            XLByteEQ(last_flush_location, last_replay_location) &&
-            XLByteEQ(walrcv->targetSwitchoverBarrierLSN, last_replay_location)) {
+        if (g_instance.streaming_dr_cxt.isInteractionCompleted) {
             PG_RETURN_BOOL(true);
         }
     } 
@@ -2303,7 +2312,7 @@ Datum gs_pitr_archive_slot_force_advance(PG_FUNCTION_ARGS)
     List *all_archive_slots = NIL;
     char globalBarrierId[MAX_BARRIER_ID_LENGTH] = {0};
     long endBarrierTimestamp = 0;
-    int readLen = 0;
+    size_t readLen = 0;
     char* oldestBarrierForNow = NULL;
     errno_t rc = EOK;
 
@@ -2338,9 +2347,26 @@ Datum gs_pitr_archive_slot_force_advance(PG_FUNCTION_ARGS)
         long currendTimestamp = 0;
         char* slotname = (char*)lfirst(cell);
         ArchiveSlotConfig *archive_conf = NULL;
-        if ((archive_conf = slot_func(slotname)) == NULL) {
-            readLen = ArchiveRead(HADR_BARRIER_ID_FILE, 0, globalBarrierId, MAX_BARRIER_ID_LENGTH,
-                &archive_conf->archive_config);
+        if ((archive_conf = slot_func(slotname)) != NULL) {
+            char pathPrefix[MAXPGPATH] = {0};
+            ArchiveConfig obsConfig;
+            /* copy OBS configs to temporary variable for customising file path */
+            rc = memcpy_s(&obsConfig, sizeof(ArchiveConfig), &archive_conf->archive_config, sizeof(ArchiveConfig));
+            securec_check(rc, "", "");
+
+            if (!IS_PGXC_COORDINATOR) {
+                rc = strcpy_s(pathPrefix, MAXPGPATH, obsConfig.archive_prefix);
+                securec_check(rc, "\0", "\0");
+
+                char *p = strrchr(pathPrefix, '/');
+                if (p == NULL) {
+                    ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("Obs path prefix is invalid")));
+                }
+                *p = '\0';
+                obsConfig.archive_prefix = pathPrefix;
+            }
+            readLen = ArchiveRead(HADR_BARRIER_ID_FILE, 0, globalBarrierId, MAX_BARRIER_ID_LENGTH, &obsConfig);
             if (readLen == 0) {
                 ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND),
                     (errmsg("Cannot read global barrier ID in %s file!", HADR_BARRIER_ID_FILE))));
@@ -2407,6 +2433,10 @@ Datum gs_pitr_archive_slot_force_advance(PG_FUNCTION_ARGS)
 
 Datum gs_get_standby_cluster_barrier_status(PG_FUNCTION_ARGS)
 {
+#ifndef ENABLE_MULTIPLE_NODES
+    DISTRIBUTED_FEATURE_NOT_SUPPORTED();
+#endif
+
     volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
     XLogRecPtr barrierLsn = InvalidXLogRecPtr;
     char lastestbarrierId[MAX_BARRIER_ID_LENGTH] = {0};
@@ -2432,11 +2462,11 @@ Datum gs_get_standby_cluster_barrier_status(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  (errmsg("gs_get_standby_cluster_barrier_status only support on standby-cluster-mode."))));
 
+    SpinLockAcquire(&walrcv->mutex);
     rc = strncpy_s((char *)lastestbarrierId, MAX_BARRIER_ID_LENGTH, (char *)walrcv->lastReceivedBarrierId,
                    MAX_BARRIER_ID_LENGTH - 1);
     securec_check(rc, "\0", "\0");
 
-    SpinLockAcquire(&walrcv->mutex);
     barrierLsn = walrcv->lastReceivedBarrierLSN;
 
     rc = snprintf_s(barrierLocation, MAXFNAMELEN, MAXFNAMELEN - 1, "%08X/%08X", (uint32)(barrierLsn >> shiftSize),
@@ -2460,7 +2490,7 @@ Datum gs_get_standby_cluster_barrier_status(PG_FUNCTION_ARGS)
     /*
      * Construct a tuple descriptor for the result row.
      */
-    resultTupleDesc = CreateTemplateTupleDesc(PG_GET_STANDBY_BARRIER_STATUS_COLS, false, TAM_HEAP);
+    resultTupleDesc = CreateTemplateTupleDesc(PG_GET_STANDBY_BARRIER_STATUS_COLS, false);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "latest_id", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "barrier_lsn", TEXTOID, -1, 0);
     TupleDescInitEntry(resultTupleDesc, (AttrNumber)3, "recovery_id", TEXTOID, -1, 0);
@@ -2486,6 +2516,10 @@ Datum gs_get_standby_cluster_barrier_status(PG_FUNCTION_ARGS)
 
 Datum gs_set_standby_cluster_target_barrier_id(PG_FUNCTION_ARGS)
 {
+#ifndef ENABLE_MULTIPLE_NODES
+    DISTRIBUTED_FEATURE_NOT_SUPPORTED();
+#endif
+
     volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
     text *barrier = PG_GETARG_TEXT_P(0);
     char *barrierstr = NULL;
@@ -2522,8 +2556,8 @@ Datum gs_set_standby_cluster_target_barrier_id(PG_FUNCTION_ARGS)
     SpinLockAcquire(&walrcv->mutex);
     errorno = strncpy_s((char *)walrcv->recoveryTargetBarrierId, MAX_BARRIER_ID_LENGTH, (char *)barrierstr,
                         MAX_BARRIER_ID_LENGTH - 1);
-    SpinLockRelease(&walrcv->mutex);
     securec_check(errorno, "\0", "\0");
+    SpinLockRelease(&walrcv->mutex);
 
     ereport(LOG, (errmsg("gs_set_standby_cluster_target_barrier_id set the barrier ID is %s", targetbarrier)));
 
@@ -2532,6 +2566,10 @@ Datum gs_set_standby_cluster_target_barrier_id(PG_FUNCTION_ARGS)
 
 Datum gs_query_standby_cluster_barrier_id_exist(PG_FUNCTION_ARGS)
 {
+#ifndef ENABLE_MULTIPLE_NODES
+    DISTRIBUTED_FEATURE_NOT_SUPPORTED();
+#endif
+
     text *barrier = PG_GETARG_TEXT_P(0);
     char *barrierstr = NULL;
     CommitSeqNo *hentry = NULL;
@@ -2551,7 +2589,7 @@ Datum gs_query_standby_cluster_barrier_id_exist(PG_FUNCTION_ARGS)
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  (errmsg("gs_query_standby_cluster_barrier_id_exist only support on standby-cluster-mode."))));
 
-    if (g_instance.csn_barrier_cxt.barrier_hash_table == NULL) {
+    if (!IS_BARRIER_HASH_INIT) {
         ereport(WARNING, (errcode(ERRCODE_OPERATE_NOT_SUPPORTED), (errmsg("barrier hash table is NULL."))));
         PG_RETURN_BOOL(found);
     }
@@ -2576,4 +2614,83 @@ Datum gs_query_standby_cluster_barrier_id_exist(PG_FUNCTION_ARGS)
         found = true;
     }
     PG_RETURN_BOOL(found);
+}
+
+Datum gs_xlog_keepers(PG_FUNCTION_ARGS)
+{
+#define PG_GET_XLOG_KEEPERS_COLS 3
+    FuncCallContext     *funcctx = NULL;
+    XlogKeeper          *xlogkeeper = NULL;
+    int                 loop = 0;
+    WalKeeperPriv       *privdata = NULL;
+    static WalKeeperDesc wkdesc[WALKEEPER_MAX] = {
+            {WALKEEPER_BASECHECK, "Base Keep", "base on redo lsn of recently checkpoint for primary or current working segment on standby"},
+            {WALKEEPER_SEGMENT_KEEP, "Segments Keep", "base on wal_keep_segments GUC"},
+            {WALKEEPER_SLOTS, "Slots Keep", "base on physical or logical slots"},
+            {WALKEEPER_BASEBACKUP, "Basebackup Keep", "a basebackup operator keep all wal segments"},
+            {WALKEEPER_BUILD, "Build Keep", "a build operator keep all wal segments"},
+            {WALKEEPER_INVALIDSEND, "Unactived Wal Send Keep", "a wal sender unactived keep all wal segments"},
+            {WALKEEPER_DUMMYSTANDBY, "Dummystandby Keep", "Dummystandby keep all wal segments"},
+            {WALKEEPER_INVALIDSLOT, "Invalid Slot Keep", "an invalid slot keep all wal segments"},
+            {WALKEEPER_CBM, "CBM Keep", "CBM feature keep wal segments"},
+            {WALKEEPER_CHECKPOINT, "Standby Checkpoint Keep", "base on redo lsn of recently checkpoint on standby"},
+            {WALKEEPER_ARCHIVE, "Archive Keep", "base on wal archive"},
+            {WALKEEPER_RESISTARCHIVE, "Resist Archive", "resist OBS archive keeper due to max_size_for_xlog_prune"},
+            {WALKEEPER_COODRECYCLE, "Other keep", "base on recycle xlog for Coordinator"}
+    };
+
+    if (SRF_IS_FIRSTCALL()) {
+        MemoryContext       oldcontext = NULL;
+        TupleDesc           resultTupleDesc = NULL;
+        
+        funcctx = SRF_FIRSTCALL_INIT();
+
+        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+        resultTupleDesc = CreateTemplateTupleDesc(PG_GET_XLOG_KEEPERS_COLS, false);
+        TupleDescInitEntry(resultTupleDesc, (AttrNumber)1, "keeptype", TEXTOID, -1, 0);
+        TupleDescInitEntry(resultTupleDesc, (AttrNumber)2, "keepsegment", TEXTOID, -1, 0);
+        TupleDescInitEntry(resultTupleDesc, (AttrNumber)3, "describe", TEXTOID, -1, 0);
+
+        privdata =  (WalKeeperPriv*)palloc0(sizeof(WalKeeperPriv));
+        privdata->keeper = generate_xlog_keepers();
+        funcctx->user_fctx = (void*)privdata;
+        funcctx->attinmeta = TupleDescGetAttInMetadata(resultTupleDesc);
+        MemoryContextSwitchTo(oldcontext);
+    }
+
+    funcctx = SRF_PERCALL_SETUP();
+    privdata = (WalKeeperPriv*)funcctx->user_fctx;
+    loop = privdata->loop++;
+    xlogkeeper = privdata->keeper;
+
+    while (loop < WALKEEPER_MAX) {
+        char        **values = NULL;
+        char        xlogFile[MAXFNAMELEN] = {0};
+
+        if(xlogkeeper[loop].valid) {
+            HeapTuple   tuple = NULL;
+            Datum       result;
+
+            memset_s(xlogFile, MAXFNAMELEN, 0, MAXFNAMELEN);
+            if(1 != xlogkeeper[loop].segno)
+                XLogFileName(xlogFile, MAXFNAMELEN, t_thrd.shemem_ptr_cxt.ControlFile->checkPointCopy.ThisTimeLineID, xlogkeeper[loop].segno);
+            else {
+                int nRet = 0;                   
+                nRet = snprintf_s(xlogFile, MAXFNAMELEN, MAXFNAMELEN - 1, "ALL");
+                securec_check_ss(nRet, "\0", "\0"); 
+            }
+            values = (char**)palloc(PG_GET_XLOG_KEEPERS_COLS * sizeof(char*));
+            values[0] = wkdesc[loop].keeper_name;
+            values[1] = xlogFile;
+            values[2] = wkdesc[loop].keeper_desc;
+            tuple = BuildTupleFromCStrings(funcctx->attinmeta, values);
+
+            result = HeapTupleGetDatum(tuple);
+            SRF_RETURN_NEXT(funcctx, result);
+        }
+        loop = privdata->loop++;
+    }
+    if (xlogkeeper)
+        pfree(xlogkeeper);
+    SRF_RETURN_DONE(funcctx);
 }

@@ -26,6 +26,7 @@
 #include "utils/syscall_lock.h"
 #include "securec.h"
 #include "securec_check.h"
+#include "nodes/pg_list.h"
 
 /* Error level codes */
 #define DEBUG5                                 \
@@ -157,6 +158,7 @@ extern int errcode_for_socket_access(void);
 extern int errmodule(ModuleId id);
 extern const char* mask_encrypted_key(const char* query_string, int str_len);
 extern char* maskPassword(const char* query_string);
+extern char* mask_error_password(const char* query_string, int str_len);
 
 #define MASK_PASSWORD_START(mask_string, query_string) \
     do {                                               \
@@ -530,6 +532,23 @@ extern void FlushErrorStateWithoutDeleteChildrenContext(void);
 extern void ReThrowError(ErrorData* edata) __attribute__((noreturn));
 extern void pg_re_throw(void) __attribute__((noreturn));
 extern void PgRethrowAsFatal(void);
+extern char* pg_strdup(const char* in);
+extern void send_message_to_frontend(ErrorData* edata);
+// only for b database, using in show warnings,show errors
+enum enum_dolphin_error_level { B_NOTE, B_WARNING, B_ERROR, B_END };
+
+typedef struct ErrorDataArea {
+    List *sqlErrorDataList;
+    uint64 current_edata_count;
+    uint64 *current_edata_count_by_level;
+} ErrorDataArea;
+
+extern ErrorDataArea *initErrorDataArea();
+extern void resetErrorDataArea(bool);
+extern void pushErrorData(ErrorData *);
+extern uint64 SqlErrorDataErrorCount();
+extern uint64 SqlErrorDataWarnCount();
+extern int SqlErrorDataCount();
 
 /* GUC-configurable parameters */
 
@@ -592,8 +611,13 @@ extern void write_stderr(const char* fmt, ...)
        the supplied arguments. */
     __attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
 
-extern void getElevelAndSqlstate(int* eLevel, int* sqlState);
+extern void write_stderr_with_prefix(const char* fmt, ...)
+    /* This extension allows gcc to check the format string for consistency with
+       the supplied arguments. */
+    __attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
 
+extern void getElevelAndSqlstate(int* eLevel, int* sqlState);
+extern void get_time_now(char* nowTime, int timeLen);
 void freeSecurityFuncSpace(char* charList, ...);
 
 extern void SimpleLogToServer(int elevel, bool silent, const char* fmt, ...)

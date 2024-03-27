@@ -19,6 +19,15 @@
 #include "parser/parse_node.h"
 #include "nodes/nodeFuncs.h"
 
+#ifndef ENABLE_MULTIPLE_NODES
+#define is_andclause(clause) \
+    ((clause) != NULL && IsA(clause, BoolExpr) && (((const BoolExpr *)(clause))->boolop) == AND_EXPR)
+#define is_orclause(clause) \
+    ((clause) != NULL && IsA(clause, BoolExpr) && (((const BoolExpr *)(clause))->boolop) == OR_EXPR)
+#define is_notclause(clause) \
+    ((clause) != NULL && IsA(clause, BoolExpr) && (((const BoolExpr *)(clause))->boolop) == NOT_EXPR)
+#endif /* ENABLE_MULTIPLE_NODES */
+
 #define is_opclause(clause) ((clause) != NULL && IsA(clause, OpExpr))
 #define is_funcclause(clause) ((clause) != NULL && IsA(clause, FuncExpr))
 
@@ -34,6 +43,14 @@ typedef struct {
     List** windowFuncs; /* lists of WindowFuncs for each winref */
     List* activeWindows;
 } WindowLists;
+
+typedef struct {
+    ParamListInfo boundParams;
+    PlannerInfo* root;
+    List* active_fns;
+    Node* case_val;
+    bool estimate;
+} eval_const_expressions_context;
 
 typedef enum { UNIQUE_CONSTRAINT, NOT_NULL_CONSTRAINT } constraintType;
 
@@ -93,14 +110,21 @@ extern Node* strip_implicit_coercions(Node* node);
 
 extern Node* eval_const_expressions(PlannerInfo* root, Node* node);
 
+extern Node* eval_const_expression_value(PlannerInfo* root, Node* node);
+
 extern Node* eval_const_expressions_params(PlannerInfo* root, Node* node, ParamListInfo boundParams);
+
+extern Node *eval_const_expression_value(PlannerInfo* root, Node* node, ParamListInfo boundParams);
+
+extern Node* simplify_select_into_expression(Node* node, ParamListInfo boundParams, int *targetlist_len);
 
 extern Node* estimate_expression_value(PlannerInfo* root, Node* node, EState* estate = NULL);
 
 extern Query* inline_set_returning_function(PlannerInfo* root, RangeTblEntry* rte);
 extern bool filter_cstore_clause(PlannerInfo* root, Expr* clause);
 /* evaluate_expr used to be a  static function */
-extern Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result_collation);
+extern Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result_collation,
+                           bool can_ignore = false);
 extern bool contain_var_unsubstitutable_functions(Node* clause);
 extern void distribute_qual_to_rels(PlannerInfo* root, Node* clause, bool is_deduced, bool below_outer_join,
     JoinType jointype, Index security_level, Relids qualscope, Relids ojscope, Relids outerjoin_nonnullable,
@@ -131,5 +155,7 @@ static inline void ExcludeRownumExpr(ParseState* pstate, Node* expr)
 extern List* get_quals_lists(Node *jtnode);
 
 extern bool isTableofType(Oid typeOid, Oid* base_oid, Oid* indexbyType);
+extern Expr* simplify_function(Oid funcid, Oid result_type, int32 result_typmod, Oid result_collid, Oid input_collid,
+    List** args_p, bool process_args, bool allow_non_const, eval_const_expressions_context* context);
 
 #endif /* CLAUSES_H */

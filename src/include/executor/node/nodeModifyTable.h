@@ -22,7 +22,6 @@ typedef TupleTableSlot* (*ExecUpdateMtd)(ItemPointer, Oid, Oid, HeapTupleHeader,
                         TupleTableSlot*, EPQState*, ModifyTableState*, bool, bool);
 
 extern ModifyTableState* ExecInitModifyTable(ModifyTable* node, EState* estate, int eflags);
-extern TupleTableSlot* ExecModifyTable(ModifyTableState* node);
 extern void ExecEndModifyTable(ModifyTableState* node);
 extern void ExecReScanModifyTable(ModifyTableState* node);
 extern void RecordDeletedTuple(Oid relid, int2 bucketid, const ItemPointer tupleid, const Relation deldelta_rel);
@@ -47,11 +46,11 @@ extern TupleTableSlot* ExecDelete(ItemPointer tupleid, Oid deletePartitionOid, i
 
 extern TupleTableSlot* ExecUpdate(ItemPointer tupleid, Oid oldPartitionOid, int2 bucketid, HeapTupleHeader oldtuple,
     TupleTableSlot* slot, TupleTableSlot* planSlot, EPQState* epqstate, ModifyTableState* node, bool canSetTag,
-    bool partKeyUpdate);
+    bool partKeyUpdate, TM_Result* out_result, char* partExprKeyStr = NULL);
 
 template <bool useHeapMultiInsert>
 extern TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, TupleTableSlot* planSlot,
-    EState* estate, bool canSetTag, int options, List** partitionList);
+    EState* estate, bool canSetTag, int options, List** partitionList, char* partExprKeyStr = NULL);
 template <bool useHeapMultiInsert>
 extern TupleTableSlot *
 ExecHBucketInsertT(ModifyTableState* state, TupleTableSlot *slot,
@@ -65,5 +64,8 @@ extern void ExecCheckPlanOutput(Relation resultRel, List* targetList);
 
 extern void ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo, EState *estate, TupleTableSlot *slot,
     Tuple oldtuple, CmdType cmdtype);
+
+extern bool ExecComputeStoredUpdateExpr(ResultRelInfo *resultRelInfo, EState *estate, TupleTableSlot *slot, Tuple tuple,
+    CmdType cmdtype, ItemPointer otid, Oid oldPartitionOid, int2 bucketid);
 
 #endif /* NODEMODIFYTABLE_H */

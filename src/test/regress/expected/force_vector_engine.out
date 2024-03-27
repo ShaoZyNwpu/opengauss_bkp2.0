@@ -71,16 +71,14 @@ select count(*) from force_vector_test1 where id=2 and val=2;
 
 set enable_indexscan=off;
 explain select count(*) from force_vector_test1 where id=2;
-                                                QUERY PLAN                                                
-----------------------------------------------------------------------------------------------------------
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
  Row Adapter  (cost=8.28..8.28 rows=1 width=8)
    ->  Vector Aggregate  (cost=8.27..8.28 rows=1 width=8)
          ->  Vector Adapter  (cost=8.27..8.27 rows=1 width=0)
-               ->  Bitmap Heap Scan on force_vector_test1  (cost=4.26..8.27 rows=1 width=0)
-                     Recheck Cond: (id = 2)
-                     ->  Bitmap Index Scan on force_vector_test1_id_idx  (cost=0.00..4.26 rows=1 width=0)
-                           Index Cond: (id = 2)
-(7 rows)
+               ->  Index Only Scan using force_vector_test1_id_idx on force_vector_test1  (cost=0.00..8.27 rows=1 width=0)
+                     Index Cond: (id = 2)
+(5 rows)
 
 select count(*) from force_vector_test1 where id=2;
  count 
@@ -260,3 +258,98 @@ drop table force_vector_test5;
 drop table force_vector_test6;
 drop function func_add_sql;
 drop schema force_vector_engine cascade;
+-- test bpcharlen in pg compatibility
+create database pg_length_cmpt_db with dbcompatibility 'PG';
+\c pg_length_cmpt_db
+set try_vector_engine_strategy='force';
+create table force_vt_tb1 (a char(10),b varchar(10));
+insert into force_vt_tb1 values('零0','零1二3');
+insert into force_vt_tb1 values('','');
+insert into force_vt_tb1 values('0','0');
+explain(costs off) select length(a),a from force_vt_tb1 order by 1;
+                  QUERY PLAN                  
+----------------------------------------------
+ Row Adapter
+   ->  Vector Sort
+         Sort Key: (length(a))
+         ->  Vector Adapter(type: BATCH MODE)
+               ->  Seq Scan on force_vt_tb1
+(5 rows)
+
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+ length |     a      | length |   b    
+--------+------------+--------+--------
+      0 |            |      0 | 
+      1 | 0          |      1 | 0
+      2 | 零0        |      4 | 零1二3
+(3 rows)
+
+set try_vector_engine_strategy='off';
+explain(costs off) select length(a),a from force_vt_tb1 order by 1;
+           QUERY PLAN           
+--------------------------------
+ Sort
+   Sort Key: (length(a))
+   ->  Seq Scan on force_vt_tb1
+(3 rows)
+
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+ length |     a      | length |   b    
+--------+------------+--------+--------
+      0 |            |      0 | 
+      1 | 0          |      1 | 0
+      2 | 零0        |      4 | 零1二3
+(3 rows)
+
+-- test with column table in codegen case
+create table force_vt_tb1_col (a char(10),b varchar(10)) with (orientation=column);
+insert into force_vt_tb1_col values('零0','零1二3');
+insert into force_vt_tb1_col values('','');
+insert into force_vt_tb1_col values('0','0');
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+ length |     a      | length |   b    
+--------+------------+--------+--------
+      0 |            |      0 | 
+      1 | 0          |      1 | 0
+      2 | 零0        |      4 | 零1二3
+(3 rows)
+
+set enable_codegen to true;
+set codegen_cost_threshold to 0;
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+ length |     a      | length |   b    
+--------+------------+--------+--------
+      0 |            |      0 | 
+      1 | 0          |      1 | 0
+      2 | 零0        |      4 | 零1二3
+(3 rows)
+
+drop table force_vt_tb1;
+drop table force_vt_tb1_col;
+\c regression;
+drop database pg_length_cmpt_db;
+-- Do not use vectorization engine
+create table force_vector_sysdomain(a information_schema.cardinal_number, b int);
+insert into force_vector_sysdomain values(10, 20);
+select a,b from force_vector_sysdomain;
+ a  | b  
+----+----
+ 10 | 20
+(1 row)
+
+set try_vector_engine_strategy='force';
+select a,b from force_vector_sysdomain;
+ a  | b  
+----+----
+ 10 | 20
+(1 row)
+
+set try_vector_engine_strategy='optimal';
+select a,b from force_vector_sysdomain;
+ a  | b  
+----+----
+ 10 | 20
+(1 row)
+
+drop table force_vector_sysdomain;
+set try_vector_engine_strategy='off';

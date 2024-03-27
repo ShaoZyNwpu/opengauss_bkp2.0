@@ -1,4 +1,4 @@
-
+DELETE FROM gs_model_warehouse;
 CREATE TABLE db4ai_houses (id INT, tax INT, bedroom INT, bath FLOAT, price INT, size INT, lot INT);
 COPY db4ai_houses FROM '@abs_srcdir@/data/houses.txt' DELIMITER '|';
 
@@ -52,6 +52,12 @@ FROM (
     FROM db4ai_houses
     WHERE prediction=target
 );
+
+-- testing nonexistent algorithms
+CREATE model m_model_xgboost_0030 USING xgboost features treatment,
+trait_anxiety target second_attack 
+FROM
+	t_model_tab_0030;
 
 -- svm binary classification with normalized data
 CREATE MODEL houses_svm_gd USING svm_classification

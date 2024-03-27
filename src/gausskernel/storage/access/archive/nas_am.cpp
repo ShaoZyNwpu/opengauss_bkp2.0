@@ -168,41 +168,37 @@ int NasWrite(const char* fileName, const char *buffer, const int bufferLength, A
     base_path = dirname(origin_file_path);
     if (!isDirExist(base_path)) {
         if (pg_mkdir_p(base_path, S_IRWXU) != 0) {
-            pfree_ext(origin_file_path);
             ereport(LOG, (errmsg("could not create path \"%s\"", base_path)));
+            pfree_ext(origin_file_path);
             return -1;
         }
     }
+    pfree_ext(origin_file_path);
 
     ret = snprintf_s(file_path_bak, MAXPGPATH, MAXPGPATH - 1, "%s.bak", file_path);
     securec_check_ss(ret, "\0", "\0");
     fp = fopen(file_path_bak, "wb");
     if (fp == NULL) {
-        pfree_ext(origin_file_path);
         ereport(LOG, (errmsg("could not create file \"%s\": %m", fileName)));
         return -1;
     }
 
     if (fwrite(buffer, bufferLength, 1, fp) != 1) {
         ereport(LOG, (errmsg("could not write file \"%s\": %m", fileName)));
-        pfree_ext(origin_file_path);
         fclose(fp);
         return -1;
     }
     if (fflush(fp) != 0) {
         ereport(LOG, (errmsg("could not fflush file \"%s\": %m", fileName)));
         (void)fclose(fp);
-        pfree_ext(origin_file_path);
         return -1;
     }
     if (rename(file_path_bak, file_path) < 0) {
         ereport(LOG, (errmsg("could not rename file \"%s\": %m", fileName)));
         (void)fclose(fp);
-        pfree_ext(origin_file_path);
         return -1;
     }
 
-    pfree_ext(origin_file_path);
     fclose(fp);
     return 0;
 }
@@ -275,9 +271,23 @@ static List* GetNasFileList(const char* prefix, ArchiveConfig *nas_config)
         ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
                 errmsg("The parameter cannot be NULL")));
     }
-
-    ret = snprintf_s(file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", nas_config->archive_prefix, prefix);
-    securec_check_ss(ret, "\0", "\0");
+    if (strncmp(prefix, "global_barrier_records", headerLen) != 0) {
+        ret = snprintf_s(file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", nas_config->archive_prefix, prefix);
+        securec_check_ss(ret, "\0", "\0");
+    } else {
+        char pathPrefix[MAXPGPATH] = {0};
+        ret = strcpy_s(pathPrefix, MAXPGPATH, nas_config->archive_prefix);
+        securec_check_ss(ret, "\0", "\0");
+        if (!IS_PGXC_COORDINATOR) {
+            char *p = strrchr(pathPrefix, '/');
+            if (p == NULL) {
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Obs path prefix is invalid")));
+            }
+            *p = '\0';
+        }
+        ret = snprintf_s(file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", pathPrefix, prefix);
+        securec_check_ss(ret, "\0", "\0");
+    }
 
     canonicalize_path(file_path);
 

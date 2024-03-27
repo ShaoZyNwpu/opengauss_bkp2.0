@@ -28,6 +28,7 @@
 #include "postmaster/bgwriter.h"
 #include "postmaster/pagewriter.h"
 #include "storage/buf/bufmgr.h"
+#include "storage/smgr/relfilenode_hash.h"
 #include "storage/ipc.h"
 #include "storage/smgr/segment.h"
 #include "storage/smgr/smgr.h"
@@ -125,17 +126,21 @@ void InitPendingOps(void)
          * Fortunately the hash table is small so that's unlikely to happen in
          * practice.
          */
-        u_sess->storage_cxt.pendingOpsCxt = AllocSetContextCreate(u_sess->top_mem_cxt,
-            "Pending ops context", ALLOCSET_DEFAULT_SIZES);
-        MemoryContextAllowInCriticalSection(u_sess->storage_cxt.pendingOpsCxt, true);
+        if (u_sess->storage_cxt.pendingOpsCxt == NULL) {
+            u_sess->storage_cxt.pendingOpsCxt = AllocSetContextCreate(u_sess->top_mem_cxt,
+                "Pending ops context", ALLOCSET_DEFAULT_SIZES);
+            MemoryContextAllowInCriticalSection(u_sess->storage_cxt.pendingOpsCxt, true);
+        }
+
         rc = memset_s(&hashCtl, sizeof(hashCtl), 0, sizeof(hashCtl));
         securec_check(rc, "", "");
         hashCtl.keysize = sizeof(FileTag);
         hashCtl.entrysize = sizeof(PendingFsyncEntry);
         hashCtl.hcxt = u_sess->storage_cxt.pendingOpsCxt;
-        hashCtl.hash = tag_hash;
+        hashCtl.hash = FileTagHashWithoutOpt;
+        hashCtl.match = FileTagMatchWithoutOpt;
         u_sess->storage_cxt.pendingOps = hash_create("Pending Ops Table",
-            100L, &hashCtl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+            100L, &hashCtl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT | HASH_COMPARE | HASH_FUNCTION);
     }
 }
 
@@ -461,7 +466,7 @@ void ProcessSyncRequests(void)
         t_thrd.xlog_cxt.CheckpointStats->ckpt_longest_sync = longest;
         t_thrd.xlog_cxt.CheckpointStats->ckpt_agg_sync_time = totalElapsed;
     }
-
+    smgrcloseall();
     /* Flag successful completion of ProcessSyncRequests */
     syncInProgress = false;
 }

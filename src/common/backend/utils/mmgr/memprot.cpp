@@ -859,7 +859,7 @@ void MemoryProtectFunctions::gs_memprot_free(void* ptr, Size sz)
 template <MemType mem_type>
 void* MemoryProtectFunctions::gs_memprot_realloc(void* ptr, Size sz, Size newsz, bool needProtect)
 {
-    Assert(GS_MP_INITED);  // Must be used when memory protect feature is avaiable
+    Assert(GS_MP_INITED);  // Must be used when memory protect feature is available
 
     void* ret = NULL;
 
@@ -956,6 +956,7 @@ void gs_memprot_reserved_backend(int avail_mem)
     int reserved_thread_count = g_instance.attr.attr_network.ReservedBackends +
                                 NUM_CMAGENT_PROCS + wal_thread_count +
                                 NUM_DCF_CALLBACK_PROCS +
+                                NUM_DMS_CALLBACK_PROCS +
                                 g_instance.attr.attr_storage.max_wal_senders;
     /* reserve 10MB per-thread for sysadmin user */
     reserved_mem += reserved_thread_count * 10;

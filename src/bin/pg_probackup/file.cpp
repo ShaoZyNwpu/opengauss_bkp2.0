@@ -15,6 +15,7 @@
 
 #include "file.h"
 #include "storage/checksum.h"
+#include "storage/file/fio_device.h"
 #include "common/fe_memutils.h"
 
 #define PRINTF_BUF_SIZE  1024
@@ -51,6 +52,7 @@ typedef struct
     bool exclusive_backup;
     bool skip_hidden;
     int  external_dir_num;
+    bool backup_replslots;
 } fio_list_dir_request;
 
 typedef struct
@@ -59,9 +61,9 @@ typedef struct
     size_t  size;
     time_t  mtime;
     bool    is_datafile;
-    bool    compressedFile;
-    uint16 compressedChunkSize;
-    uint8 compressedAlgorithm;
+    bool    compressed_file;
+    uint16  compressed_chunk_size;
+    uint8   compressed_algorithm;
     bool    is_database;
     Oid     tblspcOid;
     Oid     dbOid;
@@ -208,6 +210,12 @@ bool fio_is_remote_simple(fio_location location)
                                 && location != FIO_LOCAL_HOST
                                 && location != MyLocation;
     return is_remote;
+}
+
+/* Check if specified location is  for current node */
+bool fio_is_dss(fio_location location)
+{
+    return location == FIO_DSS_HOST;
 }
 
 /* Try to read specified amount of bytes unless error or EOF are encountered */
@@ -545,7 +553,7 @@ int fio_fprintf(FILE* f, char const* format, ...)
     return rc;
 }
 
-/* Flush stream data (does nothing for remote file) */
+/* Flush stream data (does nothing for remote file and dss file) */
 int fio_fflush(FILE* f)
 {
     int rc = 0;
@@ -625,7 +633,7 @@ int fio_truncate(int fd, off_t size)
 /*
  * Read file from specified location.
  */
-int fio_pread(FILE* f, void* buf, off_t offs, PageCompression* pageCompression)
+int fio_pread(FILE* f, void* buf, off_t offs, PageCompression* pageCompression, int size)
 {
     if (fio_is_remote_file(f))
     {
@@ -652,13 +660,13 @@ int fio_pread(FILE* f, void* buf, off_t offs, PageCompression* pageCompression)
     {
         /* For local file, opened by fopen, we should use stdio functions */
         if (pageCompression) {
-            return pageCompression->ReadCompressedBuffer(offs / BLCKSZ, (char*)buf, BLCKSZ, true);
+            return (int)pageCompression->ReadCompressedBuffer((BlockNumber)(offs / BLCKSZ), (char*)buf, size, true);
         } else {
             int rc = fseek(f, offs, SEEK_SET);
             if (rc < 0) {
                 return rc;
             }
-            return fread(buf, 1, BLCKSZ, f);
+            return fread(buf, 1, size, f);
         }
     }
 }
@@ -696,9 +704,22 @@ int fio_seek(int fd, off_t offs)
 /* Write data to stdio file */
 size_t fio_fwrite(FILE* f, void const* buf, size_t size)
 {
-    return fio_is_remote_file(f)
-            ? fio_write(fio_fileno(f), buf, size)
-            : fwrite(buf, 1, size, f);
+    if (fio_is_remote_file(f))
+    {
+        return (size_t)fio_write(fio_fileno(f), buf, size);
+    }
+    else if (is_dss_file_dec(f))
+    {
+        /* size must be multiples of ALIGNOF_BUFFER in dss */
+        char align_buf[size] __attribute__((__aligned__(ALIGNOF_BUFFER))); /* need to be aligned */
+        errno_t rc = memcpy_s(align_buf, size, buf, size);
+        securec_check_c(rc, "\0", "\0");
+        return dss_fwrite_file(align_buf, 1, size, f);
+    }
+    else
+    {
+        return fwrite(buf, 1, size, f);
+    }
 }
 
 /* Write data to the file */
@@ -727,10 +748,7 @@ int32
 fio_decompress(void* dst, void const* src, size_t size, int compress_alg)
 {
     const char *errormsg = NULL;
-    int32 uncompressed_size = do_decompress(dst, BLCKSZ,
-                                                                            src,
-                                                                            size,
-                                                                            (CompressAlg)compress_alg, &errormsg);
+    int32 uncompressed_size = do_decompress(dst, BLCKSZ, src, size, (CompressAlg)compress_alg, &errormsg);
     if (uncompressed_size < 0 && errormsg != NULL)
     {
         elog(WARNING, "An error occured during decompressing block: %s", errormsg);
@@ -747,7 +765,7 @@ fio_decompress(void* dst, void const* src, size_t size, int compress_alg)
 }
 
 /* Write data to the file */
-ssize_t fio_fwrite_compressed(FILE* f, void const* buf, size_t size, int compress_alg)
+ssize_t fio_fwrite_compressed(FILE* f, void const* buf, size_t size, int compress_alg, const char *to_fullpath, char *preWriteBuf, int *preWriteOff, int *targetSize)
 {
     if (fio_is_remote_file(f))
     {
@@ -765,20 +783,45 @@ ssize_t fio_fwrite_compressed(FILE* f, void const* buf, size_t size, int compres
     }
     else
     {
-        char uncompressed_buf[BLCKSZ];
-        int32 uncompressed_size = fio_decompress(uncompressed_buf, buf, size, compress_alg);
-
-        return (uncompressed_size < 0)
-                    ? uncompressed_size
-                    : fwrite(uncompressed_buf, 1, uncompressed_size, f);
+        if (preWriteBuf != NULL)
+        {
+            int32 uncompressed_size = fio_decompress(preWriteBuf + (*preWriteOff), buf, size, compress_alg);
+            *preWriteOff += uncompressed_size;
+            if (*preWriteOff > DSS_BLCKSZ)
+            {
+                pg_free(preWriteBuf);
+                elog(ERROR, "Offset %d is bigger than preWriteBuf size %d", *preWriteOff, DSS_BLCKSZ);
+            }
+            if (*preWriteOff == DSS_BLCKSZ)
+            {
+                int write_len = fio_fwrite(f, preWriteBuf, DSS_BLCKSZ);
+                if (write_len != DSS_BLCKSZ)
+                {
+                    pg_free(preWriteBuf);
+                    elog(ERROR, "Cannot write block of \"%s\": %s, size: %u",
+                        to_fullpath, strerror(errno), DSS_BLCKSZ);
+                }
+                *preWriteOff = 0;
+                *targetSize -= DSS_BLCKSZ;
+            }
+            return uncompressed_size;
+        }
+        else
+        {
+            char uncompressed_buf[BLCKSZ];
+            int32 uncompressed_size = fio_decompress(uncompressed_buf, buf, size, compress_alg);
+            return (uncompressed_size < 0)
+                ? uncompressed_size
+                : fio_fwrite(f, uncompressed_buf, uncompressed_size);
+        }
     }
 }
 
 void fio_construct_compressed(void const *buf, size_t size)
 {
     fio_header hdr;
-    hdr.cop = FIO_COSTRUCT_COMPRESSED;
-    hdr.size = size;
+    hdr.cop = (uint32)FIO_COSTRUCT_COMPRESSED;
+    hdr.size = (unsigned)size;
     IO_CHECK(fio_write_all(fio_stdout, &hdr, sizeof(hdr)), sizeof(hdr));
     IO_CHECK(fio_write_all(fio_stdout, buf, size), size);
 }
@@ -982,6 +1025,11 @@ int fio_sync(char const* path, fio_location location)
 
         return 0;
     }
+    else if (is_dss_file(path))
+    {
+        /* nothing to do in dss mode, data are already sync to disk */
+        return 0;
+    }
     else
     {
         int fd;
@@ -1026,7 +1074,7 @@ pg_crc32 fio_get_crc32(const char *file_path, fio_location location, bool decomp
     else
     {
 #ifdef HAVE_LIBZ                        
-        if (decompress)
+        if (decompress && !IsDssMode())
             return pgFileGetCRCgz(file_path, true, true);
         else
 #endif
@@ -1079,6 +1127,7 @@ int fio_mkdir(const char* path, int mode, fio_location location)
     }
     else
     {
+        /* operate is same in local mode and dss mode */
         return dir_create_dir(path, mode);
     }
 }
@@ -1112,7 +1161,7 @@ int fio_chmod(char const* path, int mode, fio_location location)
  */
 static void fio_load_file(int out, char const* path)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY, 0);
     fio_header hdr;
     void* buf = NULL;
 
@@ -1322,6 +1371,8 @@ static void fio_send_pages_impl(int out, char* buf)
     char         read_buffer[BLCKSZ+1];
     char         in_buf[STDIO_BUFSIZE];
     fio_header   hdr;
+    int hdr_num;
+    parray *harray = NULL;
     fio_send_request *req = (fio_send_request*) buf;
     char             *from_fullpath = (char*) buf + sizeof(fio_send_request);
     bool with_pagemap = req->bitmapsize > 0;
@@ -1331,17 +1382,27 @@ static void fio_send_pages_impl(int out, char* buf)
     datapagemap_t *map = NULL;
     datapagemap_iterator_t *iter = NULL;
     /* page headers */
-    int32       hdr_num = -1;
     int32       cur_pos_out = 0;
     BackupPageHeader2 *headers = NULL;
     PageCompression* pageCompression = NULL;
     int nRet = 0;
 
-    if (PageCompression::IsCompressedTableFile(from_fullpath, MAXPGPATH)) {
+    if (PageCompression::SkipCompressedFile(from_fullpath, strlen(from_fullpath))) {
         /* init pageCompression and return pcdFd for error check */
-        pageCompression = new PageCompression();
-        pageCompression->Init(from_fullpath, MAXPGPATH, req->segmentno / RELSEG_SIZE);
-        in = pageCompression->GetPcdFile();
+        pageCompression = new(std::nothrow) PageCompression();
+        if (pageCompression == NULL) {
+            elog(ERROR, "Decompression page init failed");
+            return;
+        }
+        COMPRESS_ERROR_STATE result = pageCompression->Init(from_fullpath, req->segmentno / RELSEG_SIZE);
+        if (result == SUCCESS) {
+            in = pageCompression->GetCompressionFile();
+        } else {
+            delete pageCompression;
+            pageCompression = NULL;
+            elog(ERROR, "Decompression page init failed \"%s\": %d", from_fullpath, (int)result);
+            return;
+        }
     } else {
         /* open source file */
         in = fopen(from_fullpath, PG_BINARY_R);
@@ -1371,6 +1432,7 @@ static void fio_send_pages_impl(int out, char* buf)
     /* TODO: what is this barrier for? */
     read_buffer[BLCKSZ] = 1; /* barrier */
 
+    harray = parray_new();
     while (blknum < req->nblocks)
     {
         int    rc = 0;
@@ -1386,12 +1448,15 @@ static void fio_send_pages_impl(int out, char* buf)
         {
             if (pageCompression) {
                 read_len = pageCompression->ReadCompressedBuffer(blknum, read_buffer, BLCKSZ, true);
+                if (read_len > MIN_COMPRESS_ERROR_RT) {
+                    elog(ERROR, "can not read actual block %u, error code: %lu,", blknum, read_len);
+                }
             } else {
                 /*
                 * Optimize stdio buffer usage, fseek only when current position
                 * does not match the position of requested block.
                 */
-                if (current_pos != (int)(blknum*BLCKSZ))
+                if (current_pos != (int)(blknum * BLCKSZ))
                 {
                     current_pos = blknum*BLCKSZ;
                     if (fseek(in, current_pos, SEEK_SET) != 0)
@@ -1428,6 +1493,9 @@ static void fio_send_pages_impl(int out, char* buf)
                 rc = validate_one_page(read_buffer, req->segmentno + blknum,
                                                         InvalidXLogRecPtr, &page_st,
                                                         req->checksumVersion);
+                if (rc == PAGE_MAYBE_COMPRESSED && pageCompression != NULL) {
+                    rc = PAGE_IS_VALID;
+                }
 
                 /* TODO: optimize copy of zeroed page */
                 if (rc == PAGE_IS_ZEROED)
@@ -1510,18 +1578,12 @@ static void fio_send_pages_impl(int out, char* buf)
             IO_CHECK(fio_write_all(out, write_buffer, hdr.size), hdr.size);
 
             /* set page header for this file */
-            hdr_num++;
-            if (!headers)
-                headers = (BackupPageHeader2 *) pgut_malloc(sizeof(BackupPageHeader2));
-            else
-                headers = (BackupPageHeader2 *) pgut_realloc(headers,
-                                                             (hdr_num) * sizeof(BackupPageHeader2),
-                                                             (hdr_num + 1) * sizeof(BackupPageHeader2));
-
-            headers[hdr_num].block = blknum;
-            headers[hdr_num].lsn = page_st.lsn;
-            headers[hdr_num].checksum = page_st.checksum;
-            headers[hdr_num].pos = cur_pos_out;
+            BackupPageHeader2 *header = pgut_new(BackupPageHeader2);
+            header->block = blknum;
+            header->lsn = page_st.lsn;
+            header->checksum = page_st.checksum;
+            header->pos = cur_pos_out;
+            parray_append(harray, header);
 
             cur_pos_out += hdr.size;
         }
@@ -1543,16 +1605,19 @@ eof:
     hdr.arg = n_blocks_read;
     hdr.size = 0;
 
-    if (headers)
-    {
-        hdr.size = (hdr_num+2) * sizeof(BackupPageHeader2);
-
-        /* add dummy header */
-        headers = (BackupPageHeader2 *) pgut_realloc(headers,
-                                                     (hdr_num + 1) * sizeof(BackupPageHeader2),
-                                                     (hdr_num + 2) * sizeof(BackupPageHeader2));
-        headers[hdr_num+1].pos = cur_pos_out;
+    hdr_num = parray_num(harray);
+    if (hdr_num > 0) {
+        hdr.size = (hdr_num + 1) * sizeof(BackupPageHeader2);
+        headers = (BackupPageHeader2 *)pgut_malloc((hdr_num + 1) * sizeof(BackupPageHeader2));
+        for (int i = 0; i < hdr_num; i++) {
+            auto *header = (BackupPageHeader2 *)parray_get(harray, i);
+            headers[i] = *header;
+            pg_free(header);
+        }
+        headers[hdr_num].pos = cur_pos_out;
     }
+    parray_free(harray);
+
     IO_CHECK(fio_write_all(out, &hdr, sizeof(hdr)), sizeof(hdr));
 
     if (headers)
@@ -1794,7 +1859,7 @@ cleanup:
 /* Compile the array of files located on remote machine in directory root */
 void fio_list_dir(parray *files, const char *root, bool exclude,
                             bool follow_symlink, bool add_root, bool backup_logs,
-                            bool skip_hidden, int external_dir_num)
+                            bool skip_hidden, int external_dir_num, bool backup_replslots)
 {
     fio_header hdr;
     fio_list_dir_request req;
@@ -1811,6 +1876,7 @@ void fio_list_dir(parray *files, const char *root, bool exclude,
     req.exclusive_backup = exclusive_backup;
     req.skip_hidden = skip_hidden;
     req.external_dir_num = external_dir_num;
+    req.backup_replslots = backup_replslots;
 
     hdr.cop = FIO_LIST_DIR;
     hdr.size = sizeof(req);
@@ -1854,9 +1920,9 @@ void fio_list_dir(parray *files, const char *root, bool exclude,
             file->forkName = fio_file.forkName;
             file->segno = fio_file.segno;
             file->external_dir_num = fio_file.external_dir_num;
-            file->compressedFile = fio_file.compressedFile;
-            file->compressedChunkSize = fio_file.compressedChunkSize;
-            file->compressedAlgorithm = fio_file.compressedAlgorithm;
+            file->compressed_file = fio_file.compressed_file;
+            file->compressed_chunk_size = fio_file.compressed_chunk_size;
+            file->compressed_algorithm = fio_file.compressed_algorithm;
 
             if (fio_file.linked_len > 0)
             {
@@ -1870,7 +1936,14 @@ void fio_list_dir(parray *files, const char *root, bool exclude,
                 securec_check_ss_c(nRet, "\0", "\0");
             }
 
-           
+            /* 
+             * Check file that under pg_replslot and judge whether it
+             * belonged to logical replication slots for subscriptions.
+             */
+            if (backup_replslots && strcmp(buf, PG_REPLSLOT_DIR) != 0 &&
+                path_is_prefix_of_path(PG_REPLSLOT_DIR, buf) && check_logical_replslot_dir(file->rel_path) != 1) {
+                continue;
+            }
 
             parray_append(files, file);
         }
@@ -1914,7 +1987,7 @@ static void fio_list_dir_impl(int out, char* buf)
 
     dir_list_file(file_files, req->path, req->exclude, req->follow_symlink,
                         req->add_root, req->backup_logs, req->skip_hidden,
-                        req->external_dir_num, FIO_LOCAL_HOST);
+                        req->external_dir_num, FIO_LOCAL_HOST, req->backup_replslots);
 
     /* send information about files to the main process */
     for (i = 0; i < (int)parray_num(file_files); i++)
@@ -1933,9 +2006,9 @@ static void fio_list_dir_impl(int out, char* buf)
         fio_file.forkName = file->forkName;
         fio_file.segno = file->segno;
         fio_file.external_dir_num = file->external_dir_num;
-        fio_file.compressedFile = file->compressedFile;
-        fio_file.compressedChunkSize = file->compressedChunkSize;
-        fio_file.compressedAlgorithm = file->compressedAlgorithm;
+        fio_file.compressed_file = file->compressed_file;
+        fio_file.compressed_chunk_size = file->compressed_chunk_size;
+        fio_file.compressed_algorithm = file->compressed_algorithm;
 
         if (file->linked)
             fio_file.linked_len = strlen(file->linked) + 1;
@@ -2075,8 +2148,8 @@ fio_get_lsn_map(const char *fullpath, uint32 checksum_version,
     }
     else
     {
-        lsn_map = get_lsn_map(fullpath, checksum_version, n_blocks,
-                                                shift_lsn, segmentno);
+        /* operate is same in local mode and dss mode */
+        lsn_map = get_lsn_map(fullpath, checksum_version, n_blocks, shift_lsn, segmentno);
     }
 
     return lsn_map;
@@ -2129,6 +2202,7 @@ pid_t fio_check_postmaster(const char *pgdata, fio_location location)
         return hdr.arg;
     }
     else
+        /* operate is same in local mode and dss mode */
         return check_postmaster(pgdata);
 }
 
@@ -2165,6 +2239,7 @@ fio_delete(mode_t mode, const char *fullpath, fio_location location)
 
     }
     else
+        /* operate is same in local mode and dss mode */
         pgFileDelete(mode, fullpath);
 }
 
@@ -2201,7 +2276,7 @@ void fio_communicate(int in, int out)
 #endif
 
     /* Main loop until end of processing all master commands */
-    while ((rc = fio_read_all(in, &hdr, sizeof hdr)) == sizeof(hdr)) {
+    while ((rc = fio_read_all(in, &hdr, sizeof(hdr))) == sizeof(hdr)) {
         if (hdr.size != 0) {
             if (hdr.size > buf_size) {
                 /* Extend buffer on demand */
@@ -2255,9 +2330,11 @@ void fio_communicate(int in, int out)
                 IO_CHECK(fio_write_compressed_impl(fd[hdr.handle], buf, hdr.size, hdr.arg), BLCKSZ);
                 break;
             case FIO_COSTRUCT_COMPRESSED: {
-                CompressCommunicate *cm = (CompressCommunicate *)buf;
-                auto result = ConstructCompressedFile(cm->path, cm->segmentNo, cm->chunkSize, cm->algorithm);
-                IO_CHECK(result, SUCCESS);
+                CompressCommunicate *cm = (CompressCommunicate *)(void *)buf;
+                COMPRESS_ERROR_STATE result = ConstructCompressedFile(cm->path,
+                                                                      (uint16)cm->chunkSize,
+                                                                      (uint8)cm->algorithm);
+                IO_CHECK((int)result, (int)SUCCESS);
                 break;
             }
             case FIO_READ: /* Read from the current position in file */

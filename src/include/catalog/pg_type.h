@@ -693,18 +693,23 @@ DESCR("range of integers");
 DATA(insert OID = 3905 ( _int4range		PGNSP PGUID  -1 f b A f t \054 0 3904 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 3906 ( numrange		PGNSP PGUID  -1 f r R f t \054 0 0 3907 range_in range_out range_recv range_send - - range_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DESCR("range of numerics");
+#define NUMRANGEOID 3906
 DATA(insert OID = 3907 ( _numrange		PGNSP PGUID  -1 f b A f t \054 0 3906 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 3908 ( tsrange		PGNSP PGUID  -1 f r R f t \054 0 0 3909 range_in range_out range_recv range_send - - range_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DESCR("range of timestamps without time zone");
+#define TSRANGEOID 3908
 DATA(insert OID = 3909 ( _tsrange		PGNSP PGUID  -1 f b A f t \054 0 3908 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 3910 ( tstzrange		PGNSP PGUID  -1 f r R f t \054 0 0 3911 range_in range_out range_recv range_send - - range_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DESCR("range of timestamps with time zone");
+#define TSTZRANGEOID 3910
 DATA(insert OID = 3911 ( _tstzrange		PGNSP PGUID  -1 f b A f t \054 0 3910 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 3912 ( daterange		PGNSP PGUID  -1 f r R f t \054 0 0 3913 range_in range_out range_recv range_send - - range_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DESCR("range of dates");
+#define DATERANGEOID 3912
 DATA(insert OID = 3913 ( _daterange		PGNSP PGUID  -1 f b A f t \054 0 3912 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 DATA(insert OID = 3926 ( int8range		PGNSP PGUID  -1 f r R f t \054 0 0 3927 range_in range_out range_recv range_send - - range_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 DESCR("range of bigints");
+#define INT8RANGEOID 3926
 DATA(insert OID = 3927 ( _int8range		PGNSP PGUID  -1 f b A f t \054 0 3926 0 array_in array_out array_recv array_send - - array_typanalyze d x f 0 -1 0 0 _null_ _null_ _null_ ));
 /*
  * pseudo-types
@@ -749,6 +754,8 @@ DATA(insert OID = 3115 ( fdw_handler	PGNSP PGUID  4 t p P f t \054 0 0 0 fdw_han
 #define FDW_HANDLEROID	3115
 DATA(insert OID = 3831 ( anyrange		PGNSP PGUID  -1 f p P f t \054 0 0 0 anyrange_in anyrange_out - - - - - d x f 0 -1 0 0 _null_ _null_ _null_ ));
 #define ANYRANGEOID		3831
+DATA(insert OID = 3838 ( event_trigger     PGNSP PGUID  4 t p P f t \054 0 0 0 event_trigger_in event_trigger_out - - - - - i p f 0 -1 0 0 _null_ _null_ _null_ ));
+#define EVTTRIGGEROID      3838
 DATA(insert OID = 9003 ( smalldatetime   PGNSP PGUID    8 FLOAT8PASSBYVAL b D f t \054 0        0 9005 smalldatetime_in smalldatetime_out smalldatetime_recv smalldatetime_send timestamptypmodin timestamptypmodout - d p f 0 -1 0 0 _null_ _null_ _null_ ));
 DESCR("date and time");
 #define SMALLDATETIMEOID        9003
@@ -804,7 +811,11 @@ DATA(insert OID = 4406 ( TdigestData		PGNSP PGUID -1 f b U f t \054 0 0 4407 tdi
 
 DATA(insert OID = 4407 ( _TdigestData		PGNSP PGUID -1 f b A f t \054 0 4406 0 array_in array_out array_recv array_send - - array_typanalyze i x f 0 -1 0 0 _null_ _null_ _null_ ));
 #define TDIGESTGARRAYOID		4407
-
+/* pg_ddl_command type */
+DATA(insert OID = 5729 ( pg_ddl_command   PGNSP PGUID    SIZEOF_POINTER t p P f t \054 0        0 0 pg_ddl_command_in pg_ddl_command_out pg_ddl_command_recv pg_ddl_command_send - - - d p f 0 -1 0 0 _null_ _null_ _null_ ));
+#define PGDDLCOMMANDOID 5729
+DATA(insert OID = 3272 ( anyset		PGNSP PGUID  -1 f s H t t \054 0 0 0 anyset_in anyset_out - - - - - i p f 0 -1 0 0 _null_ _null_ _null_ ));
+#define ANYSETOID		3272
 /*
  * macros
  */
@@ -815,6 +826,7 @@ DATA(insert OID = 4407 ( _TdigestData		PGNSP PGUID -1 f b A f t \054 0 4406 0 ar
 #define  TYPTYPE_PSEUDO		'p' /* pseudo-type */
 #define  TYPTYPE_RANGE		'r' /* range type */
 #define  TYPTYPE_TABLEOF    'o' /* table of type */
+#define  TYPTYPE_SET		's' /* set type */
 
 #define  TYPCATEGORY_INVALID	'\0'	/* not an allowed category */
 #define  TYPCATEGORY_ARRAY		'A'
@@ -835,6 +847,7 @@ DATA(insert OID = 4407 ( _TdigestData		PGNSP PGUID -1 f b A f t \054 0 4406 0 ar
 #define  TYPCATEGORY_TABLEOF    'O'     /* table of type */
 #define  TYPCATEGORY_TABLEOF_VARCHAR  'Q' /* table of type, index by varchar */
 #define  TYPCATEGORY_TABLEOF_INTEGER  'F' /* table of type, index by integer */
+#define  TYPCATEGORY_SET		'H' 	/* for set type */
 
 /* Is a type OID a polymorphic pseudotype?	(Beware of multiple evaluation) */
 #define IsPolymorphicType(typid)  \
@@ -846,5 +859,11 @@ DATA(insert OID = 4407 ( _TdigestData		PGNSP PGUID -1 f b A f t \054 0 4406 0 ar
 #define IsClientLogicType(typid) \
 ((typid) == BYTEAWITHOUTORDERCOLOID || \
 (typid) == BYTEAWITHOUTORDERWITHEQUALCOLOID)
+
+#define IsSupportCharsetType(typid) \
+	(((typid) == TEXTOID) || \
+	 ((typid) == VARCHAROID) || \
+	 ((typid) == BPCHAROID) || \
+	 ((typid) == NVARCHAR2OID))
 
 #endif   /* PG_TYPE_H */

@@ -149,7 +149,7 @@
  * predicate lock maintenance
  *		GetSerializableTransactionSnapshot(Snapshot snapshot)
  *		SetSerializableTransactionSnapshot(Snapshot snapshot,
- *										   TransactionId sourcexid)
+ *										   VirtualTransactionId *sourcevxid)
  *		RegisterPredicateLockingXid(void)
  *		PredicateLockRelation(Relation relation, Snapshot snapshot)
  *		PredicateLockPage(Relation relation, BlockNumber blkno,
@@ -202,6 +202,8 @@
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
 #include "utils/snapmgr.h"
+
+#define InvalidPid ((ThreadId)(-1))
 
 /* Uncomment the next line to test the graceful degradation code.
  *
@@ -317,6 +319,8 @@
 
 #define OldSerXidPage(xid) ((((uint32)(xid)) / OLDSERXID_ENTRIESPERPAGE) % (OLDSERXID_MAX_PAGE + 1))
 
+#define SERIALDIR (g_instance.datadir_cxt.serialDir)
+
 typedef struct OldSerXidControlData {
     int headPage;          /* newest initialized page */
     TransactionId headXid; /* newest valid Xid in the SLRU */
@@ -353,7 +357,8 @@ static void OldSerXidSetActiveSerXmin(TransactionId xid);
 static uint32 predicatelock_hash(const void *key, Size keysize);
 static void SummarizeOldestCommittedSxact(void);
 static Snapshot GetSafeSnapshot(Snapshot snapshot);
-static Snapshot GetSerializableTransactionSnapshotInt(Snapshot snapshot, TransactionId sourcexid);
+static Snapshot GetSerializableTransactionSnapshotInt(Snapshot snapshot, VirtualTransactionId *sourcevxid,
+                                                      ThreadId sourcepid);
 static bool PredicateLockExists(const PREDICATELOCKTARGETTAG *targettag);
 static bool GetParentPredicateLockTag(const PREDICATELOCKTARGETTAG* tag, PREDICATELOCKTARGETTAG* parent);
 static bool CoarserLockCovers(const PREDICATELOCKTARGETTAG* newtargettag);
@@ -642,7 +647,7 @@ static void OldSerXidInit(void)
                   NUM_OLDSERXID_BUFFERS,
                   0,
                   OldSerXidLock,
-                  "pg_serial");
+                  SERIALDIR);
     /* Override default assumption that writes should be fsync'd */
     t_thrd.shemem_ptr_cxt.OldSerXidSlruCtl->do_fsync = false;
 
@@ -1312,7 +1317,7 @@ static Snapshot GetSafeSnapshot(Snapshot origSnapshot)
          * our caller passed to us.  The pointer returned is actually the same
          * one passed to it, but we avoid assuming that here.
          */
-        snapshot = GetSerializableTransactionSnapshotInt(origSnapshot, InvalidTransactionId);
+        snapshot = GetSerializableTransactionSnapshotInt(origSnapshot, NULL, InvalidPid);
 
         if (t_thrd.xact_cxt.MySerializableXact == InvalidSerializableXact)
             return snapshot; /* no concurrent r/w xacts; it's safe */
@@ -1390,7 +1395,7 @@ Snapshot GetSerializableTransactionSnapshot(Snapshot snapshot)
     if (u_sess->attr.attr_common.XactReadOnly && u_sess->attr.attr_storage.XactDeferrable)
         return GetSafeSnapshot(snapshot);
 
-    return GetSerializableTransactionSnapshotInt(snapshot, InvalidTransactionId);
+    return GetSerializableTransactionSnapshotInt(snapshot, NULL, InvalidPid);
 }
 
 /*
@@ -1403,7 +1408,7 @@ Snapshot GetSerializableTransactionSnapshot(Snapshot snapshot)
  * transaction; and if we're read-write, the source transaction must not be
  * read-only.
  */
-void SetSerializableTransactionSnapshot(Snapshot snapshot, TransactionId sourcexid)
+void SetSerializableTransactionSnapshot(Snapshot snapshot, VirtualTransactionId *sourcevxid, ThreadId sourcepid)
 {
     Assert(IsolationIsSerializable());
 
@@ -1417,7 +1422,7 @@ void SetSerializableTransactionSnapshot(Snapshot snapshot, TransactionId sourcex
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("a snapshot-importing transaction must not be READ ONLY DEFERRABLE")));
 
-    (void)GetSerializableTransactionSnapshotInt(snapshot, sourcexid);
+    (void)GetSerializableTransactionSnapshotInt(snapshot, sourcevxid, sourcepid);
 }
 
 /*
@@ -1429,7 +1434,8 @@ void SetSerializableTransactionSnapshot(Snapshot snapshot, TransactionId sourcex
  * source xact is still running after we acquire SerializableXactHashLock.
  * We do that by calling ProcArrayInstallImportedXmin.
  */
-static Snapshot GetSerializableTransactionSnapshotInt(Snapshot snapshot, TransactionId sourcexid)
+static Snapshot GetSerializableTransactionSnapshotInt(Snapshot snapshot, VirtualTransactionId *sourcevxid,
+                                                      ThreadId sourcepid)
 {
     PGPROC *proc = NULL;
     VirtualTransactionId vxid;
@@ -1473,14 +1479,14 @@ static Snapshot GetSerializableTransactionSnapshotInt(Snapshot snapshot, Transac
     } while (sxact == NULL);
 
     /* Get the snapshot, or check that it's safe to use */
-    if (!TransactionIdIsValid(sourcexid))
+    if (!sourcevxid)
         snapshot = GetSnapshotData(snapshot, false);
-    else if (!ProcArrayInstallImportedXmin(snapshot->xmin, sourcexid)) {
+    else if (!ProcArrayInstallImportedXmin(snapshot->xmin, sourcevxid)) {
         ReleasePredXact(sxact);
         LWLockRelease(SerializableXactHashLock);
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("could not import the requested snapshot"),
-                 errdetail("The source transaction " XID_FMT " is not running anymore.", sourcexid)));
+                 errdetail("The source process with pid %lu is not running anymore.", sourcepid)));
     }
 
     /*
@@ -3446,7 +3452,6 @@ void CheckForSerializableConflictOut(bool visible, Relation relation, void* stup
      * is going on with it.
      */
     htsvResult = HeapTupleSatisfiesVacuum(tuple, u_sess->utils_cxt.TransactionXmin, buffer);
-    t_thrd.utils_cxt.pRelatedRel = NULL;
     switch (htsvResult) {
         case HEAPTUPLE_LIVE:
             if (visible)
@@ -3499,9 +3504,6 @@ void CheckForSerializableConflictOut(bool visible, Relation relation, void* stup
     if (TransactionIdEquals(xid, GetTopTransactionIdIfAny()))
         return;
     }
-
-        if (u_sess->attr.attr_storage.enable_debug_vacuum)
-            t_thrd.utils_cxt.pRelatedRel = relation;
 
     /*
      * Find sxact or summarized info for the top level xid.

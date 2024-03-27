@@ -293,7 +293,7 @@ void ThreadFlow::flushStepStatsToFile(func_stat* funcStats_flow, uint32_t stepCo
         ret = snprintf_s(buff,
             max_step_analyze_line_size,
             max_step_analyze_line_size - 1,
-            "%10d %30s %10d %15.0lf %15.0lf %15.0lf %15.0lf\n",
+            "%10u %30s %10u %15.0lf %15.0lf %15.0lf %15.0lf\n",
             stepCounter,
             getTraceFunctionName(funcStats_it->first),
             func_stat->counter,
@@ -420,7 +420,25 @@ void DumpFileFlowVisitor::flushThreadFlows()
     }
 }
 
-void DumpFileFlowVisitor::mergeFiles(const char* outPath, size_t len)
+/**
+ * @brief If exception occures, remove all temp file before exit
+ * 
+ * @param it map_flow::iterator
+ * @return trace_msg_code trace status code
+ */
+void DumpFileFlowVisitor::removeAllTempFiles(map_flow::iterator it){
+
+    //If exception occures, remove all temp file from where iterator begins
+    for ( ; it != mapFlows.end(); ++it) {
+        char tmpPath[MAX_PATH_LEN] = {0};
+        int ret;
+        ret = snprintf_s(tmpPath, MAX_PATH_LEN, MAX_PATH_LEN - 1, "tid.%d", it->first);
+        securec_check_ss_c(ret, "\0", "\0");
+        ret = remove(tmpPath);
+    }
+}
+
+trace_msg_code DumpFileFlowVisitor::mergeFiles(const char* outPath, size_t len)
 {
     FILE* fpOut = NULL;
     map_flow::iterator it;
@@ -430,8 +448,8 @@ void DumpFileFlowVisitor::mergeFiles(const char* outPath, size_t len)
 
     fpOut = trace_fopen(outPath, "w+");
     if (fpOut == NULL) {
-        printf("Cannot open file %s\n", outPath);
-        goto exit;
+        this->removeAllTempFiles(mapFlows.begin());
+        return TRACE_OPEN_OUTPUT_FILE_ERR;
     }
 
     if (!this->m_analyze) {
@@ -446,8 +464,10 @@ void DumpFileFlowVisitor::mergeFiles(const char* outPath, size_t len)
             // Open the file with read mode
             FILE* fpIn = trace_fopen(tmpPath, "r");
             if (NULL == fpIn) {
-                printf("Cannot open file %s\n", tmpPath);
-                goto exit;
+                this->removeAllTempFiles(it);
+                (void)trace_fclose(fpOut);
+                free(buffer);
+                return TRACE_OPEN_TMP_FILE_ERR;
             }
 
             while ((charRead = getline(&buffer, &bufSize, fpIn)) != -1) {
@@ -463,10 +483,9 @@ void DumpFileFlowVisitor::mergeFiles(const char* outPath, size_t len)
     } else {
         outputStat(fpOut);
     }
-
-exit:
     free(buffer);
     (void)trace_fclose(fpOut);
+    return TRACE_OK;
 }
 
 // If the ThreadFlow for a given tid is not existed, then insert one to it.
@@ -576,7 +595,7 @@ void DumpFileFlowVisitor::outputStat(FILE* fp)
         ret = snprintf_s(buff,
             max_analyze_line_size,
             max_analyze_line_size - 1,
-            "%10s %30s %10d %15.0lf %15.0lf %15.0lf %16.0lf %14d %14d\n",
+            "%10s %30s %10u %15.0lf %15.0lf %15.0lf %16.0lf %14u %14u\n",
             getCompNameById(func_it->first),
             getTraceFunctionName(func_it->first),
             func_info->counter,
@@ -1029,7 +1048,7 @@ static void gsTrcFormatUint32(char* out_buf, size_t size, const void* in_ptr, si
     char* out_buf_start = out_buf;
     int s = getRemaining(size, out_buf_start);
 
-    int written = snprintf_s(out_buf + (size - s), s, s - 1, "%d", *(uint32_t*)in_ptr);
+    int written = snprintf_s(out_buf + (size - s), s, s - 1, "%u", *(uint32_t*)in_ptr);
     securec_check_ss_c(written, "\0", "\0");
 }
 
@@ -1283,9 +1302,11 @@ static trace_msg_code formatDumpFileToFlow(const char* inputFile, size_t input_l
     DumpFileParser parser(inputFile, input_len);
     DumpFileFlowVisitor visitor(false);
     parser.acceptVisitor(&visitor);
-    ret = parser.parse();
+    if ((ret = parser.parse()) != TRACE_OK){
+        return ret;
+    }
     visitor.flushThreadFlows();
-    visitor.mergeFiles(outputFile, output_len);
+    ret = visitor.mergeFiles(outputFile, output_len);
 
     return ret;
 }
@@ -1298,8 +1319,10 @@ static trace_msg_code anlyzeDumpFile(
     DumpFileParser parser(inputFile, input_len);
     DumpFileFlowVisitor visitor(true, stepSize, outputFile, output_len);
     parser.acceptVisitor(&visitor);
-    ret = parser.parse();
-    visitor.mergeFiles(outputFile, output_len);
+    if ((ret = parser.parse()) != TRACE_OK){
+        return ret;
+    }
+    ret = visitor.mergeFiles(outputFile, output_len);
 
     return ret;
 }
@@ -1316,12 +1339,53 @@ static int findOption(int argc, char** argv, const char* option, size_t len_opti
     return -1;
 }
 
+static int ifStrBeganOption(const char *str, const char *option)
+{
+    if (strlen(str) < strlen(option)) {
+        return 0;
+    }
+    size_t i = 0;
+    for (; i < strlen(option); i++) {
+        if (str[i] != option[i]) {
+            return 0;
+        }
+    }
+    return i;
+}
+
+static int isValidArgument(const char *argument)
+{
+    const char *keyWords[] = {"start", "dump", "stop", "config", "detail", "codepath", "analyze",
+                              "-p",    "-f",   "-o",   "-t",     "-m",     "-s"};
+    const int kwLen = sizeof(keyWords) / sizeof(*keyWords);
+    for (int i = 0; i < kwLen; i++) {
+        if (strcmp(argument, keyWords[i]) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // get an optional argument
 static char* getCmdOption(int argc, char** argv, const char* option, size_t len_option)
 {
     int idx = findOption(argc, argv, option, len_option);
     if (idx != -1 && idx < argc - 1) {
-        return argv[idx + 1];
+        return isValidArgument(argv[idx + 1]) == 1 ? argv[idx + 1] : NULL;
+    }
+
+    // if don't find argument of the option at (index of option) + 1
+    for (int i = 0; i < argc; i++) {
+        int argStartIdx = ifStrBeganOption(argv[i], option);
+        if (argStartIdx > 0) {
+            if (argv[i][argStartIdx] != '\0') {
+                const int argstrLen = 500;
+                static char argString[argstrLen];
+                strncpy_s(argString, argstrLen, argv[i] + argStartIdx, strlen(argv[i]) - argStartIdx);
+                return argString;
+            }
+            break;
+        }
     }
 
     return NULL;
@@ -1450,6 +1514,7 @@ trace_msg_t trace_message[] = {
     {TRACE_DISABLE_ERR, "Trace is disable."},
     {TRACE_OPEN_OUTPUT_FILE_ERR, "Failed to open trace output file."},
     {TRACE_OPEN_INPUT_FILE_ERR, "Failed to open trace input file."},
+    {TRACE_OPEN_TMP_FILE_ERR, "Failed to open temp file."},
     {TRACE_WRITE_BUFFER_HEADER_ERR, "Failed to write trace buffer header."},
     {TRACE_WRITE_CFG_HEADER_ERR, "Failed to write trace config header."},
     {TRACE_WRITE_BUFFER_ERR, "Failed to write trace buffer."},
@@ -1468,7 +1533,7 @@ trace_msg_t trace_message[] = {
     {TRACE_SEQ_ERR, "Trace sequence check failed."},
     {TRACE_VERSION_ERR, "trace version not match."},
     {TRACE_CONFIG_SIZE_ERR, "invalid config size in trace file."},
-    {TRACE_PROCESS_NOT_EXIST, "The database process is not exist."},
+    {TRACE_PROCESS_NOT_EXIST, "Trace process does not exist."},
     {TRACE_MSG_MAX, "Failed!"},
 };
 

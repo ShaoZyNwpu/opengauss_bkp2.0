@@ -80,6 +80,7 @@ typedef struct SetOpHashEntryData {
     SetOpStatePerGroupData pergroup;
 } SetOpHashEntryData;
 
+static TupleTableSlot* ExecSetOp(PlanState* state);
 static TupleTableSlot* setop_retrieve_direct(SetOpState* setopstate);
 static void setop_fill_hash_table(SetOpState* setopstate);
 static TupleTableSlot* setop_retrieve_hash_table(SetOpState* setopstate);
@@ -143,7 +144,8 @@ static void build_hash_table(SetOpState* setopstate)
         sizeof(SetOpHashEntryData),
         setopstate->tableContext,
         setopstate->tempContext,
-        work_mem);
+        work_mem,
+        node->dup_collations);
 }
 
 /*
@@ -188,10 +190,13 @@ static void set_output_count(SetOpState* setopstate, SetOpStatePerGroup pergroup
  * ----------------------------------------------------------------
  */
 /* return: a tuple or NULL */
-TupleTableSlot* ExecSetOp(SetOpState* node)
+static TupleTableSlot* ExecSetOp(PlanState* state)
 {
+    SetOpState* node = castNode(SetOpState, state);
     SetOp* plan_node = (SetOp*)node->ps.plan;
     TupleTableSlot* result_tuple_slot = node->ps.ps_ResultTupleSlot;
+
+    CHECK_FOR_INTERRUPTS();
 
     /*
      * If the previously-returned tuple needs to be returned more than once,
@@ -277,7 +282,7 @@ static TupleTableSlot* setop_retrieve_direct(SetOpState* setopstate)
              * Check whether we've crossed a group boundary.
              */
             if (!execTuplesMatch(result_tuple_slot, outer_slot, node->numCols, node->dupColIdx, setopstate->eqfunctions,
-                                 setopstate->tempContext)) {
+                                 setopstate->tempContext, node->dup_collations)) {
                 /*
                  * Save the first input tuple of the next group.
                  */
@@ -583,6 +588,7 @@ SetOpState* ExecInitSetOp(SetOp* node, EState* estate, int eflags)
     SetOpState* setopstate = makeNode(SetOpState);
     setopstate->ps.plan = (Plan*)node;
     setopstate->ps.state = estate;
+    setopstate->ps.ExecProcNode = ExecSetOp;
 
     setopstate->eqfunctions = NULL;
     setopstate->hashfunctions = NULL;
@@ -642,7 +648,7 @@ SetOpState* ExecInitSetOp(SetOp* node, EState* estate, int eflags)
      */
     ExecAssignResultTypeFromTL(
             &setopstate->ps,
-            ExecGetResultType(outerPlanState(setopstate))->tdTableAmType);
+            ExecGetResultType(outerPlanState(setopstate))->td_tam_ops);
 
     setopstate->ps.ps_ProjInfo = NULL;
 

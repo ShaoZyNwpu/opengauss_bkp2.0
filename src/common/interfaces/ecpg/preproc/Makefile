@@ -38,6 +38,16 @@ OBJS=	preproc.o type.o ecpg.o output.o parser.o \
 	keywords.o c_keywords.o ecpg_keywords.o kwlookup.o ../ecpglib/typename.o descriptor.o variable.o \
 	$(WIN32RES)
 
+# where to find gen_keywordlist.pl and subsidiary files
+TOOLSDIR = $(top_srcdir)/src/tools
+GEN_KEYWORDLIST = $(PERL) -I $(TOOLSDIR) $(TOOLSDIR)/gen_keywordlist.pl
+GEN_KEYWORDLIST_DEPS = $(TOOLSDIR)/gen_keywordlist.pl $(TOOLSDIR)/PerfectHash.pm
+
+
+ifeq ($(GCC),yes)
+preproc.o: CXXFLAGS += -Wno-error
+endif
+
 all: ecpg
 
 ecpg: $(OBJS) | submake-libpgport
@@ -53,26 +63,46 @@ preproc.hpp: preproc.cpp ;
 
 preproc.cpp: preproc.y
 ifdef BISON
-	$(BISON) -d $(BISONFLAGS) -o $@ $<
+	$(BISON) -d $(BISONFLAGS) -t -v -o $@ $<
 else
 	@$(missing) bison $< $@
 endif
 
 pgc.cpp: pgc.l
 ifdef FLEX
-	$(FLEX) $(FLEXFLAGS) -o'$@' $<
+	$(FLEX) $(FLEXFLAGS) -o'$@' $< 
+	@grep -rn "size_t yy_size_t" $@;if [ $$? == 0 ]; then sed -i 's/int yyl;/size_t yyl;/g' $@;\
+	sed -i "s/i < _yybytes_len/(size_t)i < (size_t)_yybytes_len/g" $@;\
+	sed -i "s/n < max_size/(size_t)n < (size_t)max_size/g" $@;fi;
 else
 	@$(missing) flex $< $@
+	@grep -rn "size_t yy_size_t" $@;if [ $$? == 0 ]; then sed -i 's/int yyl;/size_t yyl;/g' $@;\
+	sed -i "s/i < _yybytes_len/(size_t)i < (size_t)_yybytes_len/g" $@;\
+	sed -i "s/n < max_size/(size_t)n < (size_t)max_size/g" $@;fi;
 endif
 
 preproc.y: ../../../../common/backend/parser/gram.y parse.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type
 	$(PERL) $(srcdir)/parse.pl $(srcdir) < $< > $@
 	$(PERL) $(srcdir)/check_rules.pl $(srcdir) $<
 
-ecpg_keywords.o c_keywords.o keywords.o preproc.o parser.o: preproc.hpp
+# generate keyword headers
+c_kwlist_d.h: c_kwlist.h $(GEN_KEYWORDLIST_DEPS)
+	$(GEN_KEYWORDLIST) --no-case-fold --varname ScanCKeywords $<
+
+ecpg_kwlist_d.h: ecpg_kwlist.h $(GEN_KEYWORDLIST_DEPS)
+	$(GEN_KEYWORDLIST) --varname ScanECPGKeywords $<
+
+# Force these dependencies to be known even without dependency info built:
+ecpg_keywords.o c_keywords.o keywords.o preproc.o parser.o: preproc.hpp kwlist_d.h
+ecpg_keywords.o: ecpg_kwlist_d.h
+c_keywords.o: c_kwlist_d.h
+keywords.o: $(top_srcdir)/src/include/parser/kwlist.h
 
 kwlookup.cpp: % : $(top_srcdir)/src/common/backend/parser/%
 	rm -f $@ && $(LN_S) $< .
+
+kwlist_d.h: $(top_srcdir)/src/include/parser/kwlist.h $(GEN_KEYWORDLIST_DEPS)
+	$(GEN_KEYWORDLIST) --extern -o $(top_srcdir)/src/include/parser $(top_srcdir)/src/include/parser/kwlist.h
 
 distprep: preproc.y preproc.cpp preproc.hpp pgc.cpp
 
@@ -85,6 +115,8 @@ installdirs:
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/ecpg$(X)'
 
+# preproc.y, preproc.c, preproc.h, pgc.c, c_kwlist_d.h, and ecpg_kwlist_d.h
+# are in the distribution tarball, so they are not cleaned here.
 clean distclean:
 	rm -f kwlookup.cpp *.o ecpg$(X)
 # garbage from development
@@ -94,4 +126,4 @@ clean distclean:
 # since we want to ship those files in the distribution for people with
 # inadequate tools.  Instead, `make maintainer-clean' will remove them.
 maintainer-clean: distclean
-	rm -f preproc.y preproc.cpp preproc.hpp pgc.cpp
+	rm -f preproc.y preproc.cpp preproc.hpp pgc.cpp c_kwlist_d.h ecpg_kwlist_d.h

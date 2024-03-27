@@ -33,9 +33,14 @@
 #include "nodes/pg_list.h"
 #include "storage/proc.h"
 #include "access/redo_statistic.h"
+#include "access/extreme_rto_redo_api.h"
 
-
-
+#ifdef ENABLE_LITE_MODE
+#define ENABLE_ONDEMAND_RECOVERY false
+#else
+#define ENABLE_ONDEMAND_RECOVERY (ENABLE_DMS && IsExtremeRedo() \
+    && g_instance.attr.attr_storage.dms_attr.enable_ondemand_recovery)
+#endif
 
 typedef enum {
     NOT_PAGE_REDO_THREAD,
@@ -44,6 +49,7 @@ typedef enum {
 } PageRedoExitStatus;
 
 extern bool g_supportHotStandby;
+extern uint32 g_startupTriggerState;
 
 const static bool SUPPORT_FPAGE_DISPATCH = true; /*  support file dispatch if true, else support page dispatche */
 const static bool SUPPORT_USTORE_UNDO_WORKER = true; /* support USTORE has undo redo worker, support page dispatch */
@@ -57,6 +63,7 @@ static const uint32 PAGE_REDO_WORKER_INVALID = 0;
 static const uint32 PAGE_REDO_WORKER_START = 1;
 static const uint32 PAGE_REDO_WORKER_READY = 2;
 static const uint32 PAGE_REDO_WORKER_EXIT = 3;
+static const uint32 BIG_RECORD_LENGTH = XLOG_BLCKSZ * 16;
 
 static inline int get_real_recovery_parallelism()
 {
@@ -87,12 +94,12 @@ static inline bool IsMultiThreadRedo()
 uint32 GetRedoWorkerCount();
 
 bool IsMultiThreadRedoRunning();
-bool IsExtremeRtoRunning();
 void DispatchRedoRecord(XLogReaderState* record, List* expectedTLIs, TimestampTz recordXTime);
 void GetThreadNameIfMultiRedo(int argc, char* argv[], char** threadNamePtr);
 
 PGPROC* MultiRedoThreadPidGetProc(ThreadId pid);
 void MultiRedoUpdateStandbyState(HotStandbyState newState);
+void MultiRedoUpdateMinRecovery(XLogRecPtr newMinRecoveryPoint);
 uint32 MultiRedoGetWorkerId();
 bool IsAllPageWorkerExit();
 void SetPageRedoWorkerIndex(int index);
@@ -111,9 +118,7 @@ void FreeAllocatedRedoItem();
 void** GetXLogInvalidPagesFromWorkers();
 void SendRecoveryEndMarkToWorkersAndWaitForFinish(int code);
 RedoWaitInfo GetRedoIoEvent(int32 event_id);
-void GetRedoWrokerStatistic(uint32* realNum, RedoWorkerStatsData* worker, uint32 workerLen);
-bool IsExtremeRtoSmartShutdown();
-void ExtremeRtoRedoManagerSendEndToStartup();
+void GetRedoWorkerStatistic(uint32* realNum, RedoWorkerStatsData* worker, uint32 workerLen);
 void CountXLogNumbers(XLogReaderState *record);
 void ApplyRedoRecord(XLogReaderState* record);
 void DiagLogRedoRecord(XLogReaderState *record, const char *funcName);

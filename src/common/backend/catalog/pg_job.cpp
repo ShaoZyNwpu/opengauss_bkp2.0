@@ -422,7 +422,7 @@ void update_pg_job_dbname(Oid jobid, const char* dbname)
     securec_check_c(rc, "\0", "\0");
 
     replaces[Anum_pg_job_dbname - 1] = true;
-    values[Anum_pg_job_dbname - 1] = CStringGetDatum(dbname);
+    values[Anum_pg_job_dbname - 1] = DirectFunctionCall1(namein, CStringGetDatum(dbname));
 
     job_relation = heap_open(PgJobRelationId, RowExclusiveLock);
 
@@ -436,7 +436,7 @@ void update_pg_job_dbname(Oid jobid, const char* dbname)
     ReleaseSysCache(tup);
     heap_freetuple_ext(newtuple);
 
-    heap_close(job_relation, RowExclusiveLock);
+    heap_close(job_relation, NoLock);
 }
 
 void update_pg_job_username(Oid jobid, const char* username)
@@ -458,11 +458,13 @@ void update_pg_job_username(Oid jobid, const char* username)
     rc = memset_s(replaces, sizeof(replaces), false, sizeof(replaces));
     securec_check_c(rc, "\0", "\0");
 
+    Assert(username != NULL);
     replaces[Anum_pg_job_log_user - 1] = true;
-    values[Anum_pg_job_log_user - 1] = CStringGetDatum(username);
-
+    replaces[Anum_pg_job_priv_user - 1] = true;
     replaces[Anum_pg_job_nspname - 1] = true;
-    values[Anum_pg_job_nspname - 1] = CStringGetDatum(username);
+    values[Anum_pg_job_log_user - 1] = DirectFunctionCall1(namein, CStringGetDatum(username));
+    values[Anum_pg_job_priv_user - 1] = DirectFunctionCall1(namein, CStringGetDatum(username));
+    values[Anum_pg_job_nspname - 1] = DirectFunctionCall1(namein, CStringGetDatum(username));
 
     job_relation = heap_open(PgJobRelationId, RowExclusiveLock);
 
@@ -888,8 +890,8 @@ static void get_interval_nextdate_by_spi(int4 job_id, bool ischeck, const char* 
 
     /* The result should be timestamp type or interval type. */
     if (!(SPI_tuptable && SPI_tuptable->tupdesc &&
-            (SPI_tuptable->tupdesc->attrs[0]->atttypid == TIMESTAMPOID ||
-                SPI_tuptable->tupdesc->attrs[0]->atttypid == INTERVALOID))) {
+            (SPI_tuptable->tupdesc->attrs[0].atttypid == TIMESTAMPOID ||
+                SPI_tuptable->tupdesc->attrs[0].atttypid == INTERVALOID))) {
         ereport(ERROR,
             (errcode(ERRCODE_SPI_ERROR), errmsg("Execute job interval for get next_date error, job_id: %d.", job_id)));
     }
@@ -897,12 +899,12 @@ static void get_interval_nextdate_by_spi(int4 job_id, bool ischeck, const char* 
     /* We don't need get value if only check the interval is valid. */
     if (!ischeck) {
         /* If INTERVALOID, start_date+INTERVALOID=next_date */
-        if (INTERVALOID == SPI_tuptable->tupdesc->attrs[0]->atttypid) {
+        if (INTERVALOID == SPI_tuptable->tupdesc->attrs[0].atttypid) {
             Datum new_interval = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isnull);
 
             MemoryContext oldcontext = MemoryContextSwitchTo(current_context);
             new_interval = datumCopy(
-                new_interval, SPI_tuptable->tupdesc->attrs[0]->attbyval, SPI_tuptable->tupdesc->attrs[0]->attlen);
+                new_interval, SPI_tuptable->tupdesc->attrs[0].attbyval, SPI_tuptable->tupdesc->attrs[0].attlen);
             *new_next_date = DirectFunctionCall2(timestamp_pl_interval, start_date, new_interval);
             (void)MemoryContextSwitchTo(oldcontext);
         } else {
@@ -910,7 +912,7 @@ static void get_interval_nextdate_by_spi(int4 job_id, bool ischeck, const char* 
         }
     } else {
         /* The interval should greater than current time if it is timestamp. */
-        if (TIMESTAMPOID == SPI_tuptable->tupdesc->attrs[0]->atttypid) {
+        if (TIMESTAMPOID == SPI_tuptable->tupdesc->attrs[0].atttypid) {
             Datum check_next_date;
 
             check_next_date = heap_getattr(SPI_tuptable->vals[0], 1, SPI_tuptable->tupdesc, &isnull);
@@ -1927,8 +1929,12 @@ void update_run_job_to_fail()
     while (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection))) {
         Form_pg_job pg_job = (Form_pg_job)GETSTRUCT(tuple);
         /* Every coordinator should update all tuples which job_status is 'r'. */
+#ifdef ENABLE_MULTIPLE_NODES
         if (pg_job->job_status == PGJOB_RUN_STATUS &&
             0 == strcmp(pg_job->node_name.data, g_instance.attr.attr_common.PGXCNodeName)) {
+#else
+        if (pg_job->job_status == PGJOB_RUN_STATUS) {
+#endif
             get_job_values(pg_job->job_id, tuple, pg_job_tbl, old_value, visnull);
             values[Anum_pg_job_failure_count - 1] = Int16GetDatum(pg_job->failure_count + 1);
 
@@ -1987,7 +1993,7 @@ void update_run_job_to_fail()
  */
 static int get_random_job_id(int64 job_max_number = JOBID_MAX_NUMBER) 
 {
-    if (job_max_number < InvalidJobId) {
+    if (job_max_number <= InvalidJobId) {
         ereport(ERROR, (errmodule(MOD_JOB), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("Cannot generate job id."), errdetail("N/A"), errcause("Invalid job id range set."),
                         erraction("Please recheck job status.")));
@@ -2189,7 +2195,7 @@ static char* query_with_update_job(int4 job_id, Datum job_status, int64 pid, Dat
     initStringInfo(&queryString);
     if (t_thrd.proc->workingVersionNum >= 92473) {
         appendStringInfo(&queryString,
-            "select * from update_pgjob(%d, \'%c\', %ld, %s, %s, %s, %s, %s, %d , %s);",
+            "select * from  pg_catalog.update_pgjob(%d, \'%c\', %ld, %s, %s, %s, %s, %s, %d , %s);",
             job_id,
             DatumGetChar(job_status),
             pid,
@@ -2215,7 +2221,7 @@ static char* query_with_update_job(int4 job_id, Datum job_status, int64 pid, Dat
                 : quote_literal_cstr(DatumGetCString(fail_msg)));
     } else {
         appendStringInfo(&queryString,
-            "select * from update_pgjob(%d, \'%c\', %ld, %s, %s, %s, %s, %s, %d);",
+            "select * from  pg_catalog.update_pgjob(%d, \'%c\', %ld, %s, %s, %s, %s, %s, %d);",
             job_id,
             DatumGetChar(job_status),
             pid,

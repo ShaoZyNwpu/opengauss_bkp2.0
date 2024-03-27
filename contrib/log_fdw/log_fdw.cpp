@@ -1530,7 +1530,7 @@ static void fill_pglog_planstate_from_logft_rel(pglogPlanState* pg_log, Relation
 
     Assert(PGLOG_ATTR_MAX == tupdesc->natts);
     for (int i = 0; i < PGLOG_ATTR_MAX; ++i) {
-        Form_pg_attribute att = tupdesc->attrs[i];
+        Form_pg_attribute att = &tupdesc->attrs[i];
         pg_log->allattr_typmod[i] = att->atttypmod;
         getTypeInputInfo(att->atttypid, &in_func_oid, &pg_log->allattr_typioparam[i]);
         fmgr_info(in_func_oid, &pg_log->allattr_fmgrinfo[i]);
@@ -2722,8 +2722,8 @@ static void log_rescan_foreign_scan(ForeignScanState* node)
     (void)MemoryContextSwitchTo(old_memcnxt);
 }
 
-static ForeignScan* log_get_foreign_plan(
-    PlannerInfo* root, RelOptInfo* baserel, Oid foreigntableid, ForeignPath* best_path, List* tlist, List* scan_clauses)
+static ForeignScan* log_get_foreign_plan(PlannerInfo* root, RelOptInfo* baserel, Oid foreigntableid,
+    ForeignPath* best_path, List* tlist, List* scan_clauses, Plan* outer_plan)
 {
     Index scan_relid = baserel->relid;
     List* fdw_data = best_path->fdw_private;
@@ -2773,6 +2773,9 @@ static ForeignScan* log_get_foreign_plan(
         scan_relid,
         NIL, /* no expressions to evaluate */
         fdw_data,
+        NIL,
+        NIL,
+        NULL,
         EXEC_ON_DATANODES); /* no private state either */
 
     return fscan;
@@ -2796,6 +2799,7 @@ static void log_get_foreign_paths(PlannerInfo* root, RelOptInfo* baserel, Oid fo
             total_cost,
             NIL,  /* no pathkeys */
             NULL, /* no outer rel either */
+            NULL, /* no outer path either */
             NIL,
             1)); /* no fdw_private data */
 

@@ -23,6 +23,7 @@
 #include "nodes/primnodes.h"
 #include "storage/lock/lock.h"
 #include "storage/pagecompress.h"
+#include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/partcache.h"
 #include "utils/snapshot.h"
@@ -255,6 +256,7 @@ extern Partition partitionOpenWithRetry(Relation relation, Oid partitionId, LOCK
 extern Partition partitionOpen(Relation relation, Oid partitionId, LOCKMODE lockmode, int2 bucketId=-1);
 extern void partitionClose(Relation relation, Partition partition, LOCKMODE lockmode);
 extern Partition tryPartitionOpen(Relation relation, Oid partitionId, LOCKMODE lockmode);
+extern Partition PartitionOpenWithPartitionno(Relation relation, Oid partition_id, int partitionno, LOCKMODE lockmode);
 extern Relation try_relation_open(Oid relationId, LOCKMODE lockmode);
 extern Relation relation_openrv(const RangeVar* relation, LOCKMODE lockmode);
 extern Relation relation_openrv_extended(const RangeVar* relation, LOCKMODE lockmode, bool missing_ok,
@@ -268,6 +270,7 @@ extern Relation HeapOpenrvExtended(const RangeVar* relation, LOCKMODE lockmode, 
     bool isSupportSynonym = false, StringInfo detailInfo = NULL);
 extern Partition bucketGetPartition(Partition part, int2 bucketid);
 extern void bucketClosePartition(Partition bucket);
+extern void HeapShrinkRelation(Relation relation);
 
 #define heap_close(r,l)  relation_close(r,l)
 
@@ -288,25 +291,30 @@ extern TableScanDesc heap_beginscan_bm(Relation relation, Snapshot snapshot, int
 extern TableScanDesc heap_beginscan_sampling(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
     bool allow_strat, bool allow_sync, RangeScanInRedis rangeScanInRedis);
 
-extern void heapgetpage(TableScanDesc scan, BlockNumber page);
+extern void heapgetpage(TableScanDesc scan, BlockNumber page, bool* has_cur_xact_write = NULL);
+
+extern void heap_invalid_invisible_tuple(HeapTuple tuple);
 
 extern void heap_invalid_invisible_tuple(HeapTuple tuple);
 
 extern void heap_rescan(TableScanDesc sscan, ScanKey key);
 extern void heap_endscan(TableScanDesc scan);
-extern HeapTuple heap_getnext(TableScanDesc scan, ScanDirection direction);
+
+extern HeapTuple heap_getnext(TableScanDesc scan, ScanDirection direction, bool* has_cur_xact_write = NULL);
 extern bool HeapamGetNextBatchMode(TableScanDesc scan, ScanDirection direction);
 
 extern void heap_init_parallel_seqscan(TableScanDesc sscan, int32 dop, ScanDirection dir);
 extern void HeapParallelscanInitialize(ParallelHeapScanDesc target, Relation relation);
-extern HeapScanDesc HeapBeginscanParallel(Relation, ParallelHeapScanDesc);
+extern TableScanDesc HeapBeginscanParallel(Relation, ParallelHeapScanDesc);
 
 extern HeapTuple heapGetNextForVerify(TableScanDesc scan, ScanDirection direction, bool& isValidRelationPage);
-extern bool heap_fetch(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer *userbuf, bool keepBuf, Relation statsRelation);
+extern bool heap_fetch(Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer *userbuf, bool keepBuf,
+    Relation statsRelation, bool* has_cur_xact_write = NULL);
 extern bool TableIndexFetchTupleCheck(Relation rel, ItemPointer tid, Snapshot snapshot, bool *allDead);
 
 extern bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, Snapshot snapshot,
-    HeapTuple heapTuple, HeapTupleHeaderData* uncompressTup, bool* all_dead, bool first_call);
+    HeapTuple heapTuple, HeapTupleHeaderData* uncompressTup, bool* all_dead, bool first_call,
+    bool* has_cur_xact_write = NULL);
 extern bool heap_hot_search(ItemPointer tid, Relation relation, Snapshot snapshot, bool* all_dead);
 
 extern void heap_get_latest_tid(Relation relation, Snapshot snapshot, ItemPointer tid);
@@ -333,7 +341,7 @@ extern TM_Result heap_update(Relation relation, Relation parentRelation, ItemPoi
     CommandId cid, Snapshot crosscheck, bool wait, TM_FailureData *tmfd, LockTupleMode *lockmode,
     bool allow_delete_self = false);
 extern TM_Result heap_lock_tuple(Relation relation, HeapTuple tuple, Buffer* buffer, 
-    CommandId cid, LockTupleMode mode, bool nowait, bool follow_updates, TM_FailureData *tmfd,
+    CommandId cid, LockTupleMode mode, LockWaitPolicy waitPolicy, bool follow_updates, TM_FailureData *tmfd,
     bool allow_lock_self = false, int waitSec = 0);
 void FixInfomaskFromInfobits(uint8 infobits, uint16 *infomask, uint16 *infomask2);
 
@@ -341,6 +349,7 @@ extern void heap_inplace_update(Relation relation, HeapTuple tuple, bool waitFlu
 extern bool heap_freeze_tuple(HeapTuple tuple, TransactionId cutoff_xid, TransactionId cutoff_multi,
     bool *changedMultiXid = NULL);
 extern bool heap_tuple_needs_freeze(HeapTuple tuple, TransactionId cutoff_xid, MultiXactId cutoff_multi, Buffer buf);
+extern TransactionId MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask, uint16 t_infomask2);
 
 extern Oid simple_heap_insert(Relation relation, HeapTuple tup);
 extern void simple_heap_delete(Relation relation, ItemPointer tid, int options = 0, bool allow_update_self = false);
@@ -353,6 +362,24 @@ extern void heap_restrpos(TableScanDesc scan);
 extern void heap_sync(Relation relation, LOCKMODE lockmode = RowExclusiveLock);
 
 extern void partition_sync(Relation rel, Oid partitionId, LOCKMODE toastLockmode);
+
+static inline void ReportPartitionOpenError(Relation relation, Oid partition_id)
+{
+#ifndef FRONTEND
+    ereport(ERROR, (errcode(ERRCODE_RELATION_OPEN_ERROR),
+        errmsg("partition %u does not exist on relation \"%s\"", partition_id, RelationGetRelationName(relation)),
+        errdetail("this partition may have already been dropped"),
+        errcause("If there is a DDL operation, the cause is incorrect operation. Otherwise, it is a system error."),
+        erraction("Retry this operation after the DDL operation finished or Contact engineer for support.")));
+#endif
+}
+
+static inline void ReportNoExistPartition(PartStatus partStatus, Oid partOid)
+{
+    if (partStatus == PART_METADATA_NOEXIST && module_logging_is_on(MOD_GPI)) {
+        ereport(LOG, (errmodule(MOD_GPI), errmsg("Partition %u does not exist in GPI", partOid)));
+    }
+}
 
 extern void heap_redo(XLogReaderState* rptr);
 extern void heap_desc(StringInfo buf, XLogReaderState* record);
@@ -395,7 +422,7 @@ extern void heap_get_root_tuples(Page page, OffsetNumber* root_offsets);
 extern IndexFetchTableData * heapam_index_fetch_begin(Relation rel);
 extern void heapam_index_fetch_reset(IndexFetchTableData *scan);
 extern void heapam_index_fetch_end(IndexFetchTableData *scan);
-extern HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead);
+extern HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has_cur_xact_write = NULL);
 
 /* in heap/syncscan.c */
 extern void ss_report_location(Relation rel, BlockNumber location);
@@ -415,7 +442,8 @@ extern void PushHeapPageToDataQueue(Buffer buffer);
  *	Hint bits in the HeapTuple's t_infomask may be updated as a side effect;
  *	if so, the indicated buffer is marked dirty.
  */
-extern bool HeapTupleSatisfiesVisibility(HeapTuple stup, Snapshot snapshot, Buffer buffer);
+extern bool HeapTupleSatisfiesVisibility(HeapTuple stup, Snapshot snapshot, Buffer buffer,
+    bool* has_cur_xact_write = NULL);
 extern void HeapTupleCheckVisible(Snapshot snapshot, HeapTuple tuple, Buffer buffer);
 
 /* Result codes for HeapTupleSatisfiesVacuum */
@@ -448,5 +476,6 @@ extern bool HeapTupleIsOnlyLocked(HeapTuple tuple);
  */
 extern bool ResolveCminCmaxDuringDecoding(
     struct HTAB* tuplecid_data, Snapshot snapshot, HeapTuple htup, Buffer buffer, CommandId* cmin, CommandId* cmax);
-
+extern TableScanDesc heap_beginscan_internal(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
+    uint32 flags, ParallelHeapScanDesc parallel_scan, RangeScanInRedis rangeScanInRedis = {false, 0, 0});
 #endif /* HEAPAM_H */

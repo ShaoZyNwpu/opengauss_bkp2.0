@@ -174,7 +174,7 @@ const int EQUAL_MARK_LEN = 3;
 #define ADDPOINTER_SIZE 2
 #define MAX_HOST_NAME_LENGTH 255
 
-#define TEMP_PGCONF_FILE "postgresql.conf.bak"
+#define TEMP_PGCONF_FILE "postgresql.conf.guc.bak"
 #define TEMP_CMAGENTCONF_FILE "cm_agent.conf.bak"
 #define TEMP_CMSERVERCONF_FILE "cm_server.conf.bak"
 #define TEMP_GTMCONF_FILE "gtm.conf.bak"
@@ -1297,6 +1297,11 @@ do_gucset(const char *action_type, const char *data_dir)
     int func_status = -1;
     int result_status = SUCCESS;
 
+    int ss_lines_index = 0;
+    int ss_optvalue_off = 0;
+    int ss_optvalue_len = 0;
+    char ss_enable_dss[MAX_VALUE_LEN] = {0x00};
+    
     FileLock filelock = {NULL, 0};
     UpdateOrAddParameter updateoradd = UPDATE_PARAMETER;
 
@@ -1324,6 +1329,13 @@ do_gucset(const char *action_type, const char *data_dir)
 
     if (NULL == opt_lines)
         return FAILURE;
+    
+    ss_lines_index = find_gucoption(opt_lines, "ss_enable_dss", NULL, NULL, &ss_optvalue_off, &ss_optvalue_len);
+    if (INVALID_LINES_IDX != ss_lines_index) {
+        rc = strncpy_s(ss_enable_dss, MAX_VALUE_LEN,
+                       (opt_lines[ss_lines_index] + ss_optvalue_off), (size_t)ss_optvalue_len);
+        securec_check_c(rc, "\0", "\0");
+    }
 
     for (i = 0; i < config_param_number; i++)
     {
@@ -1332,6 +1344,18 @@ do_gucset(const char *action_type, const char *data_dir)
             freefile(opt_lines);
             GS_FREE(tmpAZStr);
             write_stderr( _("%s: invalid input parameters\n"), progname);
+            return FAILURE;
+        }
+
+        if (strncmp(ss_enable_dss, "on", strlen("on")) == 0 &&
+            ((strncmp(config_param[i], "archive_mode", strlen("archive_mode")) == 0 &&
+            strncmp(config_value[i], "on", strlen("on")) == 0) ||
+            (strncmp(config_param[i], "archive_command", strlen("archive_command")) == 0 &&
+            config_value[i] != NULL))) {
+            release_file_lock(&filelock);
+            freefile(opt_lines);
+            GS_FREE(tmpAZStr);
+            write_stderr(_("%s: Not support archive function while DMS and DSS enabled\n"), progname);
             return FAILURE;
         }
 
@@ -1876,7 +1900,7 @@ static void do_help_set_reset_options(void)
     (void)printf(_("\nOptions for set and reload with -h host-auth-policy: \n"));
     (void)printf(_("  -Z NODE-TYPE   can be \"coordinator\", or \"datanode\"\n"));
 #else
-
+#ifdef ENABLE_LITE_MODE
     (void)printf(_("\nOptions for set with -c parameter: \n"));
     (void)printf(_("  -Z NODE-TYPE   can only be \"datanode\", default is \"datanode\". "));
 
@@ -1885,6 +1909,18 @@ static void do_help_set_reset_options(void)
 
     (void)printf(_("\nOptions for set and reload with -h host-auth-policy: \n"));
     (void)printf(_("  -Z NODE-TYPE   can only be \"datanode\", default is \"datanode\"\n"));
+#else
+    (void)printf(_("\nOptions for set with -c parameter: \n"));
+    (void)printf(_("  -Z NODE-TYPE   can be \"datanode\", \"cmserver\" or \"cmagent\". "));
+
+    (void)printf(_("NODE-TYPE is used to identify configuration file (with -c parameter) in data directory\n"));
+    (void)printf(_("  \"datanode\"                                      -- postgresql.conf\n"));
+    (void)printf(_("  \"cmserver\"                                      -- cm_server.conf\n"));
+    (void)printf(_("  \"cmagent\"                                       -- cm_agent.conf\n"));
+
+    (void)printf(_("\nOptions for set and reload with -h host-auth-policy: \n"));
+    (void)printf(_("  -Z NODE-TYPE   can only be \"datanode\"\n"));
+#endif
 #endif
 }
 
@@ -2598,6 +2634,8 @@ int main(int argc, char** argv)
     char* pgdata_C = NULL;
     char* nodename = NULL;
     char* instance_name = NULL;
+    int nodeNum = 0;
+    int instanceNum = 0;
     int nRet = 0;
     errno_t rc = 0;
     progname = PROG_NAME;
@@ -2717,11 +2755,13 @@ int main(int argc, char** argv)
                 case 'N': {
                     GS_FREE(nodename);
                     nodename = xstrdup(optarg);
+                    nodeNum++;
                     break;
                 }
                 case 'I': {
                     GS_FREE(instance_name);
                     instance_name = xstrdup(optarg);
+                    instanceNum++;
                     break;
                 }
                 case 'M': {
@@ -2873,6 +2913,11 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (nodeNum > 1 || instanceNum > 1) {
+        write_stderr(_("ERROR: The number of -I or -N must less than 2.\n"));
+        exit(1);
+    }
+
     if (false == allocate_memory_list()) {
         write_stderr(_("ERROR: Failed to allocate memory to list.\n"));
         exit(1);
@@ -2921,6 +2966,16 @@ int main(int argc, char** argv)
 
     if ((nodetype == INSTANCE_CMAGENT) || (nodetype == INSTANCE_CMSERVER)) {
         checkCMParameter(pgdata_D, nodename, instance_name);
+    }
+
+    if ((NULL == instance_name) && (NULL == pgdata_D) &&
+        ((nodetype != INSTANCE_CMAGENT) && (nodetype != INSTANCE_CMSERVER))) {
+        char* env_value = NULL;
+        env_value = getenv("PGDATA");
+        if ((NULL != env_value) && ('\0' != env_value[0]) && (MAXPGPATH > strlen(env_value))) {
+            pgdata_D = xstrdup(env_value);
+            canonicalize_path(pgdata_D);
+        }
     }
 
     if (nodetype == INSTANCE_DATANODE || nodetype == INSTANCE_COORDINATOR) {

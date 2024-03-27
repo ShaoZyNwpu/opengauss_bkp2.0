@@ -169,8 +169,22 @@ void ThreadPoolWorker::WaitMission()
     if (!WorkerThreadCanSeekAnotherMission(&m_reason)) {
         return;
     }
+    if (unlikely((u_sess->misc_cxt.SecurityRestrictionContext & RECEIVER_LOCAL_USERID_CHANGE) != 0)) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("Does not change back to old userid when session detach or clean up, and receive buffer %s.",
+                        t_thrd.libpq_cxt.PqRecvPointer < t_thrd.libpq_cxt.PqRecvLength ?
+                            "still has msg" : "is clear")));
+    }
 
     (void)enable_session_sig_alarm(u_sess->attr.attr_common.SessionTimeout * 1000);
+#ifndef ENABLE_MULTIPLE_NODES
+    if (u_sess->attr.attr_common.IdleInTransactionSessionTimeout > 0 &&
+        (IsAbortedTransactionBlockState() || IsTransactionOrTransactionBlock())) {
+        (void)enable_idle_in_transaction_session_sig_alarm(
+            u_sess->attr.attr_common.IdleInTransactionSessionTimeout * 1000);
+    }
+#endif
     bool isRawSession = false;
 
     Assert(t_thrd.int_cxt.InterruptHoldoffCount == 0);
@@ -226,6 +240,12 @@ void ThreadPoolWorker::WaitMission()
     }
     MemoryContextSwitchTo(old);
     (void)disable_session_sig_alarm();
+#ifndef ENABLE_MULTIPLE_NODES
+    if (u_sess->attr.attr_common.IdleInTransactionSessionTimeout > 0 &&
+        (IsAbortedTransactionBlockState() || IsTransactionOrTransactionBlock())) {
+        (void)disable_idle_in_transaction_session_sig_alarm();
+    }
+#endif
     /* now we can accept signal. out of this, we rely on signal handle. */
     AllowSignal();
     ShutDownIfNecessary();
@@ -384,6 +404,10 @@ void ThreadPoolWorker::WaitNextSession()
     while (true) {
         /* Wait if the thread was turned into pending mode. */
         if (unlikely(m_threadStatus == THREAD_PENDING)) {
+            /* drop table/db operator need delete files, which cannot be opened. so we need close them when sleep */
+            if (EnableLocalSysCache()) {
+                closeAllVfds();
+            }
             Pending();
             /* pending thread must don't have session on it */
             if (m_currentSession != NULL) {
@@ -403,6 +427,10 @@ void ThreadPoolWorker::WaitNextSession()
         if (!lsn->TryFeedWorker(this)) {
             /* report thread status. */
             u_sess = t_thrd.fake_session;
+            /* we need close vfds to allow delete files by drop table/db operator before sleep */
+            if (EnableLocalSysCache()) {
+                closeAllVfds();
+            }
             WaitState oldStatus = pgstat_report_waitstatus(STATE_WAIT_COMM);
 
             pthread_mutex_lock(m_mutex);
@@ -520,8 +548,6 @@ void ThreadPoolWorker::DetachSessionFromThread()
     /* If some error occur at session initialization, we need to close it. */
     if (m_currentSession->status == KNL_SESS_UNINIT) {
         m_currentSession->status = KNL_SESS_CLOSERAW;
-        /* cache may be in wrong stat, rebuild is ok */
-        ReBuildLSC();
         CleanUpSession(false);
         m_currentSession = NULL;
         u_sess = NULL;
@@ -639,11 +665,6 @@ bool ThreadPoolWorker::AttachSessionToThread()
             CleanUpSession(false);
             m_currentSession = NULL;
             u_sess = NULL;
-#ifdef ENABLE_LITE_MODE
-            if (EnableLocalSysCache()) {
-                t_thrd.lsc_cxt.lsc->LocalSysDBCacheReSet();
-            }
-#endif
         } break;
 
         default:
@@ -695,7 +716,7 @@ void ThreadPoolWorker::CleanUpSession(bool threadexit)
         }
 
         /* Close Session. */
-        m_group->GetListener()->DelSessionFromEpoll(m_currentSession);
+        m_group->GetListener()->DelSessionFromEpoll(m_currentSession, true);
 
         if (m_currentSession->proc_cxt.PassConnLimit) {
             SpinLockAcquire(&g_instance.conn_cxt.ConnCountLock);
@@ -725,10 +746,6 @@ void ThreadPoolWorker::CleanUpSession(bool threadexit)
     pgstat_beshutdown_session(m_currentSession->session_ctr_index);
     localeconv_deinitialize_session();
 
-    /* clean gpc refcount and plancache in shared memory */
-    if (ENABLE_DN_GPC)
-        CleanSessGPCPtr(m_currentSession);
-
     /*
      * clear invalid msg slot
      * If called during pool worker thread exit, session's invalid msg slot has already
@@ -738,6 +755,17 @@ void ThreadPoolWorker::CleanUpSession(bool threadexit)
         CleanupWorkSessionInvalidation();
     }
 
+#ifdef ENABLE_LITE_MODE
+    if (EnableLocalSysCache()) {
+        t_thrd.lsc_cxt.lsc->LocalSysDBCacheReSet();
+    }
+#else
+    if (EnableLocalSysCache() && m_group->m_waitServeSessionCount == 0) {
+        t_thrd.lsc_cxt.lsc->LocalSysDBCacheReSet();
+    }
+#endif
+
+    /* don't do thing like palloc between this and use_fake_session() which called by free_session_context */
     g_threadPoolControler->GetSessionCtrl()->FreeSlot(m_currentSession->session_ctr_index);
     m_currentSession->session_ctr_index = -1;
 
@@ -769,7 +797,8 @@ static void init_session_share_memory()
 #endif
 }
 
-#ifndef ENABLE_MULTIPLE_NODES
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+extern void InitASqlPluginHookIfNeeded();
 extern void InitBSqlPluginHookIfNeeded();
 #endif
 
@@ -795,6 +824,8 @@ static bool InitSession(knl_session_context* session)
 
     /* Init GUC option for this session. */
     InitializeGUCOptions();
+
+    init_set_user_params_htab();
 
     /* Read in remaining GUC variables */
     read_nondefault_variables();
@@ -847,15 +878,13 @@ static bool InitSession(knl_session_context* session)
     t_thrd.proc_cxt.PostInit->SetDatabaseAndUser(dbname, InvalidOid, username);
     t_thrd.proc_cxt.PostInit->InitSession();
 
-#ifndef ENABLE_MULTIPLE_NODES
-    if (u_sess->proc_cxt.MyDatabaseId != InvalidOid && DB_IS_CMPT(B_FORMAT)) {
-        InitBSqlPluginHookIfNeeded();
-    }
-#endif
-
     Assert(CheckMyDatabaseMatch());
 
     SetProcessingMode(NormalProcessing);
+
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+    LoadSqlPlugin();
+#endif
 
     init_session_share_memory();
 
@@ -878,7 +907,7 @@ static bool InitSession(knl_session_context* session)
                     (unsigned int)maxChunksPerProcess << (chunkSizeInBits - BITS_IN_MB))));
     }
 
-    ReadyForQuery((CommandDest)t_thrd.postgres_cxt.whereToSendOutput);
+    session->proc_cxt.MyProcPort->protocol_config->fn_send_ready_for_query((CommandDest)t_thrd.postgres_cxt.whereToSendOutput);
 
     return true;
 }
@@ -890,7 +919,9 @@ static bool InitPort(Port* port)
 
     PortInitialize(port, NULL);
 
-    CheckClientIp(port);
+    if (!CheckClientIp(port)) {
+        return false;
+    }
 
     PreClientAuthorize();
 
@@ -908,12 +939,12 @@ static void SendSessionIdxToClient()
     GenerateCancelKey(true);
 
     if (t_thrd.postgres_cxt.whereToSendOutput == DestRemote && PG_PROTOCOL_MAJOR(FrontendProtocol) >= 2) {
-        StringInfoData buf;
-
-        pq_beginmessage(&buf, 'K');
-        pq_sendint32(&buf, (uint32)u_sess->session_ctr_index);
-        pq_sendint32(&buf, (uint32)u_sess->cancel_key);
-        pq_endmessage(&buf);
+        
+        Port* MyProcPort = u_sess->proc_cxt.MyProcPort;
+        if (MyProcPort && MyProcPort->protocol_config->fn_send_cancel_key) {
+            MyProcPort->protocol_config->fn_send_cancel_key((uint32)u_sess->session_ctr_index,
+                                                            (uint32)u_sess->cancel_key);
+        }
     }
 }
 

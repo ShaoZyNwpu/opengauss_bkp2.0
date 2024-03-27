@@ -22,6 +22,7 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "commands/trigger.h"
+#include "commands/event_trigger.h"
 #include "executor/spi.h"
 #include "executor/functions.h"
 #include "parser/scanner.h"
@@ -239,6 +240,12 @@ typedef enum {
  * --------
  */
 typedef enum { PLPGSQL_TRUE, PLPGSQL_FALSE, PLPGSQL_NULL } PLpgSQL_state;
+/* --------
+ * Type of the DECLARE HANDLER.
+ * ref: https://dev.mysql.com/doc/refman/8.0/en/declare-handler.html
+ * --------
+ */
+typedef enum { DECLARE_HANDLER_EXIT, DECLARE_HANDLER_CONTINUE } PLpgSQL_declare_handler;
 
 /**********************************************************************
  * Node and structure definitions
@@ -252,6 +259,14 @@ typedef struct PLpgSQL_datum { /* Generic datum array item		*/
     int dno;
     bool ispkg;
 } PLpgSQL_datum;
+
+typedef enum PLpgSQL_trigtype
+{
+    PLPGSQL_DML_TRIGGER,
+    PLPGSQL_EVENT_TRIGGER,
+    PLPGSQL_NOT_TRIGGER
+} PLpgSQL_trigtype;
+
 /*
  * The variants PLpgSQL_var, PLpgSQL_row, and PLpgSQL_rec share these
  * fields
@@ -370,6 +385,7 @@ typedef struct PLpgSQL_var { /* Scalar variable */
     PLpgSQL_expr* cursor_explicit_expr;
     int cursor_explicit_argrow;
     int cursor_options;
+    int customCondition; /* only for declare condition variable. */
 
     Datum value;
     bool isnull;
@@ -591,6 +607,7 @@ typedef struct { /* One EXCEPTION ... WHEN clause */
     int lineno;
     PLpgSQL_condition* conditions;
     List* action; /* List of statements */
+    PLpgSQL_declare_handler handler_type;
 } PLpgSQL_exception;
 
 typedef struct PLpgSQL_stmt_block { /* Block of statements			*/
@@ -598,6 +615,7 @@ typedef struct PLpgSQL_stmt_block { /* Block of statements			*/
     int lineno;
     char* label;
     bool isAutonomous;
+    bool isDeclareHandlerStmt;      /* mysql declare handler syntax */
     List* body; /* List of statements */
     int n_initvars;
     int* initvarnos;
@@ -710,6 +728,7 @@ typedef struct { /* WHILE cond LOOP statement		*/
     PLpgSQL_expr* cond;
     List* body; /* List of statements */
     char* sqlString;
+    bool condition;
 } PLpgSQL_stmt_while;
 
 typedef struct { /* FOR statement with integer loopvar	*/
@@ -939,6 +958,7 @@ typedef struct PLpgSQL_func_hashkey { /* Hash lookup key for functions */
     Oid funcOid;
 
     bool isTrigger; /* true if called as a trigger */
+    bool isEventTrigger; /* true if called as an event trigger */
 
     /* be careful that pad bytes in this struct get zeroed! */
 
@@ -986,7 +1006,7 @@ typedef struct PLpgSQL_function { /* Complete compiled function	  */
     TransactionId fn_xmin;
     ItemPointerData fn_tid;
     bool is_private;
-    bool fn_is_trigger;
+    PLpgSQL_trigtype fn_is_trigger;
     Oid fn_input_collation;
     PLpgSQL_func_hashkey* fn_hashkey; /* back-link to hashtable key */
     MemoryContext fn_cxt;
@@ -1028,9 +1048,11 @@ typedef struct PLpgSQL_function { /* Complete compiled function	  */
     int tg_table_schema_varno;
     int tg_nargs_varno;
     int tg_argv_varno;
+    /* for event triggers */
+    int         tg_event_varno;
+    int         tg_tag_varno;
 
     List* invalItems; /* other dependencies, like other pkg's type or variable */
-
     PLpgSQL_resolve_option resolve_option;
 
     int ndatums;
@@ -1134,6 +1156,7 @@ typedef struct PLpgSQL_execstate { /* Runtime execution data	*/
 
     int64 stack_entry_start;    /* ExprContext's starting number for eval simple expression */
     Oid curr_nested_table_type;
+    int curr_nested_table_layers;
     bool is_exception;
 } PLpgSQL_execstate;
 
@@ -1156,6 +1179,16 @@ typedef struct PLpgSQL_func_tableof_index {
     Oid tableOfIndexType;
     HTAB* tableOfIndex;
 } PLpgSQL_func_tableof_index;
+
+typedef struct ExecTableOfIndexInfo {
+    ExprContext* econtext;
+    HTAB* tableOfIndex;
+    Oid tableOfIndexType;
+    bool isnestedtable;
+    int tableOfLayers;
+    int paramid;
+    Oid paramtype;
+} ExecTableOfIndexInfo;
 
 /*
  * A PLpgSQL_plugin structure represents an instrumentation plugin.
@@ -1199,9 +1232,10 @@ typedef struct PLpgSQL_plugin {
     /* Function pointers set by PL/pgSQL itself */
     void (*error_callback)(void* arg);
     void (*assign_expr)(PLpgSQL_execstate* estate, PLpgSQL_datum* target, PLpgSQL_expr* expr);
-    Datum (*eval_expr)(PLpgSQL_execstate* estate, PLpgSQL_expr* expr, bool* isNull, Oid* rettype, HTAB** tableOfIndex);
+    Datum (*eval_expr)(PLpgSQL_execstate* estate, PLpgSQL_expr* expr, bool* isNull, Oid* rettype,
+                       HTAB** tableOfIndex, ExecTableOfIndexInfo* tableOfIndexInfo);
     void (*assign_value)(PLpgSQL_execstate* estate, PLpgSQL_datum* target, Datum value,
-        Oid valtype, bool* isNull, HTAB* tableOfIndex);
+        Oid valtype, bool* isNull, HTAB* tableOfIndex, ExecTableOfIndexInfo* tableOfIndexInfo);
     void (*eval_cleanup)(PLpgSQL_execstate* estate);
     int (*validate_line)(PLpgSQL_stmt_block* block, int linenum);
 } PLpgSQL_plugin;
@@ -1287,15 +1321,6 @@ typedef struct PLpgSQL_package { /* Complete compiled package   */
     bool isInit;
 } PLpgSQL_package;
 
-typedef struct ExecTableOfIndexInfo {
-    ExprContext* econtext;
-    HTAB* tableOfIndex;
-    Oid tableOfIndexType;
-    bool isnestedtable;
-    int tableOfLayers;
-    int paramid;
-    Oid paramtype;
-} ExecTableOfIndexInfo;
 
 /**********************************************************************
  * Pl debugger
@@ -1384,6 +1409,8 @@ typedef struct PlDebugEntry {
     int commIdx;
     PLpgSQL_function* func;
 } PlDebugEntry;
+
+typedef List* (*RawParserHook)(const char*, List**);
 
 const int MAXINT8LEN = 25;
 const int DEFAULT_DEBUG_BUF_SIZE = 1024;
@@ -1559,13 +1586,14 @@ extern const char *plpgsql_code_int2cstring(int sqlcode);
 extern const int plpgsql_code_cstring2int(const char *codename);
 extern void plpgsql_set_variable(const char* varname, int value);
 extern PLpgSQL_variable* plpgsql_build_variable(const char* refname, int lineno, PLpgSQL_type* dtype, bool add2namespace, bool isImplicit = false,
-    const char* varname = NULL, knl_pl_body_type plType = PL_BODY_FUNCTION);
+    const char* varname = NULL, knl_pl_body_type plType = PL_BODY_FUNCTION, bool notNull = false);
 PLpgSQL_variable* plpgsql_build_varrayType(const char* refname, int lineno, PLpgSQL_type* dtype, bool add2namespace);
 PLpgSQL_variable* plpgsql_build_tableType(const char* refname, int lineno, PLpgSQL_type* dtype, bool add2namespace);
 extern PLpgSQL_rec_type* plpgsql_build_rec_type(const char* typname, int lineno, List* list, bool add2namespace);
-extern PLpgSQL_rec* plpgsql_build_record(const char* refname, int lineno, bool add2namespace);
+extern PLpgSQL_rec* plpgsql_build_record(const char* refname, int lineno, bool add2namespace, TupleDesc tupleDesc);
 extern int plpgsql_recognize_err_condition(const char* condname, bool allow_sqlstate);
 extern PLpgSQL_condition* plpgsql_parse_err_condition(char* condname);
+extern PLpgSQL_condition* plpgsql_parse_err_condition_b(const char* condname);
 extern int plpgsql_adddatum(PLpgSQL_datum* newm, bool isChange = true);
 extern int plpgsql_add_initdatums(int** varnos);
 extern void plpgsql_HashTableInit(void);
@@ -1634,16 +1662,18 @@ extern void plpgsql_subxact_cb(SubXactEvent event, SubTransactionId mySubid, Sub
 
 extern Oid exec_get_datum_type(PLpgSQL_execstate* estate, PLpgSQL_datum* datum);
 extern void exec_get_datum_type_info(PLpgSQL_execstate* estate, PLpgSQL_datum* datum, Oid* typid, int32* typmod,
-    Oid* collation, Oid* tableOfIndexType, PLpgSQL_function* func = NULL);
+    Oid* collation, List** tableOfIndexType, PLpgSQL_function* func = NULL);
 extern Datum exec_simple_cast_datum(
     PLpgSQL_execstate* estate, Datum value, Oid valtype, Oid reqtype, int32 reqtypmod, bool isnull);
 extern void ResetCursorOption(Portal portal, bool reset);
+extern void LockProcName(char* schemaname, char* pkgname, const char* funcname);
 #ifndef ENABLE_MULTIPLE_NODES
 extern void ResetCursorAtrribute(Portal portal);
 #endif
 extern void exec_assign_value(PLpgSQL_execstate *estate,
 				  PLpgSQL_datum *target,
-				  Datum value, Oid valtype, bool *isNull, HTAB* tableOfIndex = NULL);
+				  Datum value, Oid valtype, bool *isNull, HTAB* tableOfIndex = NULL,
+				  ExecTableOfIndexInfo* tableOfIndexInfo = NULL);
 extern void exec_eval_datum(PLpgSQL_execstate *estate,
 				PLpgSQL_datum *datum,
 				Oid *typeId,
@@ -1652,6 +1682,9 @@ extern void exec_eval_datum(PLpgSQL_execstate *estate,
 				bool *isnull,
 				bool isretry);
 extern void exec_eval_cleanup(PLpgSQL_execstate *estate);
+extern void plpgsql_estate_setup(PLpgSQL_execstate* estate, PLpgSQL_function* func, ReturnSetInfo* rsi);
+extern void plpgsql_destroy_econtext(PLpgSQL_execstate* estate);
+extern PLpgSQL_datum* copy_plpgsql_datum(PLpgSQL_datum* datum);
 extern void free_expr(PLpgSQL_expr* expr);
 extern void free_assignlist(List* assignlist);
 extern HeapTuple make_tuple_from_row(PLpgSQL_execstate* estate, PLpgSQL_row* row, TupleDesc tupdesc);
@@ -1660,9 +1693,13 @@ extern int getTableOfIndexByDatumValue(TableOfIndexKey key, HTAB* tableOfIndex, 
 extern Datum fillNestedTableArray(ArrayType* arrayval, Oid parenttypoid, Oid elemtypoid, int value, int idx);
 extern int plpgsql_estate_adddatum(PLpgSQL_execstate* estate, PLpgSQL_datum* newm);
 extern void CheckCurrCompileDependOnPackage(Oid pkgOid);
+extern bool needRecompilePlan(SPIPlanPtr plan);
+extern void plpgsql_param_fetch(ParamListInfo params, int paramid);
+extern Datum pl_coerce_type_typmod(Datum value, Oid targetTypeId, int32 targetTypMod);
 #ifndef ENABLE_MULTIPLE_NODES
 extern void estate_cursor_set(FormatCallStack* plcallstack);
 #endif
+extern Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 
 /* ----------
  * Functions for namespace handling in pl_funcs.c
@@ -1680,6 +1717,9 @@ extern void plpgsql_ns_additem(
 extern PLpgSQL_nsitem* plpgsql_ns_lookup(
     PLpgSQL_nsitem* ns_cur, bool localmode, const char* name1, const char* name2, const char* name3, int* names_used);
 extern PLpgSQL_nsitem* plpgsql_ns_lookup_label(PLpgSQL_nsitem* ns_cur, const char* name);
+extern void free_func_tableof_index();
+extern void free_temp_func_tableof_index(List* temp_tableof_index);
+
 
 /* ----------
  * Other functions in pl_funcs.c
@@ -1706,7 +1746,9 @@ extern int plpgsql_base_yylex(void);
 extern int plpgsql_yylex(void);
 extern void plpgsql_push_back_token(int token);
 extern void plpgsql_append_source_text(StringInfo buf, int startlocation, int endlocation);
+extern void plpgsql_peek(int* tok1_p);
 extern void plpgsql_peek2(int* tok1_p, int* tok2_p, int* tok1_loc, int* tok2_loc);
+extern void plpgsql_peek(int* tok1_p);
 extern int plpgsql_scanner_errposition(int location);
 extern void plpgsql_yyerror(const char* message, bool isError = false);
 extern int plpgsql_location_to_lineno(int location);
@@ -1718,6 +1760,7 @@ extern void plpgsql_process_stmt_array(StringInfo buf, List* bracket_loc);
 extern void plpgsql_append_object_typename(StringInfo buf, PLpgSQL_type *var_type);
 extern void CheckSaveExceptionsDML(int errstate);
 
+extern void plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata);
 /* ----------
  * Externs in gram.y
  * ----------
@@ -1745,6 +1788,11 @@ typedef struct PackageRuntimeState {
     PLpgSQL_datum** datums;
     int size;
 } PackageRuntimeState;
+
+typedef struct VarName{
+    char *name;
+    int  lineno;
+} VarName;
 
 typedef struct AutoSessionFuncValInfo {
     bool found;
@@ -1802,6 +1850,8 @@ typedef struct ExceptionContext {
 
     int spi_connected;              /* SPI connected level before exception. */
     int64 stackId;                  /* the start stack Id before entry exception block. */
+
+    PLpgSQL_declare_handler handler_type;
 } ExceptionContext;
 
 /* Quick access array state */
@@ -1846,5 +1896,6 @@ extern void stp_reset_xact();
 extern void stp_reset_stmt();
 extern void stp_reserve_subxact_resowner(ResourceOwner resowner);
 extern void stp_cleanup_subxact_resowner(int64 minStackId);
-
+extern void stp_cleanup_subxact_resource(int64 stackId);
+extern void InsertGsSource(Oid objId, Oid nspid, const char* name, const char* type, bool status);
 #endif /* PLPGSQL_H */

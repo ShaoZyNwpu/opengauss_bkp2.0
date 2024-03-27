@@ -34,13 +34,9 @@
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "utils/guc.h"
-#ifdef ENABLE_MOT
-#include "storage/mot/mot_fdw.h"
-#endif
 
 #include "gssignal/gs_signal.h"
 #include "access/parallel_recovery/dispatcher.h"
-#include "access/extreme_rto/dispatcher.h"
 #include "replication/dcf_replication.h"
 
 /* Signal handlers */
@@ -82,6 +78,10 @@ static void startupproc_quickdie(SIGNAL_ARGS)
      * should ensure the postmaster sees this as a crash, too, but no harm in
      * being doubly sure.)
      */
+
+    /* release compression ctx */
+    crps_destory_ctxs();
+
     exit(2);
 }
 
@@ -188,6 +188,9 @@ static void StartupProcShutdownHandler(SIGNAL_ARGS)
 {
     int save_errno = errno;
 
+    /* release compression ctx */
+    crps_destory_ctxs();
+
     if (t_thrd.startup_cxt.in_restore_command)
         proc_exit(1);
     else
@@ -217,7 +220,7 @@ void HandleStartupProcInterrupts(void)
         ProcessConfigFile(PGC_SIGHUP);
     }
 
-    if (t_thrd.startup_cxt.check_repair) {
+    if (t_thrd.startup_cxt.check_repair && g_instance.pid_cxt.PageRepairPID != 0) {
         if (!IsExtremeRedo() && !IsParallelRedo()) {
             parallel_recovery::SeqCheckRemoteReadAndRepairPage();
         }
@@ -228,6 +231,9 @@ void HandleStartupProcInterrupts(void)
      * Check if we were requested to exit without finishing recovery.
      */
     if (t_thrd.startup_cxt.shutdown_requested && SmartShutdown != g_instance.status) {
+        /* release compression ctx */
+        crps_destory_ctxs();
+
         proc_exit(1);
     }
 
@@ -235,8 +241,12 @@ void HandleStartupProcInterrupts(void)
      * Emergency bailout if postmaster has died.  This is to avoid the
      * necessity for manual cleanup of all postmaster children.
      */
-    if (IsUnderPostmaster && !PostmasterIsAlive())
+    if (IsUnderPostmaster && !PostmasterIsAlive()) {
+        /* release compression ctx */
+        crps_destory_ctxs();
+
         gs_thread_exit(1);
+    }
 }
 
 static void StartupReleaseAllLocks(int code, Datum arg)
@@ -305,7 +315,7 @@ void StartupProcessMain(void)
     (void)gspqsignal(SIGINT, StartupProcSigIntHandler);    /* check repair page and file */
     (void)gspqsignal(SIGTERM, StartupProcShutdownHandler); /* request shutdown */
     (void)gspqsignal(SIGQUIT, startupproc_quickdie);       /* hard crash time */
-
+    (void)gspqsignal(SIGURG, print_stack);
     if (g_instance.attr.attr_storage.EnableHotStandby)
         (void)gspqsignal(SIGALRM, handle_standby_sig_alarm); /* ignored unless
 
@@ -327,7 +337,9 @@ void StartupProcessMain(void)
     (void)gspqsignal(SIGWINCH, SIG_DFL);
 
     (void)RegisterRedoInterruptCallBack(HandleStartupProcInterrupts);
-    (void)RegisterRedoPageRepairCallBack(HandleStartupPageRepair);
+    if (g_instance.pid_cxt.PageRepairPID != 0) {
+        (void)RegisterRedoPageRepairCallBack(HandleStartupPageRepair);
+    }
     /*
      * Unblock signals (they were blocked when the postmaster forked us)
      */
@@ -341,21 +353,12 @@ void StartupProcessMain(void)
     pgstat_report_appname("Startup");
     pgstat_report_activity(STATE_IDLE, NULL);
 
+    /* init compression ctx for page compression */
+    crps_create_ctxs(STARTUP);
     if (dummyStandbyMode) {
         StartupDummyStandby();
     } else {
         on_shmem_exit(StartupReleaseAllLocks, 0);
-
-#ifdef ENABLE_MOT
-        /*
-         * Init MOT first
-         */
-        InitMOT();
-
-        /*
-         * MOT recovery is part of StartupXlog
-         */
-#endif
         DeleteDisConnFileInClusterStandby();
         if (!dummyStandbyMode) {
             Assert(g_instance.startup_cxt.badPageHashTbl == NULL);
@@ -364,6 +367,9 @@ void StartupProcessMain(void)
 
         StartupXLOG();
     }
+
+    /* release compression ctx */
+    crps_destory_ctxs();
 
     /*
      * Exit normally. Exit code 0 tells postmaster that we completed recovery
@@ -397,8 +403,8 @@ bool IsFailoverTriggered(void)
     if (AmStartupProcess()) {
         return t_thrd.startup_cxt.failover_triggered;
     } else {
-        uint32 tgigger = pg_atomic_read_u32(&(extreme_rto::g_startupTriggerState));
-        if (tgigger == (uint32)extreme_rto::TRIGGER_FAILOVER) {
+        uint32 tgigger = pg_atomic_read_u32(&g_startupTriggerState);
+        if (tgigger == (uint32)TRIGGER_FAILOVER) {
             return true;
         }
     }
@@ -410,8 +416,8 @@ bool IsSwitchoverTriggered(void)
     if (AmStartupProcess()) {
         return t_thrd.startup_cxt.switchover_triggered;
     } else {
-        uint32 tgigger = pg_atomic_read_u32(&(extreme_rto::g_startupTriggerState));
-        if (tgigger == (uint32)extreme_rto::TRIGGER_SWITCHOVER) {
+        uint32 tgigger = pg_atomic_read_u32(&g_startupTriggerState);
+        if (tgigger == (uint32)TRIGGER_SWITCHOVER) {
             return true;
         }
     }
@@ -423,8 +429,8 @@ bool IsPrimaryTriggered(void)
     if (AmStartupProcess()) {
         return t_thrd.startup_cxt.primary_triggered;
     } else {
-        uint32 tgigger = pg_atomic_read_u32(&(extreme_rto::g_startupTriggerState));
-        if (tgigger == (uint32)extreme_rto::TRIGGER_PRIMARY) {
+        uint32 tgigger = pg_atomic_read_u32(&g_startupTriggerState);
+        if (tgigger == (uint32)TRIGGER_PRIMARY) {
             return true;
         }
     }
@@ -436,8 +442,8 @@ bool IsStandbyTriggered(void)
     if (AmStartupProcess()) {
         return t_thrd.startup_cxt.standby_triggered;
     } else {
-        uint32 tgigger = pg_atomic_read_u32(&(extreme_rto::g_startupTriggerState));
-        if (tgigger == (uint32)extreme_rto::TRIGGER_STADNBY) {
+        uint32 tgigger = pg_atomic_read_u32(&g_startupTriggerState);
+        if (tgigger == (uint32)TRIGGER_STADNBY) {
             return true;
         }
     }

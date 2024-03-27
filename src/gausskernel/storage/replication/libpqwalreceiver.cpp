@@ -23,6 +23,7 @@
 #include "libpq/libpq-int.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender_private.h"
@@ -44,6 +45,9 @@
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #endif
+#include "utils/int8.h"
+#include "utils/pg_lsn.h"
+#include "utils/builtins.h"
 
 /* Prototypes for private functions */
 static bool libpq_select(int timeout_ms);
@@ -255,8 +259,18 @@ void StartRemoteStreaming(const LibpqrcvConnectParam *options)
             stringlist_to_identifierstr(t_thrd.libwalreceiver_cxt.streamConn, options->publicationNames);
         appendStringInfo(&cmd, ", publication_names %s",
             PQescapeLiteral(t_thrd.libwalreceiver_cxt.streamConn, pubnames_str, strlen(pubnames_str)));
-        appendStringInfoChar(&cmd, ')');
         pfree(pubnames_str);
+
+        if (options->binary && PQserverVersion(t_thrd.libwalreceiver_cxt.streamConn) >= 90204) {
+            appendStringInfoString(&cmd, ", binary 'true'");
+            ereport(DEBUG5, (errmsg("append binary true")));
+        }
+
+        if (options->useSnapshot) {
+            appendStringInfoString(&cmd, ", usesnapshot 'true'");
+        }
+
+        appendStringInfoChar(&cmd, ')');
     }
 
     PGresult *res = libpqrcv_PQexec(cmd.data);
@@ -269,28 +283,44 @@ void StartRemoteStreaming(const LibpqrcvConnectParam *options)
     PQclear(res);
 }
 
-void CreateRemoteReplicationSlot(XLogRecPtr startpoint, const char* slotname, bool isLogical)
+void CreateRemoteReplicationSlot(XLogRecPtr startpoint, const char* slotname, bool isLogical, XLogRecPtr *lsn,
+                                 bool useSnapshot, CommitSeqNo *csn)
 {
     Assert(t_thrd.libwalreceiver_cxt.streamConn != NULL);
-    char cmd[1024];
-    int nRet = 0;
+    StringInfoData cmd;
+
+    initStringInfo(&cmd);
+
+    appendStringInfo(&cmd, "CREATE_REPLICATION_SLOT \"%s\"", slotname);
 
     if (isLogical) {
-        nRet = snprintf_s(cmd, sizeof(cmd), sizeof(cmd) - 1, "CREATE_REPLICATION_SLOT \"%s\" LOGICAL pgoutput",
-                          slotname);
+        appendStringInfoString(&cmd, " LOGICAL pgoutput");
     } else {
-        nRet = snprintf_s(cmd, sizeof(cmd), sizeof(cmd) - 1, "CREATE_REPLICATION_SLOT \"%s\" PHYSICAL %X/%X", slotname,
-                          (uint32)(startpoint >> 32), (uint32)(startpoint));
+        appendStringInfo(&cmd, " PHYSICAL %X/%X", (uint32)(startpoint >> 32), (uint32)(startpoint));
     }
-    securec_check_ss(nRet, "", "");
 
-    PGresult *res = libpqrcv_PQexec(cmd);
+    if (useSnapshot) {
+        appendStringInfoString(&cmd, " USE_SNAPSHOT");
+    }
+
+    PGresult *res = libpqrcv_PQexec(cmd.data);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         PQclear(res);
+        pfree(cmd.data);
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_STATUS), errmsg("could not create replication slot %s : %s", slotname,
                                                          PQerrorMessage(t_thrd.libwalreceiver_cxt.streamConn))));
     }
+
+    if (lsn) {
+        *lsn = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid, CStringGetDatum(PQgetvalue(res, 0, 1))));
+    }
+
+    if (useSnapshot && csn) {
+        *csn = (CommitSeqNo)DatumGetInt64(
+            DirectFunctionCall1Coll(int8in, InvalidOid, CStringGetDatum(PQgetvalue(res, 0, 4))));
+    }
+    pfree(cmd.data);
     PQclear(res);
 }
 
@@ -420,7 +450,7 @@ void IdentifyRemoteSystem(bool checkRemote)
 }
 
 /* identify remote mode, should do this after connect success. */
-static ServerMode IdentifyRemoteMode()
+ServerMode IdentifyRemoteMode()
 {
     Assert(t_thrd.libwalreceiver_cxt.streamConn != NULL);
     volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
@@ -443,7 +473,9 @@ static ServerMode IdentifyRemoteMode()
                                   num_fields)));
     }
     remoteMode = (ServerMode)pg_strtoint32(PQgetvalue(res, 0, 0));
-    if (!t_thrd.walreceiver_cxt.AmWalReceiverForFailover && (!IS_PRIMARY_NORMAL(remoteMode)) &&
+    if (walrcv->conn_target != REPCONNTARGET_PUBLICATION &&
+        !t_thrd.walreceiver_cxt.AmWalReceiverForFailover &&
+        (!IS_PRIMARY_NORMAL(remoteMode)) &&
         /* remoteMode of cascade standby is a standby */
         !t_thrd.xlog_cxt.is_cascade_standby && !IS_SHARED_STORAGE_MODE) {
         PQclear(res);
@@ -562,7 +594,7 @@ static int32 IdentifyRemoteVersion()
     return remoteTerm;
 }
 
-static void SetWalSendTermChanged(void)
+static void NotifyWalSendForMainStandby(uint32 localTerm, uint32 remoteTerm)
 {
     for (int i = 0; i < g_instance.attr.attr_storage.max_wal_senders; i++) {
         volatile WalSnd *walsnd = &t_thrd.walsender_cxt.WalSndCtl->walsnds[i];
@@ -571,7 +603,10 @@ static void SetWalSendTermChanged(void)
             continue;
 
         SpinLockAcquire(&walsnd->mutex);
-        walsnd->isTermChanged = true;
+        if (IS_MULTI_DISASTER_RECOVER_MODE && localTerm != remoteTerm) {
+            walsnd->isTermChanged = true;
+        }
+        walsnd->sendKeepalive = true;
         SpinLockRelease(&walsnd->mutex);
     }
 }
@@ -601,18 +636,29 @@ bool libpqrcv_connect(char *conninfo, XLogRecPtr *startpoint, char *slotname, in
     char *remoteMaxLsnStr = NULL;
     char *remoteMaxLsnCrcStr = NULL;
     uint32 hi, lo;
+    char uuidOption[MAXCONNINFO] = {0};
+
+    if (u_sess->attr.attr_storage.repl_auth_mode == REPL_AUTH_UUID &&
+        u_sess->attr.attr_storage.repl_uuid != NULL && strlen(u_sess->attr.attr_storage.repl_uuid) > 0) {
+        nRet = snprintf_s(uuidOption, sizeof(uuidOption), sizeof(uuidOption) - 1,
+                          "options='-c repl_uuid=%s'", u_sess->attr.attr_storage.repl_uuid);
+        securec_check_ss(nRet, "\0", "\0");
+    }
 
     /*
      * Connect using deliberately undocumented parameter: replication. The
      * database name is ignored by the server in replication mode, but specify
      * "replication" for .pgpass lookup.
+     *
+     * For normal standbys(i.e. not hadr standby or Dorado standby), UUID is passed as startup option
+     * if uuid auth mode is required.
      */
     if (dummyStandbyMode) {
         nRet = snprintf_s(conninfoRepl, sizeof(conninfoRepl), sizeof(conninfoRepl) - 1,
                           "%s dbname=replication replication=true "
                           "fallback_application_name=dummystandby "
-                          "connect_timeout=%d",
-                          conninfo, u_sess->attr.attr_storage.wal_receiver_connect_timeout);
+                          "connect_timeout=%d %s",
+                          conninfo, u_sess->attr.attr_storage.wal_receiver_connect_timeout, uuidOption);
 #ifndef ENABLE_MULTIPLE_NODES
     } else if (AM_HADR_WAL_RECEIVER) {
 #else
@@ -648,13 +694,14 @@ bool libpqrcv_connect(char *conninfo, XLogRecPtr *startpoint, char *slotname, in
         nRet = snprintf_s(conninfoRepl, sizeof(conninfoRepl), sizeof(conninfoRepl) - 1,
                           "%s dbname=replication replication=true "
                           "fallback_application_name=%s "
-                          "connect_timeout=%d",
+                          "connect_timeout=%d %s",
                           conninfo,
                           (u_sess->attr.attr_common.application_name &&
                            strlen(u_sess->attr.attr_common.application_name) > 0)
                                 ? u_sess->attr.attr_common.application_name
                                 : "walreceiver",
-                          u_sess->attr.attr_storage.wal_receiver_connect_timeout);
+                          u_sess->attr.attr_storage.wal_receiver_connect_timeout,
+                          uuidOption);
     }
 
     securec_check_ss(nRet, "", "");
@@ -751,7 +798,8 @@ retry:
     }
 
 #ifndef ENABLE_MULTIPLE_NODES
-    if (t_thrd.xlog_cxt.is_cascade_standby && !t_thrd.postmaster_cxt.HaShmData->is_cross_region) {
+    if (g_instance.attr.attr_storage.enable_availablezone &&
+        t_thrd.xlog_cxt.is_cascade_standby && !t_thrd.postmaster_cxt.HaShmData->is_cross_region) {
         IdentifyRemoteAvailableZone();
     }
 #endif
@@ -803,7 +851,6 @@ retry:
         res = libpqrcv_PQexec(cmd);
         if (PQresultStatus(res) != PGRES_TUPLES_OK) {
             PQclear(res);
-            ha_set_rebuild_connerror(WALSEGMENT_REBUILD, REPL_INFO_ERROR);
             ereport(ERROR, (errcode(ERRCODE_INVALID_STATUS),
                             errmsg("failed to identify consistence at %X/%X: %s", (uint32)(localRec >> 32),
                                    (uint32)localRec, PQerrorMessage(t_thrd.libwalreceiver_cxt.streamConn))));
@@ -884,11 +931,24 @@ retry:
                          * standby connect to primary
                          * Direct check Primary and Standby, trigger build.
                          */
-                        ha_set_rebuild_connerror(WALSEGMENT_REBUILD, REPL_INFO_ERROR);
-                        ereport(ERROR, (errcode(ERRCODE_INVALID_STATUS),
-                                        errmsg("standby's local request lsn[%X/%X] 's crc mismatched with remote server"
-                                               "crc(local, remote):[%u,%u].",
-                                               (uint32)(localRec >> 32), (uint32)localRec, localRecCrc, recCrc)));
+                        if (t_thrd.postmaster_cxt.HaShmData->is_cross_region &&
+                            t_thrd.postmaster_cxt.HaShmData->is_cascade_standby &&
+                            recCrc == 0 && XLByteLT(remoteMaxLsn, localRec)) {
+                            /* The cascaded standby instance of the disaster recovery cluster
+                            has more logs than the main standby instance, the build is not triggered */
+                            ereport(ERROR, (errcode(ERRCODE_INVALID_STATUS),
+                                    errmsg("cascaded standby's local request lsn[%X/%X] 's crc mismatched with "
+                                           "main standby crc(local, remote):[%u,%u], remote max lsn is [%X/%X].",
+                                           (uint32)(localRec >> 32), (uint32)localRec, localRecCrc, recCrc,
+                                           (uint32)(remoteMaxLsn >> 32), (uint32)remoteMaxLsn)));
+                            return false;
+                        } else {
+                            ha_set_rebuild_connerror(WALSEGMENT_REBUILD, REPL_INFO_ERROR);
+                            ereport(ERROR, (errcode(ERRCODE_INVALID_STATUS),
+                                    errmsg("standby's local request lsn[%X/%X] 's crc mismatched with remote server "
+                                           "crc(local, remote):[%u,%u].",
+                                           (uint32)(localRec >> 32), (uint32)localRec, localRecCrc, recCrc)));
+                        }
                     }
                 }
             } else if (t_thrd.walreceiver_cxt.AmWalReceiverForStandby) {
@@ -1030,7 +1090,7 @@ retry:
     }
 
     if (!t_thrd.walreceiver_cxt.AmWalReceiverForFailover && slotname != NULL) {
-        CreateRemoteReplicationSlot(*startpoint, slotname, false);
+        CreateRemoteReplicationSlot(*startpoint, slotname, false, NULL);
     }
 
     /* Start streaming from the point requested by startup process */
@@ -1046,8 +1106,8 @@ retry:
             (errmsg("streaming replication successfully connected to primary, the connection is %s, start from %X/%X ",
                     conninfo, (uint32)(*startpoint >> 32), (uint32)(*startpoint))));
 
-    if (IS_DISASTER_RECOVER_MODE && t_thrd.postmaster_cxt.HaShmData->is_hadr_main_standby && localTerm != remoteTerm) {
-        SetWalSendTermChanged();
+    if (t_thrd.postmaster_cxt.HaShmData->is_hadr_main_standby) {
+        NotifyWalSendForMainStandby(localTerm, remoteTerm);
     }
 
     if (!t_thrd.walreceiver_cxt.AmWalReceiverForFailover) {
@@ -1170,6 +1230,8 @@ static PGresult *libpqrcv_PQexec(const char *query)
          * blocking.
          */
         while (PQisBusy(t_thrd.libwalreceiver_cxt.streamConn)) {
+            CHECK_FOR_INTERRUPTS();
+
             /*
              * We don't need to break down the sleep into smaller increments,
              * and check for interrupts after each nap, since we can just
@@ -1291,9 +1353,16 @@ bool libpqrcv_receive(int timeout, unsigned char *type, char **buffer, int *len)
         res = PQgetResult(t_thrd.libwalreceiver_cxt.streamConn);
         if (PQresultStatus(res) == PGRES_COMMAND_OK) {
             PQclear(res);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_STATUS),
-                            errmsg("replication terminated by primary server at %X/%X",
-                                   (uint32)(walrcv->receivedUpto >> 32), (uint32)walrcv->receivedUpto)));
+
+            /* Verify that there are no more results */
+            res = PQgetResult(t_thrd.libwalreceiver_cxt.streamConn);
+            if (res != NULL) {
+                PQclear(res);
+                ereport(ERROR,
+                        (errmsg("unexpected result after CommandComplete: %s",
+                                PQerrorMessage(t_thrd.libwalreceiver_cxt.streamConn))));
+            }
+            *len = -1;
             return false;
         }
 
@@ -1320,6 +1389,11 @@ bool libpqrcv_receive(int timeout, unsigned char *type, char **buffer, int *len)
     }
 
     /* Return received messages to caller */
+    if (type == NULL) {
+        *buffer = t_thrd.libwalreceiver_cxt.recvBuf;
+        *len = rawlen;
+        return true;
+    }
     *type = *((unsigned char *)t_thrd.libwalreceiver_cxt.recvBuf);
     if (IS_SHARED_STORAGE_MODE && !AM_HADR_WAL_RECEIVER && *type == 'w') {
         *len = 0;
@@ -1344,25 +1418,131 @@ void libpqrcv_send(const char *buffer, int nbytes)
                                                                 PQerrorMessage(t_thrd.libwalreceiver_cxt.streamConn))));
 }
 
-bool libpqrcv_command(const char *cmd, char **err, int *sqlstate)
+/*
+ * Convert tuple query result to tuplestore.
+ */
+static void libpqrcv_processTuples(PGresult *pgres, WalRcvExecResult *walres, const int nRetTypes, const Oid *retTypes)
 {
-    PGresult *res = libpqrcv_PQexec(cmd);
+    int tupn;
+    int coln;
+    int nfields = PQnfields(pgres);
+    HeapTuple tuple;
+    AttInMetadata *attinmeta;
+    MemoryContext rowcontext;
+    MemoryContext oldcontext;
 
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        PQclear(res);
-        *err = pstrdup(PQerrorMessage(t_thrd.libwalreceiver_cxt.streamConn));
-        if (sqlstate != NULL && t_thrd.libwalreceiver_cxt.streamConn != NULL) {
-            *sqlstate = MAKE_SQLSTATE(t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[0],
-                                      t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[1],
-                                      t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[2],
-                                      t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[3],
-                                      t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[4]);
+    /* Make sure we got expected number of fields. */
+    if (nfields != nRetTypes)
+        ereport(ERROR,
+            (errmsg("invalid query responser"), errdetail("Expected %d fields, got %d fields.", nRetTypes, nfields)));
+
+    walres->tuplestore = tuplestore_begin_heap(true, false, u_sess->attr.attr_memory.work_mem);
+
+    /* Create tuple descriptor corresponding to expected result. */
+    walres->tupledesc = CreateTemplateTupleDesc(nRetTypes, false);
+    for (coln = 0; coln < nRetTypes; coln++)
+        TupleDescInitEntry(walres->tupledesc, (AttrNumber)coln + 1, PQfname(pgres, coln), retTypes[coln], -1, 0);
+    attinmeta = TupleDescGetAttInMetadata(walres->tupledesc);
+
+    /* No point in doing anything here if there were no tuples returned. */
+    if (PQntuples(pgres) == 0)
+        return;
+
+    /* Create temporary context for local allocations. */
+    rowcontext = AllocSetContextCreate(CurrentMemoryContext, "libpqrcv query result context", ALLOCSET_DEFAULT_SIZES);
+
+    /* Process returned rows. */
+    for (tupn = 0; tupn < PQntuples(pgres); tupn++) {
+        char *cstrs[MaxTupleAttributeNumber];
+
+        CHECK_FOR_INTERRUPTS();
+
+        /* Do the allocations in temporary context. */
+        oldcontext = MemoryContextSwitchTo(rowcontext);
+
+        /*
+         * Fill cstrs with null-terminated strings of column values.
+         */
+        for (coln = 0; coln < nfields; coln++) {
+            if (PQgetisnull(pgres, tupn, coln))
+                cstrs[coln] = NULL;
+            else
+                cstrs[coln] = PQgetvalue(pgres, tupn, coln);
         }
-        return false;
+
+        /* Convert row to a tuple, and add it to the tuplestore */
+        tuple = BuildTupleFromCStrings(attinmeta, cstrs);
+        tuplestore_puttuple(walres->tuplestore, tuple);
+
+        /* Clean up */
+        MemoryContextSwitchTo(oldcontext);
+        MemoryContextReset(rowcontext);
     }
 
-    PQclear(res);
-    return true;
+    MemoryContextDelete(rowcontext);
+}
+
+/*
+ * Public interface for sending generic queries (and commands).
+ *
+ * This can only be called from process connected to database.
+ */
+WalRcvExecResult* libpqrcv_exec(const char *query, const int nRetTypes, const Oid *retTypes)
+{
+    PGresult *pgres = NULL;
+    WalRcvExecResult *walres = (WalRcvExecResult *)palloc0(sizeof(WalRcvExecResult));
+
+    if (u_sess->proc_cxt.MyDatabaseId == InvalidOid)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                errmsg("the query interface requires a database connection")));
+
+    pgres = libpqrcv_PQexec(query);
+
+    switch (PQresultStatus(pgres)) {
+        case PGRES_SINGLE_TUPLE:
+        case PGRES_TUPLES_OK:
+            walres->status = WALRCV_OK_TUPLES;
+            libpqrcv_processTuples(pgres, walres, nRetTypes, retTypes);
+            break;
+
+        case PGRES_COPY_IN:
+            walres->status = WALRCV_OK_COPY_IN;
+            break;
+
+        case PGRES_COPY_OUT:
+            walres->status = WALRCV_OK_COPY_OUT;
+            break;
+
+        case PGRES_COPY_BOTH:
+            walres->status = WALRCV_OK_COPY_BOTH;
+            break;
+
+        case PGRES_COMMAND_OK:
+            walres->status = WALRCV_OK_COMMAND;
+            break;
+
+        /* Empty query is considered error. */
+        case PGRES_EMPTY_QUERY:
+            walres->status = WALRCV_ERROR;
+            walres->err = _("empty query");
+            break;
+
+        case PGRES_NONFATAL_ERROR:
+        case PGRES_FATAL_ERROR:
+        case PGRES_BAD_RESPONSE:
+            walres->status = WALRCV_ERROR;
+            walres->err = pstrdup(PQerrorMessage(t_thrd.libwalreceiver_cxt.streamConn));
+            walres->sqlstate = MAKE_SQLSTATE(t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[0],
+                                             t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[1],
+                                             t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[2],
+                                             t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[3],
+                                             t_thrd.libwalreceiver_cxt.streamConn->last_sqlstate[4]);
+            break;
+    }
+
+    PQclear(pgres);
+    return walres;
 }
 
 void HaSetRebuildRepInfoError(HaRebuildReason reason)

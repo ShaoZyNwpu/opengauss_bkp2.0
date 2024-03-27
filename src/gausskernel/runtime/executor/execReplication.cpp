@@ -53,7 +53,8 @@ static bool RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode, Tuple
  * This is not generic routine, it expects the idxrel to be replication
  * identity of a rel and meet all limitations associated with that.
  */
-static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel, TupleTableSlot *searchslot)
+static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel, TupleTableSlot *searchslot,
+    EState *estate)
 {
     int attoff;
     bool isnull;
@@ -65,6 +66,16 @@ static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel
     indclassDatum = SysCacheGetAttr(INDEXRELID, idxrel->rd_indextuple, Anum_pg_index_indclass, &isnull);
     Assert(!isnull);
     opclass = (oidvector *)DatumGetPointer(indclassDatum);
+
+    List* expressionsState = NIL;
+    ExprContext* econtext = GetPerTupleExprContext(estate);
+    econtext->ecxt_scantuple = searchslot;
+    ListCell* indexpr_item = NULL;
+
+    if (idxrel->rd_indexprs != NIL) {
+        expressionsState = (List*)ExecPrepareExpr((Expr*)idxrel->rd_indexprs, estate);
+        indexpr_item = list_head(expressionsState);
+    }
 
     /* Build scankey for every attribute in the index. */
     for (attoff = 0; attoff < IndexRelationGetNumberOfKeyAttributes(idxrel); attoff++) {
@@ -92,14 +103,34 @@ static bool build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel
 
         regop = get_opcode(op);
 
-        /* Initialize the scankey. */
-        ScanKeyInit(&skey[attoff], pkattno, BTEqualStrategyNumber, regop, searchslot->tts_values[mainattno - 1]);
-        skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
+        if (mainattno != 0) {
+            /* Initialize the scankey. */
+            ScanKeyInit(&skey[attoff], pkattno, BTEqualStrategyNumber, regop, searchslot->tts_values[mainattno - 1]);
+            skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
 
-        /* Check for null value. */
-        if (searchslot->tts_isnull[mainattno - 1]) {
-            hasnulls = true;
-            skey[attoff].sk_flags |= SK_ISNULL;
+            /* Check for null value. */
+            if (searchslot->tts_isnull[mainattno - 1]) {
+                hasnulls = true;
+                skey[attoff].sk_flags |= SK_ISNULL;
+            }
+        } else {
+            if (idxrel->rd_indexprs == NIL) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("wrong number of index expressions")));
+            } else {
+                bool isNull = false;
+                Datum datum = ExecEvalExprSwitchContext((ExprState*)lfirst(indexpr_item), econtext, &isNull, NULL);
+                indexpr_item = lnext(indexpr_item);
+
+                ScanKeyInit(&skey[attoff], pkattno, BTEqualStrategyNumber, regop, datum);
+                skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
+
+                /* Check for null value. */
+                if (isNull) {
+                    hasnulls = true;
+                    skey[attoff].sk_flags |= SK_ISNULL;
+                }
+            }
         }
     }
 
@@ -113,8 +144,10 @@ static bool inline CheckTupleLockRes(TM_Result res)
         case TM_Ok:
             break;
         case TM_Updated:
+        case TM_Deleted:
             /* XXX: Improve handling here */
-            ereport(LOG, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("concurrent update, retrying")));
+            ereport(LOG, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+                errmsg("concurrent update or delete, retrying")));
             return true;
         case TM_Invisible:
             elog(ERROR, "attempted to lock invisible tuple");
@@ -171,7 +204,7 @@ static bool PartitionFindReplTupleByIndex(EState *estate, Relation rel, Relation
         /* Get index partition of this heap partition */
         Oid idxPartOid = getPartitionIndexOid(RelationGetRelid(idxrel), heapPart->pd_id);
         Partition idxPart = partitionOpen(idxrel, idxPartOid, RowExclusiveLock);
-        Relation idxPartRel = RelationIsSubPartitioned(rel) ? SubPartitionGetRelation(idxrel, idxPart, NoLock) :
+        Relation idxPartRel = RelationIsSubPartitioned(idxrel) ? SubPartitionGetRelation(idxrel, idxPart, NoLock) :
                                                               partitionGetRelation(idxrel, idxPart);
 
         fakeRelInfo->partRel = partionRel;
@@ -305,7 +338,7 @@ static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation 
     scan->isUpsert = true;
 
     /* Build scan key. */
-    build_replindex_scan_key(skey, targetRel, idxrel, searchslot);
+    build_replindex_scan_key(skey, targetRel, idxrel, searchslot, estate);
 
     while (true) {
         found = false;
@@ -322,7 +355,6 @@ static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation 
         }
         if (found) {
             /* Found tuple, try to lock it in the lockmode. */
-            outslot->tts_tuple = ExecMaterializeSlot(outslot);
             xwait = TransactionIdIsValid(snap.xmin) ? snap.xmin : snap.xmax;
             /*
              * If the tuple is locked, wait for locking transaction to finish
@@ -346,12 +378,16 @@ static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation 
             ItemPointer tid = tableam_tops_get_t_self(targetRel, outslot->tts_tuple);
 
             if (RelationIsUstoreFormat(targetRel)) {
+                /* materialize the slot, so we can visit it after the scan is end */
+                outslot->tts_tuple = UHeapMaterialize(outslot);
                 ItemPointerCopy(tid, &UHeaplocktup.ctid);
                 rc = memset_s(&tbuf, sizeof(tbuf), 0, sizeof(tbuf));
                 securec_check(rc, "\0", "\0");
                 UHeaplocktup.disk_tuple = &tbuf.hdr;
                 locktup = &UHeaplocktup;
             } else {
+                /* materialize the slot, so we can visit it after the scan is end */
+                outslot->tts_tuple = ExecMaterializeSlot(outslot);
                 ItemPointerCopy(tid, &heaplocktup.t_self);
                 locktup = &heaplocktup;
             }
@@ -364,7 +400,7 @@ static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation 
 
             PushActiveSnapshot(GetLatestSnapshot());
             res = tableam_tuple_lock(targetRel,
-                locktup, &buf, GetCurrentCommandId(false), lockmode, false, &hufd,
+                locktup, &buf, GetCurrentCommandId(false), lockmode, LockWaitBlock, &hufd,
                 false, false,             /* don't follow updates */
                 false,                    /* eval */
                 GetLatestSnapshot(), tid, /* ItemPointer */
@@ -401,6 +437,10 @@ static bool tuple_equals_slot(TupleDesc desc, const Tuple tup, TupleTableSlot *s
     /* Check equality of the attributes. */
     for (attrnum = 0; attrnum < desc->natts; attrnum++) {
         TypeCacheEntry *typentry;
+        /* skip generate column */
+        if (GetGeneratedCol(desc, attrnum)) {
+            continue;
+        }
         /*
          * If one value is NULL and other is not, then they are certainly not
          * equal
@@ -414,7 +454,7 @@ static bool tuple_equals_slot(TupleDesc desc, const Tuple tup, TupleTableSlot *s
         if (isnull[attrnum])
             continue;
 
-        att = desc->attrs[attrnum];
+        att = &desc->attrs[attrnum];
         typentry = eq[attrnum];
         if (typentry == NULL) {
             typentry = lookup_type_cache(att->atttypid, TYPECACHE_EQ_OPR_FINFO);
@@ -478,7 +518,6 @@ static bool RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode, Tuple
 
             found = true;
             ExecStoreTuple(scantuple, outslot, InvalidBuffer, false);
-            outslot->tts_tuple = ExecMaterializeSlot(outslot);
 
             xwait = TransactionIdIsValid(snap.xmin) ? snap.xmin : snap.xmax;
             /*
@@ -511,19 +550,23 @@ static bool RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode, Tuple
             ItemPointer tid = tableam_tops_get_t_self(rel, outslot->tts_tuple);
 
             if (RelationIsUstoreFormat(targetRel)) {
+                /* materialize the slot, so we can visit it after the scan is end */
+                outslot->tts_tuple = UHeapMaterialize(outslot);
                 ItemPointerCopy(tid, &UHeaplocktup.ctid);
                 rc = memset_s(&tbuf, sizeof(tbuf), 0, sizeof(tbuf));
                 securec_check(rc, "\0", "\0");
                 UHeaplocktup.disk_tuple = &tbuf.hdr;
                 locktup = &UHeaplocktup;
             } else {
+                /* materialize the slot, so we can visit it after the scan is end */
+                outslot->tts_tuple = ExecMaterializeSlot(outslot);
                 ItemPointerCopy(tid, &heaplocktup.t_self);
                 locktup = &heaplocktup;
             }
 
             PushActiveSnapshot(GetLatestSnapshot());
             res = tableam_tuple_lock(targetRel, locktup, &buf, GetCurrentCommandId(false),
-                lockmode, false, &hufd, false,
+                lockmode, LockWaitBlock, &hufd, false,
                 false,                    /* don't follow updates */
                 false,                    /* eval */
                 GetLatestSnapshot(), tid, /* ItemPointer */
@@ -586,8 +629,10 @@ void ExecSimpleRelationInsert(EState *estate, TupleTableSlot *slot, FakeRelation
     }
 
     /* Check the constraints of the tuple */
-    if (rel->rd_att->constr)
-        ExecConstraints(resultRelInfo, slot, estate);
+    if (rel->rd_att->constr) {
+        ExecConstraints(resultRelInfo, slot, estate, true);
+        tuple = ExecAutoIncrement(rel, estate, slot, tuple);
+    }
 
     /* OK, store the tuple and create index entries for it */
     (void)tableam_tuple_insert(targetRel, tuple, GetCurrentCommandId(true), 0, NULL);
@@ -653,7 +698,6 @@ void ExecSimpleRelationUpdate(EState *estate, EPQState *epqstate, TupleTableSlot
     /* Compute stored generated columns */
     if (rel->rd_att->constr && rel->rd_att->constr->has_generated_stored) {
         ExecComputeStoredGenerated(resultRelInfo, estate, slot, tuple, CMD_UPDATE);
-        tuple = slot->tts_tuple;
     }
 
     /* Check the constraints of the tuple */
@@ -672,20 +716,21 @@ void ExecSimpleRelationUpdate(EState *estate, EPQState *epqstate, TupleTableSlot
         rowMovement = true;
     }
 
+    tuple = slot->tts_tuple;
     CommandId cid = GetCurrentCommandId(true);
     /* OK, update the tuple and index entries for it */
     if (!rowMovement) {
-        res = tableam_tuple_update(targetRelation, parentRelation, searchSlotTid, slot->tts_tuple, cid,
+        res = tableam_tuple_update(targetRelation, parentRelation, searchSlotTid, tuple, cid,
             InvalidSnapshot, estate->es_snapshot, true, &oldslot, &tmfd, &updateIndexes, &modifiedIdxAttrs,
             false, allowInplaceUpdate);
         CheckTupleModifyRes(res);
-
         if (updateIndexes && resultRelInfo->ri_NumIndices > 0) {
             ExecIndexTuplesState exec_index_tuples_state;
             exec_index_tuples_state.estate = estate;
             exec_index_tuples_state.targetPartRel = RELATION_IS_PARTITIONED(rel) ? targetRelation : NULL;
             exec_index_tuples_state.p = relAndPart->part;
             exec_index_tuples_state.conflict = NULL;
+            exec_index_tuples_state.rollbackIndex = false;
             recheckIndexes = tableam_tops_exec_update_index_tuples(slot, oldslot, targetRelation, NULL, tuple,
                 searchSlotTid, exec_index_tuples_state, InvalidBktId, modifiedIdxAttrs);
         }
@@ -702,6 +747,7 @@ void ExecSimpleRelationUpdate(EState *estate, EPQState *epqstate, TupleTableSlot
         exec_index_tuples_state.targetPartRel = relAndPart->partRel;
         exec_index_tuples_state.p = relAndPart->part;
         exec_index_tuples_state.conflict = NULL;
+        exec_index_tuples_state.rollbackIndex = false;
         tableam_tops_exec_delete_index_tuples(oldslot, relAndPart->partRel, NULL, searchSlotTid,
             exec_index_tuples_state, modifiedIdxAttrs);
 
@@ -768,6 +814,7 @@ void ExecSimpleRelationDelete(EState *estate, EPQState *epqstate, TupleTableSlot
     exec_index_tuples_state.targetPartRel = RELATION_IS_PARTITIONED(rel) ? relAndPart->partRel : NULL;
     exec_index_tuples_state.p = relAndPart->part;
     exec_index_tuples_state.conflict = NULL;
+    exec_index_tuples_state.rollbackIndex = false;
     tableam_tops_exec_delete_index_tuples(oldslot, targetRel, NULL, tid, exec_index_tuples_state, modifiedIdxAttrs);
     if (oldslot) {
         ExecDropSingleTupleTableSlot(oldslot);
@@ -789,7 +836,8 @@ void CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
         return;
 
     /* If relation has replica identity we are always good. */
-    if (RelationGetRelReplident(rel) == REPLICA_IDENTITY_FULL || OidIsValid(RelationGetReplicaIndex(rel)))
+    Assert(rel->relreplident == RelationGetRelReplident(rel));
+    if (rel->relreplident == REPLICA_IDENTITY_FULL || OidIsValid(RelationGetReplicaIndex(rel)))
         return;
 
     /*
@@ -825,14 +873,15 @@ void GetFakeRelAndPart(EState *estate, Relation rel, TupleTableSlot *slot, FakeR
     Relation partRelation = NULL;
     Partition partition = NULL;
     Oid partitionOid;
+    int partitionno = INVALID_PARTITION_NO;
     Tuple tuple = tableam_tslot_get_tuple_from_slot(rel, slot);
     switch (rel->rd_rel->parttype) {
         case PARTTYPE_NON_PARTITIONED_RELATION:
         case PARTTYPE_VALUE_PARTITIONED_RELATION:
             break;
         case PARTTYPE_PARTITIONED_RELATION:
-            partitionOid = heapTupleGetPartitionId(rel, tuple);
-            searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, rel, partitionOid,
+            partitionOid = heapTupleGetPartitionId(rel, tuple, &partitionno);
+            searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, rel, partitionOid, partitionno,
                 partRelation, partition, RowExclusiveLock);
             relAndPart->partRel = partRelation;
             relAndPart->part = partition;
@@ -842,12 +891,13 @@ void GetFakeRelAndPart(EState *estate, Relation rel, TupleTableSlot *slot, FakeR
             Relation subPartRel = NULL;
             Partition subPart = NULL;
             Oid subPartOid;
-            partitionOid = heapTupleGetPartitionId(rel, tuple);
-            searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, rel, partitionOid,
+            int subpartitionno = INVALID_PARTITION_NO;
+            partitionOid = heapTupleGetPartitionId(rel, tuple, &partitionno);
+            searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, rel, partitionOid, partitionno,
                 partRelation, partition, RowExclusiveLock);
-            subPartOid = heapTupleGetPartitionId(partRelation, tuple);
+            subPartOid = heapTupleGetPartitionId(partRelation, tuple, &subpartitionno);
             searchFakeReationForPartitionOid(estate->esfRelations, estate->es_query_cxt, partRelation, subPartOid,
-                subPartRel, subPart, RowExclusiveLock);
+                subpartitionno, subPartRel, subPart, RowExclusiveLock);
 
             relAndPart->partRel = subPartRel;
             relAndPart->part = subPart;

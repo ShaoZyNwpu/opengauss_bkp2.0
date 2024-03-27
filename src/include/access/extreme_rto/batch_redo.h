@@ -23,8 +23,8 @@
  * ---------------------------------------------------------------------------------------
  */
 
-#ifndef BATCH_REDO_H
-#define BATCH_REDO_H
+#ifndef EXTREME_RTO_BATCH_REDO_H
+#define EXTREME_RTO_BATCH_REDO_H
 
 #include "c.h"
 #include "storage/buf/block.h"
@@ -45,8 +45,6 @@ namespace extreme_rto {
 
 #define INIT_REDO_ITEM_TAG(a, xx_rnode, xx_forkNum, xx_blockNum) \
     ((a).rNode = (xx_rnode), (a).forkNum = (xx_forkNum), (a).blockNum = (xx_blockNum))
-
-#define InvalidRelFileNode ((RelFileNode){ 0, 0, 0 })
 
 /*
  * Note: if there are any pad bytes in the struct, INIT_RedoItemTag have
@@ -71,4 +69,4 @@ extern  void PRTrackClearBlock(XLogRecParseState *recordBlockState, HTAB *redoIt
 extern void PRTrackAddBlock(XLogRecParseState *recordBlockState, HTAB *redoItemHash);
 
 }  // namespace extreme_rto
-#endif /* BATCH_REDO_H */
+#endif /* EXTREME_RTO_BATCH_REDO_H */

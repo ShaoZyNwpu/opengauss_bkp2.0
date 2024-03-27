@@ -85,6 +85,7 @@ typedef enum knl_thread_role {
     PERCENTILE_WORKER,
     TXNSNAP_CAPTURER,
     TXNSNAP_WORKER,
+    CFS_SHRINKER,
     RBCLEANER,
     RBWORKER,
     SNAPSHOT_WORKER,
@@ -109,6 +110,7 @@ typedef enum knl_thread_role {
     COMM_POOLER_CLEAN,
     LOGICAL_READ_RECORD,
     PARALLEL_DECODE,
+
     UNDO_RECYCLER,
     RESOURCE_MANAGER,
     UNDO_LAUNCHER,
@@ -121,6 +123,8 @@ typedef enum knl_thread_role {
     SHARE_STORAGE_XLOG_COPYER,
     APPLY_LAUNCHER,
     APPLY_WORKER,
+    STACK_PERF_WORKER,
+    DMS_AUXILIARY_THREAD,
     BARRIER_PREPARSE,
     TS_COMPACTION,
     TS_COMPACTION_CONSUMER,
@@ -145,7 +149,9 @@ typedef enum knl_thread_role {
     WAL_STANDBY_SENDER, /* Am I cascading WAL to another standby ? */
     WAL_DB_SENDER,
     TOP_CONSUMER,
-    DCF_WORKER
+    DCF_WORKER,
+    DMS_WORKER,
+    SW_SENDER
 } knl_thread_role;
 
 /*

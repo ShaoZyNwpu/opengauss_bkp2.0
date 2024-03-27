@@ -19,6 +19,7 @@
 #include "access/xlogutils.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "replication/dataqueue.h"
@@ -32,12 +33,14 @@
 #include "storage/proc.h"
 #include "storage/lmgr.h"
 #include "storage/smgr/smgr.h"
+#include "storage/smgr/relfilenode_hash.h"
 #include "postmaster/alarmchecker.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
+#include "instruments/gs_stack.h"
 #include "gssignal/gs_signal.h"
 
 #define MAX_DUMMY_DATA_FILE (RELSEG_SIZE * BLCKSZ)
@@ -101,7 +104,7 @@ void DataRcvWriterMain(void)
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, SIG_IGN);
     (void)gspqsignal(SIGUSR2, SIG_IGN);
-
+    (void)gspqsignal(SIGURG, print_stack);
     /*
      * Reset some signals that are accepted by postmaster but not here
      */
@@ -243,6 +246,9 @@ void DataRcvWriterMain(void)
      * init a hash table to store the rel file node fd.
      */
     DataWriterHashCreate();
+
+    pgstat_report_appname("Data Receive Writer");
+    pgstat_report_activity(STATE_IDLE, NULL);
 
     /*
      * Loop forever
@@ -745,9 +751,10 @@ static void DataWriterHashCreate(void)
         securec_check(rc, "", "");
         ctl.keysize = sizeof(data_writer_rel_key);
         ctl.entrysize = sizeof(data_writer_rel);
-        ctl.hash = tag_hash;
+        ctl.hash = DataWriterRelKeyHash;
+        ctl.match = DataWriterRelKeyMatch;
         t_thrd.datarcvwriter_cxt.data_writer_rel_tab = hash_create("data writer rel table", 100, &ctl,
-                                                                   HASH_ELEM | HASH_FUNCTION);
+                                                                   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
     } else
         return;
 }

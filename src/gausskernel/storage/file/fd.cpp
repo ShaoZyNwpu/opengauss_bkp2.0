@@ -83,6 +83,7 @@
 #include "storage/vfd.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
+#include "storage/file/fio_device.h"
 #include "threadpool/threadpool.h"
 #include "utils/guc.h"
 #include "utils/plog.h"
@@ -191,16 +192,6 @@ static pthread_mutex_t VFDLockArray[NUM_VFD_PARTITIONS];
 #define VFDMappingPartitionLock(hashcode) \
     (&VFDLockArray[VFDTableHashPartition(hashcode)])
 
-/*
- * pc_munmap
- */
-#define SAFE_MUNMAP(vfdP)                                  \
-    do {                                                   \
-        if ((vfdP)->with_pcmap && (vfdP)->pcmap != NULL) { \
-            UnReferenceAddrFile((vfdP));                   \
-            (vfdP)->pcmap = NULL;                          \
-        }                                                  \
-    } while (0)
 /* --------------------
  *
  * Private Routines
@@ -242,7 +233,7 @@ static File AllocateVfd(void);
 static void FreeVfd(File file);
 
 static int FileAccess(File file);
-static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError);
+static File OpenTemporaryFileInTablespaceOrDir(Oid tblspcOid, bool rejectError);
 static void CleanupTempFiles(bool isProcExit);
 static void RemovePgTempFilesInDir(const char* tmpdirname, bool unlinkAll);
 static void RemovePgTempRelationFiles(const char* tsdirname);
@@ -377,13 +368,16 @@ RelFileNodeForkNum RelFileNodeForkNumFill(RelFileNode* rnode,
  */
 int pg_fsync(int fd)
 {
+    if (is_dss_fd(fd)) {
+        return 0;
+    }
     /* #if is to skip the sync_method test if there's no need for it */
 #if defined(HAVE_FSYNC_WRITETHROUGH) && !defined(FSYNC_WRITETHROUGH_IS_FSYNC)
     if (u_sess->attr.attr_storage.sync_method == SYNC_METHOD_FSYNC_WRITETHROUGH)
         return pg_fsync_writethrough(fd);
     else
 #endif
-        return pg_fsync_no_writethrough(fd);
+    return pg_fsync_no_writethrough(fd);
 }
 
 /*
@@ -442,6 +436,9 @@ int pg_fdatasync(int fd)
  */
 void pg_flush_data(int fd, off_t offset, off_t nbytes)
 {
+    if (is_dss_fd(fd)) {
+        return;
+    }
     /*
      * Right now file flushing is primarily used to avoid making later
      * fsync()/fdatasync() calls have less impact. Thus don't trigger flushes
@@ -595,7 +592,7 @@ void InitFileAccess(void)
         t_thrd.lsc_cxt.lsc->VfdCache->fd = VFD_CLOSED;
         t_thrd.lsc_cxt.lsc->SizeVfdCache = 1;
         /* register proc-exit hook to ensure temp files are dropped at exit */
-        
+
         on_proc_exit(AtProcExit_Files, 0);
     } else {
         Assert(u_sess->storage_cxt.SizeVfdCache == 0); /* call me only once */
@@ -927,7 +924,6 @@ static void LruDelete(File file)
 
     vfdP = &vfdcache[file];
 
-    SAFE_MUNMAP(vfdP);
     /* delete the vfd record from the LRU ring */
     Delete(file);
 
@@ -1468,7 +1464,7 @@ PathNameDeleteTemporaryDir(const char *dirname)
     struct stat statbuf;
 
     /* Silently ignore missing directory. */
-    if (stat(dirname, &statbuf) != 0 && errno == ENOENT)
+    if (stat(dirname, &statbuf) != 0 && FILE_POSSIBLY_DELETED(errno))
         return;
 
     /*
@@ -1505,30 +1501,35 @@ File OpenTemporaryFile(bool interXact)
      */
     if (!interXact)
         ResourceOwnerEnlargeFiles(t_thrd.utils_cxt.CurrentResourceOwner);
-    /*
-     * If some temp tablespace(s) have been given to us, try to use the next
-     * one.  If a given tablespace can't be found, we silently fall back to
-     * the database's default tablespace.
-     *
-     * BUT: if the temp file is slated to outlive the current transaction,
-     * force it into the database's default tablespace, so that it will not
-     * pose a threat to possible tablespace drop attempts.
-     */
-    if (u_sess->storage_cxt.numTempTableSpaces > 0 && !interXact) {
-        Oid tblspcOid = GetNextTempTableSpace();
-        if (OidIsValid(tblspcOid))
-            file = OpenTemporaryFileInTablespace(tblspcOid, false);
-    }
+    
+    if (ENABLE_DSS) {
+        file = OpenTemporaryFileInTablespaceOrDir(InvalidOid, true);
+    } else {
+        /*
+        * If some temp tablespace(s) have been given to us, try to use the next
+        * one.  If a given tablespace can't be found, we silently fall back to
+        * the database's default tablespace.
+        *
+        * BUT: if the temp file is slated to outlive the current transaction,
+        * force it into the database's default tablespace, so that it will not
+        * pose a threat to possible tablespace drop attempts.
+        */
+        if (u_sess->storage_cxt.numTempTableSpaces > 0 && !interXact) {
+            Oid tblspcOid = GetNextTempTableSpace();
+            if (OidIsValid(tblspcOid))
+                file = OpenTemporaryFileInTablespaceOrDir(tblspcOid, false);
+        }
 
-    /*
-     * If not, or if tablespace is bad, create in database's default
-     * tablespace.	u_sess->proc_cxt.MyDatabaseTableSpace should normally be set before we get
-     * here, but just in case it isn't, fall back to pg_default tablespace.
-     */
-    if (file <= 0)
-        file = OpenTemporaryFileInTablespace(
-                   u_sess->proc_cxt.MyDatabaseTableSpace ? u_sess->proc_cxt.MyDatabaseTableSpace : DEFAULTTABLESPACE_OID,
-                   true);
+        /*
+        * If not, or if tablespace is bad, create in database's default
+        * tablespace.	u_sess->proc_cxt.MyDatabaseTableSpace should normally be set before we get
+        * here, but just in case it isn't, fall back to pg_default tablespace.
+        */
+        if (file <= 0)
+            file = OpenTemporaryFileInTablespaceOrDir(
+                    u_sess->proc_cxt.MyDatabaseTableSpace ? u_sess->proc_cxt.MyDatabaseTableSpace :
+                    DEFAULTTABLESPACE_OID, true);
+    }
 
     vfd *vfdcache = GetVfdCache();
     /* Mark it for deletion at close and temporary file size limit */
@@ -1553,12 +1554,19 @@ void TempTablespacePath(char *path, Oid tablespace)
      *
      * If someone tries to specify pg_global, use pg_default instead.
      */
-    if (tablespace == InvalidOid || tablespace == DEFAULTTABLESPACE_OID || tablespace == GLOBALTABLESPACE_OID)
-        err_rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "base/%s", PG_TEMP_FILES_DIR);
-    else {
+    if (tablespace == DEFAULTTABLESPACE_OID || tablespace == GLOBALTABLESPACE_OID) {
+        err_rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", DEFTBSDIR, PG_TEMP_FILES_DIR);
+    } else if (ENABLE_DSS && tablespace == InvalidOid) {
+        err_rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s", SS_PG_TEMP_FILES_DIR);
+    } else {
         /* All other tablespaces are accessed via symlinks */
-        err_rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "pg_tblspc/%u/%s_%s/%s", tablespace, 
-            TABLESPACE_VERSION_DIRECTORY, g_instance.attr.attr_common.PGXCNodeName, PG_TEMP_FILES_DIR);
+        if (ENABLE_DSS) {
+            err_rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%u/%s/%s", TBLSPCDIR, tablespace,
+                TABLESPACE_VERSION_DIRECTORY, PG_TEMP_FILES_DIR);
+        } else {
+            err_rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%u/%s_%s/%s", TBLSPCDIR, tablespace,
+                TABLESPACE_VERSION_DIRECTORY, g_instance.attr.attr_common.PGXCNodeName, PG_TEMP_FILES_DIR);
+        }
     }
     securec_check_ss(err_rc, "", "");
 }
@@ -1627,10 +1635,10 @@ void UnlinkCacheFile(const char* pathname)
 }
 
 /*
- * Open a temporary file in a specific tablespace.
+ * Open a temporary file in a specific tablespace or dirctory.
  * Subroutine for OpenTemporaryFile, which see for details.
  */
-static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+static File OpenTemporaryFileInTablespaceOrDir(Oid tblspcOid, bool rejectError)
 {
     char tempdirpath[MAXPGPATH];
     char tempfilepath[MAXPGPATH];
@@ -1644,31 +1652,46 @@ static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
      */
     if (tblspcOid == DEFAULTTABLESPACE_OID || tblspcOid == GLOBALTABLESPACE_OID) {
         /* The default tablespace is {datadir}/base */
-        rc = snprintf_s(tempdirpath, sizeof(tempdirpath), sizeof(tempdirpath) - 1, "base/%s", PG_TEMP_FILES_DIR);
-        securec_check_ss(rc, "", "");
+        rc = snprintf_s(tempdirpath, sizeof(tempdirpath), sizeof(tempdirpath) - 1,
+                        "%s/%s", DEFTBSDIR, PG_TEMP_FILES_DIR);
+    } else if (ENABLE_DSS && tblspcOid == InvalidOid) {
+        rc = snprintf_s(tempdirpath, sizeof(tempdirpath), sizeof(tempdirpath) - 1, "%s", SS_PG_TEMP_FILES_DIR);
     } else {
         /* All other tablespaces are accessed via symlinks */
 #ifdef PGXC
         /* Postgres-XC tablespaces include node name in path */
-        rc = snprintf_s(tempdirpath,
-                        sizeof(tempdirpath),
-                        sizeof(tempdirpath) - 1,
-                        "pg_tblspc/%u/%s_%s/%s",
-                        tblspcOid,
-                        TABLESPACE_VERSION_DIRECTORY,
-                        g_instance.attr.attr_common.PGXCNodeName,
-                        PG_TEMP_FILES_DIR);
+        if (ENABLE_DSS) {
+            rc = snprintf_s(tempdirpath,
+                            sizeof(tempdirpath),
+                            sizeof(tempdirpath) - 1,
+                            "%s/%u/%s/%s",
+                            TBLSPCDIR,
+                            tblspcOid,
+                            TABLESPACE_VERSION_DIRECTORY,
+                            PG_TEMP_FILES_DIR);
+        } else {
+            rc = snprintf_s(tempdirpath,
+                            sizeof(tempdirpath),
+                            sizeof(tempdirpath) - 1,
+                            "%s/%u/%s_%s/%s",
+                            TBLSPCDIR,
+                            tblspcOid,
+                            TABLESPACE_VERSION_DIRECTORY,
+                            g_instance.attr.attr_common.PGXCNodeName,
+                            PG_TEMP_FILES_DIR);
+        }
 #else
         rc = snprintf_s(tempdirpath,
                         sizeof(tempdirpath),
                         sizeof(tempdirpath) - 1,
-                        "pg_tblspc/%u/%s/%s",
+                        "%s/%u/%s/%s",
+                        TBLSPCDIR,
                         tblspcOid,
                         TABLESPACE_VERSION_DIRECTORY,
                         PG_TEMP_FILES_DIR);
 #endif
-        securec_check_ss(rc, "", "");
     }
+    securec_check_ss(rc, "", "");
 
     /*
      * Generate a tempfile name that should be unique within the current
@@ -1717,8 +1740,6 @@ void FileCloseWithThief(File file)
 {
     Vfd* vfdP = &GetVfdCache()[file];
     if (!FileIsNotOpen(file)) {
-        SAFE_MUNMAP(vfdP);
-
         /* remove the file from the lru ring */
         Delete(file);
         /* the thief has close the real fd */
@@ -1823,11 +1844,11 @@ bool PathNameDeleteTemporaryFile(const char *path, bool error_on_failure)
      * non-existence to support BufFileDeleteShared which doesn't know how
      * many segments it has to delete until it runs out.
      */
-    if (stat_errno == ENOENT)
+    if (FILE_POSSIBLY_DELETED(stat_errno))
         return false;
 
     if (unlink(path) < 0) {
-        if (errno != ENOENT)
+        if (!FILE_POSSIBLY_DELETED(errno))
             ereport(error_on_failure ? ERROR : LOG,
                 (errcode_for_file_access(), errmsg("cannot unlink temporary file \"%s\": %m", path)));
         return false;
@@ -1858,8 +1879,6 @@ void FileClose(File file)
     vfdP = &vfdcache[file];
 
     if (!FileIsNotOpen(file)) {
-        SAFE_MUNMAP(vfdP);
-
         /* remove the file from the lru ring */
         Delete(file);
 
@@ -1948,6 +1967,10 @@ int FilePrefetch(File file, off_t offset, int amount, uint32 wait_event_info)
     Assert(FileIsValid(file));
     vfd *vfdcache = GetVfdCache();
 
+    if (is_dss_file(vfdcache[file].fileName)) {
+        return 0;
+    }
+
     DO_DB(ereport(LOG,
                   (errmsg("FilePrefetch: %d (%s) " INT64_FORMAT " %d",
                           file,
@@ -2003,6 +2026,7 @@ void FileWriteback(File file, off_t offset, off_t nbytes)
 int FilePRead(File file, char* buffer, int amount, off_t offset, uint32 wait_event_info)
 {
     int returnCode;
+    int count = 0;
 
     Assert(FileIsValid(file));
     vfd *vfdcache = GetVfdCache();
@@ -2058,6 +2082,18 @@ retry:
         /* OK to retry if interrupted */
         if (errno == EINTR)
             goto retry;
+        if (errno == EIO) {
+            if (count < EIO_RETRY_TIMES) {
+                count++;
+                ereport(WARNING, (errmsg("FilePRead: %d (%s) " INT64_FORMAT " %d \
+                    failed, then retry: Input/Output ERROR",
+                        file,
+                        vfdcache[file].fileName,
+                        (int64)vfdcache[file].seekPos,
+                        amount)));
+                goto retry;
+            }
+        }
 
         /* Trouble, so assume we don't know the file position anymore */
         vfdcache[file].seekPos = FileUnknownPos;
@@ -2081,7 +2117,7 @@ int FileWrite(File file, const char* buffer, int amount, off_t offset, int fastE
             /* fast allocate large disk space for this heap file each 8MB */
             fastExtendSize = (int)(u_sess->attr.attr_storage.fast_extend_file_size * 1024LL);
         }
-    
+
         /* fast allocate large disk space for this file each 8MB */
         if ((offset % fastExtendSize) == 0) {
             returnCode = fallocate(vfdcache[file].fd, FALLOC_FL_KEEP_SIZE, offset, fastExtendSize);
@@ -2133,6 +2169,7 @@ int FileWrite(File file, const char* buffer, int amount, off_t offset, int fastE
 int FilePWrite(File file, const char* buffer, int amount, off_t offset, uint32 wait_event_info, int fastExtendSize)
 {
     int returnCode;
+    int count = 0;
 
     Assert(FileIsValid(file));
     vfd *vfdcache = GetVfdCache();
@@ -2225,6 +2262,18 @@ retry:
         /* OK to retry if interrupted */
         if (errno == EINTR)
             goto retry;
+        if (errno == EIO) {
+            if (count < EIO_RETRY_TIMES) {
+                count++;
+                ereport(WARNING, (errmsg("FilePWrite: %d (%s) " INT64_FORMAT " %d \
+                    failed, then retry: Input/Output ERROR",
+                        file,
+                        vfdcache[file].fileName,
+                        (int64)vfdcache[file].seekPos,
+                        amount)));
+                goto retry;
+            }
+        }
 
         /* Trouble, so assume we don't know the file position anymore */
         vfdcache[file].seekPos = FileUnknownPos;
@@ -3488,18 +3537,19 @@ void RemovePgTempFiles(void)
     DIR* spc_dir = NULL;
     struct dirent* spc_de = NULL;
     errno_t rc = EOK;
+
     /*
      * First process temp files in pg_default ($PGDATA/base)
      */
-    rc = snprintf_s(temp_path, sizeof(temp_path), sizeof(temp_path) - 1, "base/%s", PG_TEMP_FILES_DIR);
+    rc = snprintf_s(temp_path, sizeof(temp_path), sizeof(temp_path) - 1, "%s/%s", DEFTBSDIR, PG_TEMP_FILES_DIR);
     securec_check_ss(rc, "", "");
     RemovePgTempFilesInDir(temp_path, false);
-    RemovePgTempRelationFiles("base");
+    RemovePgTempRelationFiles(DEFTBSDIR);
 
     /*
      * Cycle through temp directories for all non-default tablespaces.
      */
-    spc_dir = AllocateDir("pg_tblspc");
+    spc_dir = AllocateDir(TBLSPCDIR);
     if (spc_dir == NULL) {
         ereport(ERROR, (errcode_for_file_access(), errmsg("Allocate dir failed.")));
     }
@@ -3512,23 +3562,40 @@ void RemovePgTempFiles(void)
          * subDir returned by ReadDir will be overwritten by the next invoking.
          * therefore, the result needs to be saved.
          */
+        char curSubDir[MAXPGPATH] = {0};
+        rc = strncpy_s(curSubDir, MAXPGPATH, spc_de->d_name, strlen(spc_de->d_name));
+        securec_check(rc, "", "");
 #ifdef PGXC
         /* Postgres-XC tablespaces include node name in path */
-        rc = snprintf_s(temp_path,
-                        sizeof(temp_path),
-                        sizeof(temp_path) - 1,
-                        "pg_tblspc/%s/%s_%s/%s",
-                        spc_de->d_name,
-                        TABLESPACE_VERSION_DIRECTORY,
-                        g_instance.attr.attr_common.PGXCNodeName,
-                        PG_TEMP_FILES_DIR);
-        securec_check_ss(rc, "", "");
+        if (ENABLE_DSS) {
+            rc = snprintf_s(temp_path,
+                            sizeof(temp_path),
+                            sizeof(temp_path) - 1,
+                            "%s/%s/%s/%s",
+                            TBLSPCDIR,
+                            spc_de->d_name,
+                            TABLESPACE_VERSION_DIRECTORY,
+                            PG_TEMP_FILES_DIR);
+            securec_check_ss(rc, "", "");
+        } else {
+            rc = snprintf_s(temp_path,
+                            sizeof(temp_path),
+                            sizeof(temp_path) - 1,
+                            "%s/%s/%s_%s/%s",
+                            TBLSPCDIR,
+                            spc_de->d_name,
+                            TABLESPACE_VERSION_DIRECTORY,
+                            g_instance.attr.attr_common.PGXCNodeName,
+                            PG_TEMP_FILES_DIR);
+            securec_check_ss(rc, "", "");
+        }
 #else
         rc = snprintf_s(temp_path,
                         sizeof(temp_path),
                         sizeof(temp_path) - 1,
-                        "pg_tblspc/%s/%s/%s",
-                        spc_de->d_name,
+                        "%s/%s/%s/%s",
+                        TBLSPCDIR,
+                        curSubDir,
                         TABLESPACE_VERSION_DIRECTORY,
                         PG_TEMP_FILES_DIR);
         securec_check_ss(rc, "", "");
@@ -3537,20 +3604,33 @@ void RemovePgTempFiles(void)
 
 #ifdef PGXC
         /* Postgres-XC tablespaces include node name in path */
-        rc = snprintf_s(temp_path,
-                        sizeof(temp_path),
-                        sizeof(temp_path) - 1,
-                        "pg_tblspc/%s/%s_%s",
-                        spc_de->d_name,
-                        TABLESPACE_VERSION_DIRECTORY,
-                        g_instance.attr.attr_common.PGXCNodeName);
-        securec_check_ss(rc, "", "");
+        if (ENABLE_DSS) {
+            rc = snprintf_s(temp_path,
+                            sizeof(temp_path),
+                            sizeof(temp_path) - 1,
+                            "%s/%s/%s",
+                            TBLSPCDIR,
+                            spc_de->d_name,
+                            TABLESPACE_VERSION_DIRECTORY);
+            securec_check_ss(rc, "", "");
+        } else {
+            rc = snprintf_s(temp_path,
+                            sizeof(temp_path),
+                            sizeof(temp_path) - 1,
+                            "%s/%s/%s_%s",
+                            TBLSPCDIR,
+                            spc_de->d_name,
+                            TABLESPACE_VERSION_DIRECTORY,
+                            g_instance.attr.attr_common.PGXCNodeName);
+            securec_check_ss(rc, "", "");
+        }
 #else
         rc = snprintf_s(temp_path,
                         sizeof(temp_path),
                         sizeof(temp_path) - 1,
-                        "pg_tblspc/%s/%s",
-                        spc_de->d_name,
+                        "%s/%s/%s",
+                        TBLSPCDIR,
+                        curSubDir,
                         TABLESPACE_VERSION_DIRECTORY);
         securec_check_ss(rc, "\0", "\0");
 #endif
@@ -3564,7 +3644,11 @@ void RemovePgTempFiles(void)
      * t_thrd.proc_cxt.DataDir as well.
      */
 #ifdef EXEC_BACKEND
-    RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, false);
+    if (ENABLE_DSS) {
+        RemovePgTempFilesInDir(SS_PG_TEMP_FILES_DIR, false);
+    } else {
+        RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, false);
+    }
 #endif
 }
 
@@ -3579,8 +3663,9 @@ static void RemovePgTempFilesInDir(const char* tmpdirname, bool unlinkAll)
     temp_dir = AllocateDir(tmpdirname);
     if (temp_dir == NULL) {
         /* anything except ENOENT is fishy */
-        if (errno != ENOENT)
+        if (!FILE_POSSIBLY_DELETED(errno)) {
             ereport(LOG, (errmsg("could not open temporary-files directory \"%s\": %m", tmpdirname)));
+        }
         return;
     }
 
@@ -3916,7 +4001,7 @@ void InitializeVFDLocks(void)
  * Alternate version that allows caller to specify the elevel for any
  * error report.  If elevel < ERROR, returns NULL on any error.
  */
-static struct dirent *ReadDirExtended(DIR *dir, const char *dirname, int elevel)
+struct dirent *ReadDirExtended(DIR *dir, const char *dirname, int elevel)
 {
     struct dirent *dent;
 
@@ -4003,56 +4088,27 @@ static void Walkdir(const char *path, void (*action)(const char *fname, bool isd
 static void UnlinkIfExistsFname(const char *fname, bool isdir, int elevel)
 {
     if (isdir) {
-        if (rmdir(fname) != 0 && errno != ENOENT)
+        if (rmdir(fname) != 0 && !FILE_POSSIBLY_DELETED(errno)) {
             ereport(elevel, (errcode_for_file_access(), errmsg("could not rmdir directory \"%s\": %m", fname)));
+        }
     } else {
         /* Use PathNameDeleteTemporaryFile to report filesize */
         PathNameDeleteTemporaryFile(fname, false);
     }
 }
 
-/*
- * initialize page compress memory map.
- *
- */
-void SetupPageCompressMemoryMap(File file, RelFileNode node, const RelFileNodeForkNum& relFileNodeForkNum)
+void FileAllocate(File file, uint32 offset, uint32 size)
 {
-    Vfd *vfdP = &GetVfdCache()[file];
-    auto chunk_size = CHUNK_SIZE_LIST[GET_COMPRESS_CHUNK_SIZE(node.opt)];
-    int returnCode = FileAccess(file);
-    if (returnCode < 0) {
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("Failed to open file %s: %m", vfdP->fileName)));
+    vfd *vfdcache = GetVfdCache();
+    if (fallocate(vfdcache[file].fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) < 0) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("fallocate failed on relation: \"%s\": ", FilePathName(file))));
     }
-    RelFileNodeForkNum newOne(relFileNodeForkNum);
-    newOne.forknumber = PCA_FORKNUM;
-    PageCompressHeader *map = GetPageCompressHeader(vfdP, chunk_size, newOne);
-    vfdP->with_pcmap = true;
-    vfdP->pcmap = map;
 }
 
-/*
- * Return the page compress memory map.
- *
- */
-PageCompressHeader *GetPageCompressMemoryMap(File file, uint32 chunk_size)
+void FileAllocateDirectly(int fd, char* path, uint32 offset, uint32 size)
 {
-    int returnCode;
-    Vfd *vfdP = &GetVfdCache()[file];
-    PageCompressHeader *map = NULL;
-
-    Assert(FileIsValid(file));
-
-    returnCode = FileAccess(file);
-    if (returnCode < 0) {
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("Failed to open file %s: %m", vfdP->fileName)));
+    if (fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) < 0) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("fallocate failed on relation: \"%s\"", path)));
     }
-
-    Assert(vfdP->with_pcmap);
-    if (vfdP->pcmap == NULL) {
-        map = GetPageCompressHeader(vfdP, chunk_size, vfdP->fileNode);
-        vfdP->with_pcmap = true;
-        vfdP->pcmap = map;
-    }
-
-    return vfdP->pcmap;
 }

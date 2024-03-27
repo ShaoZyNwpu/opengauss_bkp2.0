@@ -9,11 +9,12 @@ execute_process(
     COMMAND ln -fs ${PROJECT_SRC_DIR}/bin/pg_basebackup/receivelog.cpp ${CMAKE_CURRENT_SOURCE_DIR}/receivelog.cpp
     COMMAND ln -fs ${PROJECT_SRC_DIR}/bin/pg_basebackup/streamutil.cpp ${CMAKE_CURRENT_SOURCE_DIR}/streamutil.cpp
     COMMAND ln -fs ${PROJECT_SRC_DIR}/gausskernel/storage/access/transam/xlogreader.cpp ${CMAKE_CURRENT_SOURCE_DIR}/xlogreader.cpp
+    COMMAND ln -fs ${PROJECT_SRC_DIR}/gausskernel/storage/dss/dss_adaptor.cpp ${CMAKE_CURRENT_SOURCE_DIR}/dss_adaptor.cpp
 )
 
 AUX_SOURCE_DIRECTORY(${CMAKE_CURRENT_SOURCE_DIR} TGT_probackup_SRC)
 
-set(TGT_probackup_INC ${ZLIB_INCLUDE_PATH} ${PROJECT_SRC_DIR}/lib/page_compression)
+set(TGT_probackup_INC ${ZLIB_INCLUDE_PATH} ${LZ4_INCLUDE_PATH} ${ZSTD_INCLUDE_PATH} ${PROJECT_SRC_DIR}/lib/page_compression)
 
 set(probackup_DEF_OPTIONS ${MACRO_OPTIONS} -DFRONTEND -DHAVE_LIBZ)
 set(probackup_COMPILE_OPTIONS ${PROTECT_OPTIONS} ${BIN_SECURE_OPTIONS} ${OS_OPTIONS} ${WARNING_OPTIONS} ${OPTIMIZE_OPTIONS} ${CHECK_OPTIONS})

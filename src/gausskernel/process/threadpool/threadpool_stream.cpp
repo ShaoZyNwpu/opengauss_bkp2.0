@@ -139,7 +139,6 @@ void ThreadPoolStream::InitStream()
     read_nondefault_variables();
 
     /* Do local initialization of file, storage and buffer managers */
-    ReBuildLSC();
     InitFileAccess();
     smgrinit();
 
@@ -182,6 +181,7 @@ static void ResetStreamStatus()
     /* Add the pg_delete_audit operation to audit log */
     t_thrd.audit.Audit_delete = false;
     t_thrd.postgres_cxt.debug_query_string = NULL;
+    t_thrd.postgres_cxt.cur_command_tag = T_Invalid;
     t_thrd.postgres_cxt.g_NoAnalyzeRelNameList = NIL;
     t_thrd.postgres_cxt.mark_explain_analyze = false;
     t_thrd.postgres_cxt.mark_explain_only = false;
@@ -191,6 +191,9 @@ static void ResetStreamStatus()
     if (unlikely(t_thrd.log_cxt.msgbuf->data != NULL)) {
         pfree_ext(t_thrd.log_cxt.msgbuf->data);
     }
+
+    t_thrd.proc->databaseId = InvalidOid;
+    t_thrd.proc->roleId = InvalidOid;
 
     /*
      * Reset extended-query-message flag, so that any errors

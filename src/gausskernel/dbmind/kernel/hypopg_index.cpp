@@ -44,6 +44,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
 #include "optimizer/var.h"
+#include "optimizer/tlist.h"
 #include "parser/parse_utilcmd.h"
 #include "parser/parser.h"
 #include "storage/buf/bufmgr.h"
@@ -67,8 +68,8 @@ static explain_get_index_name_hook_type prev_explain_get_index_name_hook = NULL;
 extern Oid GetIndexOpClass(List *opclass, Oid attrType, const char *accessMethodName, Oid accessMethodId);
 extern void CheckPredicate(Expr *predicate);
 extern bool CheckMutability(Expr *expr);
-static void hypo_utility_hook(Node *parsetree, const char *queryString, ParamListInfo params, bool isTopLevel,
-    DestReceiver *dest, bool sentToRemote, char *completionTag, bool isCtas);
+static void hypo_utility_hook(processutility_context* processutility_cxt,
+    DestReceiver *dest, bool sentToRemote, char *completionTag, ProcessUtilityContext context, bool isCtas);
 static void hypo_executorEnd_hook(QueryDesc *queryDesc);
 static void hypo_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId, bool inhparent, RelOptInfo *rel);
 static const char *hypo_explain_get_index_name_hook(Oid indexId);
@@ -104,19 +105,10 @@ void InitHypopg()
     isExplain = false;
 }
 
-/*
- * This function is used for setting prev_utility_hook to rewrite
- * standard_ProcessUtility by extension.
- */
-void set_hypopg_prehook(ProcessUtility_hook_type func)
-{
-    prev_utility_hook = func;
-}
-
 void hypopg_register_hook()
 {
     // register hooks
-    set_hypopg_prehook(ProcessUtility_hook);
+    prev_utility_hook = ProcessUtility_hook;
     ProcessUtility_hook = hypo_utility_hook;
 
     prev_ExecutorEnd_hook = ExecutorEnd_hook;
@@ -165,15 +157,16 @@ static Oid hypo_getNewOid(Oid relid)
 /* This function setup the "isExplain" flag for next hooks.
  * If this flag is setup, we can add hypothetical indexes.
  */
-void hypo_utility_hook(Node *parsetree, const char *queryString, ParamListInfo params, bool isTopLevel,
-    DestReceiver *dest, bool sentToRemote, char *completionTag, bool isCtas)
+void hypo_utility_hook(processutility_context* processutility_cxt,
+    DestReceiver *dest, bool sentToRemote, char *completionTag, ProcessUtilityContext context, bool isCtas)
 {
+    Node* parsetree = processutility_cxt->parse_tree;
     isExplain = query_or_expression_tree_walker(parsetree, (bool (*)())hypo_query_walker, NULL, 0);
 
     if (prev_utility_hook) {
-        prev_utility_hook(parsetree, queryString, params, isTopLevel, dest, sentToRemote, completionTag, isCtas);
+        prev_utility_hook(processutility_cxt, dest, sentToRemote, completionTag, context, isCtas);
     } else {
-        standard_ProcessUtility(parsetree, queryString, params, isTopLevel, dest, sentToRemote, completionTag, isCtas);
+        standard_ProcessUtility(processutility_cxt, dest, sentToRemote, completionTag, context, isCtas);
     }
 }
 
@@ -1294,7 +1287,7 @@ Datum hypopg_reset_index(PG_FUNCTION_ARGS)
  */
 static void hypo_set_indexname(hypoIndex *entry, const char *indexname)
 {
-    char oid[12] = {0}; /* store <oid>, oid shouldn't be more than 9999999999 */
+    char oid[16] = {0}; /* store <oid>, oid shouldn't be more than 99999999999999 */
     int totalsize;
     errno_t rc = EOK;
 
@@ -1342,6 +1335,7 @@ static void hypo_estimate_index_simple(hypoIndex *entry, BlockNumber *pages, dou
     rel->min_attr = FirstLowInvalidHeapAttributeNumber + 1;
     rel->max_attr = RelationGetNumberOfAttributes(relation);
     rel->reltablespace = RelationGetForm(relation)->reltablespace;
+    rel->reltarget = create_empty_pathtarget();
 
     Assert(rel->max_attr >= rel->min_attr);
     rel->attr_needed = (Relids *)palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(Relids));

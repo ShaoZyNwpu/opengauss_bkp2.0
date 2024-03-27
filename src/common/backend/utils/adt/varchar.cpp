@@ -24,6 +24,8 @@
 #include "mb/pg_wchar.h"
 #include "utils/sortsupport.h"
 #include "vecexecutor/vectorbatch.h"
+#include "utils/pg_locale.h"
+#include "catalog/gs_utf8_collation.h"
 
 #include "miscadmin.h"
 
@@ -37,6 +39,7 @@
         }                                                       \
     } while (0)
 
+int bpcharcase(PG_FUNCTION_ARGS);
 
 /* common code for bpchartypmodin and varchartypmodin */
 static int32 anychar_typmodin(ArrayType* ta, const char* typname)
@@ -301,10 +304,12 @@ Datum bpchar(PG_FUNCTION_ARGS)
 
         if (!isExplicit) {
             for (i = maxmblen; i < len; i++)
-                if (s[i] != ' ')
-                    ereport(ERROR,
+                if (s[i] != ' ') {
+                    ereport(fcinfo->can_ignore ? WARNING : ERROR,
                         (errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-                            errmsg("value too long for type character(%d)", maxlen)));
+                             errmsg("value too long for type character(%d)", maxlen)));
+                    break;
+                }
         }
 
         len = maxmblen;
@@ -315,7 +320,7 @@ Datum bpchar(PG_FUNCTION_ARGS)
          *
          * Now, only explicit cast char type data should pad blank space.
          */
-        if (!isExplicit)
+        if (!isExplicit || DB_IS_CMPT(PG_FORMAT | B_FORMAT))
             maxlen = len;
     }
 
@@ -605,10 +610,12 @@ Datum varchar(PG_FUNCTION_ARGS)
 
     if (!isExplicit) {
         for (i = maxmblen; i < len; i++)
-            if (s_data[i] != ' ')
-                ereport(ERROR,
+            if (s_data[i] != ' ') {
+                ereport(fcinfo->can_ignore ? WARNING : ERROR,
                     (errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
                         errmsg("value too long for type character varying(%d)", maxlen)));
+                break;
+            }
     }
 
     PG_RETURN_VARCHAR_P((VarChar*)cstring_to_text_with_len(s_data, maxmblen));
@@ -721,10 +728,16 @@ Datum bpcharoctetlen(PG_FUNCTION_ARGS)
 
 Datum bpchareq(PG_FUNCTION_ARGS)
 {
+    bool result = false;
+    if (is_b_format_collation(PG_GET_COLLATION())) {
+        /* use varstr_cmp to compare, return 0 means equal */
+        result = (bpcharcase(fcinfo) == 0);
+        PG_RETURN_BOOL(result);
+    }
+
     BpChar* arg1 = PG_GETARG_BPCHAR_PP(0);
     BpChar* arg2 = PG_GETARG_BPCHAR_PP(1);
     int len1, len2;
-    bool result = false;
 
     len1 = bcTruelen(arg1);
     len2 = bcTruelen(arg2);
@@ -746,10 +759,15 @@ Datum bpchareq(PG_FUNCTION_ARGS)
 
 Datum bpcharne(PG_FUNCTION_ARGS)
 {
+    bool result = false;
+    if (is_b_format_collation(PG_GET_COLLATION())) {
+        result = !(bpcharcase(fcinfo) == 0);
+        PG_RETURN_BOOL(result);
+    }
+
     BpChar* arg1 = PG_GETARG_BPCHAR_PP(0);
     BpChar* arg2 = PG_GETARG_BPCHAR_PP(1);
     int len1, len2;
-    bool result = false;
 
     len1 = bcTruelen(arg1);
     len2 = bcTruelen(arg2);
@@ -963,11 +981,16 @@ Datum hashbpchar(PG_FUNCTION_ARGS)
     char* keydata = NULL;
     int keylen;
     Datum result;
+    Oid collid = PG_GET_COLLATION();
 
     keydata = VARDATA_ANY(key);
     keylen = bcTruelen(key);
 
-    result = hash_any((unsigned char*)keydata, keylen);
+    if (!is_b_format_collation(collid)) {
+        result = hash_any((unsigned char*)keydata, keylen);
+    } else {
+        result = hash_text_by_builtin_colltions((unsigned char *)VARDATA_ANY(key), keylen, collid);
+    }
 
     /* Avoid leaking memory for toasted inputs */
     PG_FREE_IF_COPY(key, 0);
@@ -1221,10 +1244,12 @@ Datum nvarchar2(PG_FUNCTION_ARGS)
 
     if (!isExplicit) {
         for (i = maxmblen; i < len; i++)
-            if (s_data[i] != ' ')
-                ereport(ERROR,
+            if (s_data[i] != ' ') {
+                ereport(fcinfo->can_ignore ? WARNING: ERROR,
                     (errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
                         errmsg("value too long for type nvarchar2(%d)", maxlen)));
+                break;
+            }
     }
 
     PG_RETURN_NVARCHAR2_P((NVarChar2*)cstring_to_text_with_len(s_data, maxmblen));
@@ -1520,7 +1545,7 @@ static void vlpad_internal(ScalarVector* parg1, ScalarVector* parg2, ScalarVecto
 
     SET_VARSIZE(ret, ptr_ret - (char*)ret);
 
-    if (0 == VARSIZE_ANY_EXHDR(ret) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !RETURN_NS) {
+    if (0 == VARSIZE_ANY_EXHDR(ret) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !ACCEPT_EMPTY_STR && !RETURN_NS) {
         SET_NULL(pflagsRes[idx]);
     } else {
         VecRet->m_vals[idx] = PointerGetDatum(ret);
@@ -1781,12 +1806,13 @@ ScalarVector* vbpcharlen(PG_FUNCTION_ARGS)
     int len;
     int eml;
     eml = pg_database_encoding_max_length();
+    bool getTrueLen = DB_IS_CMPT(PG_FORMAT | B_FORMAT);
 
     if (pselection != NULL) {
         for (k = 0; k < nvalues; k++) {
             if (pselection[k]) {
                 if (NOT_NULL(vflag[k])) {
-                    len = VARSIZE_ANY_EXHDR(varg->m_vals[k]);
+                    len = getTrueLen ? bcTruelen((BpChar*)varg->m_vals[k]) : VARSIZE_ANY_EXHDR(varg->m_vals[k]);
                     if (eml != 1)
                         len = pg_mbstrlen_with_len_eml(VARDATA_ANY(varg->m_vals[k]), len, eml);
                     vresult->m_vals[k] = Int32GetDatum(len);
@@ -1799,7 +1825,7 @@ ScalarVector* vbpcharlen(PG_FUNCTION_ARGS)
     } else {
         for (k = 0; k < nvalues; k++) {
             if (NOT_NULL(vflag[k])) {
-                len = VARSIZE_ANY_EXHDR(varg->m_vals[k]);
+                len = getTrueLen ? bcTruelen((BpChar*)varg->m_vals[k]) : VARSIZE_ANY_EXHDR(varg->m_vals[k]);
                 if (eml != 1)
                     len = pg_mbstrlen_with_len_eml(VARDATA_ANY(varg->m_vals[k]), len, eml);
                 vresult->m_vals[k] = Int32GetDatum(len);

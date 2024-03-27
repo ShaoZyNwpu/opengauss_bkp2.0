@@ -31,8 +31,8 @@
 #include "storage/smgr/segment.h"
 #include "storage/smgr/smgr.h"
 #include "utils/resowner.h"
-#include "tsan_annotation.h"
 #include "pgstat.h"
+#include "ddes/dms/ss_dms_bufmgr.h"
 
 /* 
  * Segment buffer, used for segment meta data, e.g., segment head, space map head. We separate segment
@@ -49,11 +49,20 @@ static const int TEN_MICROSECOND = 10;
 #define SegBufferIsPinned(bufHdr) ((bufHdr)->state & BUF_REFCOUNT_MASK)
 
 static BufferDesc *SegStrategyGetBuffer(uint32 *buf_state);
-static bool SegStartBufferIO(BufferDesc *buf, bool forInput);
-static void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
 
-extern PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool create, bool do_move);
+extern PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
 extern void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
+
+void SetInProgressFlags(BufferDesc *bufDesc, bool input)
+{
+    InProgressBuf = bufDesc;
+    isForInput = input;
+}
+
+bool HasInProgressBuf(void)
+{
+    return InProgressBuf != NULL;
+}
 
 void AbortSegBufferIO(void)
 {
@@ -63,31 +72,21 @@ void AbortSegBufferIO(void)
     }
 }
 
-static void WaitIO(BufferDesc *buf)
-{
-    while (true) {
-        uint32 buf_state;
-
-        buf_state = LockBufHdr(buf);
-        UnlockBufHdr(buf, buf_state);
-
-        if (!(buf_state & BM_IO_IN_PROGRESS)) {
-            break;
-        }
-
-        LWLockAcquire(buf->io_in_progress_lock, LW_SHARED);
-        LWLockRelease(buf->io_in_progress_lock);
-    }
-}
-
 static bool SegStartBufferIO(BufferDesc *buf, bool forInput)
 {
     uint32 buf_state;
+    bool dms_need_flush = false; // used in dms
 
     SegmentCheck(!InProgressBuf);
 
     while (true) {
         LWLockAcquire(buf->io_in_progress_lock, LW_EXCLUSIVE);
+
+        if (buf->extra->aio_in_progress) {
+            LWLockRelease(buf->io_in_progress_lock);
+            pg_usleep(1000L);
+            continue;
+        }
 
         buf_state = LockBufHdr(buf);
 
@@ -100,7 +99,14 @@ static bool SegStartBufferIO(BufferDesc *buf, bool forInput)
         WaitIO(buf);
     }
 
-    if (forInput ? (buf_state & BM_VALID) : !(buf_state & BM_DIRTY)) {
+    if (ENABLE_DMS) {
+        dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buf->buf_id);
+        if (buf_ctrl->state & BUF_DIRTY_NEED_FLUSH) {
+            dms_need_flush = true;
+        }
+    }
+
+    if (forInput ? (buf_state & BM_VALID) : !(buf_state & BM_DIRTY) && !dms_need_flush) {
         /* IO finished */
         UnlockBufHdr(buf, buf_state);
         LWLockRelease(buf->io_in_progress_lock);
@@ -117,7 +123,7 @@ static bool SegStartBufferIO(BufferDesc *buf, bool forInput)
     return true;
 }
 
-static void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
+void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits)
 {
     SegmentCheck(buf == InProgressBuf);
 
@@ -128,8 +134,25 @@ static void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_f
     buf_state &= ~(BM_IO_IN_PROGRESS | BM_IO_ERROR);
     if (clear_dirty) {
         if (ENABLE_INCRE_CKPT) {
-            if (!XLogRecPtrIsInvalid(pg_atomic_read_u64(&buf->rec_lsn))) {
+            if (!XLogRecPtrIsInvalid(pg_atomic_read_u64(&buf->extra->rec_lsn))) {
                 remove_dirty_page_from_queue(buf);
+            } else if (ENABLE_DMS) {
+                dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(buf->buf_id);
+                if (!(buf_ctrl->state & BUF_DIRTY_NEED_FLUSH)) {
+                    ereport(PANIC, (errmodule(MOD_INCRE_CKPT), errcode(ERRCODE_INVALID_BUFFER),
+                        (errmsg("buffer is dirty but not in dirty page queue in SegTerminateBufferIO"))));
+                }
+                buf_ctrl->state &= ~BUF_DIRTY_NEED_FLUSH;
+                XLogRecPtr pagelsn = BufferGetLSN(buf);
+                bool in_flush_copy = SS_IN_FLUSHCOPY;
+                bool in_recovery = !g_instance.dms_cxt.SSRecoveryInfo.recovery_pause_flag;
+                ereport(LOG,
+                    (errmsg("[SS flush copy] finish seg flush buffer with need flush, "
+                    "spc/db/rel/bucket fork-block: %u/%u/%u/%d %d-%u, page lsn (0x%llx), seg info:%u-%u, reform phase "
+                    "is in flush_copy:%d, in recovery:%d",
+                    buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, buf->tag.rnode.bucketNode,
+                    buf->tag.forkNum, buf->tag.blockNum, (unsigned long long)pagelsn, 
+                    (unsigned int)buf->extra->seg_fileno, buf->extra->seg_blockno, in_flush_copy, in_recovery)));
             } else {
                 ereport(PANIC, (errmodule(MOD_INCRE_CKPT), errcode(ERRCODE_INVALID_BUFFER),
                                 (errmsg("buffer is dirty but not in dirty page queue in TerminateBufferIO_common"))));
@@ -157,48 +180,28 @@ static void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_f
     LWLockRelease(buf->io_in_progress_lock);
 }
 
-static uint32 SegWaitBufHdrUnlocked(BufferDesc *buf)
-{
-#ifndef ENABLE_THREAD_CHECK
-    SpinDelayStatus delayStatus = init_spin_delay(buf);
-#endif
-    uint32 buf_state;
-
-    buf_state = pg_atomic_read_u32(&buf->state);
-
-    while (buf_state & BM_LOCKED) {
-#ifndef ENABLE_THREAD_CHECK
-        perform_spin_delay(&delayStatus);
-#endif
-        buf_state = pg_atomic_read_u32(&buf->state);
-    }
-
-#ifndef ENABLE_THREAD_CHECK
-    finish_spin_delay(&delayStatus);
-#endif
-
-    /* ENABLE_THREAD_CHECK only, acqurie semantic */
-    TsAnnotateHappensAfter(&buf->state);
-
-    return buf_state;
-}
-
 bool SegPinBuffer(BufferDesc *buf)
 {
     ereport(DEBUG5, (errmodule(MOD_SEGMENT_PAGE),
                      errmsg("[SegPinBuffer] (%u %u %u %d) %d %u ", buf->tag.rnode.spcNode, buf->tag.rnode.dbNode,
                             buf->tag.rnode.relNode, buf->tag.rnode.bucketNode, buf->tag.forkNum, buf->tag.blockNum)));
-    bool result;
-    PrivateRefCountEntry * ref = GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), true, true);
-    SegmentCheck(ref != NULL);
+    
+    ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
 
-    if (ref->refcount == 0) {
+    Buffer b = BufferDescriptorGetBuffer(buf);
+    bool result;
+    PrivateRefCountEntry * ref = GetPrivateRefCountEntry(b, true);
+
+    if (ref == NULL) {
         uint32 buf_state;
         uint32 old_buf_state = pg_atomic_read_u32(&buf->state);
 
+        ReservePrivateRefCountEntry();
+        ref = NewPrivateRefCountEntry(b);
+
         for (;;) {
             if (old_buf_state & BM_LOCKED) {
-                old_buf_state = SegWaitBufHdrUnlocked(buf);
+                old_buf_state = WaitBufHdrUnlocked(buf);
             }
             buf_state = old_buf_state;
 
@@ -213,9 +216,7 @@ bool SegPinBuffer(BufferDesc *buf)
     }
 
     ref->refcount++;
-
-    ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
-    ResourceOwnerRememberBuffer(t_thrd.utils_cxt.CurrentResourceOwner, BufferDescriptorGetBuffer(buf));
+    ResourceOwnerRememberBuffer(t_thrd.utils_cxt.CurrentResourceOwner, b);
 
     return result;
 }
@@ -226,20 +227,27 @@ static bool SegPinBufferLocked(BufferDesc *buf, const BufferTag *tag)
                      errmsg("[SegPinBufferLocked] (%u %u %u %d) %d %u ", tag->rnode.spcNode, tag->rnode.dbNode,
                             tag->rnode.relNode, tag->rnode.bucketNode, tag->forkNum, tag->blockNum)));
     SegmentCheck(BufHdrLocked(buf));
-    PrivateRefCountEntry * ref = GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), true, true);
-    SegmentCheck(ref != NULL);
+    Buffer b;
+    PrivateRefCountEntry *ref = NULL;
+
+    /*
+     * As explained, We don't expect any preexisting pins. That allows us to
+     * manipulate the PrivateRefCount after releasing the spinlock
+     */
+    Assert(GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), false) == NULL);
 
     uint32 buf_state = pg_atomic_read_u32(&buf->state);
-
-    if (ref->refcount == 0) {
-        buf_state += BUF_REFCOUNT_ONE;
-    }
+    Assert(buf_state & BM_LOCKED);
+    buf_state += BUF_REFCOUNT_ONE;
     UnlockBufHdr(buf, buf_state);
 
+    b = BufferDescriptorGetBuffer(buf);
+
+    ref = NewPrivateRefCountEntry(b);
     ref->refcount++;
 
     ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
-    ResourceOwnerRememberBuffer(t_thrd.utils_cxt.CurrentResourceOwner, BufferDescriptorGetBuffer(buf));
+    ResourceOwnerRememberBuffer(t_thrd.utils_cxt.CurrentResourceOwner, b);
 
     return buf_state & BM_VALID;
 }
@@ -249,7 +257,7 @@ void SegUnpinBuffer(BufferDesc *buf)
     ereport(DEBUG5, (errmodule(MOD_SEGMENT_PAGE),
                      errmsg("[SegUnpinBuffer] (%u %u %u %d) %d %u ", buf->tag.rnode.spcNode, buf->tag.rnode.dbNode,
                             buf->tag.rnode.relNode, buf->tag.rnode.bucketNode, buf->tag.forkNum, buf->tag.blockNum)));
-    PrivateRefCountEntry * ref = GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), true, true);
+    PrivateRefCountEntry * ref = GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), true);
     SegmentCheck(ref != NULL);
 
     ResourceOwnerForgetBuffer(t_thrd.utils_cxt.CurrentResourceOwner, BufferDescriptorGetBuffer(buf));
@@ -263,7 +271,7 @@ void SegUnpinBuffer(BufferDesc *buf)
         old_buf_state = pg_atomic_read_u32(&buf->state);
         for (;;) {
             if (old_buf_state & BM_LOCKED) {
-                old_buf_state = SegWaitBufHdrUnlocked(buf);
+                old_buf_state = WaitBufHdrUnlocked(buf);
             }
 
             buf_state = old_buf_state;
@@ -316,7 +324,7 @@ void SegMarkBufferDirty(Buffer buf)
     if (ENABLE_INCRE_CKPT) {
         for (;;) {
             buf_state = old_buf_state | (BM_DIRTY | BM_JUST_DIRTIED);
-            if (!XLogRecPtrIsInvalid(pg_atomic_read_u64(&bufHdr->rec_lsn))) {
+            if (!XLogRecPtrIsInvalid(pg_atomic_read_u64(&bufHdr->extra->rec_lsn))) {
                 break;
             }
 
@@ -333,8 +341,30 @@ void SegMarkBufferDirty(Buffer buf)
     UnlockBufHdr(bufHdr, buf_state);
 }
 
+#ifdef USE_ASSERT_CHECKING
+void SegFlushCheckDiskLSN(SegSpace *spc, RelFileNode rNode, ForkNumber forknum, BlockNumber blocknum, char *buf)
+{
+    if (!RecoveryInProgress() && !SS_IN_ONDEMAND_RECOVERY && ENABLE_DSS && ENABLE_VERIFY_PAGE_VERSION) {
+        char *origin_buf = (char *)palloc(BLCKSZ + ALIGNOF_BUFFER);
+        char *temp_buf = (char *)BUFFERALIGN(origin_buf);
+        seg_physical_read(spc, rNode, forknum, blocknum, temp_buf);
+        XLogRecPtr lsn_on_disk = PageGetLSN(temp_buf);
+        XLogRecPtr lsn_on_mem = PageGetLSN(buf);
+        /* maybe some pages are not protected by WAL-Logged */
+        if ((lsn_on_mem != InvalidXLogRecPtr) && (lsn_on_disk > lsn_on_mem)) {
+            ereport(PANIC, (errmsg("[%d/%d/%d/%d/%d %d-%d] memory lsn(0x%llx) is less than disk lsn(0x%llx)",
+                rNode.spcNode, rNode.dbNode, rNode.relNode, rNode.bucketNode, rNode.opt,
+                forknum, blocknum, (unsigned long long)lsn_on_mem, (unsigned long long)lsn_on_disk)));
+        }
+        pfree(origin_buf);
+    }
+}
+#endif
+
 void SegFlushBuffer(BufferDesc *buf, SMgrRelation reln)
 {
+    t_thrd.dms_cxt.buf_in_aio = false;
+
     if (!SegStartBufferIO(buf, false)) {
         /* Someone else flushed the buffer */
         return;
@@ -354,7 +384,7 @@ void SegFlushBuffer(BufferDesc *buf, SMgrRelation reln)
 
     char *buf_to_write = NULL;
     RedoBufferInfo buffer_info;
-    
+
     SegSpace *spc;
     if (reln == NULL || reln->seg_space == NULL) {
         spc = spc_open(buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, false);
@@ -387,7 +417,42 @@ void SegFlushBuffer(BufferDesc *buf, SMgrRelation reln)
         buf_to_write = PageSetChecksumCopy((Page)buf_to_write, buffer_info.blockinfo.blkno, true);
     }
 
-    seg_physical_write(spc, buf->tag.rnode, buf->tag.forkNum, buf->tag.blockNum, (char *)buf_to_write, false);
+#ifdef USE_ASSERT_CHECKING
+    SegFlushCheckDiskLSN(spc, buf->tag.rnode, buf->tag.forkNum, buf->tag.blockNum, buf_to_write);
+#endif
+
+    if (ENABLE_DMS && t_thrd.role == PAGEWRITER_THREAD && ENABLE_DSS_AIO) {
+        int thread_id = t_thrd.pagewriter_cxt.pagewriter_id;
+        PageWriterProc *pgwr = &g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id];
+        DSSAioCxt *aio_cxt = &pgwr->aio_cxt;
+        int aiobuf_id = DSSAioGetIOCBIndex(aio_cxt);
+        char *tempBuf = (char *)(pgwr->aio_buf + aiobuf_id * BLCKSZ);
+        errno_t ret = memcpy_s(tempBuf, BLCKSZ, buf_to_write, BLCKSZ);
+        securec_check(ret, "\0", "\0");
+
+        struct iocb *iocb_ptr = DSSAioGetIOCB(aio_cxt);
+        int32 io_ret = seg_physical_aio_prep_pwrite(spc, buf->tag.rnode, buf->tag.forkNum,
+            buf->tag.blockNum, tempBuf, (void *)iocb_ptr);
+        if (io_ret != DSS_SUCCESS) {
+            ereport(PANIC, (errmsg("dss aio failed, buffer: %d/%d/%d/%d/%d %d-%u",
+                buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, (int)buf->tag.rnode.bucketNode,
+                (int)buf->tag.rnode.opt, buf->tag.forkNum, buf->tag.blockNum)));
+        }
+
+        if (buf->extra->aio_in_progress) {
+            ereport(PANIC, (errmsg("buffer is already in aio progress, buffer: %d/%d/%d/%d/%d %d-%u",
+                buf->tag.rnode.spcNode, buf->tag.rnode.dbNode, buf->tag.rnode.relNode, (int)buf->tag.rnode.bucketNode,
+                (int)buf->tag.rnode.opt, buf->tag.forkNum, buf->tag.blockNum)));
+        }
+
+        buf->extra->aio_in_progress = true;
+        t_thrd.dms_cxt.buf_in_aio = true;
+        /* should be after io_prep_pwrite, because io_prep_pwrite will memset iocb struct */
+        iocb_ptr->data = (void *)buf;
+        DSSAioAppendIOCB(aio_cxt, iocb_ptr);
+    } else {
+        seg_physical_write(spc, buf->tag.rnode, buf->tag.forkNum, buf->tag.blockNum, (char *)buf_to_write, false);
+    }
 
     SegTerminateBufferIO(buf, true, 0);
 
@@ -415,9 +480,116 @@ void ReportInvalidPage(RepairBlockKey key)
     return;
 }
 
+void ReadSegBufferForCheck(BufferDesc* bufHdr, ReadBufferMode mode, SegSpace *spc, Block bufBlock)
+{
+    if (spc == NULL) {
+        spc = spc_open(bufHdr->tag.rnode.spcNode, bufHdr->tag.rnode.dbNode, false, false);
+        SegmentCheck(spc != NULL);
+    }
+
+    seg_physical_read(spc, bufHdr->tag.rnode, bufHdr->tag.forkNum, bufHdr->tag.blockNum, (char *)bufBlock);
+    if (!PageIsVerified((char *)bufBlock, bufHdr->tag.blockNum)) {
+        ereport(WARNING, (errmsg("[%d/%d/%d/%d %d-%d] verified failed",
+            bufHdr->tag.rnode.spcNode, bufHdr->tag.rnode.dbNode, bufHdr->tag.rnode.relNode,
+            bufHdr->tag.rnode.bucketNode, bufHdr->tag.forkNum, bufHdr->tag.blockNum)));
+        return;
+    }
+
+    if (!PageIsSegmentVersion(bufBlock) && !PageIsNew(bufBlock)) {
+        ereport(PANIC, (errmsg("[%d/%d/%d/%d %d-%d] page version is %d",
+            bufHdr->tag.rnode.spcNode, bufHdr->tag.rnode.dbNode, bufHdr->tag.rnode.relNode,
+            bufHdr->tag.rnode.bucketNode, bufHdr->tag.forkNum, bufHdr->tag.blockNum,
+            PageGetPageLayoutVersion(bufBlock))));
+    }
+}
+
+Buffer ReadSegBufferForDMS(BufferDesc* bufHdr, ReadBufferMode mode, SegSpace *spc)
+{
+    if (spc == NULL) {
+        bool found;
+        SegSpcTag tag = {.spcNode = bufHdr->tag.rnode.spcNode, .dbNode = bufHdr->tag.rnode.dbNode};
+        SegmentCheck(t_thrd.storage_cxt.SegSpcCache != NULL);
+        spc = (SegSpace *)hash_search(t_thrd.storage_cxt.SegSpcCache, (void *)&tag, HASH_FIND, &found);
+        SegmentCheck(found);
+        ereport(DEBUG1, (errmsg("Fetch cached SegSpace success, spcNode:%u dbNode:%u.", bufHdr->tag.rnode.spcNode,
+            bufHdr->tag.rnode.dbNode)));
+    }
+
+    char *bufBlock = (char *)BufHdrGetBlock(bufHdr);
+    if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK || mode == RBM_ZERO) {
+        errno_t er = memset_s((char *)bufBlock, BLCKSZ, 0, BLCKSZ);
+        securec_check(er, "", "");
+#ifdef USE_ASSERT_CHECKING
+        if (ENABLE_DSS) {
+            seg_physical_write(spc, bufHdr->tag.rnode, bufHdr->tag.forkNum, bufHdr->tag.blockNum, bufBlock, false);
+        }
+#endif
+    } else {
+#ifdef USE_ASSERT_CHECKING
+        bool need_verify = (!RecoveryInProgress() && !SS_IN_ONDEMAND_RECOVERY &&
+            ((pg_atomic_read_u32(&bufHdr->state) & BM_VALID) != 0) && ENABLE_DSS &&
+            ENABLE_VERIFY_PAGE_VERSION);
+        char *past_image = NULL;
+        if (need_verify) {
+            past_image = (char *)palloc(BLCKSZ);
+            errno_t ret = memcpy_s(past_image, BLCKSZ, bufBlock, BLCKSZ);
+            securec_check_ss(ret, "\0", "\0");
+        }
+#endif
+    
+        seg_physical_read(spc, bufHdr->tag.rnode, bufHdr->tag.forkNum, bufHdr->tag.blockNum, bufBlock);
+        ereport(DEBUG1,
+            (errmsg("DMS SegPage ReadBuffer success, bufid:%d, blockNum:%u of reln:%s mode %d.",
+                bufHdr->buf_id, bufHdr->tag.blockNum, relpathperm(bufHdr->tag.rnode, bufHdr->tag.forkNum), (int)mode)));
+        if (!PageIsVerified(bufBlock, bufHdr->tag.blockNum)) {
+            RepairBlockKey key;
+            key.relfilenode = bufHdr->tag.rnode;
+            key.forknum = bufHdr->tag.forkNum;
+            key.blocknum = bufHdr->tag.blockNum;
+            ReportInvalidPage(key);
+#ifdef USE_ASSERT_CHECKING
+            pfree_ext(past_image);
+#endif
+            return InvalidBuffer;
+        }
+
+#ifdef USE_ASSERT_CHECKING
+        if (need_verify) {
+            XLogRecPtr lsn_past = PageGetLSN(past_image);
+            XLogRecPtr lsn_now = PageGetLSN(bufBlock);
+            if (lsn_now < lsn_past) {
+                RelFileNode rnode = bufHdr->tag.rnode;
+                ereport(PANIC, (errmsg("[%d/%d/%d/%d/%d %d-%d] now lsn(0x%llx) is less than past lsn(0x%llx)",
+                    rnode.spcNode, rnode.dbNode, rnode.relNode, rnode.bucketNode, rnode.opt,
+                    bufHdr->tag.forkNum, bufHdr->tag.blockNum,
+                    (unsigned long long)lsn_now, (unsigned long long)lsn_past)));
+            }
+        }
+        pfree_ext(past_image);
+#endif
+
+        if (!PageIsSegmentVersion(bufBlock) && !PageIsNew(bufBlock)) {
+            ereport(PANIC, (errmsg("Read DMS SegPage buffer, block %u of relation %s, but page version is %d",
+                bufHdr->tag.blockNum, relpathperm(bufHdr->tag.rnode, bufHdr->tag.forkNum),
+                PageGetPageLayoutVersion(bufBlock))));
+        }
+    }
+
+    bufHdr->extra->lsn_on_disk = PageGetLSN(bufBlock);
+#ifdef USE_ASSERT_CHECKING
+    bufHdr->lsn_dirty = InvalidXLogRecPtr;
+#endif
+    SegTerminateBufferIO(bufHdr, false, BM_VALID);
+    SegmentCheck(SegBufferIsPinned(bufHdr));
+    return BufferDescriptorGetBuffer(bufHdr);
+}
+
 Buffer ReadBufferFast(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum, BlockNumber blockNum, ReadBufferMode mode)
 {
     bool found = false;
+
+    /* Make sure we will have room to remember the buffer pin */
+    ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
 
     BufferDesc *bufHdr = SegBufferAlloc(spc, rnode, forkNum, blockNum, &found);
 
@@ -425,9 +597,65 @@ Buffer ReadBufferFast(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum, Bloc
         SegmentCheck(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID));
 
         char *bufBlock = (char *)BufHdrGetBlock(bufHdr);
-        if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK) {
+
+        if (ENABLE_DMS && mode != RBM_FOR_REMOTE) {
+            Assert(!(pg_atomic_read_u32(&bufHdr->state) & BM_VALID));
+
+            do {
+                bool startio;
+                if (LWLockHeldByMe(bufHdr->io_in_progress_lock)) {
+                    startio = true;
+                } else {
+                    startio = SegStartBufferIO(bufHdr, true);
+                }
+
+                if (!startio) {
+                    Assert(pg_atomic_read_u32(&bufHdr->state) & BM_VALID);
+                    found = true;
+                    goto found_branch;
+                }
+
+                dms_buf_ctrl_t *buf_ctrl = GetDmsBufCtrl(bufHdr->buf_id);
+                LWLockMode lockmode = LW_SHARED;
+                if (!LockModeCompatible(buf_ctrl, lockmode)) {
+                    if (!StartReadPage(bufHdr, lockmode)) {
+                        SegTerminateBufferIO((BufferDesc *)bufHdr, false, 0);
+                        // when reform fail, should return InvalidBuffer to reform proc thread
+                        if (AmDmsReformProcProcess() && dms_reform_failed()) {
+                            SSUnPinBuffer(bufHdr);
+                            return InvalidBuffer;
+                        }
+
+                        if ((AmPageRedoProcess() || AmStartupProcess()) && dms_reform_failed()) {
+                            SSUnPinBuffer(bufHdr);
+                            return InvalidBuffer;
+                        }
+
+                        pg_usleep(5000L);
+                        continue;
+                    }
+                } else {
+                    /*
+                    * previous attempts to read the buffer must have failed,
+                    * but DRC has been created, so load page directly again
+                    */
+                    Assert(pg_atomic_read_u32(&bufHdr->state) & BM_IO_ERROR);
+                    buf_ctrl->state |= BUF_NEED_LOAD;
+                }
+
+                break;
+            } while (true);
+            return TerminateReadSegPage(bufHdr, mode, spc);
+        }
+
+        if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK || mode == RBM_ZERO) {
             errno_t er = memset_s((char *)bufBlock, BLCKSZ, 0, BLCKSZ);
             securec_check(er, "", "");
+#ifdef USE_ASSERT_CHECKING
+            if (ENABLE_DSS) {
+                seg_physical_write(spc, rnode, forkNum, blockNum, bufBlock, false);
+            }
+#endif
         } else {
             seg_physical_read(spc, rnode, forkNum, blockNum, bufBlock);
             if (!PageIsVerified(bufBlock, blockNum)) {
@@ -444,33 +672,25 @@ Buffer ReadBufferFast(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum, Bloc
                                 blockNum, relpathperm(rnode, forkNum), PageGetPageLayoutVersion(bufBlock))));
             }
         }
-        bufHdr->lsn_on_disk = PageGetLSN(bufBlock);
+        bufHdr->extra->lsn_on_disk = PageGetLSN(bufBlock);
 #ifdef USE_ASSERT_CHECKING
         bufHdr->lsn_dirty = InvalidXLogRecPtr;
 #endif
         SegTerminateBufferIO(bufHdr, false, BM_VALID);
     }
 
+found_branch:
     if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK) {
-        LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+        if (ENABLE_DMS) {
+            GetDmsBufCtrl(bufHdr->buf_id)->state |= BUF_READ_MODE_ZERO_LOCK;
+            LockBuffer(BufferDescriptorGetBuffer(bufHdr), BUFFER_LOCK_EXCLUSIVE);
+        } else {
+            LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+        }
     }
 
     SegmentCheck(SegBufferIsPinned(bufHdr));
     return BufferDescriptorGetBuffer(bufHdr);
-}
-
-void LockTwoLWLock(LWLock *new_partition_lock, LWLock *old_partition_lock)
-{
-    if (old_partition_lock < new_partition_lock) {
-        (void)LWLockAcquire(old_partition_lock, LW_EXCLUSIVE);
-        (void)LWLockAcquire(new_partition_lock, LW_EXCLUSIVE);
-    } else if (old_partition_lock > new_partition_lock) {
-        (void)LWLockAcquire(new_partition_lock, LW_EXCLUSIVE);
-        (void)LWLockAcquire(old_partition_lock, LW_EXCLUSIVE);
-    } else {
-        /* only one partition, only one lock */
-        (void)LWLockAcquire(new_partition_lock, LW_EXCLUSIVE);
-    }
 }
 
 BufferDesc * FoundBufferInHashTable(int buf_id, LWLock *new_partition_lock, bool *foundPtr)
@@ -517,12 +737,19 @@ BufferDesc *SegBufferAlloc(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum,
     LWLockRelease(new_partition_lock);
 
     for (;;) {
+        ReservePrivateRefCountEntry();
+
         buf = SegStrategyGetBuffer(&buf_state);
         SegmentCheck(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 
         old_flags = buf_state & BUF_FLAG_MASK;
 
         SegPinBufferLocked(buf, &new_tag);
+
+        if (!SSHelpFlushBufferIfNeed(buf)) {
+            SegUnpinBuffer(buf);
+            continue;
+        }
 
         if (old_flags & BM_DIRTY) {
             /* backend should not flush dirty pages if working version less than DW_SUPPORT_NEW_SINGLE_FLUSH */
@@ -571,7 +798,19 @@ BufferDesc *SegBufferAlloc(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum,
         old_flags = buf_state & BUF_FLAG_MASK;
 
         if (BUF_STATE_GET_REFCOUNT(buf_state) == 1 && !(old_flags & BM_DIRTY)) {
-            break;
+            if (ENABLE_DMS && (old_flags & BM_TAG_VALID)) {
+                /*
+                * notify DMS to release drc owner. if failed, can't recycle this buffer.
+                * release owner procedure is in buf header lock, it's not reasonable,
+                * need to improve.
+                */
+                if (DmsReleaseOwner(old_tag, buf->buf_id)) {
+                    ClearReadHint(buf->buf_id, true);
+                    break;
+                }
+            } else {
+                break;
+            }
         }
         UnlockBufHdr(buf, buf_state);
         BufTableDelete(&new_tag, new_hash);
@@ -587,6 +826,11 @@ BufferDesc *SegBufferAlloc(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum,
                    BUF_USAGECOUNT_MASK);
     buf_state |= BM_TAG_VALID | BM_PERMANENT | BUF_USAGECOUNT_ONE;
     UnlockBufHdr(buf, buf_state);
+
+    if (ENABLE_DMS) {
+        GetDmsBufCtrl(buf->buf_id)->lock_mode = DMS_LOCK_NULL;
+        GetDmsBufCtrl(buf->buf_id)->been_loaded = false;
+    }
 
     if (old_flag_valid) {
         BufTableDelete(&old_tag, old_hash);
@@ -626,7 +870,7 @@ static BufferDesc* get_segbuf_from_candidate_list(uint32* buf_state)
             /* the pagewriter sub thread store normal buffer pool, sub thread starts from 1 */
             int thread_id = (list_id + i) % list_num + 1;
             Assert(thread_id > 0 && thread_id <= list_num);
-            while (seg_candidate_buf_pop(&buf_id, thread_id)) {
+            while (candidate_buf_pop(&g_instance.ckpt_cxt_ctl->pgwr_procs.writer_proc[thread_id].seg_list, &buf_id)) {
                 buf = GetBufferDescriptor(buf_id);
                 local_buf_state = LockBufHdr(buf);
                 SegmentCheck(buf_id >= SegmentBufferStartID);
@@ -698,7 +942,7 @@ void SegDropSpaceMetaBuffers(Oid spcNode, Oid dbNode)
          * As in DropRelFileNodeBuffers, an unlocked precheck should be safe
          * and saves some cycles.
          */
-        if (buf_desc->tag.rnode.spcNode != spcNode) {
+        if (buf_desc->tag.rnode.spcNode != spcNode || buf_desc->tag.rnode.dbNode != dbNode) {
             continue;
         }
 

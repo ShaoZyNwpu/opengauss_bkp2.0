@@ -39,7 +39,6 @@
 #include "vecexecutor/vecnodes.h"
 #include "vecexecutor/vecstream.h"
 #include "pgxc/pgxc.h"
-#include "vecexecutor/vecnodedfsindexscan.h"
 #include "vecexecutor/vecnodecstorescan.h"
 #include "vecexecutor/vecnodecstoreindexscan.h"
 #include "vecexecutor/vecnodecstoreindexctidscan.h"
@@ -91,11 +90,9 @@ VectorEngineFunc VectorEngineRunner[] = {
     reinterpret_cast<VectorEngineFunc>(ExecVecSort),
     reinterpret_cast<VectorEngineFunc>(ExecVecForeignScan),
     reinterpret_cast<VectorEngineFunc>(ExecCStoreScan),
-    reinterpret_cast<VectorEngineFunc>(ExecDfsScan),
 #ifdef ENABLE_MULTIPLE_NODES
     reinterpret_cast<VectorEngineFunc>(ExecTsStoreScan),
 #endif   /* ENABLE_MULTIPLE_NODES */
-    reinterpret_cast<VectorEngineFunc>(ExecDfsIndexScan),
     reinterpret_cast<VectorEngineFunc>(ExecCstoreIndexScan),
     reinterpret_cast<VectorEngineFunc>(ExecCstoreIndexCtidScan),
     reinterpret_cast<VectorEngineFunc>(ExecCstoreIndexHeapScan),
@@ -145,7 +142,7 @@ static bool NeedStub(const Plan* node)
 VectorBatch* VectorEngine(PlanState* node)
 {
     VectorBatch* result = NULL;
-    MemoryContext old_context;
+    MemoryContext old_context = NULL;
 
     CHECK_FOR_INTERRUPTS();
 
@@ -159,7 +156,9 @@ VectorBatch* VectorEngine(PlanState* node)
 #endif
     Assert(node->vectorized);
 
-    old_context = MemoryContextSwitchTo(node->nodeContext);
+    if (node->nodeContext) {
+        old_context = MemoryContextSwitchTo(node->nodeContext);
+    }
 
     if (node->chgParam != NULL) /* something changed */
         VecExecReScan(node);    /* let ReScan handle this */
@@ -207,8 +206,9 @@ VectorBatch* VectorEngine(PlanState* node)
             node->instrument->status = true;
     }
 
-    (void)MemoryContextSwitchTo(old_context);
-
+    if (old_context) {
+        (void)MemoryContextSwitchTo(old_context);
+    }
     return result;
 }
 

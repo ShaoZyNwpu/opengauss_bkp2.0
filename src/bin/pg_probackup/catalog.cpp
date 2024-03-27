@@ -66,7 +66,7 @@ timelineInfoFree(void *tliInfo)
 
 /* Iterate over locked backups and delete locks files */
 void
-unlink_lock_atexit(void)
+unlink_lock_atexit(bool fatal, void *userdata)
 {
     int i;
 
@@ -876,6 +876,16 @@ pgBackupCreateDir(pgBackup *backup)
 
     backup->database_dir = (char *)pgut_malloc(MAXPGPATH);
     join_path_components(backup->database_dir, backup->root_dir, DATABASE_DIR);
+
+    if (IsDssMode())
+    {
+        /* prepare dssdata_dir */
+        backup->dssdata_dir = (char *)pgut_malloc(MAXPGPATH);
+        join_path_components(backup->dssdata_dir, backup->root_dir, DSSDATA_DIR);
+
+        /* add into subdirs array, which will be create later */
+        parray_append(subdirs, pg_strdup(DSSDATA_DIR));
+    }
 
     /* block header map */
     init_header_map(backup);
@@ -1907,6 +1917,9 @@ pgBackupWriteControl(FILE *out, pgBackup *backup)
 
     if (backup->content_crc != 0)
         fio_fprintf(out, "content-crc = %u\n", backup->content_crc);
+    
+    fio_fprintf(out, "\n#Database Storage type\n");
+    fio_fprintf(out, "storage-type = %s\n", dev2str(backup->storage_type));
 
 }
 
@@ -1979,13 +1992,13 @@ void flush_and_close_file(pgBackup *backup, bool sync, FILE *out, char *control_
          control_path_temp, strerror(errno));
 }
 
-inline int WriteCompressOption(pgFile *file, char *line, int remainLen, int len)
+inline int write_compress_option(pgFile *file, char *line, int remain_len, int len)
 {
-    if (file->is_datafile && file->compressedFile) {
-        auto nRet =
-            snprintf_s(line + len, remainLen - len, remainLen - len - 1,
+    if (file->is_datafile && file->compressed_file) {
+        int nRet =
+            snprintf_s(line + len, (uint32)(remain_len - len), (uint32)((remain_len - len) - 1),
                        ",\"compressedFile\":\"%d\",\"compressedChunkSize\":\"%d\",\"compressedAlgorithm\":\"%d\"", 1,
-                       file->compressedChunkSize, file->compressedAlgorithm);
+                       file->compressed_chunk_size, file->compressed_algorithm);
         securec_check_ss_c(nRet, "\0", "\0");
         return nRet;
     }
@@ -2069,14 +2082,15 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
                          "\"mode\":\"%u\", \"is_datafile\":\"%u\", "
                          "\"is_cfs\":\"%u\", \"crc\":\"%u\", "
                          "\"compress_alg\":\"%s\", \"external_dir_num\":\"%d\", "
-                         "\"dbOid\":\"%u\"",
+                         "\"dbOid\":\"%u\", \"file_type\":\"%d\"",
                         file->rel_path, file->write_size, file->mode,
                         file->is_datafile ? 1 : 0,
                         file->is_cfs ? 1 : 0,
                         file->crc,
                         deparse_compress_alg(file->compress_alg),
                         file->external_dir_num,
-                        file->dbOid);
+                        file->dbOid,
+                        (int)file->type);
         securec_check_ss_c(nRet, "\0", "\0");
         len = nRet;
 
@@ -2086,9 +2100,9 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
             securec_check_ss_c(nRet, "\0", "\0");
             len += nRet;
             /* persistence compress option */
-            len += WriteCompressOption(file, line, remainLen, len);
+            len += write_compress_option(file, line, remainLen, len);
         }
-
+        
         if (file->linked)
         {
             nRet = snprintf_s(line+len, remainLen - len,remainLen - len - 1,",\"linked\":\"%s\"", file->linked);
@@ -2195,6 +2209,7 @@ readBackupControlFile(const char *path)
     char    *compress_alg = NULL;
 	char    *recovery_name = NULL;
     int     parsed_options;
+    char    *storage_type = NULL;
     errno_t rc = 0;
 
     ConfigOption options[] =
@@ -2229,6 +2244,7 @@ readBackupControlFile(const char *path)
         {'s', 0, "note",				&backup->note, SOURCE_FILE_STRICT},
         {'s', 0, "recovery-name",		&recovery_name, SOURCE_FILE_STRICT},
         {'u', 0, "content-crc",			&backup->content_crc, SOURCE_FILE_STRICT},
+        {'s', 0, "storage-type",        &storage_type, SOURCE_FILE_STRICT},
         {0}
     };
 
@@ -2327,6 +2343,9 @@ readBackupControlFile(const char *path)
     if (compress_alg)
         backup->compress_alg = parse_compress_alg(compress_alg);
 
+    if (storage_type)
+        backup->storage_type = str2dev(storage_type);
+
     return backup;
 }
 
@@ -2382,6 +2401,10 @@ parse_compress_alg(const char *arg)
 
     if (pg_strncasecmp("zlib", arg, len) == 0)
         return ZLIB_COMPRESS;
+    else if (pg_strncasecmp("lz4", arg, len) == 0)
+        return LZ4_COMPRESS;
+    else if (pg_strncasecmp("zstd", arg, len) == 0)
+        return ZSTD_COMPRESS;
     else if (pg_strncasecmp("pglz", arg, len) == 0)
         return PGLZ_COMPRESS;
     else if (pg_strncasecmp("none", arg, len) == 0)
@@ -2404,6 +2427,10 @@ deparse_compress_alg(int alg)
             return "zlib";
         case PGLZ_COMPRESS:
             return "pglz";
+        case LZ4_COMPRESS:
+            return "lz4";
+        case ZSTD_COMPRESS:
+            return "zstd";
     }
 
     return NULL;

@@ -30,6 +30,7 @@
 #include "executor/exec/execdebug.h"
 #include "executor/node/nodeSubqueryscan.h"
 
+static TupleTableSlot* ExecSubqueryScan(PlanState* state);
 static TupleTableSlot* SubqueryNext(SubqueryScanState* node);
 
 /* ----------------------------------------------------------------
@@ -77,8 +78,9 @@ static bool SubqueryRecheck(SubqueryScanState* node, TupleTableSlot* slot)
  *		access method functions.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecSubqueryScan(SubqueryScanState* node)
+static TupleTableSlot* ExecSubqueryScan(PlanState* state)
 {
+    SubqueryScanState* node = castNode(SubqueryScanState, state);
     return ExecScan(&node->ss, (ExecScanAccessMtd)SubqueryNext, (ExecScanRecheckMtd)SubqueryRecheck);
 }
 
@@ -101,6 +103,7 @@ SubqueryScanState* ExecInitSubqueryScan(SubqueryScan* node, EState* estate, int 
     SubqueryScanState* sub_query_state = makeNode(SubqueryScanState);
     sub_query_state->ss.ps.plan = (Plan*)node;
     sub_query_state->ss.ps.state = estate;
+    sub_query_state->ss.ps.ExecProcNode = ExecSubqueryScan;
 
     /*
      * Miscellaneous initialization
@@ -138,11 +141,11 @@ SubqueryScanState* ExecInitSubqueryScan(SubqueryScan* node, EState* estate, int 
      */
     ExecAssignResultTypeFromTL(
             &sub_query_state->ss.ps,
-            sub_query_state->ss.ss_ScanTupleSlot->tts_tupleDescriptor->tdTableAmType);
+            sub_query_state->ss.ss_ScanTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     ExecAssignScanProjectionInfo(&sub_query_state->ss);
 
-    Assert(sub_query_state->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->tdTableAmType != TAM_INVALID);
+    Assert(sub_query_state->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     return sub_query_state;
 }

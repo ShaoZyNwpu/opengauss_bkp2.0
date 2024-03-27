@@ -80,6 +80,7 @@
 #include "c.h"
 #include "pgstat.h"
 #include "catalog/pg_proc_fn.h"
+#include "catalog/gs_utf8_collation.h"
 
 #ifdef ENABLE_MULTIPLE_NODES
 #include "streaming/planner.h"
@@ -1102,9 +1103,18 @@ static FuncCandidateList FuncnameAddCandidates(FuncCandidateList resultList, Hea
     int* argNumbers = NULL;
     FuncCandidateList newResult;
     bool isNull = false;
-
 #ifndef ENABLE_MULTIPLE_NODES
-    if (enable_outparam_override) {
+    Oid schema_oid = get_func_namespace(HeapTupleGetOid(procTup));
+    (void)SysCacheGetAttr(PROCOID, procTup, Anum_pg_proc_proallargtypes, &isNull);
+    if (IsAformatStyleFunctionOid(schema_oid) && isNull) {
+        includeOut = false;
+    }
+    if (enable_outparam_override && includeOut) {
+        if (isNull) {
+            proNargs = procForm->pronargs;
+            allArgTypes = NULL;
+            includeOut = false;
+        }
         Datum argTypes = ProcedureGetAllArgTypes(procTup, &isNull);
         if (!isNull) {
             allArgTypes = (oidvector *)PG_DETOAST_DATUM(argTypes);
@@ -1539,7 +1549,7 @@ FuncCandidateList FuncnameGetCandidates(List* names, int nargs, List* argnames, 
     bool isNull;
     Oid funcoid;
     Oid caller_pkg_oid = InvalidOid;
-    Oid initNamesapceId = InvalidOid;
+    Oid initNamespaceId = InvalidOid;
     bool enable_outparam_override = false;
 
 #ifndef ENABLE_MULTIPLE_NODES
@@ -1573,7 +1583,7 @@ FuncCandidateList FuncnameGetCandidates(List* names, int nargs, List* argnames, 
         namespaceId = InvalidOid;
         recomputeNamespacePath();
     }
-    initNamesapceId = namespaceId;
+    initNamespaceId = namespaceId;
 
     /* Step1. search syscache by name only and add candidates from pg_proc */
     CatCList* catlist = NULL;
@@ -1588,7 +1598,7 @@ FuncCandidateList FuncnameGetCandidates(List* names, int nargs, List* argnames, 
 #endif
 
     for (i = 0; i < catlist->n_members; i++) {
-        namespaceId = initNamesapceId;
+        namespaceId = initNamespaceId;
         HeapTuple proctup = t_thrd.lsc_cxt.FetchTupleFromCatCList(catlist, i);
         if (!OidIsValid(HeapTupleGetOid(proctup)) || !HeapTupleIsValid(proctup)) {
             continue;
@@ -2061,7 +2071,6 @@ bool FunctionIsVisible(Oid funcid)
     Form_pg_proc procform;
     Oid pronamespace;
     bool visible = false;
-
     proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
     if (!HeapTupleIsValid(proctup))
         ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for function %u", funcid)));
@@ -2093,11 +2102,12 @@ bool FunctionIsVisible(Oid funcid)
         oidvector* proargs = ProcedureGetArgTypes(proctup);
 
 #ifndef ENABLE_MULTIPLE_NODES
+        Oid prolang = procform->prolang;
         bool enable_outparam_override = false;
         enable_outparam_override = enable_out_param_override();
-        if (enable_outparam_override) {
+        if (enable_outparam_override && strcasecmp(get_language_name((Oid)prolang), "plpgsql") == 0) {
             bool isNull = false;
-            Datum argTypes = ProcedureGetAllArgTypes(proctup, &isNull);
+            Datum argTypes = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proallargtypes, &isNull);
             if (!isNull) {
                 oidvector* allArgTypes = (oidvector *)PG_DETOAST_DATUM(argTypes);
                 int proNargs = allArgTypes->dim1;
@@ -3088,6 +3098,7 @@ void DeconstructQualifiedName(const List* names, char** nspname_p, char** objnam
                 if (OidIsValid(PackageNameGetOid(pkgname, nspoid))) {
                     schemaname = strVal(linitial(names));
                     objname = pkgname;
+                    pkgname = NULL;
                 } else {
                     pkgname = NULL;
                 }
@@ -3150,6 +3161,7 @@ bool IsPackageFunction(List* funcname)
     Oid namespaceId = InvalidOid;
     char *pkgname = NULL;   
     bool isFirstFunction = true; 
+    bool isSynonymPkg = false;
 
     /* deconstruct the name list */
     DeconstructQualifiedName(funcname, &schemaname, &func_name, &pkgname);
@@ -3160,6 +3172,30 @@ bool IsPackageFunction(List* funcname)
         /* flag to indicate we need namespace search */
         namespaceId = InvalidOid;
         recomputeNamespacePath();
+    }
+
+    if (NULL != pkgname) {
+        if (OidIsValid(namespaceId)) {
+            if (OidIsValid(SysynonymPkgNameGetOid(pkgname, namespaceId))) {
+                 isSynonymPkg = true;
+            }
+        } else {
+            List* tempActiveSearchPath = NIL;
+            ListCell* l = NULL;
+
+            recomputeNamespacePath();
+
+            tempActiveSearchPath = list_copy(u_sess->catalog_cxt.activeSearchPath);
+            foreach (l, tempActiveSearchPath) {
+                Oid namespaceId = lfirst_oid(l);
+                if (OidIsValid(SysynonymPkgNameGetOid(pkgname, namespaceId))) {
+                   isSynonymPkg = true;
+                   list_free_ext(tempActiveSearchPath);
+                   break;
+                }
+            }
+            list_free_ext(tempActiveSearchPath);
+        }
     }
 
 #ifndef ENABLE_MULTIPLE_NODES
@@ -3182,27 +3218,28 @@ bool IsPackageFunction(List* funcname)
         } else {
             packageid = InvalidOid;
         }
-        if (OidIsValid(namespaceId)) {
-            /* Consider only procs in specified namespace */
-            if (procform->pronamespace != namespaceId)
-                continue;
-        } else {
-            /*
-             * Consider only procs that are in the search path and are not in
-             * the temp namespace.
-             */
-            ListCell* nsp = NULL;
+        if (!isSynonymPkg) {
+            if (OidIsValid(namespaceId)) {
+                /* Consider only procs in specified namespace */
+                if (procform->pronamespace != namespaceId)
+                    continue;
+            } else {
+                /*
+                 * Consider only procs that are in the search path and are not in
+                 * the temp namespace.
+                 */
+                ListCell* nsp = NULL;
 
-            foreach (nsp, u_sess->catalog_cxt.activeSearchPath) {
-                if (procform->pronamespace == lfirst_oid(nsp) &&
-                    procform->pronamespace != u_sess->catalog_cxt.myTempNamespace)
-                    break;
+                foreach (nsp, u_sess->catalog_cxt.activeSearchPath) {
+                    if (procform->pronamespace == lfirst_oid(nsp) &&
+                        procform->pronamespace != u_sess->catalog_cxt.myTempNamespace)
+                        break;
+                }
+
+                if (nsp == NULL)
+                    continue; /* proc is not in search path */
             }
-
-            if (nsp == NULL)
-                continue; /* proc is not in search path */
         }
-
         /* package function and not package function can not overload */
         proctup = t_thrd.lsc_cxt.FetchTupleFromCatCList(catlist, i);
         Datum ispackage = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_package, &isNull);
@@ -3378,20 +3415,14 @@ void CheckSetNamespace(Oid oldNspOid, Oid nspOid, Oid classid, Oid objid)
         ereport(
             ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot move objects into or out of TOAST schema")));
 
-    /*disallow set into cstore schema*/
-    if (nspOid == CSTORE_NAMESPACE)
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot move objects into CSTORE schema")));
-
     if (nspOid == PG_CATALOG_NAMESPACE)
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot move objects into system schema")));
 
-    /* disallow set into dbe_perf schema */
-    if (nspOid == PG_DBEPERF_NAMESPACE)
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot move objects into dbe_perf schema")));
-    
-    /* disallow set into snapshot schema */
-    if (nspOid == PG_SNAPSHOT_NAMESPACE)
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot move objects into snapshot schema")));
+    /* disallow user to set table into system schema */
+    if (IsSysSchema(nspOid)) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("cannot move objects into %s schema", get_namespace_name(nspOid))));
+    }
 }
 
 /*
@@ -4035,6 +4066,29 @@ void RemoveTmpNspFromSearchPath(Oid tmpnspId)
     MemoryContextSwitchTo(oldcxt);
 }
 
+/* If the collate string is in uppercase, change to lowercase and search it again */
+Oid get_collation_oid_with_lower_name(const char* collation_name, int charset)
+{
+    Oid colloid = InvalidOid;
+    char* lower_coll_name = pstrdup(collation_name);
+    lower_coll_name = pg_strtolower(lower_coll_name);
+    if (charset == PG_INVALID_ENCODING) {
+        CatCList* list = NULL;
+        HeapTuple coll_tup;
+        list = SearchSysCacheList1(COLLNAMEENCNSP, PointerGetDatum(lower_coll_name));
+        if (list->n_members == 1) {
+            coll_tup = t_thrd.lsc_cxt.FetchTupleFromCatCList(list, 0);
+            colloid = HeapTupleGetOid(coll_tup);
+        }
+        ReleaseSysCacheList(list);
+    } else {
+        colloid = GetSysCacheOid3(COLLNAMEENCNSP, PointerGetDatum(lower_coll_name),
+            Int32GetDatum(charset), ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+    }
+
+    return colloid;
+}
+
 /*
  * get_collation_oid - find a collation by possibly qualified name
  */
@@ -4057,11 +4111,11 @@ Oid get_collation_oid(List* name, bool missing_ok)
         /* first try for encoding-specific entry, then any-encoding */
         colloid = GetSysCacheOid3(
             COLLNAMEENCNSP, PointerGetDatum(collation_name), Int32GetDatum(dbencoding), ObjectIdGetDatum(namespaceId));
-        if (OidIsValid(colloid))
+        if (OidIsValid(colloid) && is_support_b_format_collation(colloid))
             return colloid;
         colloid = GetSysCacheOid3(
             COLLNAMEENCNSP, PointerGetDatum(collation_name), Int32GetDatum(-1), ObjectIdGetDatum(namespaceId));
-        if (OidIsValid(colloid))
+        if (OidIsValid(colloid) && is_support_b_format_collation(colloid))
             return colloid;
     } else {
         /* search for it in search path */
@@ -4081,14 +4135,14 @@ Oid get_collation_oid(List* name, bool missing_ok)
                 PointerGetDatum(collation_name),
                 Int32GetDatum(dbencoding),
                 ObjectIdGetDatum(namespaceId));
-            if (OidIsValid(colloid)) {
+            if (OidIsValid(colloid) && is_support_b_format_collation(colloid)) {
                 list_free_ext(tempActiveSearchPath);
                 return colloid;
             }
 
             colloid = GetSysCacheOid3(
                 COLLNAMEENCNSP, PointerGetDatum(collation_name), Int32GetDatum(-1), ObjectIdGetDatum(namespaceId));
-            if (OidIsValid(colloid)) {
+            if (OidIsValid(colloid) && is_support_b_format_collation(colloid)) {
                 list_free_ext(tempActiveSearchPath);
                 return colloid;
             }
@@ -4097,6 +4151,12 @@ Oid get_collation_oid(List* name, bool missing_ok)
         list_free_ext(tempActiveSearchPath);
     }
 
+    if (DB_IS_CMPT(B_FORMAT)) {
+        colloid = get_collation_oid_with_lower_name(collation_name, PG_INVALID_ENCODING);
+        if (OidIsValid(colloid) && is_support_b_format_collation(colloid)) {
+            return colloid;
+        }
+    }
     /* Not found in path */
     if (!missing_ok)
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -4435,6 +4495,10 @@ static void InitTempTableNamespace(void)
         ereport(ERROR,
             (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot create temporary tables during recovery")));
 
+    if (SSIsServerModeReadOnly()) {
+        ereport(ERROR, (errmsg("cannot create temporary tables at Standby with DMS enabled")));
+    }
+
     timeLineId = get_controlfile_timeline();
     tempID = __sync_add_and_fetch(&gt_tempID_seed, 1);
 
@@ -4505,10 +4569,18 @@ static void InitTempTableNamespace(void)
     create_stmt->schemaElts = NULL;
     create_stmt->schemaname = namespaceName;
     create_stmt->temptype = Temp_Rel;
+    create_stmt->charset = PG_INVALID_ENCODING;
     ret = snprintf_s(
         str, sizeof(str), sizeof(str) - 1, "CREATE SCHEMA %s AUTHORIZATION \"%s\"", namespaceName, bootstrap_username);
     securec_check_ss(ret, "\0", "\0");
-    ProcessUtility((Node*)create_stmt, str, NULL, false, None_Receiver, false, NULL);
+
+    processutility_context proutility_cxt;
+    proutility_cxt.parse_tree = (Node*)create_stmt;
+    proutility_cxt.query_string = str;
+    proutility_cxt.readOnlyTree = false;
+    proutility_cxt.params = NULL;
+    proutility_cxt.is_top_level = false;
+    ProcessUtility(&proutility_cxt, None_Receiver, false, NULL, PROCESS_UTILITY_GENERATED);
 
     if (IS_PGXC_COORDINATOR)
         if (PoolManagerSetCommand(POOL_CMD_TEMP, namespaceName) < 0)
@@ -4552,6 +4624,7 @@ static void InitTempTableNamespace(void)
     create_stmt->schemaElts = NULL;
     create_stmt->schemaname = toastNamespaceName;
     create_stmt->temptype = Temp_Toast;
+    create_stmt->charset = PG_INVALID_ENCODING;
     rc = memset_s(str, sizeof(str), 0, sizeof(str));
     securec_check(rc, "", "");
     ret = snprintf_s(str,
@@ -4561,7 +4634,13 @@ static void InitTempTableNamespace(void)
         toastNamespaceName,
         bootstrap_username);
     securec_check_ss(ret, "\0", "\0");
-    ProcessUtility((Node*)create_stmt, str, NULL, false, None_Receiver, false, NULL);
+
+    proutility_cxt.parse_tree = (Node*)create_stmt;
+    proutility_cxt.query_string = str;
+    proutility_cxt.readOnlyTree = false;
+    proutility_cxt.params = NULL;
+    proutility_cxt.is_top_level = false;
+    ProcessUtility(&proutility_cxt, None_Receiver, false, NULL, PROCESS_UTILITY_GENERATED);
 
     /* Advance command counter to make namespace visible */
     CommandCounterIncrement();
@@ -4598,6 +4677,14 @@ void AtEOXact_Namespace(bool isCommit)
             u_sess->catalog_cxt.baseSearchPathValid = false; /* need to rebuild list */
         }
         u_sess->catalog_cxt.myTempNamespaceSubID = InvalidSubTransactionId;
+    }
+
+    if (u_sess->catalog_cxt.myLobTempNamespaceSubID != InvalidSubTransactionId) {
+        if (!isCommit) {
+            u_sess->catalog_cxt.myLobTempToastNamespace = InvalidOid;
+            u_sess->catalog_cxt.ActiveLobToastOid = InvalidOid;
+        }
+        u_sess->catalog_cxt.myLobTempNamespaceSubID = InvalidSubTransactionId;
     }
 
     /*
@@ -4651,6 +4738,16 @@ void AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid, SubTransacti
             u_sess->catalog_cxt.myTempNamespace = InvalidOid;
             u_sess->catalog_cxt.myTempToastNamespace = InvalidOid;
             u_sess->catalog_cxt.baseSearchPathValid = false; /* need to rebuild list */
+        }
+    }
+
+    if (u_sess->catalog_cxt.myLobTempNamespaceSubID == mySubid) {
+        if (isCommit) {
+            u_sess->catalog_cxt.myLobTempNamespaceSubID = parentSubid;
+        } else {
+            u_sess->catalog_cxt.myLobTempNamespaceSubID = InvalidSubTransactionId;
+            u_sess->catalog_cxt.myLobTempToastNamespace = InvalidOid;
+            u_sess->catalog_cxt.ActiveLobToastOid = InvalidOid;
         }
     }
 
@@ -5155,8 +5252,13 @@ void SetTempNamespace(Node* stmt, Oid namespaceOid)
         u_sess->catalog_cxt.myTempNamespaceSubID = GetCurrentSubTransactionId();
     } else if (((CreateSchemaStmt*)stmt)->temptype == Temp_Toast) {
         u_sess->catalog_cxt.myTempToastNamespace = namespaceOid;
+    } else if (((CreateSchemaStmt*)stmt)->temptype == Temp_Lob_Toast) {
+        /* save xact id incase rollback and delete this schema */
+        u_sess->catalog_cxt.myLobTempNamespaceSubID = GetCurrentSubTransactionId();
+        u_sess->catalog_cxt.myLobTempToastNamespace = namespaceOid;
     }
 }
+
 void setTempToastNspName()
 {
     Assert(u_sess->catalog_cxt.myTempNamespace != InvalidOid);
@@ -5384,7 +5486,14 @@ dropExistTempNamespace(char *namespaceName)
     ereport(NOTICE, (errmsg("Deleting invalid temp schema %s.", namespaceName)));
     ret = snprintf_s(str, sizeof(str), sizeof(str) - 1, "DROP SCHEMA %s CASCADE", namespaceName);
     securec_check_ss(ret, "\0", "\0");
-    ProcessUtility((Node*)drop_stmt, str, NULL, false, None_Receiver, false, NULL);
+
+    processutility_context proutility_cxt;
+    proutility_cxt.parse_tree = (Node*)drop_stmt;
+    proutility_cxt.query_string = str;
+    proutility_cxt.readOnlyTree = false;
+    proutility_cxt.params = NULL;
+    proutility_cxt.is_top_level = false;
+    ProcessUtility(&proutility_cxt, None_Receiver, false, NULL, PROCESS_UTILITY_GENERATED);
     CommandCounterIncrement();
 }
 

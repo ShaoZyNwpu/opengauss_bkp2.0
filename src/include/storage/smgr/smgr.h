@@ -16,14 +16,16 @@
 
 #include "fmgr.h"
 #include "lib/ilist.h"
-#include "storage/smgr/knl_usync.h"
-#include "storage/buf/block.h"
+#include "storage/smgr/knl_usync.h" 
 #include "storage/smgr/relfilenode.h"
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
 #include "vecexecutor/vectorbatch.h"
 #include "nodes/bitmapset.h"
+#include "storage/file/fio_device_com.h"
+#include "storage/dss/dss_api_def.h"
 
+typedef int File;
 
 /*
  * smgr.c maintains a table of SMgrRelation objects, which are essentially
@@ -49,6 +51,7 @@ typedef struct SMgrRelationData {
 
     /* pointer to owning pointer, or NULL if none */
     struct SMgrRelationData** smgr_owner;
+    uint64 xact_seqno;
 
     /*
      * These next three fields are not actually used or manipulated by smgr,
@@ -102,6 +105,12 @@ typedef enum {             /* behavior for open file */
 
 typedef SMgrRelationData* SMgrRelation;
 
+typedef struct _MdfdVec {
+    File mdfd_vfd;               /* fd number in fd.c's pool */
+    BlockNumber mdfd_segno;      /* segment number, from 0 */
+    struct _MdfdVec *mdfd_chain; /* next segment, or NULL */
+} MdfdVec;
+
 #define IsSegmentSmgrRelation(smgr) (IsSegmentFileNode((smgr)->smgr_rnode.node))
 
 #define SmgrIsTemp(smgr) RelFileNodeBackendIsTemp((smgr)->smgr_rnode)
@@ -130,10 +139,12 @@ enum SMGR_READ_STATUS {
  * a pending fsync request getting canceled ... see mdsync).
  */
 #ifndef WIN32
-#define FILE_POSSIBLY_DELETED(err) ((err) == ENOENT)
+#define FILE_POSSIBLY_DELETED(err) ((err) == ENOENT || (err) == ERR_DSS_FILE_NOT_EXIST)
 #else
 #define FILE_POSSIBLY_DELETED(err) ((err) == ENOENT || (err) == EACCES)
 #endif
+
+#define FILE_ALREADY_EXIST(err) ((err) == EEXIST || (err) == ERR_DSS_DIR_CREATE_DUPLICATED)
 
 extern void smgrinit(void);
 extern SMgrRelation smgropen(const RelFileNode& rnode, BackendId backend, int col = 0);
@@ -143,7 +154,6 @@ extern void smgrsetowner(SMgrRelation* owner, SMgrRelation reln);
 extern void smgrclearowner(SMgrRelation* owner, SMgrRelation reln);
 extern void smgrclose(SMgrRelation reln, BlockNumber blockNum = InvalidBlockNumber);
 extern void smgrcloseall(void);
-extern void smgrcleanblocknumall(void);
 extern void smgrclosenode(const RelFileNodeBackend& rnode);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrdounlink(SMgrRelation reln, bool isRedo, BlockNumber blockNum = InvalidBlockNumber);
@@ -161,6 +171,11 @@ extern void smgrtruncatefunc(SMgrRelation reln, ForkNumber forknum, BlockNumber 
 extern void smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks);
 extern void smgrimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void smgrmovebuckets(SMgrRelation reln1, SMgrRelation reln2, List *bList);
+extern void SmgrRecoveryPca(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, bool isPcaCheckNeed, bool skipFsync);
+extern void SmgrAssistFileProcess(const char *assistInfo, int assistFd);
+extern void SmgrChunkFragmentsRestore(const RelFileNode& rnode, ForkNumber forknum, char parttype, bool nowait);
+extern void SmgrChunkFragmentsRestoreRecord(const RelFileNode &rnode, ForkNumber forknum);
+extern void CfsShrinkerShmemListPush(const RelFileNode &rnode, ForkNumber forknum, char parttype);
 
 extern void AtEOXact_SMgr(void);
 
@@ -185,6 +200,13 @@ extern void md_register_forget_request(RelFileNode rnode, ForkNumber forknum, Bl
 
 /* md sync callbacks */
 extern void mdForgetDatabaseFsyncRequests(Oid dbid);
+
+/* chunk compression api */
+extern void MdRecoveryPcaPage(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, bool skipFsync);
+extern void MdAssistFileProcess(SMgrRelation relation, const char *assistInfo, int assistFd);
+extern void CfsRecycleChunk(SMgrRelation reln, ForkNumber forknum);
+extern void CfsShrinkRecord(const RelFileNode &node, ForkNumber forknum);
+extern void CfsShrinkImpl(void);
 
 /* md sync requests */
 extern void ForgetDatabaseSyncRequests(Oid dbid);
@@ -222,7 +244,8 @@ extern Datum smgrin(PG_FUNCTION_ARGS);
 extern Datum smgreq(PG_FUNCTION_ARGS);
 extern Datum smgrne(PG_FUNCTION_ARGS);
 
-extern void partition_create_new_storage(Relation rel, Partition part, const RelFileNodeBackend& filenode);
+extern void partition_create_new_storage(Relation rel, Partition part, const RelFileNodeBackend& filenode,
+    bool keep_old_relfilenode = false);
 extern ScalarToDatum GetTransferFuncByTypeOid(Oid attTypeOid);
 extern bool check_unlink_rel_hashtbl(RelFileNode rnode, ForkNumber forknum);
 

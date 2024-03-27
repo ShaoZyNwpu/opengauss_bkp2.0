@@ -73,9 +73,11 @@
 #include "db4ai/gd.h"
 #include "catalog/pg_proc_fn.h"
 #include "access/tuptoaster.h"
+#include "parser/parse_expr.h"
+#include "auditfuncs.h"
+#include "rewrite/rewriteHandler.h"
 
 /* static function decls */
-static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 static bool isAssignmentIndirectionExpr(ExprState* exprstate);
 static Datum ExecEvalAggref(AggrefExprState* aggref, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 static Datum ExecEvalWindowFunc(WindowFuncExprState* wfunc, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
@@ -93,7 +95,7 @@ static Datum ExecEvalParamExtern(ExprState* exprstate, ExprContext* econtext, bo
 static bool isVectorEngineSupportSetFunc(Oid funcid);
 template <bool vectorized>
 static void init_fcache(
-    Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt, bool needDescForSets);
+    Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt, bool allowSRF, bool needDescForSets);
 static void ShutdownFuncExpr(Datum arg);
 static TupleDesc get_cached_rowtype(Oid type_id, int32 typmod, TupleDesc* cache_field, ExprContext* econtext);
 static void ShutdownTupleDescRef(Datum arg);
@@ -230,7 +232,7 @@ THR_LOCAL PLpgSQL_execstate* plpgsql_estate = NULL;
  * have to know the difference (that's what they need refattrlength for).
  * ----------
  */
-static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
 {
     ArrayRef* arrayRef = (ArrayRef*)astate->xprstate.expr;
     ArrayType* array_source = NULL;
@@ -255,6 +257,7 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
         if (!isAssignment)
             return (Datum)NULL;
     }
+    int returnNestTableLayer = 0;
     ExecTableOfIndexInfo execTableOfIndexInfo;
     initExecTableOfIndexInfo(&execTableOfIndexInfo, econtext);
     ExecEvalParamExternTableOfIndex((Node*)astate->refexpr->expr, &execTableOfIndexInfo);
@@ -274,8 +277,9 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
         if (OidIsValid(execTableOfIndexInfo.tableOfIndexType) || execTableOfIndexInfo.isnestedtable) {
             bool isTran = false;
             PLpgSQL_execstate* old_estate = plpgsql_estate;
-            Datum exprValue = ExecEvalExpr(eltstate, econtext, &eisnull, NULL);
+            Datum exprValue = (Datum)ExecEvalExpr(eltstate, econtext, &eisnull, NULL);
             plpgsql_estate = old_estate;
+            if (unlikely(execTableOfIndexInfo.tableOfIndexType))
             if (execTableOfIndexInfo.tableOfIndexType == VARCHAROID && !eisnull && VARATT_IS_1B(exprValue)) {
                 exprValue = transVaratt1BTo4B(exprValue);
                 isTran = true;
@@ -299,10 +303,13 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
                     execTableOfIndexInfo.tableOfIndexType = var->datatype->tableOfIndexType;
                     execTableOfIndexInfo.tableOfIndex = var->tableOfIndex;
                     eisnull = var->isnull;
+                    returnNestTableLayer = var->nest_layers;
                     if (plpgsql_estate)
                         plpgsql_estate->curr_nested_table_type = var->datatype->typoid;
                     continue;
                 }
+            } else {
+                returnNestTableLayer = 0;
             }
             if (index == -1) {
                 eisnull = true;
@@ -310,7 +317,10 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
                 upper.indx[i++] = index;
             }
         } else {
+            PLpgSQL_execstate* old_estate = plpgsql_estate;
             upper.indx[i++] = DatumGetInt32(ExecEvalExpr(eltstate, econtext, &eisnull, NULL));
+            plpgsql_estate = old_estate;
+            returnNestTableLayer = 0;
         }
         
         /* If any index expr yields NULL, result is NULL or error */
@@ -338,7 +348,9 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
                         (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                             errmsg("index by varchar or nested table don't support two subscripts")));
             } else {
+                PLpgSQL_execstate* old_estate = plpgsql_estate;
                 lower.indx[j++] = DatumGetInt32(ExecEvalExpr(eltstate, econtext, &eisnull, NULL));
+                plpgsql_estate = old_estate;
             }
             /* If any index expr yields NULL, result is NULL or error */
             if (eisnull) {
@@ -475,7 +487,9 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
                                 &astate->refelemalign);
         }
     }
-
+    if (plpgsql_estate) {
+        plpgsql_estate->curr_nested_table_layers = returnNestTableLayer;
+    }
     if (lIndex == NULL) {
         if (unlikely(i == 0)) {
             /* get nested table's inner table */
@@ -609,12 +623,24 @@ static Datum ExecEvalScalarVar(ExprState* exprstate, ExprContext* econtext, bool
             break;
     }
 
-    Assert(slot != NULL);
-
     attnum = variable->varattno;
 
     /* This was checked by ExecInitExpr */
     Assert(attnum != InvalidAttrNumber);
+
+    RightRefState* refState = econtext->rightRefState;
+    int index = attnum - 1;
+    if (refState && refState->values &&
+        (IS_ENABLE_INSERT_RIGHT_REF(refState) ||
+         (IS_ENABLE_UPSERT_RIGHT_REF(refState) && refState->hasExecs[index] && index < refState->colCnt))) {
+        *isNull = refState->isNulls[index];
+        return refState->values[index];
+    }
+
+    if (slot == nullptr) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_ATTRIBUTE), errmodule(MOD_EXECUTOR),
+                        errmsg("attribute number %d does not exists.", attnum)));
+    }
 
     /*
      * If it's a user attribute, check validity (bogus system attnums will be
@@ -643,7 +669,7 @@ static Datum ExecEvalScalarVar(ExprState* exprstate, ExprContext* econtext, bool
                     errmodule(MOD_EXECUTOR),
                     errmsg("attribute number %d exceeds number of columns %d", attnum, slot_tupdesc->natts)));
 
-        attr = slot_tupdesc->attrs[attnum - 1];
+        attr = &slot_tupdesc->attrs[attnum - 1];
 
         /* can't check type if dropped, since atttypid is probably 0 */
         if (!attr->attisdropped) {
@@ -720,7 +746,6 @@ static Datum ExecEvalWholeRowVar(
 {
     Var* variable = (Var*)wrvstate->xprstate.expr;
     TupleTableSlot* slot = NULL;
-    TupleDesc slot_tupdesc;
     bool needslow = false;
 
     if (isDone != NULL)
@@ -792,7 +817,8 @@ static Datum ExecEvalWholeRowVar(
                 oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
                 wrvstate->wrv_junkFilter = ExecInitJunkFilter(subplan->plan->targetlist,
                     ExecGetResultType(subplan)->tdhasoid,
-                    ExecInitExtraTupleSlot(wrvstate->parent->state));
+                    ExecInitExtraTupleSlot(wrvstate->parent->state),
+                    TableAmHeap);
                 MemoryContextSwitchTo(oldcontext);
             }
         }
@@ -802,21 +828,13 @@ static Datum ExecEvalWholeRowVar(
     if (wrvstate->wrv_junkFilter != NULL)
         slot = ExecFilterJunk(wrvstate->wrv_junkFilter, slot);
 
-    slot_tupdesc = slot->tts_tupleDescriptor;
-
     /*
-     * If it's a RECORD Var, we'll use the slot's type ID info.  It's likely
-     * that the slot's type is also RECORD; if so, make sure it's been
-     * "blessed", so that the Datum can be interpreted later.
-     *
      * If the Var identifies a named composite type, we must check that the
      * actual tuple type is compatible with it.
      */
-    if (variable->vartype == RECORDOID) {
-        if (slot_tupdesc->tdtypeid == RECORDOID && slot_tupdesc->tdtypmod < 0)
-            assign_record_type_typmod(slot_tupdesc);
-    } else {
+    if (variable->vartype != RECORDOID) {
         TupleDesc var_tupdesc;
+        TupleDesc slot_tupdesc;
         int i;
 
         /*
@@ -833,6 +851,8 @@ static Datum ExecEvalWholeRowVar(
          */
         var_tupdesc = lookup_rowtype_tupdesc(variable->vartype, -1);
 
+        slot_tupdesc = slot->tts_tupleDescriptor;
+
         if (var_tupdesc->natts != slot_tupdesc->natts)
             ereport(ERROR,
                 (errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -844,8 +864,8 @@ static Datum ExecEvalWholeRowVar(
                         var_tupdesc->natts)));
 
         for (i = 0; i < var_tupdesc->natts; i++) {
-            Form_pg_attribute vattr = var_tupdesc->attrs[i];
-            Form_pg_attribute sattr = slot_tupdesc->attrs[i];
+            Form_pg_attribute vattr = &var_tupdesc->attrs[i];
+            Form_pg_attribute sattr = &slot_tupdesc->attrs[i];
 
             if (vattr->atttypid == sattr->atttypid)
                 continue; /* no worries */
@@ -886,6 +906,7 @@ static Datum ExecEvalWholeRowFast(
 {
     Var* variable = (Var*)wrvstate->xprstate.expr;
     TupleTableSlot* slot = NULL;
+    TupleDesc slot_tupdesc;
     HeapTuple tuple;
     TupleDesc tupleDesc;
     HeapTupleHeader dtuple;
@@ -915,8 +936,31 @@ static Datum ExecEvalWholeRowFast(
     if (wrvstate->wrv_junkFilter != NULL)
         slot = ExecFilterJunk(wrvstate->wrv_junkFilter, slot);
 
+    /*
+     * If it's a RECORD Var, we'll use the slot's type ID info.  It's likely
+     * that the slot's type is also RECORD; if so, make sure it's been
+     * "blessed", so that the Datum can be interpreted later.
+     */        
+    slot_tupdesc = slot->tts_tupleDescriptor;
+    if (variable->vartype == RECORDOID) {
+        if (slot_tupdesc->tdtypeid == RECORDOID && slot_tupdesc->tdtypmod < 0)
+            assign_record_type_typmod(slot_tupdesc);
+    }
+
     tuple = ExecFetchSlotTuple(slot);
     tupleDesc = slot->tts_tupleDescriptor;
+    /*
+     * If it's a RECORD Var, we'll use the slot's type ID info.  It's likely
+     * that the slot's type is also RECORD; if so, make sure it's been
+     * "blessed", so that the Datum can be interpreted later.  (Note: we must
+     * do this here, not in ExecEvalWholeRowVar, because some plan trees may
+     * return different slots at different times.  We have to be ready to
+     * bless additional slots during the run.)
+     */
+    if (variable->vartype == RECORDOID &&
+        tupleDesc->tdtypeid == RECORDOID &&
+        tupleDesc->tdtypmod < 0)
+        assign_record_type_typmod(tupleDesc);
 
     /*
      * We have to make a copy of the tuple so we can safely insert the Datum
@@ -994,8 +1038,8 @@ static Datum ExecEvalWholeRowSlow(
 
     /* Check to see if any dropped attributes are non-null */
     for (i = 0; i < var_tupdesc->natts; i++) {
-        Form_pg_attribute vattr = var_tupdesc->attrs[i];
-        Form_pg_attribute sattr = tupleDesc->attrs[i];
+        Form_pg_attribute vattr = &var_tupdesc->attrs[i];
+        Form_pg_attribute sattr = &tupleDesc->attrs[i];
 
         if (!vattr->attisdropped)
             continue; /* already checked non-dropped cols */
@@ -1036,7 +1080,35 @@ static Datum ExecEvalWholeRowSlow(
  */
 static Datum ExecEvalConst(ExprState* exprstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
 {
-    Const* con = (Const*)exprstate->expr;
+    Const* con = NULL;
+    if (IsA(exprstate->expr, UserVar)) {
+        bool found = false;
+        UserVar *uservar = (UserVar *)exprstate->expr;
+        GucUserParamsEntry *entry = (GucUserParamsEntry *)hash_search(u_sess->utils_cxt.set_user_params_htab, uservar->name, HASH_FIND, &found);
+
+        /* if not found, return a null const */
+        if (found) {
+            if (entry->isParse) {
+                con = (Const *)uservar->value;
+            } else {
+                Node *node = coerce_type(NULL, (Node *)entry->value, entry->value->consttype, ((Const *)uservar->value)->consttype,
+                    -1, COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+                node = eval_const_expression_value(NULL, node, NULL);
+                if (nodeTag(node) != T_Const) {
+                    ereport(ERROR, (errcode(ERRCODE_INVALID_OPERATION),
+                        errmsg("The value of a user_defined variable must be convertible to a constant.")));
+                }
+                con = (Const *)node;
+            }
+        } else {
+            con = makeConst(UNKNOWNOID, -1, InvalidOid, -2, (Datum)0, true, false);
+        }
+    } else if (IsA(exprstate->expr, SetVariableExpr)) {
+        SetVariableExpr* setvar = (SetVariableExpr*)transformSetVariableExpr((SetVariableExpr*)exprstate->expr);
+        con = (Const*)setvar->value;
+    } else {
+        con = (Const*)exprstate->expr;
+    }
 
     if (isDone != NULL)
         *isDone = ExprSingleResult;
@@ -1069,6 +1141,196 @@ static Datum ExecEvalRownum(RownumState* exprstate, ExprContext* econtext, bool*
     }
 }
 
+/*----------------------------------------------------------------
+* find_uservar_in_expr: A recursive function 
+* For UserSetElemnt like @var := sin(@var), already remember root
+* as Sin's exprState, and this function is used to find wheter @var
+* is used in here.
+* if_use : true means this @var is used inside a correct expression
+*/
+static void find_uservar_in_expr(ExprState *root, char *return_name, bool *if_use)
+{
+    if(root == NULL) {
+        return;
+    }
+    switch(root->type) {
+        case T_FuncExprState: {
+        FuncExprState* parent = (FuncExprState*)root;
+        ListCell* arg = NULL;
+            foreach(arg,parent->args) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_ExprState: {
+            if (root->expr != NULL && root->expr->type == T_UserVar) {
+                UserVar* temp = (UserVar*)root->expr;
+                char* usename = temp->name;
+                if(strcmp(return_name, usename) == 0) {
+                    *if_use = true;
+                }
+            }
+        } break;
+        case T_AggrefExprState: {
+            AggrefExprState* parent = (AggrefExprState*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent->args) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_MinMaxExprState: {
+            MinMaxExprState* parent = (MinMaxExprState*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent->args) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_GenericExprState: {
+            GenericExprState* parent = (GenericExprState*)root;
+            find_uservar_in_expr(parent->arg, return_name, if_use);
+        } break;
+        case T_CaseExprState: {
+            CaseExprState* parent = (CaseExprState*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent->args) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_CaseWhenState: {
+            CaseWhenState* parent = (CaseWhenState*)root;
+            find_uservar_in_expr(parent->expr, return_name, if_use);
+            find_uservar_in_expr(parent->result, return_name, if_use);
+        } break;
+        case T_WindowFuncExprState: {
+            WindowFuncExprState* parent = (WindowFuncExprState*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent->args) {
+                ExprState* child =(ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_BoolExprState: {
+            BoolExprState* parent = (BoolExprState*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent->args) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_CoalesceExprState: {
+            CoalesceExprState* parent = (CoalesceExprState*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent->args) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_List: {
+            List* parent = (List*)root;
+            ListCell* arg = NULL;
+            foreach(arg, parent) {
+                ExprState* child = (ExprState*)lfirst(arg);
+                find_uservar_in_expr(child, return_name, if_use);
+            }
+        } break;
+        case T_NullTestState: {
+            NullTestState* parent = (NullTestState*)root;
+            find_uservar_in_expr(parent->arg,return_name, if_use);
+        } break;
+        case T_SubPlanState: 
+            break;
+        default: {
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmodule(MOD_DFS),
+                errmsg("Unsupported expr type for select @i:= expr.")));
+        }
+    }
+}
+
+
+static char* CStringFromDatum(Oid typeoid, Datum d) 
+{
+    bool isVarlena;
+    Oid outOid = InvalidOid;
+    getTypeOutputInfo(typeoid, &outOid, &isVarlena);
+    char* outStr = OidOutputFunctionCall(outOid, d);
+    if (outStr == NULL)
+        return "";
+    return outStr;
+}
+
+/* ----------------------------------------------------------------
+ * ExecEvalUserSetElm: set and Returns the user_define variable value
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalUserSetElm(ExprState* exprstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+{
+    UserSetElemState* usestate = (UserSetElemState*)exprstate;
+    UserSetElem* elem = usestate->use;
+    Node* node = NULL;
+    UserSetElem elemcopy;
+    elemcopy.xpr = elem->xpr;
+    elemcopy.name = elem->name;
+
+    if (isDone != NULL)
+        *isDone = ExprSingleResult;
+    Assert(isNull);
+    *isNull = false;
+
+    bool is_in_table = false;
+    if (econtext->ecxt_innertuple != NULL || econtext->ecxt_outertuple != NULL ||
+        econtext->ecxt_scantuple != NULL) {
+        is_in_table = true;
+    }
+
+    Const* con = NULL;
+    Node* res = NULL;
+    char* value  =  NULL;
+
+    Datum result = ExecEvalExpr(usestate->instate, econtext, isNull, isDone);
+
+    if (*isNull) {
+        con = makeConst(UNKNOWNOID, -1, InvalidOid, -2, result, true, false);
+        res = (Node*)con;
+        elemcopy.val = (Expr*)const_expression_to_const(res);
+    } else {
+        bool found = false;
+        GucUserParamsEntry *entry = NULL;
+        if (u_sess->utils_cxt.set_user_params_htab != NULL) {
+            UserVar *uservar = (UserVar*)linitial(elem->name);
+            entry = (GucUserParamsEntry*)hash_search(u_sess->utils_cxt.set_user_params_htab,
+                uservar->name, HASH_FIND, &found);
+            if (found) {
+                Const* expr = entry->value;
+                bool if_use = false;
+                if (expr->consttype != (usestate->xprstate).resultType && is_in_table) {
+                    find_uservar_in_expr(usestate->instate, uservar->name, &if_use);
+                    if (if_use) {  
+                        ereport(ERROR, 
+                            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                                 errmsg("Can not change type of user defined variable when use relations.")));
+                    }
+                }
+            }
+        }
+
+        Oid atttypid = exprType((Node*)elem->val);
+
+        value = CStringFromDatum(atttypid, result);
+        con = processResToConst(value, atttypid);
+        if (atttypid == BOOLOID)
+            res = (Node*)con;
+        else
+            res = type_transfer((Node *)con, atttypid, true);
+        elemcopy.val = (Expr*)const_expression_to_const(res);
+    }
+
+    check_set_user_message(&elemcopy);
+
+    return result;
+}
 /* ----------------------------------------------------------------
  *		ExecEvalParamExec
  *
@@ -1138,7 +1400,10 @@ static Datum ExecEvalParamExtern(ExprState* exprstate, ExprContext* econtext, bo
                             format_type_be(expression->paramtype))));
 
             *isNull = prm->isnull;
-
+            if (prm->tabInfo && prm->tabInfo->isnestedtable && plpgsql_estate) {
+                plpgsql_estate->curr_nested_table_type = prm->ptype;
+                plpgsql_estate->curr_nested_table_layers = prm->tabInfo->tableOfLayers;
+            }
             /* copy cursor option from param to econtext */
             if (econtext->is_cursor && prm->ptype == REFCURSOROID) {
                 CopyCursorInfoData(&econtext->cursor_data, &prm->cursor_data);
@@ -1334,8 +1599,8 @@ Datum GetAttributeByName(HeapTupleHeader tuple, const char* attname, bool* isNul
 
     attrno = InvalidAttrNumber;
     for (i = 0; i < tupDesc->natts; i++) {
-        if (namestrcmp(&(tupDesc->attrs[i]->attname), attname) == 0) {
-            attrno = tupDesc->attrs[i]->attnum;
+        if (namestrcmp(&(tupDesc->attrs[i].attname), attname) == 0) {
+            attrno = tupDesc->attrs[i].attnum;
             break;
         }
     }
@@ -1423,13 +1688,30 @@ static bool isVectorEngineSupportSetFunc(Oid funcid)
  */
 template <bool vectorized>
 static void init_fcache(
-    Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt, bool needDescForSets)
+    Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt, bool allowSRF, bool needDescForSRF)
 {
     AclResult aclresult;
     MemoryContext oldcontext;
+    Form_pg_proc procStruct;
+    HeapTuple procTup;
+    Oid definer = GetUserId();
+    
+    if (u_sess->attr.attr_sql.sql_compatibility ==  B_FORMAT)
+    {
+        /* Get the function's pg_proc entry */
+        procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(foid));
+        if (!HeapTupleIsValid(procTup)) {
+            ereport(ERROR, (errmodule(MOD_EXECUTOR), errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                    errmsg("cache lookup failed for function %u", foid)));
+        }
+        procStruct = (Form_pg_proc)GETSTRUCT(procTup);
+        if (procStruct->prosecdef)
+            definer = procStruct->proowner;
+        ReleaseSysCache(procTup);
+    }
 
     /* Check permission to call function */
-    aclresult = pg_proc_aclcheck(foid, GetUserId(), ACL_EXECUTE);
+    aclresult = pg_proc_aclcheck(foid, definer, ACL_EXECUTE);
     if (aclresult != ACLCHECK_OK)
         aclcheck_error(aclresult, ACL_KIND_PROC, get_func_name(foid));
 
@@ -1453,6 +1735,17 @@ static void init_fcache(
 
     /* palloc args in fcache's context  */
     oldcontext = MemoryContextSwitchTo(fcacheCxt);
+
+    /* If function returns set, check if that's allowed by caller */
+    if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+        if (fcache->func.fn_retset && !allowSRF)
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("set-valued function called in context that cannot accept a set")));
+
+        /* Otherwise, ExecInitExpr should have marked the fcache correctly */
+        Assert(fcache->func.fn_retset == fcache->funcReturnsSet);
+    }
+
     /* Initialize the function call parameter struct as well */
     if (vectorized)
         InitVecFunctionCallInfoData(
@@ -1560,7 +1853,7 @@ static void init_fcache(
         fcache->funcResultDesc = NULL;
     } else {
         /* If function returns set, prepare expected tuple descriptor */
-        if (fcache->func.fn_retset && needDescForSets) {
+        if (fcache->func.fn_retset && needDescForSRF) {
             TypeFuncClass functypclass;
             Oid funcrettype;
             TupleDesc tupdesc;
@@ -1579,7 +1872,7 @@ static void init_fcache(
                 fcache->funcReturnsTuple = true;
             } else if (functypclass == TYPEFUNC_SCALAR) {
                 /* Base data type, i.e. scalar */
-                tupdesc = CreateTemplateTupleDesc(1, false, TAM_HEAP);
+                tupdesc = CreateTemplateTupleDesc(1, false, TableAmHeap);
                 TupleDescInitEntry(tupdesc, (AttrNumber)1, NULL, funcrettype, -1, 0);
                 fcache->funcResultDesc = tupdesc;
                 fcache->funcReturnsTuple = false;
@@ -1606,7 +1899,7 @@ static void init_fcache(
 
 void initVectorFcache(Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt)
 {
-    init_fcache<true>(foid, input_collation, fcache, fcacheCxt, false);
+    init_fcache<true>(foid, input_collation, fcache, fcacheCxt, false, false);
 }
 
 /*
@@ -1835,8 +2128,8 @@ static void tupledesc_match(TupleDesc dst_tupdesc, TupleDesc src_tupdesc)
                     dst_tupdesc->natts)));
 
     for (i = 0; i < dst_tupdesc->natts; i++) {
-        Form_pg_attribute dattr = dst_tupdesc->attrs[i];
-        Form_pg_attribute sattr = src_tupdesc->attrs[i];
+        Form_pg_attribute dattr = &dst_tupdesc->attrs[i];
+        Form_pg_attribute sattr = &src_tupdesc->attrs[i];
 
         if (IsBinaryCoercible(sattr->atttypid, dattr->atttypid))
             continue; /* no worries */
@@ -1918,6 +2211,24 @@ restart:
     /* Guard against stack overflow due to overly complex expressions */
     check_stack_depth();
 
+    if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+        /*
+        * Initialize function cache if first time through.  The expression node
+        * could be either a FuncExpr or an OpExpr.
+        */
+        if (fcache->func.fn_oid == InvalidOid) {
+            if (IsA(fcache->xprstate.expr, FuncExpr)) {
+                FuncExpr *func = (FuncExpr *)fcache->xprstate.expr;
+
+                init_fcache<false>(func->funcid, func->inputcollid, fcache, econtext->ecxt_per_query_memory, true, true);
+            } else if (IsA(fcache->xprstate.expr, OpExpr)) {
+                OpExpr *op = (OpExpr *)fcache->xprstate.expr;
+
+                init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, true, true);
+            } else
+                elog(ERROR, "unrecognized node type: %d", (int)nodeTag(fcache->xprstate.expr));
+        }
+    }
     /*
      * If a previous call of the function returned a set result in the form of
      * a tuplestore, continue reading rows from the tuplestore until it's
@@ -1929,6 +2240,7 @@ restart:
             ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
                     errmsg("set-valued function called in context that cannot accept a set")));
         }
+        econtext->hasSetResultStore = true;
         if (tuplestore_gettupleslot(fcache->funcResultStore, true, false, fcache->funcResultSlot)) {
             *isDone = ExprMultipleResult;
             if (fcache->funcReturnsTuple) {
@@ -1986,17 +2298,29 @@ restart:
             argDone = ExecEvalFuncArgs<true>(fcinfo, arguments, econtext, var_dno);
         else
             argDone = ExecEvalFuncArgs<false>(fcinfo, arguments, econtext);
-        if (argDone == ExprEndResult) {
-            /* input is an empty set, so return an empty set. */
-            *isNull = true;
-            if (isDone != NULL)
-                *isDone = ExprEndResult;
-            else
+        if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+            if (argDone != ExprSingleResult) {
                 ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("set-valued function called in context that cannot accept a set")));
-            return (Datum)0;
+                return (Datum)0;
+            }
+        } else {
+            if (argDone == ExprEndResult) {
+                /* input is an empty set, so return an empty set. */
+                *isNull = true;
+                if (isDone != NULL)
+                    *isDone = ExprEndResult;
+                else
+                    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("set-valued function called in context that cannot accept a set")));
+                return (Datum)0;
+            }
         }
-        hasSetArg = (argDone != ExprSingleResult);
+        if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+            hasSetArg = false;
+        } else {
+            hasSetArg = (argDone != ExprSingleResult);
+        }
     } else {
         /* Re-use callinfo from previous evaluation */
         hasSetArg = fcache->setHasSetArg;
@@ -2063,6 +2387,9 @@ restart:
                 fcinfo->isnull = false;
                 rsinfo.isDone = ExprSingleResult;
                 result = FunctionCallInvoke(fcinfo);
+                if (AUDIT_SYSTEM_EXEC_ENABLED) {
+                    audit_system_function(fcinfo, AUDIT_OK);
+                }
                 *isNull = fcinfo->isnull;
                 *isDone = rsinfo.isDone;
 
@@ -2250,6 +2577,39 @@ restart:
 }
 
 /*
+ *		ExecMakeFunctionResultSet
+ *
+ * Evaluate the arguments to a set-returning function and then call the
+ * function itself.  The argument expressions may not contain set-returning
+ * functions (the planner is supposed to have separated evaluation for those).
+ */
+Datum ExecMakeFunctionResultSet(FuncExprState *fcache, ExprContext *econtext, bool *isNull, ExprDoneCond *isDone)
+{
+    FuncExpr* func = (FuncExpr*)fcache->xprstate.expr;
+    bool has_refcursor = func_has_refcursor_args(func->funcid, &fcache->fcinfo_data);
+    int cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
+
+    if (has_refcursor) {
+        if (cursor_return_number > 0) {
+            fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResult<true, true, true>;
+            return ExecMakeFunctionResult<true, true, true>(fcache, econtext, isNull, isDone);
+        } else {
+            fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResult<true, false, true>;
+            return ExecMakeFunctionResult<true, false, true>(fcache, econtext, isNull, isDone);
+        }
+    } 
+    else {
+        if (cursor_return_number > 0) {
+            fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResult<false, true, true>;
+            return ExecMakeFunctionResult<false, true, true>(fcache, econtext, isNull, isDone);
+        } else {
+            fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResult<false, false, true>;
+            return ExecMakeFunctionResult<false, false, true>(fcache, econtext, isNull, isDone);
+        }
+    }
+}
+
+/*
  *		ExecMakeFunctionResultNoSets
  *
  * Simplified version of ExecMakeFunctionResult that can only handle
@@ -2365,6 +2725,10 @@ static Datum ExecMakeFunctionResultNoSets(
     /* Only allow commit at CN, therefore need to set callcontext in CN only */
     if (supportTranaction) {
         fcinfo->context = (Node *)node;
+    }
+
+    if (econtext) {
+        fcinfo->can_ignore = econtext->can_ignore;
     }
 
     /*
@@ -2483,6 +2847,9 @@ static Datum ExecMakeFunctionResultNoSets(
         result = FunctionCallInvoke(fcinfo);
     }
     *isNull = fcinfo->isnull;
+    if (AUDIT_SYSTEM_EXEC_ENABLED) {
+        audit_system_function(fcinfo, AUDIT_OK);
+    }
 
     if (has_refcursor && econtext->plpgsql_estate != NULL) {
         PLpgSQL_execstate* estate = econtext->plpgsql_estate;
@@ -2739,7 +3106,7 @@ Tuplestorestate* ExecMakeTableFunctionResult(
         if (fcache->func.fn_oid == InvalidOid) {
             FuncExpr* func = (FuncExpr*)fcache->xprstate.expr;
 
-            init_fcache<false>(func->funcid, func->inputcollid, fcache, econtext->ecxt_per_query_memory, false);
+            init_fcache<false>(func->funcid, func->inputcollid, fcache, econtext->ecxt_per_query_memory, true, false);
         }
         returnsSet = fcache->func.fn_retset;
         InitFunctionCallInfoData(fcinfo,
@@ -2837,6 +3204,9 @@ Tuplestorestate* ExecMakeTableFunctionResult(
             fcinfo.isnull = false;
             rsinfo.isDone = ExprSingleResult;
             result = FunctionCallInvoke(&fcinfo);
+            if (AUDIT_SYSTEM_EXEC_ENABLED) {
+                audit_system_function(&fcinfo, AUDIT_OK);
+            }
 
             if (econtext->plpgsql_estate != NULL) {
                 PLpgSQL_execstate* estate = econtext->plpgsql_estate;
@@ -2928,7 +3298,7 @@ Tuplestorestate* ExecMakeTableFunctionResult(
                     /*
                      * Scalar type, so make a single-column descriptor
                      */
-                    tupdesc = CreateTemplateTupleDesc(1, false, TAM_HEAP);
+                    tupdesc = CreateTemplateTupleDesc(1, false, TableAmHeap);
                     TupleDescInitEntry(tupdesc, (AttrNumber)1, "column", funcrettype, -1, 0);
                 }
                 tupstore = tuplestore_begin_heap(randomAccess, false, u_sess->attr.attr_memory.work_mem);
@@ -3084,12 +3454,40 @@ static Datum ExecEvalFunc(FuncExprState* fcache, ExprContext* econtext, bool* is
     FuncExpr* func = (FuncExpr*)fcache->xprstate.expr;
     Oid target_type = InvalidOid;
     Oid source_type = InvalidOid;
+    bool has_refcursor = false;
+    int cursor_return_number = 0;
+
+    if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+        init_fcache<false>(func->funcid, func->inputcollid, fcache, econtext->ecxt_per_query_memory, false, false);
+        has_refcursor = func_has_refcursor_args(func->funcid, &fcache->fcinfo_data);
+        cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
+
+        Assert(!fcache->func.fn_retset);
+
+        if (has_refcursor) {
+            if (cursor_return_number > 0) {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<true, true>;
+                return ExecMakeFunctionResultNoSets<true, true>(fcache, econtext, isNull, isDone);
+            } else {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<true, false>;
+                return ExecMakeFunctionResultNoSets<true, false>(fcache, econtext, isNull, isDone);
+            }
+        } else {
+            if (cursor_return_number > 0) {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<false, true>;
+                return ExecMakeFunctionResultNoSets<false, true>(fcache, econtext, isNull, isDone);
+            } else {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<false, false>;
+                return ExecMakeFunctionResultNoSets<false, false>(fcache, econtext, isNull, isDone);
+            }
+        }
+    }
 
     /* Initialize function lookup info */
-    init_fcache<false>(func->funcid, func->inputcollid, fcache, econtext->ecxt_per_query_memory, true);
+    init_fcache<false>(func->funcid, func->inputcollid, fcache, econtext->ecxt_per_query_memory, false, true);
 
-    bool has_refcursor = func_has_refcursor_args(func->funcid, &fcache->fcinfo_data);
-    int cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
+    has_refcursor = func_has_refcursor_args(func->funcid, &fcache->fcinfo_data);
+    cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
 
     if (func->funcformat == COERCE_EXPLICIT_CAST || func->funcformat == COERCE_IMPLICIT_CAST) {
         target_type = func->funcresulttype;
@@ -3193,11 +3591,35 @@ static Datum ExecEvalOper(FuncExprState* fcache, ExprContext* econtext, bool* is
     /* This is called only the first time through */
     OpExpr* op = (OpExpr*)fcache->xprstate.expr;
     bool has_refcursor = false;
+    int cursor_return_number = 0;
+    if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+        init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, false, false);
+        has_refcursor = func_has_refcursor_args(op->opfuncid, &fcache->fcinfo_data);
+        cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
+        Assert(!fcache->func.fn_retset);
+        if (has_refcursor) {
+            if (cursor_return_number > 0) {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<true, true>;
+                return ExecMakeFunctionResultNoSets<true, true>(fcache, econtext, isNull, isDone);
+            } else {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<true, false>;
+                return ExecMakeFunctionResultNoSets<true, false>(fcache, econtext, isNull, isDone);
+            }
+        } else {
+            if (cursor_return_number > 0) {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<false, true>;
+                return ExecMakeFunctionResultNoSets<false, true>(fcache, econtext, isNull, isDone);
+            } else {
+                fcache->xprstate.evalfunc = (ExprStateEvalFunc)ExecMakeFunctionResultNoSets<false, false>;
+                return ExecMakeFunctionResultNoSets<false, false>(fcache, econtext, isNull, isDone);
+            }
+        }
+    }
 
     /* Initialize function lookup info */
-    init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, true);
+    init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, false, true);
     has_refcursor = func_has_refcursor_args(op->opfuncid, &fcache->fcinfo_data);
-    int cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
+    cursor_return_number = fcache->fcinfo_data.refcursor_data.return_number;
 
     /*
      * We need to invoke ExecMakeFunctionResult if either the function itself
@@ -3289,9 +3711,12 @@ static Datum ExecEvalDistinct(FuncExprState* fcache, ExprContext* econtext, bool
      */
     if (fcache->func.fn_oid == InvalidOid) {
         DistinctExpr* op = (DistinctExpr*)fcache->xprstate.expr;
-
-        init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, true);
-        Assert(!fcache->func.fn_retset);
+        if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+            init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, false, false);
+        } else {
+            init_fcache<false>(op->opfuncid, op->inputcollid, fcache, econtext->ecxt_per_query_memory, false, true);
+            Assert(!fcache->func.fn_retset);
+        }
     }
 
     /*
@@ -3356,9 +3781,14 @@ static Datum ExecEvalScalarArrayOp(
      * Initialize function cache if first time through
      */
     if (sstate->fxprstate.func.fn_oid == InvalidOid) {
-        init_fcache<false>(
-            opexpr->opfuncid, opexpr->inputcollid, &sstate->fxprstate, econtext->ecxt_per_query_memory, true);
-        Assert(!sstate->fxprstate.func.fn_retset);
+        if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+            init_fcache<false>(opexpr->opfuncid, opexpr->inputcollid, &sstate->fxprstate,
+                               econtext->ecxt_per_query_memory, false, false);
+        } else {
+            init_fcache<false>(opexpr->opfuncid, opexpr->inputcollid, &sstate->fxprstate,
+                               econtext->ecxt_per_query_memory, false, true);
+            Assert(!sstate->fxprstate.func.fn_retset);
+        }
     }
 
     /*
@@ -3437,6 +3867,7 @@ static Datum ExecEvalScalarArrayOp(
             s = (char*)att_align_nominal(s, typalign);
             fcinfo->arg[1] = elt;
             fcinfo->argnull[1] = false;
+            fcinfo->argTypes[1] = ARR_ELEMTYPE(arr);
         }
 
         /* Call comparison function */
@@ -4053,7 +4484,7 @@ static Datum ExecEvalRow(RowExprState* rstate, ExprContext* econtext, bool* isNu
         i++;
     }
 
-    tuple = (HeapTuple)tableam_tops_form_tuple(rstate->tupdesc, values, isnull, HEAP_TUPLE);
+    tuple = (HeapTuple)tableam_tops_form_tuple(rstate->tupdesc, values, isnull);
 
     pfree_ext(values);
     pfree_ext(isnull);
@@ -4421,9 +4852,14 @@ static Datum ExecEvalNullIf(FuncExprState* nullIfExpr, ExprContext* econtext, bo
      */
     if (nullIfExpr->func.fn_oid == InvalidOid) {
         NullIfExpr* op = (NullIfExpr*)nullIfExpr->xprstate.expr;
-
-        init_fcache<false>(op->opfuncid, op->inputcollid, nullIfExpr, econtext->ecxt_per_query_memory, true);
-        Assert(!nullIfExpr->func.fn_retset);
+        if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+            init_fcache<false>(op->opfuncid, op->inputcollid, nullIfExpr,
+                               econtext->ecxt_per_query_memory, false, false);
+        } else {
+            init_fcache<false>(op->opfuncid, op->inputcollid, nullIfExpr,
+                               econtext->ecxt_per_query_memory, false, true);
+            Assert(!nullIfExpr->func.fn_retset);
+        }
     }
 
     /*
@@ -4457,7 +4893,7 @@ static Datum CheckRowTypeIsNull(TupleDesc tupDesc, HeapTupleData tmptup, NullTes
 
     for (att = 1; att <= tupDesc->natts; att++) {
         /* ignore dropped columns */
-        if (tupDesc->attrs[att - 1]->attisdropped)
+        if (tupDesc->attrs[att - 1].attisdropped)
             continue;
         if (tableam_tops_tuple_attisnull(&tmptup, att, tupDesc)) {
             /* null field disproves IS NOT NULL */
@@ -4479,7 +4915,7 @@ static Datum CheckRowTypeIsNullForAFormat(TupleDesc tupDesc, HeapTupleData tmptu
 
     for (att = 1; att <= tupDesc->natts; att++) {
         /* ignore dropped columns */
-        if (tupDesc->attrs[att - 1]->attisdropped)
+        if (tupDesc->attrs[att - 1].attisdropped)
             continue;
         if (!tableam_tops_tuple_attisnull(&tmptup, att, tupDesc)) {
             /* non-null field disproves IS NULL */
@@ -4867,7 +5303,7 @@ static Datum ExecEvalFieldSelect(FieldSelectState* fstate, ExprContext* econtext
             (errcode(ERRCODE_INVALID_ATTRIBUTE),
                 errmodule(MOD_EXECUTOR),
                 errmsg("attribute number %d exceeds number of columns %d", fieldnum, tupDesc->natts)));
-    attr = tupDesc->attrs[fieldnum - 1];
+    attr = &tupDesc->attrs[fieldnum - 1];
 
     /* Check for dropped column, and force a NULL result if so */
     if (attr->attisdropped) {
@@ -4982,7 +5418,7 @@ static Datum ExecEvalFieldStore(FieldStoreState* fstate, ExprContext* econtext, 
     econtext->caseValue_datum = save_datum;
     econtext->caseValue_isNull = save_isNull;
 
-    tuple = (HeapTuple)tableam_tops_form_tuple(tupDesc, values, isnull, HEAP_TUPLE);
+    tuple = (HeapTuple)tableam_tops_form_tuple(tupDesc, values, isnull);
 
     pfree_ext(values);
     pfree_ext(isnull);
@@ -5112,6 +5548,37 @@ static Datum ExecEvalCurrentOfExpr(ExprState* exprstate, ExprContext* econtext, 
     return 0; /* keep compiler quiet */
 }
 
+/* ----------------------------------------------------------------
+ *		ExecEvalPrefixText
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPrefixText(GenericExprState* state, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+{
+    PrefixKey* pkey = (PrefixKey*)state->xprstate.expr;
+    Datum result = ExecEvalExpr(state->arg, econtext, isNull, isDone);
+
+    if (*isNull) {
+        return (Datum)0;
+    }
+
+    return PointerGetDatum(text_substring(result, 1, pkey->length, false));
+}
+/* ----------------------------------------------------------------
+ *		ExecEvalPrefixBytea
+ * ----------------------------------------------------------------
+ */
+static Datum ExecEvalPrefixBytea(GenericExprState* state, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+{
+    PrefixKey* pkey = (PrefixKey*)state->xprstate.expr;
+    Datum result = ExecEvalExpr(state->arg, econtext, isNull, isDone);
+
+    if (*isNull) {
+        return (Datum)0;
+    }
+
+    return PointerGetDatum(bytea_substring(result, 1, pkey->length, false));
+}
+
 /*
  * ExecEvalExprSwitchContext
  *
@@ -5162,6 +5629,11 @@ Datum ExecEvalExprSwitchContext(ExprState* expression, ExprContext* econtext, bo
  */
 ExprState* ExecInitExpr(Expr* node, PlanState* parent)
 {
+    if (u_sess->hook_cxt.execInitExprHook != NULL) {
+        ExprState* expr = ((execInitExprFunc)(u_sess->hook_cxt.execInitExprHook))(node, parent);
+        if (expr != NULL)
+            return expr;
+    }
     ExprState* state = NULL;
 
     gstrace_entry(GS_TRC_ID_ExecInitExpr);
@@ -5189,6 +5661,8 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
             }
             break;
         case T_Const:
+        case T_UserVar:
+        case T_SetVariableExpr:
             state = (ExprState*)makeNode(ExprState);
             state->evalfunc = ExecEvalConst;
             break;
@@ -5338,6 +5812,11 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
 
             fstate->args = (List*)ExecInitExpr((Expr*)funcexpr->args, parent);
             fstate->func.fn_oid = InvalidOid; /* not initialized */
+            if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+                fstate->funcReturnsSet = funcexpr->funcretset;
+            } else {
+                fstate->funcReturnsSet = false;
+            }
             state = (ExprState*)fstate;
         } break;
         case T_OpExpr: {
@@ -5347,6 +5826,11 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
             fstate->xprstate.evalfunc = (ExprStateEvalFunc)ExecEvalOper;
             fstate->args = (List*)ExecInitExpr((Expr*)opexpr->args, parent);
             fstate->func.fn_oid = InvalidOid; /* not initialized */
+            if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+                fstate->funcReturnsSet = opexpr->opretset;
+            } else {
+                fstate->funcReturnsSet = false;
+            }
             state = (ExprState*)fstate;
         } break;
         case T_DistinctExpr: {
@@ -5544,7 +6028,7 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
         case T_RowExpr: {
             RowExpr* rowexpr = (RowExpr*)node;
             RowExprState* rstate = makeNode(RowExprState);
-            Form_pg_attribute* attrs = NULL;
+            FormData_pg_attribute* attrs = NULL;
             List* outlist = NIL;
             ListCell* l = NULL;
             int i;
@@ -5553,7 +6037,7 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
             /* Build tupdesc to describe result tuples */
             if (rowexpr->row_typeid == RECORDOID) {
                 /* generic record, use runtime type assignment */
-                rstate->tupdesc = ExecTypeFromExprList(rowexpr->args, rowexpr->colnames, TAM_HEAP);
+                rstate->tupdesc = ExecTypeFromExprList(rowexpr->args, rowexpr->colnames);
                 BlessTupleDesc(rstate->tupdesc);
                 /* we won't need to redo this at runtime */
             } else {
@@ -5568,19 +6052,19 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
                 Expr* e = (Expr*)lfirst(l);
                 ExprState* estate = NULL;
 
-                if (!attrs[i]->attisdropped) {
+                if (!attrs[i].attisdropped) {
                     /*
                      * Guard against ALTER COLUMN TYPE on rowtype since
                      * the RowExpr was created.  XXX should we check
                      * typmod too?	Not sure we can be sure it'll be the
                      * same.
                      */
-                    if (exprType((Node*)e) != attrs[i]->atttypid)
+                    if (exprType((Node*)e) != attrs[i].atttypid)
                         ereport(ERROR,
                             (errcode(ERRCODE_DATATYPE_MISMATCH),
                                 errmsg("ROW() column has type %s instead of type %s",
                                     format_type_be(exprType((Node*)e)),
-                                    format_type_be(attrs[i]->atttypid))));
+                                    format_type_be(attrs[i].atttypid))));
                 } else {
                     /*
                      * Ignore original expression and insert a NULL. We
@@ -5817,6 +6301,27 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
             state = (ExprState*)rnstate;
             state->evalfunc = (ExprStateEvalFunc)ExecEvalRownum;
         } break;
+        case T_PrefixKey: {
+            PrefixKey* pkey = (PrefixKey*)node;
+            GenericExprState* gstate = makeNode(GenericExprState);
+            Oid argtype = exprType((Node*)pkey->arg);
+
+            if (argtype == BYTEAOID || argtype == RAWOID || argtype == BLOBOID) {
+                gstate->xprstate.evalfunc = (ExprStateEvalFunc)ExecEvalPrefixBytea;
+            } else {
+                gstate->xprstate.evalfunc = (ExprStateEvalFunc)ExecEvalPrefixText;
+            }
+            gstate->arg = ExecInitExpr(pkey->arg, parent);
+            state = (ExprState*)gstate;
+        } break;
+        case T_UserSetElem: {
+            UserSetElem* useexpr = (UserSetElem*)node;
+            UserSetElemState* usestate = (UserSetElemState*)makeNode(UserSetElemState);
+            usestate->use = useexpr;
+            state = (ExprState*)usestate;
+            state->evalfunc = (ExprStateEvalFunc)ExecEvalUserSetElm;
+            usestate->instate = ExecInitExpr((Expr *)useexpr->val, parent);
+        } break;
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
@@ -5833,6 +6338,21 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
 
     gstrace_exit(GS_TRC_ID_ExecInitExpr);
     return state;
+}
+
+/*
+ * ExecInitExprList: call ExecInitExpr on a repression list, return a list of ExprStates.
+ */
+List* ExecInitExprList(List* nodes, PlanState *parent)
+{
+    List* result = NIL;
+    ListCell* lc = NULL;
+
+    foreach (lc, nodes) {
+        Expr* experssion = (Expr*)lfirst(lc);
+        result = lappend(result, ExecInitExpr(experssion, parent));
+    }
+    return result;
 }
 
 /*
@@ -6105,6 +6625,55 @@ Datum fetch_lob_value_from_tuple(varatt_lob_pointer* lob_pointer, Oid update_oid
 }
 
 /*
+ * Return true if objid is a partition oid, and set relationid to objid's parent relation oid.
+ * Return false if objid is a relation oid.
+ */
+static bool getRelIdForPartition(Oid objid, Oid *relationid)
+{
+    HeapTuple reltuple = SearchSysCache1(RELOID, ObjectIdGetDatum(objid));
+    if (HeapTupleIsValid(reltuple)) {
+        ReleaseSysCache(reltuple);
+        /* is relation oid */
+        return false;
+    } else {
+        HeapTuple partuple = SearchSysCache1(PARTRELID, ObjectIdGetDatum(objid));
+        if (HeapTupleIsValid(partuple)) {
+            /* is partition oid */
+            Form_pg_partition partition = (Form_pg_partition)GETSTRUCT(partuple);
+            Oid relid = InvalidOid;
+            if (partition->parttype == PART_OBJ_TYPE_TABLE_PARTITION) {
+                relid = partition->parentid;
+                ReleaseSysCache(partuple);
+            } else if (partition->parttype == PART_OBJ_TYPE_TABLE_SUB_PARTITION) {
+                Oid partid = partition->parentid;
+                ReleaseSysCache(partuple);
+                HeapTuple partuple_subparent = SearchSysCache1(PARTRELID, ObjectIdGetDatum(partid));
+                if (HeapTupleIsValid(partuple_subparent)) {
+                    relid = ((Form_pg_partition)GETSTRUCT(partuple_subparent))->parentid;
+                    ReleaseSysCache(partuple_subparent);
+                } else {
+                    /* wrong sub partition oid */
+                    ereport(ERROR, (errcode(ERRCODE_RELATION_OPEN_ERROR),
+                                    errmsg("could not fine relation for subpartition OID %u", objid)));
+                }
+            }
+            HeapTuple parenttuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+            if (HeapTupleIsValid(parenttuple)) {
+                ReleaseSysCache(parenttuple);
+                *relationid = relid;
+                return true;
+            } else {
+                /* wrong partition oid */
+                ereport(ERROR, (errcode(ERRCODE_RELATION_OPEN_ERROR),
+                                errmsg("could not fine relation for partition OID %u", objid)));
+            }
+        }
+    }
+    /* is relation oid */
+    return false;
+}
+
+/*
  * ExecTargetList
  *		Evaluates a targetlist with respect to the given
  *		expression context.  Returns TRUE if we were able to create
@@ -6123,7 +6692,6 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
     ExprDoneCond* itemIsDone, ExprDoneCond* isDone)
 {
     MemoryContext oldContext;
-    ListCell* tl = NULL;
     bool haveDoneSets = false;
 
     /*
@@ -6131,19 +6699,32 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
      */
     oldContext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
+    RightRefState* refState = econtext->rightRefState;
+    int targetCount = list_length(targetlist);
+    GenericExprState* targetArr[targetCount];
+    
+    int colCnt = (IS_ENABLE_RIGHT_REF(refState) && refState->colCnt > 0) ? refState->colCnt : 1;
+    bool hasExecs[colCnt];
+
+    SortTargetListAsArray(refState, targetlist, targetArr);
+
+    InitOutputValues(refState, targetArr, values, isnull, targetCount, hasExecs);
+    
     /*
      * evaluate all the expressions in the target list
      */
     haveDoneSets = false; /* any exhausted set exprs in tlist? */
 
-    foreach (tl, targetlist) {
-        GenericExprState* gstate = (GenericExprState*)lfirst(tl);
+    for (GenericExprState* gstate : targetArr) {
         TargetEntry* tle = (TargetEntry*)gstate->xprstate.expr;
         AttrNumber resind = tle->resno - 1;
 
         ELOG_FIELD_NAME_START(tle->resname);
 
         values[resind] = ExecEvalExpr(gstate->arg, econtext, &isnull[resind], &itemIsDone[resind]);
+        if (IS_ENABLE_RIGHT_REF(refState) && resind < refState->colCnt) {
+            hasExecs[resind] = true;
+        }
 
         if (T_Var == nodeTag(tle->expr) && !isnull[resind]) {
             Var *var = (Var *)tle->expr;
@@ -6156,17 +6737,37 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
         bool isClobAndNotNull = false;
         isClobAndNotNull = (IsA(tle->expr, Param)) && (!isnull[resind]) && (((Param*)tle->expr)->paramtype == CLOBOID
             || ((Param*)tle->expr)->paramtype == BLOBOID);
-        if (isClobAndNotNull) {
+        if (isClobAndNotNull && econtext->ecxt_scantuple != NULL) {
             /* if is big lob, fetch and copy from toast */
             if (VARATT_IS_HUGE_TOAST_POINTER(values[resind])) {
                 Datum new_attr = (Datum)0;
-                Oid update_oid = econtext->ecxt_scantuple != NULL ?
-                    ((HeapTuple)(econtext->ecxt_scantuple->tts_tuple))->t_tableOid : InvalidOid;
-                Relation update_rel = heap_open(update_oid, RowExclusiveLock);
+                Oid update_oid = ((HeapTuple)(econtext->ecxt_scantuple->tts_tuple))->t_tableOid;
+                Oid parent_oid = InvalidOid;
+                Relation parent_rel = NULL;
+                Relation part_rel = NULL;
+                Partition part = NULL;
+                bool ispartition = getRelIdForPartition(update_oid, &parent_oid);
+                if (ispartition) {
+                    parent_rel = heap_open(parent_oid, RowExclusiveLock);
+                    part = partitionOpen(parent_rel, update_oid, RowExclusiveLock);
+                    part_rel = partitionGetRelation(parent_rel, part);
+                } else {
+                    parent_rel = heap_open(update_oid, RowExclusiveLock);
+                }
                 struct varlena *old_value = (struct varlena *)DatumGetPointer(values[resind]);
-                struct varlena *new_value = heap_tuple_fetch_and_copy(update_rel, old_value,true);
+                struct varlena *new_value = heap_tuple_fetch_and_copy(part_rel == NULL ? parent_rel : part_rel,
+                                                                      old_value, false);
+                if (new_value == NULL) {
+                    isnull[resind] = true;
+                }
                 new_attr = PointerGetDatum(new_value);
-                heap_close(update_rel, NoLock);
+                if (ispartition) {
+                    releaseDummyRelation(&part_rel);
+                    partitionClose(parent_rel, part, NoLock);
+                    heap_close(parent_rel, NoLock);
+                } else {
+                    heap_close(parent_rel, NoLock);
+                }
                 values[resind] = new_attr;
             }
         }
@@ -6205,8 +6806,7 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
              * We have some done and some undone sets.	Restart the done ones
              * so that we can deliver a tuple (if possible).
              */
-            foreach (tl, targetlist) {
-                GenericExprState* gstate = (GenericExprState*)lfirst(tl);
+            for (GenericExprState* gstate : targetArr) {
                 TargetEntry* tle = (TargetEntry*)gstate->xprstate.expr;
                 AttrNumber resind = tle->resno - 1;
 
@@ -6232,8 +6832,7 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
              * XXX is that still necessary?
              */
             if (*isDone == ExprEndResult) {
-                foreach (tl, targetlist) {
-                    GenericExprState* gstate = (GenericExprState*)lfirst(tl);
+                for (GenericExprState* gstate : targetArr) {
                     TargetEntry* tle = (TargetEntry*)gstate->xprstate.expr;
                     AttrNumber resind = tle->resno - 1;
 
@@ -6248,6 +6847,13 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
         }
     }
 
+
+    if (IS_ENABLE_RIGHT_REF(econtext->rightRefState)) {
+        econtext->rightRefState->values = nullptr;
+        econtext->rightRefState->isNulls = nullptr;
+        econtext->rightRefState->hasExecs = nullptr;
+    }
+    
     /* Report success */
     MemoryContextSwitchTo(oldContext);
 
@@ -6304,7 +6910,7 @@ TupleTableSlot* ExecProject(ProjectionInfo* projInfo, ExprDoneCond* isDone)
         tableam_tslot_getsomeattrs(econtext->ecxt_outertuple, projInfo->pi_lastOuterVar);
     }
 
-    if (projInfo->pi_lastScanVar > 0) {
+    if (projInfo->pi_lastScanVar > 0 && econtext->ecxt_scantuple) {
     	tableam_tslot_getsomeattrs(econtext->ecxt_scantuple, projInfo->pi_lastScanVar);
     }
 
@@ -6313,7 +6919,7 @@ TupleTableSlot* ExecProject(ProjectionInfo* projInfo, ExprDoneCond* isDone)
      * slots ... a mite ugly, but fast ...
      */
     int numSimpleVars = projInfo->pi_numSimpleVars;
-    if (numSimpleVars > 0) {
+    if (numSimpleVars > 0 && !IS_ENABLE_RIGHT_REF(projInfo->pi_exprContext->rightRefState)) {
         Datum* values = slot->tts_values;
         bool* isnull = slot->tts_isnull;
         int* varSlotOffsets = projInfo->pi_varSlotOffsets;
@@ -6357,9 +6963,19 @@ TupleTableSlot* ExecProject(ProjectionInfo* projInfo, ExprDoneCond* isDone)
      * already marked empty.
      */
     if (projInfo->pi_targetlist) {
-        if (!ExecTargetList(
-                projInfo->pi_targetlist, econtext, slot->tts_values, slot->tts_isnull, projInfo->pi_itemIsDone, isDone))
+        if (IS_ENABLE_RIGHT_REF(econtext->rightRefState)) {
+            econtext->rightRefState->isUpsert = projInfo->isUpsertHasRightRef;
+        }
+        bool flag = !ExecTargetList(projInfo->pi_targetlist, econtext, slot->tts_values,
+                                    slot->tts_isnull, projInfo->pi_itemIsDone, isDone);
+
+        if (econtext->rightRefState) {
+            econtext->rightRefState->isUpsert = false;
+        }
+        
+        if (flag) {
             return slot; /* no more result rows, return empty slot */
+        }
     }
 
     /*

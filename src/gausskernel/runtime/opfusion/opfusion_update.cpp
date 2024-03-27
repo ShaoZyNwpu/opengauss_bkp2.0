@@ -41,7 +41,7 @@ UHeapTuple UpdateFusion::uheapModifyTuple(UHeapTuple tuple, Relation rel)
      * create a new tuple from the values and isnull arrays
      */
     newTuple = (UHeapTuple)tableam_tops_form_tuple(m_global->m_tupDesc, m_local.m_values,
-        m_local.m_isnull, UHEAP_TUPLE);
+        m_local.m_isnull, TableAmUstore);
 
     /*
      * copy the identification info of the old tuple: t_ctid, t_self, and OID
@@ -68,7 +68,7 @@ HeapTuple UpdateFusion::heapModifyTuple(HeapTuple tuple)
     /*
      * create a new tuple from the values and isnull arrays
      */
-    new_tuple = (HeapTuple)tableam_tops_form_tuple(m_global->m_tupDesc, m_local.m_values, m_local.m_isnull, HEAP_TUPLE);
+    new_tuple = (HeapTuple)tableam_tops_form_tuple(m_global->m_tupDesc, m_local.m_values, m_local.m_isnull);
 
     /*
      * copy the identification info of the old tuple: t_ctid, t_self, and OID
@@ -113,7 +113,8 @@ void UpdateFusion::InitGlobals()
     ModifyTable* node = (ModifyTable*)m_global->m_planstmt->planTree;
     Plan *updatePlan = (Plan *)linitial(node->plans);
     IndexScan* indexscan = (IndexScan *)JudgePlanIsPartIterator(updatePlan);
-    m_global->m_reloid = getrelid(linitial_int(m_global->m_planstmt->resultRelations), m_global->m_planstmt->rtable);
+    m_global->m_reloid = getrelid(linitial_int((List*)linitial(m_global->m_planstmt->resultRelations)),
+                                  m_global->m_planstmt->rtable);
 
     Relation rel = heap_open(m_global->m_reloid, AccessShareLock);
     m_global->m_table_type = RelationIsUstoreFormat(rel) ? TAM_USTORE : TAM_HEAP;
@@ -121,6 +122,7 @@ void UpdateFusion::InitGlobals()
     m_global->m_is_bucket_rel = RELATION_OWN_BUCKET(rel);
     m_global->m_natts = RelationGetDescr(rel)->natts;
     m_global->m_tupDesc = CreateTupleDescCopy(RelationGetDescr(rel));
+    m_global->m_tupDesc->td_tam_ops = GetTableAmRoutine(m_global->m_table_type);
     hash_col_num = rel->rd_isblockchain ? 1 : 0;
     heap_close(rel, AccessShareLock);
 
@@ -202,12 +204,13 @@ void UpdateFusion::InitLocals(ParamListInfo params)
 {
     m_local.m_tmpisnull = NULL;
     m_local.m_tmpvals = NULL;
-    m_c_local.m_estate = CreateExecutorState();
+    m_c_local.m_estate = CreateExecutorStateForOpfusion(m_local.m_localContext, m_local.m_tmpContext);
     m_c_local.m_estate->es_range_table = m_global->m_planstmt->rtable;
+    m_c_local.m_estate->es_plannedstmt = m_global->m_planstmt;
 
     m_local.m_reslot = MakeSingleTupleTableSlot(m_global->m_tupDesc);
     if (m_global->m_table_type == TAM_USTORE) {
-        m_local.m_reslot->tts_tupslotTableAm = TAM_USTORE;
+        m_local.m_reslot->tts_tam_ops = TableAmUstore;
     }
     m_local.m_values = (Datum*)palloc0(m_global->m_natts * sizeof(Datum));
     m_local.m_isnull = (bool*)palloc0(m_global->m_natts * sizeof(bool));
@@ -333,7 +336,7 @@ lreplace:
             HeapTuple tmp_tup = (HeapTuple)tup;
             MemoryContext oldContext = MemoryContextSwitchTo(m_local.m_tmpContext);
             hash_del = get_user_tuple_hash((HeapTuple)oldtup, RelationGetDescr(ledger_dest_rel));
-            tup = set_user_tuple_hash(tmp_tup, ledger_dest_rel);
+            tup = set_user_tuple_hash(tmp_tup, ledger_dest_rel, NULL);
             (void)MemoryContextSwitchTo(oldContext);
             tableam_tops_free_tuple(tmp_tup);
         }
@@ -351,8 +354,67 @@ lreplace:
             }
         }
 
-        if (rel->rd_att->constr)
-            ExecConstraints(result_rel_info, m_local.m_reslot, m_c_local.m_estate);
+        /* acquire Form_pg_attrdef ad_on_update */
+        if (result_rel_info->ri_RelationDesc->rd_att->constr &&
+            result_rel_info->ri_RelationDesc->rd_att->constr->has_on_update) {
+            char relkind;
+            bool isNull = false;
+            ItemPointer tupleid = NULL;
+            bool *temp_isnull = NULL;
+            Datum *temp_values;
+            relkind = result_rel_info->ri_RelationDesc->rd_rel->relkind;
+            result_rel_info = result_rel_info + m_c_local.m_estate->result_rel_index;
+            if (relkind == RELKIND_RELATION || RELKIND_IS_SEQUENCE(relkind)) {
+                if (result_rel_info->ri_junkFilter != NULL) {
+                    tupleid = (ItemPointer)DatumGetPointer(
+                        ExecGetJunkAttribute(m_local.m_reslot, result_rel_info->ri_junkFilter->jf_junkAttNo, &isNull));
+                } else {
+                    tupleid = (ItemPointer) & (((HeapTuple)tup)->t_self);
+                }
+            }
+            temp_isnull = m_local.m_reslot->tts_isnull;
+            m_local.m_reslot->tts_isnull = m_local.m_isnull;
+            temp_values = m_local.m_reslot->tts_values;
+            m_local.m_reslot->tts_values = m_local.m_values;
+            bool update_fix_result = ExecComputeStoredUpdateExpr(result_rel_info, m_c_local.m_estate, m_local.m_reslot,
+                tup, CMD_UPDATE, tupleid, (part == NULL ? InvalidOid : part->pd_id), bucketid);
+            if (!update_fix_result) {
+                if (tup != m_local.m_reslot->tts_tuple) {
+                    tableam_tops_free_tuple(tup);
+                    tup = m_local.m_reslot->tts_tuple;
+                }
+            }
+            m_local.m_reslot->tts_isnull = temp_isnull;
+            m_local.m_reslot->tts_values = temp_values;
+        }
+
+        if (rel->rd_att->constr) {
+            if (!ExecConstraints(result_rel_info, m_local.m_reslot, m_c_local.m_estate)) {
+                if (u_sess->utils_cxt.sql_ignore_strategy_val != SQL_OVERWRITE_NULL) {
+                    break;
+                }
+                tup = ReplaceTupleNullCol(RelationGetDescr(result_rel_info->ri_RelationDesc), m_local.m_reslot);
+                /* Double check constraints in case that new val in column with not null constraints
+                 * violated check constraints */
+                ExecConstraints(result_rel_info, m_local.m_reslot, m_c_local.m_estate);
+            }
+        }
+
+        /* Check unique constraints first if SQL has keyword IGNORE */
+        bool isgpi = false;
+        ConflictInfoData conflictInfo;
+        Oid conflictPartOid = InvalidOid;
+        int2 conflictBucketid = InvalidBktId;
+        if (m_c_local.m_estate->es_plannedstmt && m_c_local.m_estate->es_plannedstmt->hasIgnore &&
+            !ExecCheckIndexConstraints(m_local.m_reslot, m_c_local.m_estate, ledger_dest_rel, part, &isgpi, bucketid,
+                                       &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+            // check whether the conflicted info is the update tuple. If not, report warning and return.
+            if (!ItemPointerEquals(&((HeapTuple)tup)->t_self, &conflictInfo.conflictTid)) {
+                ereport(WARNING, (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                         RelationGetRelationName(ledger_dest_rel))));
+                break;
+            }
+        }
 
         bool update_indexes = false;
         TupleTableSlot* oldslot = NULL;
@@ -411,6 +473,7 @@ lreplace:
                     exec_index_tuples_state.targetPartRel = RELATION_IS_PARTITIONED(rel) ? partRel : NULL;
                     exec_index_tuples_state.p = RELATION_IS_PARTITIONED(rel) ? part : NULL;
                     exec_index_tuples_state.conflict = NULL;
+                    exec_index_tuples_state.rollbackIndex = false;
                     recheck_indexes = tableam_tops_exec_update_index_tuples(m_local.m_reslot, oldslot,
                         bucket_rel == NULL ? destRel : bucket_rel,
                         NULL, tup, &((HeapTuple)oldtup)->t_self, exec_index_tuples_state, bucketid, modifiedIdxAttrs);
@@ -491,6 +554,12 @@ lreplace:
             m_local.m_ledger_hash_exist = true;
             m_local.m_ledger_relhash += res_hash;
         }
+
+        /* Check any WITH CHECK OPTION constraints */
+        if (result_rel_info->ri_WithCheckOptions != NIL) {
+            ExecWithCheckOptions(result_rel_info, m_local.m_reslot, m_c_local.m_estate);
+        }
+
         bms_free(modifiedIdxAttrs);
         list_free_ext(recheck_indexes);
     }
@@ -533,9 +602,30 @@ bool UpdateFusion::execute(long max_rows, char *completionTag)
     InitResultRelInfo(result_rel_info, rel, 1, 0);
     m_c_local.m_estate->es_result_relation_info = result_rel_info;
     m_c_local.m_estate->es_output_cid = GetCurrentCommandId(true);
+    m_c_local.m_estate->es_plannedstmt = m_global->m_planstmt;
 
     if (result_rel_info->ri_RelationDesc->rd_rel->relhasindex) {
-        ExecOpenIndices(result_rel_info, false);
+        bool speculative = m_c_local.m_estate->es_plannedstmt && m_c_local.m_estate->es_plannedstmt->hasIgnore;
+        ExecOpenIndices(result_rel_info, speculative);
+    }
+
+    ModifyTable* node = (ModifyTable*)(m_global->m_planstmt->planTree);
+    PlanState* ps = NULL;
+    if (node->withCheckOptionLists != NIL) {
+        Plan* plan = (Plan*)linitial(node->plans);
+        ps = ExecInitNode(plan, m_c_local.m_estate, 0);
+        List* wcoList = (List*)linitial(node->withCheckOptionLists);
+        List* wcoExprs = NIL;
+        ListCell* ll = NULL;
+
+        foreach(ll, wcoList) {
+            WithCheckOption* wco = (WithCheckOption*)lfirst(ll);
+            ExprState* wcoExpr = ExecInitExpr((Expr*)wco->qual, ps);
+            wcoExprs = lappend(wcoExprs, wcoExpr);
+        }
+
+        result_rel_info->ri_WithCheckOptions = wcoList;
+        result_rel_info->ri_WithCheckOptionExprs = wcoExprs;
     }
 
     /* ********************************
@@ -546,6 +636,9 @@ bool UpdateFusion::execute(long max_rows, char *completionTag)
     /* ***************
      * step 3: done *
      * ************** */
+    if (ps != NULL) {
+        ExecEndNode(ps);
+    }
     success = true;
     if (m_local.m_ledger_hash_exist && !IsConnFromApp()) {
         errorno = snprintf_s(completionTag, COMPLETION_TAG_BUFSIZE, COMPLETION_TAG_BUFSIZE - 1,
@@ -555,5 +648,8 @@ bool UpdateFusion::execute(long max_rows, char *completionTag)
             snprintf_s(completionTag, COMPLETION_TAG_BUFSIZE, COMPLETION_TAG_BUFSIZE - 1, "UPDATE %ld", nprocessed);
     }
     securec_check_ss(errorno, "\0", "\0");
+    FreeExecutorStateForOpfusion(m_c_local.m_estate);
+    u_sess->statement_cxt.current_row_count = nprocessed;
+    u_sess->statement_cxt.last_row_count = u_sess->statement_cxt.current_row_count;
     return success;
 }

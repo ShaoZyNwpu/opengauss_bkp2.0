@@ -40,6 +40,7 @@
 /* Returns true if doing null-fill on inner relation */
 #define HJ_FILL_INNER(hjstate) ((hjstate)->hj_NullOuterTupleSlot != NULL)
 
+static TupleTableSlot* ExecHashJoin(PlanState* state);
 static TupleTableSlot* ExecHashJoinOuterGetTuple(PlanState* outerNode, HashJoinState* hjstate, uint32* hashvalue);
 static TupleTableSlot* ExecHashJoinGetSavedTuple(
     HashJoinState* hjstate, BufFile* file, uint32* hashvalue, TupleTableSlot* tupleSlot);
@@ -55,8 +56,9 @@ static bool ExecHashJoinNewBatch(HashJoinState* hjstate);
  * ----------------------------------------------------------------
  */
 /* return: a tuple or NULL */
-TupleTableSlot* ExecHashJoin(HashJoinState* node)
+static TupleTableSlot* ExecHashJoin(PlanState* state)
 {
+    HashJoinState* node = castNode(HashJoinState, state);
     PlanState* outerNode = NULL;
     HashState* hashNode = NULL;
     List* joinqual = NIL;
@@ -67,7 +69,7 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
     TupleTableSlot* outerTupleSlot = NULL;
     uint32 hashvalue;
     int batchno;
-    MemoryContext oldcxt;
+    MemoryContext oldcxt = NULL;
     JoinType jointype;
 
     /*
@@ -107,6 +109,14 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
      * run the hash join state machine
      */
     for (;;) {
+        /*
+         * It's possible to iterate this loop many times before returning a
+         * tuple, in some pathological cases such as needing to move much of
+         * the current batch to a later batch.  So let's check for interrupts
+         * each time through.
+         */
+        CHECK_FOR_INTERRUPTS();
+        
         switch (node->hj_JoinState) {
             case HJ_BUILD_HASHTABLE: {
                 /*
@@ -170,10 +180,19 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
                 /*
                  * create the hash table, sometimes we should keep nulls
                  */
-                oldcxt = MemoryContextSwitchTo(hashNode->ps.nodeContext);
+                if (hashNode->ps.nodeContext) {
+                    /* enable_memory_limit */
+                    oldcxt = MemoryContextSwitchTo(hashNode->ps.nodeContext);
+                }
+
                 hashtable = ExecHashTableCreate((Hash*)hashNode->ps.plan, node->hj_HashOperators,
-                    HJ_FILL_INNER(node) || node->js.nulleqqual != NIL);
-                MemoryContextSwitchTo(oldcxt);
+                    HJ_FILL_INNER(node) || node->js.nulleqqual != NIL, node->hj_hashCollations);
+                    
+                if (oldcxt) {
+                    /* enable_memory_limit */
+                    MemoryContextSwitchTo(oldcxt);
+                }
+                
                 node->hj_HashTable = hashtable;
 
                 /*
@@ -284,14 +303,6 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
 
                 /* fall through */
             case HJ_SCAN_BUCKET:
-
-                /*
-                 * We check for interrupts here because this corresponds to
-                 * where we'd fetch a row from a child plan node in other join
-                 * types.
-                 */
-                CHECK_FOR_INTERRUPTS();
-
                 /*
                  * Scan the selected hash bucket for matches to current outer
                  */
@@ -340,17 +351,15 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
                             continue;
                         }
 
-                        /* Semi join: we'll consider returning the first match, but after
-                         *	that we're done with this outer tuple */
-                        if (jointype == JOIN_SEMI)
+                        if (node->js.single_match) {
                             node->hj_JoinState = HJ_NEED_NEW_OUTER;
+                        }
                     }
 
                     if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                         TupleTableSlot* result = NULL;
-
+                        
                         result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
-
                         if (isDone != ExprEndResult) {
                             node->js.ps.ps_TupFromTlist = (isDone == ExprMultipleResult);
                             return result;
@@ -516,6 +525,7 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
     List* lclauses = NIL;
     List* rclauses = NIL;
     List* hoperators = NIL;
+    List* hcollations = NIL;
     ListCell* l = NULL;
 
     /* check for unsupported flags */
@@ -529,6 +539,7 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
     hjstate->js.ps.state = estate;
     hjstate->hj_streamBothSides = node->streamBothSides;
     hjstate->hj_rebuildHashtable = node->rebuildHashTable;
+    hjstate->js.ps.ExecProcNode = ExecHashJoin;
 
     /*
      * Miscellaneous initialization
@@ -565,6 +576,8 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
      */
     ExecInitResultTupleSlot(estate, &hjstate->js.ps);
     hjstate->hj_OuterTupleSlot = ExecInitExtraTupleSlot(estate);
+
+    hjstate->js.single_match = (node->join.inner_unique || node->join.jointype == JOIN_SEMI);
 
     /* set up null tuples for outer joins, if needed */
     switch (node->join.jointype) {
@@ -612,7 +625,7 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
      * result tupleSlot only contains virtual tuple, so the default
      * tableAm type is set to HEAP.
      */
-    ExecAssignResultTypeFromTL(&hjstate->js.ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&hjstate->js.ps);
     ExecAssignProjectionInfo(&hjstate->js.ps, NULL);
 
     ExecSetSlotDescriptor(hjstate->hj_OuterTupleSlot, ExecGetResultType(outerPlanState(hjstate)));
@@ -637,6 +650,7 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
     lclauses = NIL;
     rclauses = NIL;
     hoperators = NIL;
+    hcollations = NIL;
     foreach (l, hjstate->hashclauses) {
         FuncExprState* fstate = (FuncExprState*)lfirst(l);
         OpExpr* hclause = NULL;
@@ -647,10 +661,12 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
         lclauses = lappend(lclauses, linitial(fstate->args));
         rclauses = lappend(rclauses, lsecond(fstate->args));
         hoperators = lappend_oid(hoperators, hclause->opno);
+        hcollations = lappend_oid(hcollations, hclause->inputcollid);
     }
     hjstate->hj_OuterHashKeys = lclauses;
     hjstate->hj_InnerHashKeys = rclauses;
     hjstate->hj_HashOperators = hoperators;
+    hjstate->hj_hashCollations = hcollations;
     /* child Hash node needs to evaluate inner hash keys, too */
     ((HashState*)innerPlanState(hjstate))->hashkeys = rclauses;
 
@@ -1107,6 +1123,12 @@ void ExecEarlyFreeHashJoin(HashJoinState* node)
     if (node->hj_HashTable) {
         ExecHashTableDestroy(node->hj_HashTable);
         node->hj_HashTable = NULL;
+        /*
+         * HashState.hashtable also point to hj_HashTable(check ExecHashJoin),
+         * so set it to null directly to avoid heap-use-after-free
+         */
+        HashState* hash_state = (HashState*)innerPlanState(node);
+        hash_state->hashtable = NULL;
     }
 
     /*

@@ -28,6 +28,7 @@
 #include "commands/createas.h"
 #include "commands/defrem.h"
 #include "commands/prepare.h"
+#include "executor/node/nodeModifyTable.h"
 #include "executor/exec/execStream.h"
 #include "executor/hashjoin.h"
 #include "executor/lightProxy.h"
@@ -172,7 +173,6 @@ static void show_instrumentation_count(const char* qlabel, int which, const Plan
 static void show_removed_rows(int which, const PlanState* planstate, int idx, int smpIdx, int* removeRows);
 static int check_integer_overflow(double var);
 static void show_foreignscan_info(ForeignScanState* fsstate, ExplainState* es);
-static void show_dfs_block_info(PlanState* planstate, ExplainState* es);
 static void show_detail_storage_info_text(Instrumentation* instr, StringInfo instr_info);
 static void show_detail_storage_info_json(Instrumentation* instr, StringInfo instr_info, ExplainState* es);
 static void show_storage_filter_info(PlanState* planstate, ExplainState* es);
@@ -184,7 +184,7 @@ static const char* explain_get_index_name(Oid indexId);
 static void ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir, ExplainState* es);
 static void ExplainScanTarget(Scan* plan, ExplainState* es);
 static void ExplainModifyTarget(ModifyTable* plan, ExplainState* es);
-static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es);
+static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es, bool multiTarget = false);
 static void show_on_duplicate_info(ModifyTableState* mtstate, ExplainState* es, List* ancestors);
 #ifndef PGXC
 static void show_modifytable_info(ModifyTableState* mtstate, ExplainState* es);
@@ -216,7 +216,8 @@ static void show_datanode_time(ExplainState* es, PlanState* planstate);
 static void ShowStreamRunNodeInfo(Stream* stream, ExplainState* es);
 static void ShowRunNodeInfo(const ExecNodes* en, ExplainState* es, const char* qlabel);
 template <bool is_detail>
-static void show_datanode_hash_info(ExplainState* es, int nbatch, int nbatch_original, int nbuckets, long spacePeakKb);
+static void show_datanode_hash_info(ExplainState *es, int nbatch, int nbuckets_original, int nbatch_original,
+                                    int nbuckets, long spacePeakKb);
 static void ShowRoughCheckInfo(ExplainState* es, Instrumentation* instrument, int nodeIdx, int smpIdx);
 static void show_hashAgg_info(AggState* hashaggstate, ExplainState* es);
 static void ExplainPrettyList(List* data, ExplainState* es);
@@ -262,7 +263,7 @@ static bool show_scan_distributekey(const Plan* plan)
 {
     return (
         IsA(plan, CStoreScan) || IsA(plan, CStoreIndexScan) || IsA(plan, CStoreIndexHeapScan) || IsA(plan, SeqScan) ||
-        IsA(plan, DfsScan) || IsA(plan, IndexScan) || IsA(plan, IndexOnlyScan) || IsA(plan, CteScan) ||
+        IsA(plan, IndexScan) || IsA(plan, IndexOnlyScan) || IsA(plan, CteScan) ||
         IsA(plan, ForeignScan) || IsA(plan, VecForeignScan) || IsA(plan, BitmapHeapScan) || IsA(plan, TsStoreScan)
     );
 }
@@ -434,15 +435,9 @@ void ExplainQuery(
      * rewriter.  We do not do AcquireRewriteLocks: we assume the query either
      * came straight from the parser, or suitable locks were acquired by
      * plancache.c.
-     *
-     * Because the rewriter and planner tend to scribble on the input, we make
-     * a preliminary copy of the source querytree.	This prevents problems in
-     * the case that the EXPLAIN is in a portal or plpgsql function and is
-     * executed repeatedly.  (See also the same hack in DECLARE CURSOR and
-     * PREPARE.)
      */
     AssertEreport(IsA(stmt->query, Query), MOD_EXECUTOR, "unexpect query type");
-    rewritten = QueryRewrite((Query*)copyObject(stmt->query));
+    rewritten = QueryRewrite(castNode(Query, stmt->query));
 
     /* emit opening boilerplate */
     ExplainBeginOutput(&es);
@@ -492,7 +487,15 @@ void ExplainQuery(
 
         /* Explain every plan */
         foreach (l, rewritten) {
-            ExplainOneQuery((Query*)lfirst(l), NULL, &es, queryString, None_Receiver, params);
+            Query* query_tree = (Query*)lfirst(l);
+
+            /*
+             * We need to revert this query_tree, so that ExplainOneQuery can get correct
+             * message when generating PlanedStmt.
+             */
+            query_tree->is_flt_frame = !query_check_no_flt(query_tree);
+
+            ExplainOneQuery(query_tree, NULL, &es, queryString, None_Receiver, params);
 
             /* Separate plans with an appropriate separator */
             if (lnext(l) != NULL)
@@ -567,6 +570,7 @@ void ExplainInitState(ExplainState* es)
     es->indent = 0;
     es->pindent = 0;
     es->wlm_statistics_plan_max_digit = NULL;
+    es->es_frs.parent = es;
     /* Reset flag for plan_table. */
     IsExplainPlanStmt = false;
     IsExplainPlanSelectForUpdateStmt = false;
@@ -607,7 +611,7 @@ TupleDesc ExplainResultDesc(ExplainStmt* stmt)
 
     if (!explain_plan) {
         /* Need a tuple descriptor representing a single TEXT or XML column */
-        tupdesc = CreateTemplateTupleDesc(1, false, TAM_HEAP);
+        tupdesc = CreateTemplateTupleDesc(1, false);
 
         /* If current plan is set as random plan, explain desc should show random seed value */
         if (u_sess->attr.attr_sql.plan_mode_seed != OPTIMIZE_PLAN) {
@@ -706,7 +710,6 @@ static void ExplainOneQuery(
                     errmsg("EXPLAIN %s is not supported when declaring a cursor.", s),
                     errdetail("Query is not actually executed when declaring a cursor.")));
     }
-
     PlannedStmt* plan = NULL;
 
     /*
@@ -731,7 +734,7 @@ static void ExplainOneQuery(
     AFTER_EXPLAIN_RECOVER_SET_HINT();
     CleanHotkeyCandidates(true);
 
-    check_gtm_free_plan((PlannedStmt *)plan, es->analyze ? ERROR : WARNING);
+    check_gtm_free_plan((PlannedStmt *)plan, (es->analyze && !ClusterResizingInProgress()) ? ERROR : WARNING);
     check_plan_mergeinto_replicate(plan, es->analyze ? ERROR : WARNING);
     es->is_explain_gplan = true;
 
@@ -778,11 +781,18 @@ void ExplainOneUtility(
  */
 static void ExecRemoteprocessPlan(EState* estate)
 {
+#ifdef ENABLE_MULTIPLE_NODES
     ListCell* lc = NULL;
     foreach (lc, estate->es_remotequerystates) {
         PlanState* ps = (PlanState*)lfirst(lc);
         ExecEndRemoteQuery((RemoteQueryState*)ps, true);
     }
+#else
+    if (u_sess->stream_cxt.global_obj) {
+        u_sess->stream_cxt.global_obj->SigStreamThreadClose();
+        StreamNodeGroup::syncQuit(STREAM_COMPLETE);
+    }
+#endif
 }
 
 /*
@@ -886,7 +896,7 @@ void ReorganizeSqlStatement(
          * prepared statement in DN will only be sent once.
          */
         StringInfo sql = makeStringInfo();
-        appendStringInfo(sql, "%s %s %s", queryString, prefix->data, explain_sql);
+        appendStringInfo(sql, "%s; %s %s", queryString, prefix->data, explain_sql);
 
         rq->execute_statement = sql->data;
     } else {
@@ -959,6 +969,10 @@ void ExplainOnePlan(
 
     if (es->buffers)
         instrument_option |= INSTRUMENT_BUFFERS;
+#ifndef ENABLE_MULTIPLE_NODES
+    if (es->cpu)
+        instrument_option |= INSTRUMENT_CPUS;
+#endif
 
     INSTR_TIME_SET_CURRENT(starttime);
 
@@ -1208,6 +1222,13 @@ void ExplainOnePlan(
         }
         u_sess->exec_cxt.remotequery_list = NIL;
     }
+
+    /* we have get all plan of foreignscan remote sql, append it */
+    if (es->es_frs.node_num > 0) {
+        appendStringInfo(es->str, "%s\n", es->es_frs.str->data);
+        pfree_ext(es->es_frs.str->data);
+    }
+
     /*
      * Close down the query and free resources.  Include time for this in the
      * total runtime (although it should be pretty minimal).
@@ -1238,17 +1259,20 @@ void ExplainOnePlan(
                     appendStringInfo(es->str, "Total runtime: %.3f ms\n", 1000.0 * totaltime);
             }
             else if (es->planinfo != NULL && es->planinfo->m_query_summary) {
-                appendStringInfo(es->planinfo->m_query_summary->info_str,
-                    "Coordinator executor start time: %.3f ms\n",
-                    1000.0 * exec_totaltime);
 
-                appendStringInfo(es->planinfo->m_query_summary->info_str,
-                    "Coordinator executor run time: %.3f ms\n",
-                    1000.0 * execrun_totaltime);
+                const char *process_role = "Datanode";
+                if (IS_PGXC_COORDINATOR) {
+                    process_role = "Coordinator";
+                }
 
-                appendStringInfo(es->planinfo->m_query_summary->info_str,
-                    "Coordinator executor end time: %.3f ms\n",
-                    1000.0 * execend_totaltime);
+                appendStringInfo(es->planinfo->m_query_summary->info_str, "%s executor start time: %.3f ms\n",
+                                 process_role, 1000.0 * exec_totaltime);
+
+                appendStringInfo(es->planinfo->m_query_summary->info_str, "%s executor run time: %.3f ms\n",
+                                 process_role, 1000.0 * execrun_totaltime);
+
+                appendStringInfo(es->planinfo->m_query_summary->info_str, "%s executor end time: %.3f ms\n",
+                                 process_role, 1000.0 * execend_totaltime);
 
                 if (es->planinfo->m_runtimeinfo && es->planinfo->m_query_summary->m_size) {
                     long spacePeakKb = (es->planinfo->m_query_summary->m_size + 1023) / 1024;
@@ -1615,7 +1639,7 @@ static void add_pruning_info_nums(StringInfo dest, PrintFlags flags, int partID,
 }
 
 /*
- * Show number of subpartitions selected for each partition.
+ * Show number of subpartitions selected for each subpartition.
  * If subpartitions is not pruned at all, show "ALL".
  * The caller should call DestroyStringInfo to free allocated memory.
  */
@@ -1626,8 +1650,9 @@ static StringInfo get_subpartition_pruning_info(Scan* scanplan, List* rtable)
     ListCell* lc = NULL;
     bool all = true;
     RangeTblEntry* rte = rt_fetch(scanplan->scanrelid, rtable);
-    Relation rel = heap_open(rte->relid, AccessShareLock);
+    Relation rel = heap_open(rte->relid, NoLock);
     List* subpartList = RelationGetSubPartitionOidListList(rel);
+
     int idx = 0;
     foreach (lc, pr->ls_selectedSubPartitions) {
         idx++;
@@ -1637,8 +1662,13 @@ static StringInfo get_subpartition_pruning_info(Scan* scanplan, List* rtable)
         SubPartitionPruningResult* spr = (SubPartitionPruningResult*)lfirst(lc);
         /* check if all subpartition is selected */
         int selected = list_length(spr->ls_selectedSubPartitions);
-        int count = list_length((List*)list_nth(subpartList, spr->partSeq));
-        all &= (selected == count);
+        /* the partseq may be dislocationed if parallel DDL commits, even out of range */
+        if (spr->partSeq >= list_length(subpartList)) {
+            all = false;
+        } else {
+            int count = list_length((List*)list_nth(subpartList, spr->partSeq));
+            all &= (selected == count);
+        }
         /* save pruning map in strif temporarily */
         appendStringInfo(strif, "%d:%d", spr->partSeq + 1, selected);
         if (lc != list_tail(pr->ls_selectedSubPartitions)) {
@@ -1653,7 +1683,7 @@ static StringInfo get_subpartition_pruning_info(Scan* scanplan, List* rtable)
 
     /* clean-ups */
     ReleaseSubPartitionOidList(&subpartList);
-    heap_close(rel, AccessShareLock);
+    heap_close(rel, NoLock);
     return strif;
 }
 /*
@@ -2077,7 +2107,6 @@ static void ExplainNode(
     switch (nodeTag(plan)) {
         case T_SeqScan:
         case T_CStoreScan:
-        case T_DfsScan:
 #ifdef ENABLE_MULTIPLE_NODES
         case T_TsStoreScan:
 #endif   /* ENABLE_MULTIPLE_NODES */
@@ -2092,7 +2121,9 @@ static void ExplainNode(
         case T_WorkTableScan:
         case T_ForeignScan:
         case T_VecForeignScan:
-            ExplainScanTarget((Scan*)plan, es);
+            if (((Scan *) plan)->scanrelid > 0) {
+                ExplainScanTarget((Scan*)plan, es);
+            }
             break;
         case T_TrainModel:
             appendStringInfo(es->str, " - %s", sname);
@@ -2146,15 +2177,6 @@ static void ExplainNode(
 
             pt_index_name = indexname;
             pt_index_owner = get_namespace_name(get_rel_namespace(bitmapindexscan->indexid));
-        } break;
-        case T_DfsIndexScan: {
-            DfsIndexScan* indexscan = (DfsIndexScan*)plan;
-
-            ExplainIndexScanDetails(indexscan->indexid, indexscan->indexorderdir, es);
-            ExplainScanTarget((Scan*)indexscan, es);
-
-            pt_index_name = explain_get_index_name(indexscan->indexid);
-            pt_index_owner = get_namespace_name(get_rel_namespace(indexscan->indexid));
         } break;
         case T_CStoreIndexScan: {
             CStoreIndexScan* indexscan = (CStoreIndexScan*)plan;
@@ -2511,6 +2533,23 @@ static void ExplainNode(
         show_plan_execnodes(planstate, es);
     }
 
+    /* unique join */
+    switch (nodeTag(plan)) {
+        case T_NestLoop:
+        case T_MergeJoin:
+        case T_HashJoin:
+            if (es->format != EXPLAIN_FORMAT_TEXT || (es->verbose && ((Join *) plan)->inner_unique))
+                ExplainProperty("Inner Unique", ((Join *) plan)->inner_unique?"true":"false", true, es);
+            if (is_pretty && es->verbose && ((Join *)plan)->inner_unique) {
+                es->planinfo->m_detailInfo->set_plan_name<true, true>();
+                appendStringInfo(es->planinfo->m_detailInfo->info_str, "Inner Unique: %s\n",
+                                 ((Join *)plan)->inner_unique ? "true" : "false");
+            }
+            break;
+        default:
+            break;
+    }
+
     /* quals, sort keys, etc */
     switch (nodeTag(plan)) {
         case T_IndexScan:
@@ -2549,18 +2588,6 @@ static void ExplainNode(
                 show_instrumentation_count("Rows Removed by Filter", 1, planstate, es);
             show_llvm_info(planstate, es);
             break;
-        case T_DfsIndexScan:
-            show_scan_qual(((DfsIndexScan*)plan)->indexqualorig, "Index Cond", planstate, ancestors, es);
-            if (((DfsIndexScan*)plan)->indexqualorig)
-                show_instrumentation_count("Rows Removed by Index Recheck", 2, planstate, es);
-            show_scan_qual(((DfsIndexScan*)plan)->indexorderbyorig, "Order By", planstate, ancestors, es);
-            show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
-            if (plan->qual)
-                show_instrumentation_count("Rows Removed by Filter", 1, planstate, es);
-            show_pushdown_qual(planstate, ancestors, es, PUSHDOWN_PREDICATE_FLAG);
-            show_llvm_info(planstate, es);
-            break;
-
 #ifdef PGXC
         case T_ModifyTable:
         case T_VecModifyTable: {
@@ -2684,19 +2711,7 @@ static void ExplainNode(
                 show_instrumentation_count("Rows Removed by Filter", 1, planstate, es);
             show_llvm_info(planstate, es);
             break;
-        case T_DfsScan: {
-            show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
-            show_pushdown_qual(planstate, ancestors, es, PUSHDOWN_PREDICATE_FLAG);
-            show_bloomfilter<false>(plan, planstate, ancestors, es);
-
-            if (plan->qual)
-                show_instrumentation_count("Rows Removed by Filter", 1, planstate, es);
-            show_storage_filter_info(planstate, es);
-            show_dfs_block_info(planstate, es);
-            show_llvm_info(planstate, es);
-            break;
-        }
-            /* FALL THRU */
+        /* FALL THRU */
         case T_Stream:
         case T_VecStream: {
             show_merge_sort_keys(planstate, ancestors, es);
@@ -2760,7 +2775,6 @@ static void ExplainNode(
                 show_foreignscan_info((ForeignScanState*)planstate, es);
             }
             show_storage_filter_info(planstate, es);
-            show_dfs_block_info(planstate, es);
             show_llvm_info(planstate, es);
 
             if (IsA(plan, VecForeignScan)) {
@@ -3268,10 +3282,6 @@ static void CalculateProcessedRows(
 #ifdef ENABLE_MULTIPLE_NODES
         case T_TsStoreScan:
 #endif   /* ENABLE_MULTIPLE_NODES */
-        case T_DfsScan:
-            show_removed_rows(1, planstate, idx, smpIdx, &removed_rows);
-            *processed_rows += removed_rows;
-            break;
         case T_NestLoop:
         case T_VecNestLoop:
         case T_VecMergeJoin:
@@ -3358,7 +3368,7 @@ static void show_plan_tlist(PlanState* planstate, List* ancestors, ExplainState*
 
     if (IsA(plan, ForeignScan) || IsA(plan, VecForeignScan)) {
         ForeignScan* fscan = (ForeignScan*)plan;
-        if (IsSpecifiedFDWFromRelid(fscan->scan_relid, GC_FDW)) {
+        if (OidIsValid(fscan->scan_relid) && IsSpecifiedFDWFromRelid(fscan->scan_relid, GC_FDW)) {
             List* str_targetlist = get_str_targetlist(fscan->fdw_private);
             if (str_targetlist != NULL)
                 result = str_targetlist;
@@ -3678,19 +3688,6 @@ static void show_pushdown_qual(PlanState* planstate, List* ancestors, ExplainSta
     Plan* plan = planstate->plan;
 
     switch (nodeTag(plan)) {
-        case T_DfsScan: {
-            DfsPrivateItem* item = (DfsPrivateItem*)((DefElem*)linitial(((DfsScan*)plan)->privateData))->arg;
-            show_scan_qual(item->hdfsQual, identifier, planstate, ancestors, es);
-            break;
-        }
-        case T_DfsIndexScan: {
-            DfsScan* scan = ((DfsIndexScan*)plan)->dfsScan;
-            if (!((DfsIndexScan*)plan)->indexonly) {
-                DfsPrivateItem* item = (DfsPrivateItem*)((DefElem*)linitial(scan->privateData))->arg;
-                show_scan_qual(item->hdfsQual, identifier, planstate, ancestors, es);
-            }
-            break;
-        }
         case T_ForeignScan:
         case T_VecForeignScan: {
             /*
@@ -4325,10 +4322,12 @@ static void show_sort_info(SortState* sortstate, ExplainState* es)
 }
 
 template <bool is_detail>
-static void show_datanode_hash_info(ExplainState* es, int nbatch, int nbatch_original, int nbuckets, long spacePeakKb)
+static void show_datanode_hash_info(ExplainState *es, int nbatch, int nbuckets_original, int nbatch_original,
+                                    int nbuckets, long spacePeakKb)
 {
     if (es->format != EXPLAIN_FORMAT_TEXT) {
         ExplainPropertyLong("Hash Buckets", nbuckets, es);
+        ExplainPropertyLong("Original Hash Buckets", nbuckets_original, es);
         ExplainPropertyLong("Hash Batches", nbatch, es);
         ExplainPropertyLong("Original Hash Batches", nbatch_original, es);
         ExplainPropertyLong("Peak Memory Usage", spacePeakKb, es);
@@ -4336,8 +4335,9 @@ static void show_datanode_hash_info(ExplainState* es, int nbatch, int nbatch_ori
                es->planinfo->m_staticInfo) {
         if (nbatch_original != nbatch) {
             appendStringInfo(es->planinfo->m_staticInfo->info_str,
-                " Buckets: %d  Batches: %d (originally %d)  Memory Usage: %ldkB\n",
+                " Buckets: %d (originally %d) Batches: %d (originally %d)  Memory Usage: %ldkB\n",
                 nbuckets,
+                nbuckets_original,
                 nbatch,
                 nbatch_original,
                 spacePeakKb);
@@ -4351,8 +4351,9 @@ static void show_datanode_hash_info(ExplainState* es, int nbatch, int nbatch_ori
     } else {
         if (nbatch_original != nbatch) {
             appendStringInfo(es->str,
-                " Buckets: %d  Batches: %d (originally %d)	Memory Usage: %ldkB\n",
+                " Buckets: %d (originally %d) Batches: %d (originally %d)	Memory Usage: %ldkB\n",
                 nbuckets,
+                nbuckets_original,
                 nbatch,
                 nbatch_original,
                 spacePeakKb);
@@ -4763,6 +4764,7 @@ static void show_hash_info(HashState* hashstate, ExplainState* es)
     int nbatch;
     int nbatch_original;
     int nbuckets;
+    int nbuckets_original;
     long spacePeakKb = 0;
     int max_nbatch = -1;
     int min_nbatch = INT_MAX;
@@ -4808,9 +4810,9 @@ static void show_hash_info(HashState* hashstate, ExplainState* es)
 
                     es->planinfo->m_staticInfo->set_plan_name<false, true>();
                     appendStringInfo(es->planinfo->m_staticInfo->info_str, "%s ", node_name);
-                    show_datanode_hash_info<false>(es, nbatch, nbatch_original, nbuckets, spacePeakKb);
+                    show_datanode_hash_info<false>(es, nbatch, nbuckets, nbatch_original, nbuckets, spacePeakKb);
                 }
-                show_datanode_hash_info<true>(es, nbatch, nbatch_original, nbuckets, spacePeakKb);
+                show_datanode_hash_info<true>(es, nbatch, nbuckets, nbatch_original, nbuckets, spacePeakKb);
                 ExplainCloseGroup("Plan", NULL, true, es);
             }
             ExplainCloseGroup("Hash Detail", "Hash Detail", false, es);
@@ -4924,12 +4926,16 @@ static void show_hash_info(HashState* hashstate, ExplainState* es)
         nbatch = hashinfo.nbatch;
         nbatch_original = hashinfo.nbatch_original;
         nbuckets = hashinfo.nbuckets;
-
+        if (es->analyze) {
+            nbuckets_original = hashtable ? hashtable->nbuckets_original : nbuckets;
+        } else {
+            nbuckets_original = nbuckets;
+        }
         /* wlm_statistics_plan_max_digit: this variable is used to judge, isn't it a active sql */
         if (es->wlm_statistics_plan_max_digit == NULL) {
             if (es->format == EXPLAIN_FORMAT_TEXT)
                 appendStringInfoSpaces(es->str, es->indent * 2);
-            show_datanode_hash_info<false>(es, nbatch, nbatch_original, nbuckets, spacePeakKb);
+            show_datanode_hash_info<false>(es, nbatch, nbuckets_original, nbatch_original, nbuckets, spacePeakKb);
         }
     }
 }
@@ -7490,9 +7496,33 @@ static void show_foreignscan_info(ForeignScanState* fsstate, ExplainState* es)
 {
     FdwRoutine* fdwroutine = fsstate->fdwroutine;
 
+    /* if we want to know what the remote plan like, numbering this node to find it quickly later. */
+    if (u_sess->attr.attr_common.show_fdw_remote_plan) {
+        es->es_frs.node_num++;
+        ExplainPropertyInteger("Node ID", es->es_frs.node_num , es);
+    }
+
     /* Let the FDW emit whatever fields it wants */
     if (NULL != fdwroutine && NULL != fdwroutine->ExplainForeignScan)
         fdwroutine->ExplainForeignScan(fsstate, es);
+    
+    /* Let the FDW get the remote plan */
+    if (u_sess->attr.attr_common.show_fdw_remote_plan) {
+        /* Set a title */
+        if (es->es_frs.node_num == 1) {
+            es->es_frs.str=makeStringInfo();
+            appendStringInfo(es->es_frs.str, "\nFDW remote plans:\n");
+        }
+
+        appendStringInfo(es->es_frs.str, "Node %d: ", es->es_frs.node_num);
+
+        /* Let the FDW emit whatever fields it wants */
+        if (NULL != fdwroutine && NULL != fdwroutine->ExplainForeignScanRemote) {
+            fdwroutine->ExplainForeignScanRemote(fsstate, es);
+        } else {
+            appendStringInfo(es->es_frs.str, "No remote plan information.\n");
+        }
+    }
 }
 
 /*
@@ -7530,238 +7560,6 @@ static inline bool storage_has_minmax_filter(const Instrumentation* instr)
 static inline bool storage_has_pruned_info(const Instrumentation* instr)
 {
     return (instr->dynamicPrunFiles > 0 || instr->staticPruneFiles > 0);
-}
-
-/*
- * @Description: check whether Instrumentation object has
- *               orc data cache info to display about storage.
- * @IN instr: Instrumentation object
- * @Return: true if needed to display orc data cache info; otherwise false.
- * @See also:
- */
-static inline bool storage_has_cached_info(const Instrumentation* instr)
-{
-    return (instr->orcMetaCacheBlockCount > 0 || instr->orcMetaLoadBlockCount > 0 ||
-            instr->orcDataCacheBlockCount > 0 || instr->orcDataLoadBlockCount > 0);
-}
-
-/*
- * @Description: append dfs block info to str
- * @in planstate - current plan state info
- * @in es - explain state info
- * @return - void
- */
-static void append_dfs_block_info(
-    ExplainState* es, double localRatio, double metaCacheRatio, double dataCacheRatio, Instrumentation* instr)
-{
-    if (es->format == EXPLAIN_FORMAT_TEXT) {
-        appendStringInfo(es->str,
-            "(local read ratio: %.1f%s, local: %.0f, remote: %.0f)",
-            localRatio * 100,
-            "%",
-            instr->localBlock,
-            instr->remoteBlock);
-        appendStringInfo(
-            es->str, " (nn intersection count: %lu, dn intersection count: %lu)", instr->nnCalls, instr->dnCalls);
-
-        appendStringInfo(es->str,
-            " (meta cache: hit ratio %.1f%s, hit[count %lu, size %lu], read[count %lu, size %lu]",
-            metaCacheRatio * 100,
-            "%",
-            instr->orcMetaCacheBlockCount,
-            instr->orcMetaCacheBlockSize,
-            instr->orcMetaLoadBlockCount,
-            instr->orcMetaLoadBlockSize);
-        appendStringInfo(es->str,
-            " data cache: hit ratio %.1f%s, hit[count %lu, size %lu], read[count %lu, size %lu])",
-            dataCacheRatio * 100,
-            "%",
-            instr->orcDataCacheBlockCount,
-            instr->orcDataCacheBlockSize,
-            instr->orcDataLoadBlockCount,
-            instr->orcDataLoadBlockSize);
-        appendStringInfo(es->str, "\n");
-    } else {
-        ExplainPropertyFloat("local read ratio", localRatio * 100, 1, es);
-        ExplainPropertyFloat("local block", instr->localBlock, 0, es);
-        ExplainPropertyFloat("remote block", instr->remoteBlock, 0, es);
-        ExplainPropertyLong("nn intersection count", instr->nnCalls, es);
-        ExplainPropertyLong("dn intersection count", instr->dnCalls, es);
-        ExplainPropertyFloat("meta cache hit ratio", metaCacheRatio * 100, 1, es);
-        ExplainPropertyLong("meta cache hit count", instr->orcMetaCacheBlockCount, es);
-        ExplainPropertyLong("meta cache hit size", instr->orcMetaCacheBlockSize, es);
-        ExplainPropertyLong("meta cache read count", instr->orcMetaLoadBlockCount, es);
-        ExplainPropertyLong("meta cache read size", instr->orcMetaLoadBlockSize, es);
-        ExplainPropertyFloat("data cache hit ratio", dataCacheRatio * 100, 1, es);
-        ExplainPropertyLong("data cache hit count", instr->orcDataCacheBlockCount, es);
-        ExplainPropertyLong("data cache hit size", instr->orcDataCacheBlockSize, es);
-        ExplainPropertyLong("data cache read count", instr->orcDataLoadBlockCount, es);
-        ExplainPropertyLong("data cache read size", instr->orcDataLoadBlockSize, es);
-    }
-}
-
-/*
- * @Description: print dfs info in detail=off
- * @in planstate - current plan state info
- * @in es - explain state info
- * @return - void
- */
-static void show_analyze_dfs_info(const PlanState* planstate, ExplainState* es)
-{
-    Instrumentation* instr = NULL;
-    int i = 0;
-    int j = 0;
-    int dop = planstate->plan->parallel_enabled ? planstate->plan->dop : 1;
-    double total_local_block = 0.0;
-    double total_remote_block = 0.0;
-    double total_datacache_block_count = 0.0;
-    double total_metacache_block_count = 0.0;
-    double total_metaload_block_count = 0.0;
-    double total_dataload_block_count = 0.0;
-
-    for (i = 0; i < u_sess->instr_cxt.global_instr->getInstruNodeNum(); i++) {
-        for (j = 0; j < dop; j++) {
-            instr = u_sess->instr_cxt.global_instr->getInstrSlot(i, planstate->plan->plan_node_id, j);
-            if (instr != NULL) {
-                total_local_block += instr->localBlock;
-                total_remote_block += instr->remoteBlock;
-                total_datacache_block_count += instr->orcDataCacheBlockCount;
-                total_metacache_block_count += instr->orcMetaCacheBlockCount;
-                total_dataload_block_count += instr->orcDataLoadBlockCount;
-                total_metaload_block_count += instr->orcMetaLoadBlockCount;
-            }
-        }
-    }
-
-    if (total_local_block > 0 || total_remote_block > 0 || total_datacache_block_count > 0 ||
-        total_metacache_block_count > 0 || total_metaload_block_count || total_dataload_block_count) {
-        double localRatio = (total_local_block + total_remote_block == 0)
-                                ? 0
-                                : (total_local_block / (total_local_block + total_remote_block));
-        double metaCacheRatio =
-            (total_metacache_block_count + total_metaload_block_count == 0)
-                ? 0
-                : (double)total_metacache_block_count / (total_metacache_block_count + total_metaload_block_count);
-        double dataCacheRatio =
-            (total_datacache_block_count + total_dataload_block_count == 0)
-                ? 0
-                : (double)total_datacache_block_count / (total_dataload_block_count + total_datacache_block_count);
-
-        if (t_thrd.explain_cxt.explain_perf_mode != EXPLAIN_NORMAL && es->planinfo->m_staticInfo) {
-            es->planinfo->m_staticInfo->set_plan_name<true, true>();
-            appendStringInfo(es->planinfo->m_staticInfo->info_str, "(local read ratio: %.1f%s,", localRatio * 100, "%");
-            appendStringInfo(
-                es->planinfo->m_staticInfo->info_str, " meta cache hit ratio: %.1f%s,", metaCacheRatio * 100, "%");
-            appendStringInfo(
-                es->planinfo->m_staticInfo->info_str, " data cache hit ratio %.1f%s)\n", dataCacheRatio * 100, "%");
-        }
-
-        if (es->format == EXPLAIN_FORMAT_TEXT) {
-            appendStringInfoSpaces(es->str, es->indent * 2);
-            appendStringInfo(es->str, "(local read ratio: %.1f%s,", localRatio * 100, "%");
-            appendStringInfo(es->str, " meta cache hit ratio: %.1f%s,", metaCacheRatio * 100, "%");
-            appendStringInfo(es->str, " data cache hit ratio: %.1f%s)\n", dataCacheRatio * 100, "%");
-        } else {
-            ExplainPropertyFloat("local read ratio", localRatio, 1, es);
-            ExplainPropertyFloat("meta cache hit ratio", metaCacheRatio, 1, es);
-            ExplainPropertyFloat("data cache hit ratio", dataCacheRatio, 1, es);
-        }
-    }
-}
-
-static void show_dfs_block_info(PlanState* planstate, ExplainState* es)
-{
-    AssertEreport(planstate != NULL && es != NULL, MOD_EXECUTOR, "unexpect null value");
-
-    if (planstate->plan->plan_node_id > 0 && u_sess->instr_cxt.global_instr &&
-        u_sess->instr_cxt.global_instr->isFromDataNode(planstate->plan->plan_node_id)) {
-        Instrumentation* instr = NULL;
-        int i = 0;
-        int j = 0;
-        bool has_info = false;
-        int dop = planstate->plan->parallel_enabled ? planstate->plan->dop : 1;
-
-        if (es->detail) {
-            for (i = 0; i < u_sess->instr_cxt.global_instr->getInstruNodeNum(); i++) {
-#ifdef ENABLE_MULTIPLE_NODES
-                char* node_name = PGXCNodeGetNodeNameFromId(i, PGXC_NODE_DATANODE);
-#else
-                char* node_name = g_instance.exec_cxt.nodeName;
-#endif
-                for (j = 0; j < dop; j++) {
-                    instr = u_sess->instr_cxt.global_instr->getInstrSlot(i, planstate->plan->plan_node_id, j);
-                    if (instr == NULL)
-                        continue;
-                    bool blockOrHasCachedInfo = instr->localBlock > 0 || instr->remoteBlock > 0 ||
-                        storage_has_cached_info(instr);
-                    if (blockOrHasCachedInfo) {
-                        if (has_info == false)
-                            ExplainOpenGroup("Dfs Block Detail", "Dfs Block Detail", false, es);
-                        has_info = true;
-                        ExplainOpenGroup("Plan", NULL, true, es);
-                        double localRatio = instr->localBlock / (instr->localBlock + instr->remoteBlock);
-                        double metaCacheRatio =
-                            (instr->orcMetaCacheBlockCount + instr->orcMetaLoadBlockCount == 0)
-                                ? 0
-                                : (double)instr->orcMetaCacheBlockCount /
-                                      (instr->orcMetaCacheBlockCount + instr->orcMetaLoadBlockCount);
-                        double dataCacheRatio =
-                            (instr->orcDataCacheBlockCount + instr->orcDataLoadBlockCount == 0)
-                                ? 0
-                                : (double)instr->orcDataCacheBlockCount /
-                                      (instr->orcDataCacheBlockCount + instr->orcDataLoadBlockCount);
-
-                        if (t_thrd.explain_cxt.explain_perf_mode != EXPLAIN_NORMAL && es->planinfo->m_runtimeinfo) {
-                            es->planinfo->m_runtimeinfo->put(i, 0, DFS_BLOCK_INFO, BoolGetDatum(true));
-                            es->planinfo->m_datanodeInfo->set_plan_name<false, true>();
-                            es->planinfo->m_datanodeInfo->set_datanode_name(node_name, j, dop);
-
-                            appendStringInfo(es->planinfo->m_datanodeInfo->info_str,
-                                "(local read ratio: %.1f%s, local: %.0f, remote: %.0f)",
-                                localRatio * 100,
-                                "%",
-                                instr->localBlock,
-                                instr->remoteBlock);
-
-                            /* as for the obs foreign table, we do not have the datanode and namenode. */
-                            if (instr->nnCalls != 0 && instr->dnCalls != 0) {
-                                appendStringInfo(es->planinfo->m_datanodeInfo->info_str,
-                                    " (nn intersection count: %lu, dn intersection count: %lu)",
-                                    instr->nnCalls,
-                                    instr->dnCalls);
-                            }
-
-                            appendStringInfo(es->planinfo->m_datanodeInfo->info_str,
-                                " (meta cache: hit ratio %.1f%s, hit[count %lu, size %lu], read[count %lu, size %lu]",
-                                metaCacheRatio * 100,
-                                "%",
-                                instr->orcMetaCacheBlockCount,
-                                instr->orcMetaCacheBlockSize,
-                                instr->orcMetaLoadBlockCount,
-                                instr->orcMetaLoadBlockSize);
-                            appendStringInfo(es->planinfo->m_datanodeInfo->info_str,
-                                " data cache: hit ratio %.1f%s, hit[count %lu, size %lu], read[count %lu, size %lu])",
-                                dataCacheRatio * 100,
-                                "%",
-                                instr->orcDataCacheBlockCount,
-                                instr->orcDataCacheBlockSize,
-                                instr->orcDataLoadBlockCount,
-                                instr->orcDataLoadBlockSize);
-                            appendStringInfo(es->planinfo->m_datanodeInfo->info_str, "\n");
-                            continue;
-                        }
-
-                        append_datanode_name(es, node_name, dop, j);
-                        append_dfs_block_info(es, localRatio, metaCacheRatio, dataCacheRatio, instr);
-                        ExplainCloseGroup("Plan", NULL, true, es);
-                    }
-                }
-            }
-            if (has_info)
-                ExplainCloseGroup("Dfs Block Detail", "Dfs Block Detail", false, es);
-        } else
-            show_analyze_dfs_info(planstate, es);
-    }
 }
 
 /*
@@ -8288,21 +8086,21 @@ static void ExplainScanTarget(Scan* plan, ExplainState* es)
 static void ExplainModifyTarget(ModifyTable* plan, ExplainState* es)
 {
     Index rti;
-
+    bool multiTarget = (list_length((List*)linitial(plan->resultRelations)) > 1);
     /*
      * We show the name of the first target relation.  In multi-target-table
      * cases this should always be the parent of the inheritance tree.
      */
     AssertEreport(plan->resultRelations != NIL, MOD_EXECUTOR, "unexpect empty list");
-    rti = linitial_int(plan->resultRelations);
+    rti = (Index)linitial_int((List*)linitial(plan->resultRelations));
 
-    ExplainTargetRel((Plan*)plan, rti, es);
+    ExplainTargetRel((Plan*)plan, rti, es, multiTarget);
 }
 
 /*
  * Show the target relation of a scan or modify node
  */
-static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es)
+static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es, bool multiTarget)
 {
     char* objectname = NULL;
     char* namespc = NULL;
@@ -8332,13 +8130,25 @@ static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es)
     }
 
     switch (nodeTag(plan)) {
+        case T_ModifyTable:
+        case T_VecModifyTable: {
+            if (multiTarget) {
+                objecttag = "Relation Name";
+                break;
+            }
+            /* Assert it's on a real relation */
+            Assert(rte != NULL);
+            Assert(rte->rtekind == RTE_RELATION);
+            objectname = get_rel_name(rte->relid);
+            if (es->verbose || es->plan)
+                namespc = get_namespace_name(get_rel_namespace(rte->relid));
+            objecttag = "Relation Name";
+        } break;
         case T_SeqScan:
         case T_CStoreScan:
 #ifdef ENABLE_MULTIPLE_NODES
         case T_TsStoreScan:
 #endif   /* ENABLE_MULTIPLE_NODES */
-        case T_DfsScan:
-        case T_DfsIndexScan:
         case T_IndexScan:
         case T_IndexOnlyScan:
         case T_BitmapHeapScan:
@@ -8348,9 +8158,7 @@ static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es)
         case T_TidScan:
         case T_ForeignScan:
         case T_ExtensiblePlan:
-        case T_VecForeignScan:
-        case T_ModifyTable:
-        case T_VecModifyTable: {
+        case T_VecForeignScan: {
             /* Assert it's on a real relation */
             Assert(rte != NULL);
             Assert(rte->rtekind == RTE_RELATION);
@@ -8419,35 +8227,47 @@ static void ExplainTargetRel(Plan* plan, Index rti, ExplainState* es)
             tmpName = &es->planinfo->m_planInfo->m_pname;
 
         appendStringInfoString(tmpName, " on");
-        if (namespc != NULL && objectname != NULL) {
-            appendStringInfo(tmpName, " %s.%s", quote_identifier(namespc), quote_identifier(objectname));
-        } else if (objectname != NULL) {
-            appendStringInfo(tmpName, " %s", quote_identifier(objectname));
-        }
+        if (multiTarget) {
+            appendStringInfoString(tmpName, " MULTI-RELATION");
+        } else {
+            if (namespc != NULL && objectname != NULL) {
+                appendStringInfo(tmpName, " %s.%s", quote_identifier(namespc), quote_identifier(objectname));
+            } else if (objectname != NULL) {
+                appendStringInfo(tmpName, " %s", quote_identifier(objectname));
+            }
 
-        if (rte && rte->eref && (objectname == NULL || strcmp(rte->eref->aliasname, objectname) != 0)) {
-            appendStringInfo(tmpName, " %s", quote_identifier(rte->eref->aliasname));
-        }
+            if (rte && rte->eref && (objectname == NULL || strcmp(rte->eref->aliasname, objectname) != 0)) {
+                appendStringInfo(tmpName, " %s", quote_identifier(rte->eref->aliasname));
+            }
 
-        /* Show if use column table min/max optimization. */
-        if (IsA(plan, CStoreScan) && ((CStoreScan*)plan)->minMaxInfo != NULL) {
-            appendStringInfo(tmpName, " %s", "(min-max optimization)");
+            /* Show if use column table min/max optimization. */
+            if (IsA(plan, CStoreScan) && ((CStoreScan*)plan)->minMaxInfo != NULL) {
+                appendStringInfo(tmpName, " %s", "(min-max optimization)");
+            }
         }
 
         if (t_thrd.explain_cxt.explain_perf_mode != EXPLAIN_NORMAL)
             es->planinfo->m_planInfo->put(PLAN, PointerGetDatum(cstring_to_text(tmpName->data)));
     } else {
-        if (objecttag != NULL && objectname != NULL)
-            ExplainPropertyText(objecttag, objectname, es);
-        if (namespc != NULL)
-            ExplainPropertyText("Schema", namespc, es);
-        if (rte != NULL && rte->eref != NULL) {
-            ExplainPropertyText("Alias", rte->eref->aliasname, es);
+        if (objecttag != NULL && multiTarget) {
+            ExplainPropertyText(objecttag, "MULTI-RELATION", es);
+        } else {
+            if (objecttag != NULL && objectname != NULL)
+                ExplainPropertyText(objecttag, objectname, es);
+            if (namespc != NULL)
+                ExplainPropertyText("Schema", namespc, es);
+            if (rte != NULL && rte->eref != NULL) {
+                ExplainPropertyText("Alias", rte->eref->aliasname, es);
+            }
         }
     }
 
     /* Set object_name, object_type, object_owner for 'plan_table'. */
     if (es->plan) {
+        if (multiTarget) {
+            es->planinfo->m_planTableData->set_plan_table_objs(plan->plan_node_id, "MULTI-RELATION", NULL, NULL);
+            return;
+        }
         /* If rte are subquery and values, then rte name will be null. And we get their name from alias. */
         if (objectname == NULL && rte != NULL && rte->eref != NULL)
             objectname = rte->eref->aliasname;
@@ -9920,7 +9740,7 @@ TupleDesc PlanTable::getTupleDesc()
         attnum = attnum - 1;
     }
 
-    tupdesc = CreateTemplateTupleDesc(attnum, false, TAM_HEAP);
+    tupdesc = CreateTemplateTupleDesc(attnum, false);
     for (int i = 0; i < SLOT_NUMBER; i++) {
         bool add_slot = false;
 
@@ -9964,7 +9784,7 @@ TupleDesc PlanTable::getTupleDesc_detail()
     int attnum = EXPLAIN_TOTAL_ATTNUM;
     int i = 1;
 
-    tupdesc = CreateTemplateTupleDesc(attnum, false, TAM_HEAP);
+    tupdesc = CreateTemplateTupleDesc(attnum, false);
     TupleDescInitEntry(tupdesc, (AttrNumber)i++, "query id", INT8OID, -1, 0);
 
     TupleDescInitEntry(tupdesc, (AttrNumber)i++, "plan parent node id", INT4OID, -1, 0);
@@ -10046,7 +9866,7 @@ TupleDesc PlanTable::getTupleDesc(const char* attname)
 {
     TupleDesc tupdesc;
 
-    tupdesc = CreateTemplateTupleDesc(1, false, TAM_HEAP);
+    tupdesc = CreateTemplateTupleDesc(1, false);
 
     TupleDescInitEntry(tupdesc, (AttrNumber)1, attname, TEXTOID, -1, 0);
     return tupdesc;
@@ -10352,7 +10172,7 @@ void PlanTable::set_plan_table_ops(int plan_node_id, char* operation, char* opti
     if (operation != NULL) {
         /* Transform the vaules into upper case. */
         operation = set_strtoupper(operation, OPERATIONLEN);
-        rc = strncpy_s(m_plan_table[plan_node_id - 1]->m_datum->operation, OPERATIONLEN, operation, strlen(operation));
+        rc = strncpy_s(m_plan_table[plan_node_id - 1]->m_datum->operation, OPERATIONLEN, operation, OPERATIONLEN - 1);
         securec_check(rc, "\0", "\0");
         pfree(operation);
 
@@ -10360,7 +10180,7 @@ void PlanTable::set_plan_table_ops(int plan_node_id, char* operation, char* opti
     }
     if (options != NULL) {
         options = set_strtoupper(options, OPTIONSLEN);
-        rc = strncpy_s(m_plan_table[plan_node_id - 1]->m_datum->options, OPTIONSLEN, options, strlen(options));
+        rc = strncpy_s(m_plan_table[plan_node_id - 1]->m_datum->options, OPTIONSLEN, options, OPTIONSLEN - 1);
         securec_check(rc, "\0", "\0");
         pfree(options);
 
@@ -10917,7 +10737,7 @@ void PlanTable::flush_data_to_file()
                     else
                         appendBinaryStringInfo(info_str, ",", 1);
                 } else {
-                    typoid = m_desc->attrs[k]->atttypid;
+                    typoid = m_desc->attrs[k].atttypid;
 
                     getTypeOutputInfo(typoid, &foutoid, &typisvarlena);
 

@@ -1453,9 +1453,6 @@ int get_nodename_list_by_AZ(const char* AZName, const char* data_dir, char** nod
                 if (dn->datanodeId == 0)
                     continue;
 
-                if (dn->datanodeRole == CASCADE_STANDBY_TYPE)
-                    continue;
-
                 for (n = 0; n < CM_MAX_DATANODE_STANDBY_NUM && !get_dn_in_same_shard; n++) {
                     peerDatanodeInfo* peer_datanode = &(dn->peerDatanodes[n]);
                     if (strlen(peer_datanode->datanodePeerHAIP[0]) == 0)
@@ -1646,7 +1643,7 @@ bool CheckDataNameValue(const char *datanodeName, const char *dataDir)
             nRet = memset_s(dnId, sizeof(dnId), '\0', sizeof(dnId));
             securec_check_c(nRet, "\0", "\0");
             nRet = snprintf_s(
-                dnId, sizeof(dnId) / sizeof(char), sizeof(dnId) / sizeof(char) - 1, "dn_%4d", dn->datanodeId);
+                dnId, sizeof(dnId) / sizeof(char), sizeof(dnId) / sizeof(char) - 1, "dn_%4u", dn->datanodeId);
             securec_check_ss_c(nRet, "\0", "\0");
             if (strncmp(dnId, datanodeName,
                 ((strlen(dnId) > strlen(datanodeName)) ? strlen(dnId) : strlen(datanodeName))) != 0) {

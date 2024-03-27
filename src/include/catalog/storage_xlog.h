@@ -53,8 +53,6 @@ typedef struct xl_smgr_truncate_compress {
     uint2 pageCompressOpts;
 } xl_smgr_truncate_compress;
 
-
-
 extern void log_smgrcreate(RelFileNode *rnode, ForkNumber forkNum);
 
 extern void smgr_redo(XLogReaderState *record);
@@ -166,6 +164,32 @@ typedef struct XLogMoveExtent {
 
 struct HTAB* redo_create_remain_segs_htbl();
 extern void move_extent_flush_buffer(XLogMoveExtent *xlog_data);
+
+/*==========================================CFS redo design====================================*/
+
+struct CfsShrink_t {
+    RelFileNode node;
+    ForkNumber forknum;
+    char parttype;
+};
+
+#define XLOG_CFS_SHRINK_OPERATION 0x00
+
+extern void CfsShrinkRedo(XLogReaderState *record);
+extern void CfsShrinkDesc(StringInfo buf, XLogReaderState *record);
+extern const char* CfsShrinkTypeName(uint8 subtype);
+
+static inline uint2 GetCreateXlogFileNodeOpt(const XLogReaderState *record)
+{
+    bool compress = (bool)(XLogRecGetInfo(record) & XLR_REL_COMPRESS);
+    return compress ? ((xl_smgr_create_compress*)(void *)XLogRecGetData(record))->pageCompressOpts : 0;
+}
+
+static inline uint2 GetTruncateXlogFileNodeOpt(const XLogReaderState *record)
+{
+    bool compress = (bool)(XLogRecGetInfo(record) & XLR_REL_COMPRESS);
+    return compress ? ((xl_smgr_truncate_compress*)(void *)XLogRecGetData(record))->pageCompressOpts : 0;
+}
 
 #endif   /* STORAGE_XLOG_H */
 

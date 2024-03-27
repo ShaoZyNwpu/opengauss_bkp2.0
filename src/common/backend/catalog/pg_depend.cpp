@@ -161,6 +161,14 @@ void recordDependencyOnCurrentExtension(const ObjectAddress* object, bool isRepl
                             getObjectDescription(object),
                             get_extension_name(oldext))));
             }
+
+            /* It's a free-standing object, so reject */
+            ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                    errmsg("%s is not a member of extension \"%s\"",
+                        getObjectDescription(object),
+                        get_extension_name(u_sess->cmd_cxt.CurrentExtensionObject)),
+                        errdetail("An extension is not allowed to replace an object that it does not own.")));
         }
 
         /* OK, record it as a member of CurrentExtensionObject */
@@ -171,6 +179,49 @@ void recordDependencyOnCurrentExtension(const ObjectAddress* object, bool isRepl
         recordDependencyOn(object, &extension, DEPENDENCY_EXTENSION);
     }
 }
+
+/*
+ * If we are executing a CREATE EXTENSION operation, check that the given
+ * object is a member of the extension, and throw an error if it isn't.
+ * Otherwise, do nothing.
+ *
+ * This must be called whenever a CREATE IF NOT EXISTS operation (for an
+ * object type that can be an extension member) has found that an object of
+ * the desired name already exists.  It is insecure for an extension to use
+ * IF NOT EXISTS except when the conflicting object is already an extension
+ * member; otherwise a hostile user could substitute an object with arbitrary
+ * properties.
+ */
+void checkMembershipInCurrentExtension(const ObjectAddress *object)
+{
+	/*
+	 * This is actually the same condition tested in
+	 * recordDependencyOnCurrentExtension; but we want to issue a
+	 * differently-worded error, and anyway it would be pretty confusing to
+	 * call recordDependencyOnCurrentExtension in these circumstances.
+	 */
+
+	/* Only whole objects can be extension members */
+	Assert(object->objectSubId == 0);
+
+	if (creating_extension) {
+            Oid oldext;
+
+            oldext = getExtensionOfObject(object->classId, object->objectId);
+            /* If already a member of this extension, OK */
+            if (oldext == u_sess->cmd_cxt.CurrentExtensionObject)
+                return;
+            /* Else complain */
+            ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                    errmsg("%s is not a member of extension \"%s\"",
+                        getObjectDescription(object),
+                        get_extension_name(u_sess->cmd_cxt.CurrentExtensionObject)),
+                        errdetail("An extension may only use CREATE ... IF NOT EXISTS to skip object creation"
+                            "if the conflicting object is one that it already owns.")));
+	}
+}
+
 
 /*
  * Record pinned dependency for  fabricated system tables during in-place upgrade.
@@ -397,6 +448,125 @@ long changeDependencyFor(Oid classId, Oid objectId, Oid refClassId, Oid oldRefOb
     heap_close(depRel, RowExclusiveLock);
 
     return count;
+}
+
+/*
+ * Adjust all dependency records to come from a different object of the same type
+ *
+ * classId/oldObjectId specify the old referencing object.
+ * newObjectId is the new referencing object (must be of class classId).
+ */
+void changeDependenciesOf(Oid classId, Oid oldObjectId, Oid newObjectId)
+{
+    Relation    depRel;
+    ScanKeyData key[2];
+    SysScanDesc scan;
+    HeapTuple   tup;
+
+    depRel = heap_open(DependRelationId, RowExclusiveLock);
+
+    ScanKeyInit(&key[0],
+                Anum_pg_depend_classid,
+                BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(classId));
+    ScanKeyInit(&key[1],
+                Anum_pg_depend_objid,
+                BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(oldObjectId));
+
+    scan = systable_beginscan(depRel, DependDependerIndexId, true,
+                              NULL, 2, key);
+
+    while (HeapTupleIsValid((tup = systable_getnext(scan))))
+    {
+        Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+
+        /* make a modifiable copy */
+        tup = heap_copytuple(tup);
+        depform = (Form_pg_depend) GETSTRUCT(tup);
+
+        depform->objid = newObjectId;
+
+        simple_heap_update(depRel, &tup->t_self, tup);
+        CatalogUpdateIndexes(depRel, tup);
+
+        heap_freetuple_ext(tup);
+    }
+
+    systable_endscan(scan);
+
+    heap_close(depRel, RowExclusiveLock);
+}
+
+/*
+ * Adjust all dependency records to point to a different object of the same type
+ *
+ * refClassId/oldRefObjectId specify the old referenced object.
+ * newRefObjectId is the new referenced object (must be of class refClassId).
+ */
+void changeDependenciesOn(Oid refClassId, Oid oldRefObjectId, Oid newRefObjectId)
+{
+    Relation depRel = NULL;
+    ScanKeyData key[2];
+    SysScanDesc scan = NULL;
+    HeapTuple tup = NULL;
+    ObjectAddress objAddr;
+    bool newIsPinned = false;
+
+    depRel = heap_open(DependRelationId, RowExclusiveLock);
+    /*
+     * If oldRefObjectId is pinned, there won't be any dependency entries on
+     * it --- we can't cope in that case. (This isn't really worth expending
+     * code to fix, in current usage; it just means you can't rename stuff out
+     * of pg_catalog, which would likely be a bad move anyway.)
+     */
+    objAddr.classId = refClassId;
+    objAddr.objectId = oldRefObjectId;
+    objAddr.objectSubId = 0;
+
+    if (isObjectPinned(&objAddr, depRel))
+        ereport (ERROR, 
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("cannot remove dependency on %s because it is a system object",
+                    getObjectDescription(&objAddr))));
+
+    /*
+     * We can handle adding a dependency on something pinned, though, since
+     * that just means deleting the dependency entry.
+     */
+    objAddr.objectId = newRefObjectId;
+
+    newIsPinned = isObjectPinned(&objAddr, depRel);
+
+    /* Now search for dependency records */
+    ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(refClassId));
+    ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(oldRefObjectId));
+
+    scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+
+    while (HeapTupleIsValid(tup = systable_getnext(scan)))
+    {
+        Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+
+        if(newIsPinned)
+            simple_heap_delete(depRel, &tup->t_self);
+        else {
+            /* make a modifiable copy */
+            tup = heap_copytuple(tup);
+            depform = (Form_pg_depend) GETSTRUCT(tup);
+
+            depform->refobjid = newRefObjectId;
+
+            simple_heap_update(depRel, &tup->t_self, tup);
+            CatalogUpdateIndexes(depRel, tup);
+
+            heap_freetuple_ext(tup);
+        }
+    }
+
+    systable_endscan(scan);
+
+    heap_close(depRel, RowExclusiveLock);
 }
 
 /*
@@ -683,6 +853,49 @@ Oid get_index_constraint(Oid indexId)
     heap_close(depRel, AccessShareLock);
 
     return constraintId;
+}
+
+/*
+ * get_index_ref_constraints
+ *     Given the OID of an index, return the OID of all foreign key
+ *     constraints which reference the index.
+ */
+List* get_index_ref_constraints(Oid indexId)
+{
+    List* result = NULL;
+    Relation depRel = NULL;
+    ScanKeyData key[3];
+    SysScanDesc scan = NULL;
+    HeapTuple tup = NULL;
+
+    /* search the dependency table for the index */
+    depRel = heap_open(DependRelationId,AccessShareLock);
+
+    ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(RelationRelationId));
+    ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(indexId));
+    ScanKeyInit(&key[2], Anum_pg_depend_refobjsubid, BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(0));
+
+    scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 3, key);
+
+    while (HeapTupleIsValid(tup = systable_getnext(scan)))
+    {
+        Form_pg_depend deprec = (Form_pg_depend) GETSTRUCT(tup);
+
+        /*
+         * We assume any normal dependency from a constraint must be what we
+         * are looking for.
+         */
+        if (deprec->classid == ConstraintRelationId && deprec->objsubid == 0 &&
+            deprec->deptype == DEPENDENCY_NORMAL)
+        {
+            result = lappend_oid(result, deprec->objid);
+        }
+    }
+
+    systable_endscan(scan);
+    heap_close(depRel, AccessShareLock);
+
+    return result;
 }
 
 long DeleteTypesDenpendOnPackage(Oid classId, Oid objectId, bool isSpec)

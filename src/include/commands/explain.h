@@ -420,7 +420,6 @@ private:
     void append_roughcheck_info(int node_idx, int plan_idx, bool from_datanode);
     void append_llvm_info(int node_idx, int plan_idx, bool from_datanode);
     void append_bloomfilter_info(int node_idx, int plan_idx, bool from_datanode);
-    void append_dfs_block_info(int node_idx, int plan_idx, bool from_datanode);
 
     void write_memory();
     void append_peak_memory_info(int node_idx, int plan_idx, bool from_datanode);
@@ -473,6 +472,7 @@ typedef struct ExplainState {
     char* statement_id;                 /* statement_id for EXPLAIN PLAN */
     bool is_explain_gplan;
     char* opt_model_name;
+    ExplainFRSqlState es_frs;   /* explain state for remote sql of foreign scan. */
 } ExplainState;
 
 /* Hook for plugins to get control in explain_get_index_name() */

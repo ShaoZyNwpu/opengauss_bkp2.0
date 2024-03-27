@@ -33,9 +33,19 @@ static void resetIsTimeCapsuleFlag()
     u_sess->parser_cxt.isTimeCapsule = false;
 }
 
+static void resetHasPartitionComment()
+{
+    u_sess->parser_cxt.hasPartitionComment = false;
+}
+
 static void resetCreateFuncFlag()
 {
     u_sess->parser_cxt.isCreateFuncOrProc = false;
+}
+
+static void resetForbidTruncateFlag()
+{
+    u_sess->parser_cxt.isForbidTruncate = false;
 }
 
 /*
@@ -52,15 +62,21 @@ List* raw_parser(const char* str, List** query_string_locationlist)
 
     /* reset u_sess->parser_cxt.stmt_contains_operator_plus */
     resetOperatorPlusFlag();
-
+    
+    /* reset u_sess->parser_cxt.hasPartitionComment */
+    resetHasPartitionComment();
+    
     /* reset u_sess->parser_cxt.isTimeCapsule */
     resetIsTimeCapsuleFlag();
 
     /* reset u_sess->parser_cxt.isCreateFuncOrProc */
     resetCreateFuncFlag();
 
+    /* reset u_sess->parser_cxt.isForbidTruncate */
+    resetForbidTruncateFlag();
+
     /* initialize the flex scanner */
-    yyscanner = scanner_init(str, &yyextra.core_yy_extra, ScanKeywords, NumScanKeywords);
+    yyscanner = scanner_init(str, &yyextra.core_yy_extra, &ScanKeywords, ScanKeywordTokens);
 
     /* base_yylex() only needs this much initialization */
     yyextra.lookahead_num = 0;
@@ -92,19 +108,23 @@ List* raw_parser(const char* str, List** query_string_locationlist)
     return yyextra.parsetree;
 }
 
-#define GET_NEXT_TOKEN()                                                                 \
+#define GET_NEXT_TOKEN_WITHOUT_YY()                                                      \
     do {                                                                                 \
-        cur_yylval = lvalp->core_yystype;                                                \
-        cur_yylloc = *llocp;                                                             \
         if (yyextra->lookahead_num != 0) {                                               \
             next_token = yyextra->lookahead_token[yyextra->lookahead_num - 1];           \
             lvalp->core_yystype = yyextra->lookahead_yylval[yyextra->lookahead_num - 1]; \
             *llocp = yyextra->lookahead_yylloc[yyextra->lookahead_num - 1];              \
             yyextra->lookahead_num--;                                                    \
-            Assert(yyextra->lookahead_num == 0);                                         \
         } else {                                                                         \
             next_token = core_yylex(&(lvalp->core_yystype), llocp, yyscanner);           \
         }                                                                                \
+    } while (0)
+
+#define GET_NEXT_TOKEN()                                                                 \
+    do {                                                                                 \
+        cur_yylval = lvalp->core_yystype;                                                \
+        cur_yylloc = *llocp;                                                             \
+        GET_NEXT_TOKEN_WITHOUT_YY();                                                     \
     } while (0)
 
 #define SET_LOOKAHEAD_TOKEN()                               \
@@ -150,6 +170,32 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
         cur_token = core_yylex(&(lvalp->core_yystype), llocp, yyscanner);
     }
 
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT && yyextra->lookahead_num == 0) {
+        bool is_last_colon;
+        if (cur_token == int(';')) {
+            is_last_colon = true;
+        } else {
+            is_last_colon = false;
+        }
+        if (yyextra->core_yy_extra.is_delimiter_name == true) {
+            if (strcmp(";",u_sess->attr.attr_common.delimiter_name) == 0) {
+                cur_token = END_OF_INPUT_COLON;
+            } else {
+                if (yyextra->core_yy_extra.is_last_colon == false ) {
+                    cur_token = END_OF_INPUT_COLON;
+                } else {
+                    cur_token = END_OF_INPUT;
+                }
+            }
+        }
+        if (yyextra->core_yy_extra.is_proc_end == true) {
+            cur_token = END_OF_PROC;
+        }
+        yyextra->core_yy_extra.is_proc_end = false;
+        yyextra->core_yy_extra.is_delimiter_name = false;
+        yyextra->core_yy_extra.is_last_colon = is_last_colon;
+    }
+    
     /* Do we need to look ahead for a possible multiword token? */
     switch (cur_token) {
         case NULLS_P:
@@ -185,6 +231,21 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
                 case ENFORCED:
                     cur_token = NOT_ENFORCED;
                     break;
+                case IN_P:
+                    cur_token = NOT_IN;
+                    break;
+                case BETWEEN:
+                    cur_token = NOT_BETWEEN;
+                    break;
+                case LIKE:
+                    cur_token = NOT_LIKE;
+                    break;
+                case ILIKE:
+                    cur_token = NOT_ILIKE;
+                    break;
+                case SIMILAR:
+                    cur_token = NOT_SIMILAR;
+                    break;
                 default:
                     /* save the lookahead token for next time */
                     SET_LOOKAHEAD_TOKEN();
@@ -196,6 +257,25 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
             }
             break;
 
+        case EVENT:
+            /*
+             * Event trigger must be reduced to one token
+             */
+            GET_NEXT_TOKEN();
+            switch (next_token) {
+                case TRIGGER:
+                    cur_token = EVENT_TRIGGER;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
         case WITH:
             /*
              * WITH TIME must be reduced to one token
@@ -386,17 +466,20 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
             /*
              * DECLARE foo CUROSR must be looked ahead, and if determined as a DECLARE_CURSOR, we should set the yylaval
              * and yylloc back, letting the parser read the cursor name correctly.
+             * here we may still have token in lookahead_token, so use GET_NEXT_TOKEN to get
              */
-            cur_yylval = lvalp->core_yystype;
-            cur_yylloc = *llocp;
-            next_token = core_yylex(&(lvalp->core_yystype), llocp, yyscanner);
+            GET_NEXT_TOKEN();
             /* get first token after DECLARE. We don't care what it is */
             yyextra->lookahead_token[1] = next_token;
             yyextra->lookahead_yylval[1] = lvalp->core_yystype;
             yyextra->lookahead_yylloc[1] = *llocp;
 
-            /* get the second token after DECLARE. If it is cursor grammer, we are sure that this is a cursr stmt */
-            next_token = core_yylex(&(lvalp->core_yystype), llocp, yyscanner);
+            /* 
+             * get the second token after DECLARE. If it is cursor grammar, we are sure that this is a cursr stmt
+             * in fact we don't have any lookahead_token here for sure, cause MAX_LOOKAHEAD_NUM is 2.
+             * but maybe someday MAX_LOOKAHEAD_NUM increase, so we still use GET_NEXT_TOKEN_WITHOUT_SET_CURYY
+             */
+            GET_NEXT_TOKEN_WITHOUT_YY();
             yyextra->lookahead_token[0] = next_token;
             yyextra->lookahead_yylval[0] = lvalp->core_yystype;
             yyextra->lookahead_yylloc[0] = *llocp;
@@ -480,6 +563,104 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
                     break;
             }
             break;
+        case ON:
+            /* here we may still have token in lookahead_token, so use GET_NEXT_TOKEN to get */
+            GET_NEXT_TOKEN();
+            /* get first token after ON (Normal UPDATE). We don't care what it is */
+            yyextra->lookahead_token[1] = next_token;
+            yyextra->lookahead_yylval[1] = lvalp->core_yystype;
+            yyextra->lookahead_yylloc[1] = *llocp;
+
+            /*
+             * get the second token after ON.
+             * in fact we don't have any lookahead_token here for sure, cause MAX_LOOKAHEAD_NUM is 2.
+             * but maybe someday MAX_LOOKAHEAD_NUM increase, so we still use GET_NEXT_TOKEN_WITHOUT_SET_CURYY
+             */
+            GET_NEXT_TOKEN_WITHOUT_YY();
+            yyextra->lookahead_token[0] = next_token;
+            yyextra->lookahead_yylval[0] = lvalp->core_yystype;
+            yyextra->lookahead_yylloc[0] = *llocp;
+            yyextra->lookahead_num = 2;
+            switch (next_token) {
+                case CURRENT_TIMESTAMP:
+                case CURRENT_TIME:
+                case CURRENT_DATE:
+                case LOCALTIME:
+                case LOCALTIMESTAMP:
+                    cur_token = ON_UPDATE_TIME;
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+                default:
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
+        case SHOW:
+            /*
+             * SHOW ERRORS must be reduced to one token, to allow ERRORS as table / column alias.
+             */
+            GET_NEXT_TOKEN();
+
+            switch (next_token) {
+                case ERRORS:
+                    cur_token = SHOW_ERRORS;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
+        case USE_P:
+        /*
+        * USE INDEX \USE KEY must be reduced to one token,to allow KEY\USE as table / column alias.
+        */
+            GET_NEXT_TOKEN();
+
+            switch (next_token) {
+                case KEY:
+                    cur_token = USE_INDEX;
+                    break;
+                case INDEX:
+                    cur_token = USE_INDEX;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
+        case FORCE:
+        /*
+        * FORCE INDEX \FORCE KEY must be reduced to one token,to allow KEY\FORCE as table / column alias.
+        */
+            GET_NEXT_TOKEN();
+
+            switch (next_token) {
+                case KEY:
+                    cur_token = FORCE_INDEX;
+                    break;
+                case INDEX:
+                    cur_token = FORCE_INDEX;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
         default:
             break;
     }
@@ -490,14 +671,14 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
 /*
  * @Description: Check whether its a empty query with only comments and semicolon.
  * @Param query_string: the query need check.
- * @retrun:true or false.
+ * @return:true or false.
  */
 static bool is_empty_query(char* query_string)
 {
     char begin_comment[3] = "/*";
     char end_comment[3] = "*/";
     char empty_query[2] = ";";
-    char* end_comment_postion = NULL;
+    char* end_comment_position = NULL;
 
     /* Trim all the spaces at the begin of the string. */
     while (isspace((unsigned char)*query_string)) {
@@ -508,10 +689,10 @@ static bool is_empty_query(char* query_string)
     while (strncmp(query_string, begin_comment, 2) == 0) {
         /*
          * As query_string have been through parser, whenever it contain the begin_comment
-         * it will comtain the end_comment and end_comment_postion can't be null here.
+         * it will contain the end_comment and end_comment_position can't be null here.
          */
-        end_comment_postion = strstr(query_string, end_comment);
-        query_string = end_comment_postion + 2;
+        end_comment_position = strstr(query_string, end_comment);
+        query_string = end_comment_position + 2;
         while (isspace((unsigned char)*query_string)) {
             query_string++;
         }
@@ -526,12 +707,12 @@ static bool is_empty_query(char* query_string)
 }
 
 /*
- * @Description: split the query_string to distinct single querys.
- * @Param [IN] query_string_single: store the splited single querys.
+ * @Description: split the query_string to distinct single queries.
+ * @Param [IN] query_string_single: store the splited single queries.
  * @Param [IN] query_string: initial query string which contain multi statements.
  * @Param [IN] query_string_locationList: record single query terminator-semicolon locations which get from lexer.
  * @Param [IN] stmt_num: show this is the n-ths single query of the multi query.
- * @return [IN/OUT] query_string_single: store the point arrary of single query.
+ * @return [IN/OUT] query_string_single: store the point array of single query.
  * @NOTICE:The caller is responsible for freeing the storage palloced here.
  */
 char** get_next_snippet(
@@ -551,12 +732,12 @@ char** get_next_snippet(
 
     /*
      * Get the snippet of multi_query until we get a non-empty query as the empty query string
-     * needn't be dealed with.
+     * needn't be dealt with.
      */
     for (; *stmt_num < stmt_count;) {
         /*
-         * Notice : The locationlist only store the end postion of each single query but not any
-         * start postion.
+         * Notice : The locationlist only store the end position of each single query but not any
+         * start position.
          */
         if (*stmt_num == 0) {
             query_string_location_start = 0;

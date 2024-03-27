@@ -15,6 +15,8 @@
 
 #include "catalog/pg_publication.h"
 
+#include "commands/defrem.h"
+
 #include "replication/logical.h"
 #include "replication/logicalproto.h"
 #include "replication/origin.h"
@@ -44,6 +46,8 @@ static bool pgoutput_origin_filter(LogicalDecodingContext *ctx, RepOriginId orig
 
 static List *LoadPublications(List *pubnames);
 static void publication_invalidation_cb(Datum arg, int cacheid, uint32 hashvalue);
+static bool ReplconninfoChanged();
+static bool GetConninfo(StringInfoData* standbysInfo);
 
 /* Entry in the map used to remember which relation schemas we sent. */
 typedef struct RelationSyncEntry {
@@ -79,6 +83,10 @@ static void parse_output_parameters(List *options, PGOutputData *data)
     ListCell *lc;
     bool protocol_version_given = false;
     bool publication_names_given = false;
+    bool binary_option_given = false;
+    bool use_snapshot_given = false;
+
+    data->binary = false;
 
     foreach (lc, options) {
         DefElem *defel = (DefElem *)lfirst(lc);
@@ -108,6 +116,18 @@ static void parse_output_parameters(List *options, PGOutputData *data)
 
             if (!SplitIdentifierString(strVal(defel->arg), ',', &(data->publication_names)))
                 ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("invalid publication_names syntax")));
+        } else if (strcmp(defel->defname, "binary") == 0) {
+            if (binary_option_given)
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+            binary_option_given = true;
+
+            data->binary = defGetBoolean(defel);
+        } else if (strcmp(defel->defname, "usesnapshot") == 0) {
+            if (use_snapshot_given)
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("conflicting or redundant options")));
+            use_snapshot_given = true;
+
+            t_thrd.walsender_cxt.isUseSnapshot = true;
         } else
             elog(ERROR, "unrecognized pgoutput option: %s", defel->defname);
     }
@@ -121,7 +141,8 @@ static void pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *o
     PGOutputData *data = (PGOutputData *)palloc0(sizeof(PGOutputData));
 
     /* Create our memory context for private allocations. */
-    data->context = AllocSetContextCreate(ctx->context, "logical replication output context", ALLOCSET_DEFAULT_SIZES);
+    data->common.context = AllocSetContextCreate(ctx->context,
+        "logical replication output context", ALLOCSET_DEFAULT_SIZES);
 
     ctx->output_plugin_private = data;
 
@@ -138,15 +159,15 @@ static void pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *o
         parse_output_parameters(ctx->output_plugin_options, data);
 
         /* Check if we support requested protol */
-        if (data->protocol_version > LOGICALREP_PROTO_MAX_VERSION_NUM)
+        if (data->protocol_version >= LOGICALREP_PROTO_MAX_VERSION_NUM)
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("client sent proto_version=%d but we only support protocol %d or lower", data->protocol_version,
-                LOGICALREP_PROTO_MAX_VERSION_NUM)));
+                LOGICALREP_PROTO_MAX_VERSION_NUM - 1)));
 
-        if (data->protocol_version < LOGICALREP_PROTO_MIN_VERSION_NUM)
+        if (data->protocol_version <= LOGICALREP_PROTO_MIN_VERSION_NUM)
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("client sent proto_version=%d but we only support protocol %d or higher", data->protocol_version,
-                LOGICALREP_PROTO_MIN_VERSION_NUM)));
+                LOGICALREP_PROTO_MIN_VERSION_NUM + 1)));
 
         if (list_length(data->publication_names) < 1)
             ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("publication_names parameter missing")));
@@ -154,6 +175,10 @@ static void pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *o
         /* Init publication state. */
         data->publications = NIL;
         t_thrd.publication_cxt.publications_valid = false;
+        if (data->protocol_version >= LOGICALREP_CONNINFO_PROTO_VERSION_NUM) {
+            t_thrd.publication_cxt.updateConninfoNeeded = true;
+        }
+        t_thrd.publication_cxt.firstTimeSendConninfo = true;
         CacheRegisterThreadSyscacheCallback(PUBLICATIONOID, publication_invalidation_cb, (Datum)0);
 
         /* Initialize relation schema cache. */
@@ -206,6 +231,26 @@ static void pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *t
     OutputPluginPrepareWrite(ctx, true);
     logicalrep_write_commit(ctx->out, txn, commit_lsn);
     OutputPluginWrite(ctx, true);
+
+    /*
+     * Send the newest connection information to the subscriber,
+     * when the connection information about the standby changes.
+     */
+    if ((t_thrd.publication_cxt.updateConninfoNeeded && ReplconninfoChanged()) ||
+        t_thrd.publication_cxt.firstTimeSendConninfo) {
+        StringInfoData standbysInfo;
+        initStringInfo(&standbysInfo);
+
+        /* If there is no standby, don't need to send connection info to subscriber */
+        if (GetConninfo(&standbysInfo)) {
+            OutputPluginPrepareWrite(ctx, true);
+            logicalrep_write_conninfo(ctx->out, standbysInfo.data);
+            OutputPluginWrite(ctx, true);
+        }
+
+        FreeStringInfo(&standbysInfo);
+        t_thrd.publication_cxt.firstTimeSendConninfo = false;
+    }
 }
 
 /*
@@ -250,7 +295,7 @@ static void MaybeSendSchema(LogicalDecodingContext *ctx, Relation relation, Rela
      * types.
      */
     for (i = 0; i < desc->natts; i++) {
-        Form_pg_attribute att = desc->attrs[i];
+        Form_pg_attribute att = &desc->attrs[i];
 
         if (att->attisdropped || GetGeneratedCol(desc, i))
             continue;
@@ -289,7 +334,7 @@ static void pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, 
     }
 
     /* Avoid leaking memory by using and resetting our own context */
-    old = MemoryContextSwitchTo(data->context);
+    old = MemoryContextSwitchTo(data->common.context);
 
     /*
      * Write the relation schema if the current schema haven't been sent yet.
@@ -299,35 +344,46 @@ static void pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, 
     /* Send the data */
     switch (change->action) {
         case REORDER_BUFFER_CHANGE_INSERT:
-            OutputPluginPrepareWrite(ctx, true);
-            logicalrep_write_insert(ctx->out, relation, &change->data.tp.newtuple->tuple);
-            OutputPluginWrite(ctx, true);
+            if (change->data.tp.newtuple != NULL) {
+                OutputPluginPrepareWrite(ctx, true);
+                logicalrep_write_insert(ctx->out, relation, &change->data.tp.newtuple->tuple, data->binary);
+                OutputPluginWrite(ctx, true);
+            }
             break;
         case REORDER_BUFFER_CHANGE_UINSERT:
-            OutputPluginPrepareWrite(ctx, true);
-            logicalrep_write_insert(ctx->out, relation, (HeapTuple)(&change->data.utp.newtuple->tuple));
-            OutputPluginWrite(ctx, true);
+            if (change->data.utp.newtuple != NULL) {
+                OutputPluginPrepareWrite(ctx, true);
+                logicalrep_write_insert(ctx->out, relation,
+                    (HeapTuple)(&change->data.utp.newtuple->tuple), data->binary);
+                OutputPluginWrite(ctx, true);
+            }
             break;
         case REORDER_BUFFER_CHANGE_UPDATE: {
-            HeapTuple oldtuple = change->data.tp.oldtuple ? &change->data.tp.oldtuple->tuple : NULL;
+            if (change->data.tp.newtuple != NULL) {
+                HeapTuple oldtuple = change->data.tp.oldtuple ? &change->data.tp.oldtuple->tuple : NULL;
 
-            OutputPluginPrepareWrite(ctx, true);
-            logicalrep_write_update(ctx->out, relation, oldtuple, &change->data.tp.newtuple->tuple);
-            OutputPluginWrite(ctx, true);
+                OutputPluginPrepareWrite(ctx, true);
+                logicalrep_write_update(ctx->out, relation, oldtuple, &change->data.tp.newtuple->tuple, data->binary);
+                OutputPluginWrite(ctx, true);
+            }
             break;
         }
         case REORDER_BUFFER_CHANGE_UUPDATE: {
-            HeapTuple oldtuple = change->data.utp.oldtuple ? ((HeapTuple)(&change->data.utp.oldtuple->tuple)) : NULL;
+            if (change->data.utp.newtuple != NULL) {
+                HeapTuple oldtuple = change->data.utp.oldtuple ?
+                    ((HeapTuple)(&change->data.utp.oldtuple->tuple)) : NULL;
 
-            OutputPluginPrepareWrite(ctx, true);
-            logicalrep_write_update(ctx->out, relation, oldtuple, (HeapTuple)(&change->data.utp.newtuple->tuple));
-            OutputPluginWrite(ctx, true);
+                OutputPluginPrepareWrite(ctx, true);
+                logicalrep_write_update(ctx->out, relation, oldtuple, (HeapTuple)(&change->data.utp.newtuple->tuple),
+                    data->binary);
+                OutputPluginWrite(ctx, true);
+            }
             break;
         }
         case REORDER_BUFFER_CHANGE_DELETE:
             if (change->data.tp.oldtuple) {
                 OutputPluginPrepareWrite(ctx, true);
-                logicalrep_write_delete(ctx->out, relation, &change->data.tp.oldtuple->tuple);
+                logicalrep_write_delete(ctx->out, relation, &change->data.tp.oldtuple->tuple, data->binary);
                 OutputPluginWrite(ctx, true);
             } else
                 elog(DEBUG1, "didn't send DELETE change because of missing oldtuple");
@@ -335,7 +391,7 @@ static void pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, 
         case REORDER_BUFFER_CHANGE_UDELETE:
             if (change->data.utp.oldtuple) {
                 OutputPluginPrepareWrite(ctx, true);
-                logicalrep_write_delete(ctx->out, relation, (HeapTuple)(&change->data.utp.oldtuple->tuple));
+                logicalrep_write_delete(ctx->out, relation, (HeapTuple)(&change->data.utp.oldtuple->tuple), data->binary);
                 OutputPluginWrite(ctx, true);
             } else
                 elog(DEBUG1, "didn't send DELETE change because of missing oldtuple");
@@ -346,7 +402,7 @@ static void pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, 
 
     /* Cleanup */
     MemoryContextSwitchTo(old);
-    MemoryContextReset(data->context);
+    MemoryContextReset(data->common.context);
 }
 
 /*
@@ -604,4 +660,48 @@ static void rel_sync_cache_publication_cb(Datum arg, int cacheid, uint32 hashval
         entry->pubactions.pubupdate = false;
         entry->pubactions.pubdelete = false;
     }
+}
+
+/* Get all primary and standby connection info. If there is no standby, return false, otherwise return true. */
+static bool GetConninfo(StringInfoData* standbysInfo)
+{
+    bool primaryJoined = false;
+    StringInfoData hosts;
+    StringInfoData ports;
+    initStringInfo(&hosts);
+    initStringInfo(&ports);
+    for (int i = 1; i < MAX_REPLNODE_NUM + 1; ++i) {
+        t_thrd.postmaster_cxt.ReplConnChangeType[i] = 0;
+        if (t_thrd.postmaster_cxt.ReplConnArray[i] == NULL) {
+            continue;
+        }
+        if (!primaryJoined) {
+            appendStringInfo(&hosts, "%s,%s",
+                t_thrd.postmaster_cxt.ReplConnArray[i]->localhost,
+                t_thrd.postmaster_cxt.ReplConnArray[i]->remotehost);
+            appendStringInfo(&ports, "%d,%d",
+                t_thrd.postmaster_cxt.ReplConnArray[i]->localport,
+                t_thrd.postmaster_cxt.ReplConnArray[i]->remoteport);
+            primaryJoined = true;
+        } else {
+            appendStringInfo(&hosts, ",%s",
+                t_thrd.postmaster_cxt.ReplConnArray[i]->remotehost);
+            appendStringInfo(&ports, ",%d",
+                t_thrd.postmaster_cxt.ReplConnArray[i]->remoteport);
+        }
+    }
+    appendStringInfo(standbysInfo, "host=%s port=%s", hosts.data, ports.data);
+    FreeStringInfo(&hosts);
+    FreeStringInfo(&ports);
+    return primaryJoined;
+}
+
+static inline bool ReplconninfoChanged()
+{
+    for (int i = 1; i < MAX_REPLNODE_NUM; ++i) {
+        if (t_thrd.postmaster_cxt.ReplConnChangeType[i]) {
+            return true;
+        }
+    }
+    return false;
 }

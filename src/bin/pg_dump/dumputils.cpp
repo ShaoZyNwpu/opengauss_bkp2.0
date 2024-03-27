@@ -32,15 +32,12 @@
 #include "gauss_sft.h"
 #endif
 
-/* Globals from keywords.c */
-extern ScanKeyword FEScanKeywords[];
-extern int NumFEScanKeywords;
-
 /* Globals exported by this file */
 int quote_all_identifiers = 0;
 const char* progname = NULL;
 const char* dbname = NULL;
 const char* instport = NULL;
+const char *gdatcompatibility = NULL;
 
 char* binary_upgrade_oldowner = NULL;
 char* binary_upgrade_newowner = NULL;
@@ -152,9 +149,9 @@ const char* fmtId(const char* rawid)
          * Note: ScanKeywordLookup() does case-insensitive comparison, but
          * that's fine, since we already know we have all-lower-case.
          */
-        const ScanKeyword* keyword = ScanKeywordLookup(rawid, FEScanKeywords, NumFEScanKeywords);
+        int kwnum = ScanKeywordLookup(rawid, &ScanKeywords);
 
-        if (keyword != NULL && keyword->category != UNRESERVED_KEYWORD)
+        if (kwnum >= 0 && ScanKeywordCategories[kwnum] != UNRESERVED_KEYWORD)
             need_quotes = true;
     }
 
@@ -1793,3 +1790,32 @@ bool is_column_exists(PGconn* conn, Oid relid, const char* column_name)
 
     return isExists;
 }
+
+#ifndef ENABLE_MULTIPLE_NODES
+bool SetUppercaseAttributeNameToOff(PGconn* conn)
+{
+    PGresult* res = NULL;
+    PQExpBuffer query = createPQExpBuffer();
+
+    /* check whether uppercase_attribute_name exist, can't use show xx, cause it will report error if not exist */
+    appendPQExpBuffer(query, "select setting from pg_settings where name = 'uppercase_attribute_name';");
+
+    res = PQexec(conn, query->data);
+    if (PQntuples(res) != 1 || strcmp(PQgetvalue(res, 0, 0), "on") != 0) {
+        PQclear(res);
+        destroyPQExpBuffer(query);
+        return true;
+    }
+
+    PQclear(res);
+    destroyPQExpBuffer(query);
+
+    res = PQexec(conn, "set uppercase_attribute_name=off;");
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        PQclear(res);
+        return false;
+    }
+    PQclear(res);
+    return true;
+}
+#endif

@@ -11,6 +11,8 @@
 #ifndef PG_PROBACKUPB_H
 #define PG_PROBACKUPB_H
 
+#include "tool_common.h"
+
 /* Information about single file (or dir) in backup */
 typedef struct pgFile_t
 {
@@ -32,9 +34,9 @@ typedef struct pgFile_t
     char   *rel_path;        /* relative path of the file */
     char   *linked;            /* path of the linked file */
     bool    is_datafile;    /* true if the file is PostgreSQL data file */
-    bool compressedFile;    /* true if the file is the openGauss compressed file */
-    uint16 compressedChunkSize;       /* chunk size of compressed file */
-    uint8 compressedAlgorithm;         /* algorithm of comrpessed file */
+    bool compressed_file;    /* true if the file is the openGauss compressed file */
+    uint16 compressed_chunk_size;       /* chunk size of compressed file */
+    uint8 compressed_algorithm;         /* algorithm of comrpessed file */
     Oid        tblspcOid;        /* tblspcOid extracted from path, if applicable */
     Oid        dbOid;            /* dbOid extracted from path, if applicable */
     Oid        relOid;            /* relOid extracted from path, if applicable */
@@ -56,6 +58,7 @@ typedef struct pgFile_t
     pg_crc32 hdr_crc;        /* CRC value of header file: name_hdr */
     off_t    hdr_off;       /* offset in header map */
     int      hdr_size;       /* offset in header map */
+    device_type_t type;      /* file device type */
 } pgFile;
 
 typedef struct page_map_entry
@@ -168,6 +171,9 @@ typedef struct InstanceConfig
 
     /* Archive description */
     ArchiveOptions archive;
+
+    /* DSS conntct parameters */
+    DssOptions dss;
 } InstanceConfig;
 
 extern ConfigOption instance_options[];
@@ -268,6 +274,8 @@ struct pgBackup
                                        backup_path/instance_name/backup_id */
     char            *database_dir;    /* Full path to directory with data files:
                                        backup_path/instance_name/backup_id/database */
+    char            *dssdata_dir;     /* Full path to directory with dss data files:
+                                       backup_path/instance_name/backup_id/database/dssdata */
     parray            *files;            /* list of files belonging to this backup
                                      * must be populated explicitly */
     char            *note;
@@ -278,6 +286,9 @@ struct pgBackup
 
     /* map used for access to page headers */
     HeaderMap       hdr_map;
+
+    /* device type */
+    device_type_t storage_type;
 };
 
 /* Recovery target for restore and validate subcommands */
@@ -334,6 +345,8 @@ typedef struct
 
     const char *from_root;
     const char *to_root;
+    const char *src_dss;
+    const char *dst_dss;
     const char *external_prefix;
 
     parray       *files_list;

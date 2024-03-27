@@ -65,6 +65,7 @@
 #include "storage/ipc.h"
 #include "storage/procarray.h"
 #include "storage/smgr/smgr.h"
+#include "storage/file/fio_device.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -83,7 +84,6 @@
 #include "pgxc/poolutils.h"
 #include "tcop/utility.h"
 #endif
-#include "storage/dfs/dfs_connector.h"
 #include "storage/smgr/segment.h"
 
 typedef struct {
@@ -142,7 +142,7 @@ bool userbindlc(Oid rolid)
 /*
  * CREATE DATABASE
  */
-void createdb(const CreatedbStmt* stmt)
+Oid createdb(const CreatedbStmt* stmt)
 {
     TableScanDesc scan;
     Relation rel;
@@ -187,6 +187,14 @@ void createdb(const CreatedbStmt* stmt)
     int npreparedxacts;
     createdb_failure_params fparms;
     Snapshot snapshot;
+
+    if (u_sess->attr.attr_common.upgrade_mode > 0) {
+        LOCKTAG tag;
+        SET_LOCKTAG_OBJECT(tag, InvalidOid, DatabaseRelationId, get_database_oid_by_name("template0"), 0);
+        if (LockAcquire(&tag, RowExclusiveLock, false, true) == LOCKACQUIRE_NOT_AVAIL) {
+            ereport(ERROR, (errmsg("can not execute create database statement when update template0")));
+        }
+    }
 
     /* Extract options from the statement node tree */
     foreach (option, stmt->options) {
@@ -429,12 +437,6 @@ void createdb(const CreatedbStmt* stmt)
             ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("pg_global cannot be used as default tablespace")));
 
-        if (IsSpecifiedTblspc(dst_deftablespace, FILESYSTEM_HDFS)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                    errmsg("DFS tablespace can not be used as default tablespace.")));
-        }
-
         /*
          * If we are trying to change the default tablespace of the template,
          * we require that the template not have any files in the new default
@@ -473,8 +475,14 @@ void createdb(const CreatedbStmt* stmt)
      * message than "unique index violation".  There's a race condition but
      * we're willing to accept the less friendly message in that case.
      */
-    if (OidIsValid(get_database_oid(dbname, true)))
-        ereport(ERROR, (errcode(ERRCODE_DUPLICATE_DATABASE), errmsg("database \"%s\" already exists", dbname)));
+    if (OidIsValid(get_database_oid(dbname, true))) {
+        if (stmt->missing_ok) {
+            ereport(NOTICE, (errmsg("database \"%s\" already exists, skipping", dbname)));
+            return InvalidOid;
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_DUPLICATE_DATABASE), errmsg("database \"%s\" already exists", dbname)));
+        }
+    }
 
     /*
      * The source DB can't have any active backends, except this one
@@ -633,7 +641,7 @@ void createdb(const CreatedbStmt* stmt)
                 dsttablespace = dst_deftablespace;
             else
                 dsttablespace = srctablespace;
-            
+
             dstpath = GetDatabasePath(dboid, dsttablespace);
 
             /*
@@ -723,6 +731,7 @@ void createdb(const CreatedbStmt* stmt)
      */
     set_dbcleanup_callback(createdb_xact_callback, &fparms.dest_dboid, sizeof(fparms.dest_dboid));
 #endif
+    return dboid;
 }
 
 /*
@@ -954,7 +963,7 @@ static void DropdbXactCallback(bool isCommit, const void* arg)
             pfree_ext(dstpath);
             continue;
         }
-
+        spc_drop_space_node(dsttablespace, dbOid);
         if (!rmtree(dstpath, true))
             ereport(
                 WARNING, (errmsg("some useless files may be left behind in old database directory \"%s\"", dstpath)));
@@ -1103,9 +1112,8 @@ void dropdb(const char* dbname, bool missing_ok)
     if (!HeapTupleIsValid(tup))
         ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for database %u", db_id)));
 
-    if (EnableGlobalSysCache()) {
-        g_instance.global_sysdbcache.DropDB(db_id, true);
-    }
+    NotifyGscDropDB(db_id, true);
+
     simple_heap_delete(pgdbrel, &tup->t_self);
 
     ReleaseSysCache(tup);
@@ -1210,7 +1218,7 @@ void dropdb(const char* dbname, bool missing_ok)
 /*
  * Must be owner or have alter privilege to alter database
  */
-static void AlterDatabasePermissionCheck(Oid dboid, const char* dbname)
+void AlterDatabasePermissionCheck(Oid dboid, const char* dbname)
 {
     AclResult aclresult = pg_database_aclcheck(dboid, GetUserId(), ACL_ALTER);
     if (aclresult != ACLCHECK_OK && !pg_database_ownercheck(dboid, GetUserId())) {
@@ -1221,14 +1229,14 @@ static void AlterDatabasePermissionCheck(Oid dboid, const char* dbname)
 /*
  * Rename database
  */
-void RenameDatabase(const char* oldname, const char* newname)
+ObjectAddress RenameDatabase(const char* oldname, const char* newname)
 {
     Oid db_id;
     HeapTuple newtup;
     Relation rel;
     int notherbackends;
     int npreparedxacts;
-    List* existTblSpcList = NIL;
+    ObjectAddress address;
     Relation pg_job_tbl = NULL;
     TableScanDesc scan = NULL;
     HeapTuple tuple = NULL;
@@ -1277,16 +1285,6 @@ void RenameDatabase(const char* oldname, const char* newname)
                 errmsg("database \"%s\" is being accessed by other users", oldname),
                 errdetail_busy_db(notherbackends, npreparedxacts)));
 
-    existTblSpcList = HDFSTablespaceDirExistDatabase(db_id);
-    if (existTblSpcList != NIL) {
-        StringInfo existTblspc = (StringInfo)linitial(existTblSpcList);
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("It is unsupported to rename database \"%s\" on DFS tablespace \"%s\".",
-                    oldname,
-                    existTblspc->data)));
-    }
-
     /* rename */
     newtup = SearchSysCacheCopy1(DATABASEOID, ObjectIdGetDatum(db_id));
     if (!HeapTupleIsValid(newtup))
@@ -1298,9 +1296,7 @@ void RenameDatabase(const char* oldname, const char* newname)
      * rename db dont change GSC content, but a name swap for two db may cause lsc fake cache hit, which
      * brings about inconsistent data event
      **/
-    if (EnableGlobalSysCache()) {
-        g_instance.global_sysdbcache.DropDB(db_id, false);
-    }
+    NotifyGscDropDB(db_id, false);
 
     simple_heap_update(rel, &newtup->t_self, newtup);
     CatalogUpdateIndexes(rel, newtup);
@@ -1329,19 +1325,11 @@ void RenameDatabase(const char* oldname, const char* newname)
     heap_endscan(scan);
     heap_close(pg_job_tbl, ExclusiveLock);
 
+    ObjectAddressSet(address, DatabaseRelationId, db_id);
+
+    return address;
 }
 
-/*
- * Whether Check existance of a database with given db_id in
- * HDFS tablesacpe or not.
- * @_in_param db_id: The database oid to be checked.
- * @return Return StringInfo list of tablespace name if exists, otherwise return
- * NIL.
- */
-List* HDFSTablespaceDirExistDatabase(Oid db_id)
-{
-    return NIL;
-}
 
 #ifdef PGXC
 /*
@@ -1483,6 +1471,11 @@ static void movedb(const char* dbname, const char* tblspcname)
      * files, which would cause rmdir() to fail.
      */
     RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+    /* when alter database back to it's origin tablespace in a short time,
+     * it may miss some new changes since the old database buffers will be referenced again.
+     * to avoid this we need to drop database buffers here.
+     */
+    DropDatabaseBuffers(db_id);
 
     /*
      * Check for existence of files in the target directory, i.e., objects of
@@ -1570,9 +1563,8 @@ static void movedb(const char* dbname, const char* tblspcname)
 
         newtuple =
             (HeapTuple) tableam_tops_modify_tuple(oldtuple, RelationGetDescr(pgdbrel), new_record, new_record_nulls, new_record_repl);
-        if (EnableGlobalSysCache()) {
-            g_instance.global_sysdbcache.DropDB(db_id, false);
-        }
+        NotifyGscDropDB(db_id, false);
+
         simple_heap_update(pgdbrel, &oldtuple->t_self, newtuple);
 
         /* Update indexes */
@@ -1647,7 +1639,7 @@ static void movedb_success_callback(Oid db_id, Oid src_tblspcoid)
     /* Start new transaction for the remaining work; don't need a snapshot */
     StartTransactionCommand();
 #endif
-
+    spc_drop_space_node(src_tblspcoid, db_id);
     /*
      * Remove files from the old tablespace
      */
@@ -1713,8 +1705,9 @@ static void movedb_failure_callback(int code, Datum arg)
 /*
  * ALTER DATABASE name ...
  */
-void AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
+Oid AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
 {
+    Oid dboid;
     Relation rel;
     HeapTuple tuple, newtuple;
     ScanKeyData scankey;
@@ -1749,15 +1742,6 @@ void AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
     }
 
     if (dtablespace != NULL) {
-        Oid dst_deftablespace = get_tablespace_oid(strVal(dtablespace->arg), false);
-        /* currently, can't be specified along with any other options */
-        Assert(!dconnlimit);
-        if (IsSpecifiedTblspc(dst_deftablespace, FILESYSTEM_HDFS)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                    errmsg("DFS tablespace can not be used as default tablespace.")));
-        }
-        /* this case isn't allowed within a transaction block */
 #ifdef PGXC
         /* Clean connections before alter a database on local node */
         if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
@@ -1771,7 +1755,7 @@ void AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
             PreventTransactionChain(isTopLevel, "ALTER DATABASE SET TABLESPACE");
 
         movedb(stmt->dbname, strVal(dtablespace->arg));
-        return;
+        return InvalidOid;
     }
 
     if (dconnlimit != NULL) {
@@ -1793,6 +1777,7 @@ void AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
     if (!HeapTupleIsValid(tuple))
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_DATABASE), errmsg("database \"%s\" does not exist", stmt->dbname)));
 
+    dboid = HeapTupleGetOid(tuple);
     /* Permmision Check */
     AlterDatabasePermissionCheck(HeapTupleGetOid(tuple), stmt->dbname);
 
@@ -1821,8 +1806,8 @@ void AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
     }
 
     newtuple = (HeapTuple) tableam_tops_modify_tuple(tuple, RelationGetDescr(rel), new_record, new_record_nulls, new_record_repl);
-    if (EnableGlobalSysCache() && privateobject != NULL) {
-        g_instance.global_sysdbcache.DropDB(HeapTupleGetOid(tuple), false);
+    if (privateobject != NULL) {
+        NotifyGscDropDB(HeapTupleGetOid(tuple), false);
     }
     simple_heap_update(rel, &tuple->t_self, newtuple);
 
@@ -1833,12 +1818,13 @@ void AlterDatabase(AlterDatabaseStmt* stmt, bool isTopLevel)
 
     /* Close pg_database, but keep lock till commit */
     heap_close(rel, NoLock);
+    return dboid;
 }
 
 /*
  * ALTER DATABASE name SET ...
  */
-void AlterDatabaseSet(AlterDatabaseSetStmt* stmt)
+Oid AlterDatabaseSet(AlterDatabaseSetStmt* stmt)
 {
     Oid datid = get_database_oid(stmt->dbname, false);
 
@@ -1858,18 +1844,21 @@ void AlterDatabaseSet(AlterDatabaseSetStmt* stmt)
 #endif
 
     UnlockSharedObject(DatabaseRelationId, datid, 0, AccessShareLock);
+    return datid;
 }
 
 /*
  * ALTER DATABASE name OWNER TO newowner
  */
-void AlterDatabaseOwner(const char* dbname, Oid newOwnerId)
+ObjectAddress AlterDatabaseOwner(const char* dbname, Oid newOwnerId)
 {
+    Oid db_id;    
     HeapTuple tuple;
     Relation rel;
     ScanKeyData scankey;
     SysScanDesc scan;
     Form_pg_database datForm;
+    ObjectAddress address;
 
     if (userbindlc(newOwnerId))
         ereport(ERROR,
@@ -1887,6 +1876,7 @@ void AlterDatabaseOwner(const char* dbname, Oid newOwnerId)
     if (!HeapTupleIsValid(tuple))
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_DATABASE), errmsg("database \"%s\" does not exist", dbname)));
 
+    db_id = HeapTupleGetOid(tuple);
     datForm = (Form_pg_database)GETSTRUCT(tuple);
 
     /*
@@ -1952,11 +1942,13 @@ void AlterDatabaseOwner(const char* dbname, Oid newOwnerId)
         /* Update owner dependency reference */
         changeDependencyOnOwner(DatabaseRelationId, HeapTupleGetOid(tuple), newOwnerId);
     }
-
+    
+    ObjectAddressSet(address, DatabaseRelationId, db_id);
     systable_endscan(scan);
 
     /* Close pg_database, but keep lock till commit */
     heap_close(rel, NoLock);
+    return address;
 }
 
 /*
@@ -2259,6 +2251,9 @@ int errdetail_busy_db(int notherbackends, int npreparedxacts)
             "There are %d other sessions using the database.",
             notherbackends,
             notherbackends);
+    else if (ENABLE_DMS && notherbackends == 0 && npreparedxacts == 0)
+        errdetail("[SS] There is other session(s) or prepared transaction(s) using the database "
+            "in other db node(s). Or some other node(s) is not connected in the cluster by dms.");
     else
         errdetail_plural("There is %d prepared transaction using the database.",
             "There are %d prepared transactions using the database.",
@@ -2391,7 +2386,7 @@ void xlog_db_create(Oid dstDbId, Oid dstTbSpcId, Oid srcDbId, Oid srcTbSpcId)
      *  #5. start again and Redo from #1, when Redo #2, src_path do not exits because it is already drop in Redo #3;
      */
     if (!copyRes) {
-        RelFileNode tmp = {srcTbSpcId, srcDbId, 0, InvalidBktId};
+        RelFileNode tmp = {srcTbSpcId, srcDbId, 0, InvalidBktId, 0};
 
         /* forknum and blockno has no meaning */
         log_invalid_page(tmp, MAIN_FORKNUM, 0, NOT_PRESENT, NULL);
@@ -2412,6 +2407,7 @@ void do_db_drop(Oid dbId, Oid tbSpcId)
         LockSharedObjectForSession(DatabaseRelationId, dbId, 0, AccessExclusiveLock);
         ResolveRecoveryConflictWithDatabase(dbId);
     }
+    NotifyGscDropDB(dbId, true);
 
     /* Drop pages for this database that are in the shared buffer cache */
     DropDatabaseBuffers(dbId);
@@ -2421,7 +2417,7 @@ void do_db_drop(Oid dbId, Oid tbSpcId)
     
     /* Clean out the xlog relcache too */
     XLogDropDatabase(dbId);
-
+    spc_drop_space_node(tbSpcId, dbId);
     /* And remove the physical files */
     if (!rmtree(dst_path, true)) {
         ereport(WARNING, (errmsg("some useless files may be left behind in old database directory \"%s\"", dst_path)));

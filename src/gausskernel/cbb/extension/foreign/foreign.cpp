@@ -33,11 +33,12 @@
 #include "utils/syscache.h"
 #include "cipher.h"
 #include "utils/knl_relcache.h"
+#include "optimizer/planmain.h"
+#include "optimizer/pathnode.h"
 
 extern Datum pg_options_to_table(PG_FUNCTION_ARGS);
 extern Datum postgresql_fdw_validator(PG_FUNCTION_ARGS);
 
-extern void CheckGetServerIpAndPort(const char* Address, List** AddrList, bool IsCheck, int real_addr_max);
 extern void decryptKeyString(
     const char* keyStr, char destplainStr[], uint32 destplainLength, const char* obskey = NULL);
 
@@ -216,6 +217,11 @@ bool IsSpecifiedFDW(const char* ServerName, const char* SepcifiedType)
  */
 bool IsSpecifiedFDWFromRelid(Oid relId, const char* SepcifiedType)
 {
+    if (!OidIsValid(relId)) {
+        ereport(ERROR, (errmsg("Invalid relid is used to verify fdw type."),
+                        errhint("This may be a join relationship, or has aggregation, etc.")));
+    }
+
     ForeignTable* ftbl = NULL;
     ForeignServer* fsvr = NULL;
     bool IsSpecifiedTable = false;
@@ -249,10 +255,10 @@ bool IsSpecifiedFDWFromRelid(Oid relId, const char* SepcifiedType)
 
 /**
  * @Description: Jude whether type of the foreign table support SELECT/INSERT/UPDATE/DELETE/COPY
- * @in relId: The foreign table Oid.
+ * @in oid: The foreign table Oid or The foreign server Oid.
  * @return Rreturn true if the foreign table support those DML.
  */
-bool CheckSupportedFDWType(Oid relId)
+bool CheckSupportedFDWType(Oid oid, bool byServerId)
 {
     static const char* supportFDWType[] = {MOT_FDW, MYSQL_FDW, ORACLE_FDW, POSTGRES_FDW};
     int size = sizeof(supportFDWType) / sizeof(supportFDWType[0]);
@@ -269,8 +275,8 @@ bool CheckSupportedFDWType(Oid relId)
     }
     MemoryContext oldContext = MemoryContextSwitchTo(u_sess->opt_cxt.ft_context);
 
-    ForeignTable* ftbl = GetForeignTable(relId);
-    ForeignServer* fsvr = GetForeignServer(ftbl->serverid);
+    Oid serverid = byServerId ? oid : GetForeignTable(oid)->serverid;
+    ForeignServer* fsvr = GetForeignServer(serverid);
     ForeignDataWrapper* fdw = GetForeignDataWrapper(fsvr->fdwid);
 
     for (int i = 0; i < size; i++) {
@@ -287,6 +293,11 @@ bool CheckSupportedFDWType(Oid relId)
 
 bool isSpecifiedSrvTypeFromRelId(Oid relId, const char* SepcifiedType)
 {
+    if (!OidIsValid(relId)) {
+        ereport(ERROR, (errmsg("Invalid relid is used to verify foreign server type."),
+                        errhint("This may be a join relationship, or has aggregation, etc.")));
+    }
+
     ForeignTable* ftbl = NULL;
     ForeignServer* fsrv = NULL;
     bool ret = false;
@@ -496,10 +507,31 @@ FdwRoutine* GetFdwRoutine(Oid fdwhandler)
 }
 
 /*
+ * GetForeignServerIdByRelId - look up the foreign server
+ * for the given foreign table, and return its OID.
+ */
+Oid GetForeignServerIdByRelId(Oid relid)
+{
+    HeapTuple tp;
+    Form_pg_foreign_table tableform;
+    Oid serverid;
+
+    tp = SearchSysCache1(FOREIGNTABLEREL, ObjectIdGetDatum(relid));
+    if (!HeapTupleIsValid(tp))
+        elog(ERROR, "cache lookup failed for foreign table %u", relid);
+    tableform = (Form_pg_foreign_table)GETSTRUCT(tp);
+    serverid = tableform->ftserver;
+    ReleaseSysCache(tp);
+
+    return serverid;
+}
+
+/*
  * GetFdwRoutineByRelId - look up the handler of the foreign-data wrapper
  * for the given foreign table, and retrieve its FdwRoutine struct.
+ * If missHandlerOk is true, will return NULL if the fdwhandler is invalid.
  */
-FdwRoutine* GetFdwRoutineByRelId(Oid relid)
+FdwRoutine* GetFdwRoutineByRelId(Oid relid, bool missHandlerOk)
 {
     HeapTuple tp;
     Form_pg_foreign_data_wrapper fdwform;
@@ -539,6 +571,10 @@ FdwRoutine* GetFdwRoutineByRelId(Oid relid)
 
     /* Complain if FDW has been set to NO HANDLER. */
     if (!OidIsValid(fdwhandler)) {
+        if (missHandlerOk) {
+            ReleaseSysCache(tp);
+            return NULL;
+        }
         ereport(ERROR,
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("foreign-data wrapper \"%s\" has no handler", NameStr(fdwform->fdwname))));
@@ -872,33 +908,6 @@ DefElem* GetForeignTableOptionByName(Oid reloid, const char* optname)
     return NULL;
 }
 
-HdfsFdwOptions* HdfsGetOptions(Oid foreignTableId)
-{
-    HdfsFdwOptions* hdfsFdwOptions = NULL;
-    char* address = NULL;
-    List* AddrList = NULL;
-
-    hdfsFdwOptions = (HdfsFdwOptions*)palloc0(sizeof(HdfsFdwOptions));
-    hdfsFdwOptions->filename = HdfsGetOptionValue(foreignTableId, OPTION_NAME_FILENAMES);
-    hdfsFdwOptions->foldername = HdfsGetOptionValue(foreignTableId, OPTION_NAME_FOLDERNAME);
-    hdfsFdwOptions->location = HdfsGetOptionValue(foreignTableId, OPTION_NAME_LOCATION);
-
-    address = HdfsGetOptionValue(foreignTableId, OPTION_NAME_ADDRESS);
-
-    if (NULL != address) {
-        if (T_HDFS_SERVER == getServerType(foreignTableId)) {
-            CheckGetServerIpAndPort(address, &AddrList, false, -1);
-            hdfsFdwOptions->address = ((HdfsServerAddress*)linitial(AddrList))->HdfsIp;
-            hdfsFdwOptions->port = atoi(((HdfsServerAddress*)linitial(AddrList))->HdfsPort);
-        } else {
-            /* As for OBS table, only the address is needed. */
-            hdfsFdwOptions->address = address;
-        }
-    }
-
-    return hdfsFdwOptions;
-}
-
 /*
  * @Description: get option DefElem
  * @IN foreignTableId: foreign table oid
@@ -1019,6 +1028,10 @@ ObsOptions* getObsOptions(Oid foreignTableId)
  */
 ServerTypeOption getServerType(Oid foreignTableId)
 {
+    if (!OidIsValid(foreignTableId)) {
+        ereport(ERROR, (errmsg("Invalid foreignTableId is used to get server type."),
+                        errhint("This may be a join relationship, or has aggregation, etc.")));
+    }
     char* optionValue = HdfsGetOptionValue(foreignTableId, "type");
     ServerTypeOption srvType = T_INVALID;
 
@@ -1250,20 +1263,6 @@ ObsOptions* setObsSrvOptions(ForeignOptions* fOptions)
 
     rc = memset_s(decrypStr, DEST_CIPHER_LENGTH, 0, DEST_CIPHER_LENGTH);
     securec_check(rc, "\0", "\0");
-
-    return options;
-}
-
-HdfsOptions* setHdfsSrvOptions(ForeignOptions* fOptions)
-{
-    HdfsOptions* options = (HdfsOptions*)palloc0(sizeof(HdfsOptions));
-
-    options->servername = getFTOptionValue(fOptions->fOptions, OPTION_NAME_REMOTESERVERNAME);
-
-    options->format = getFTOptionValue(fOptions->fOptions, OPTION_NAME_FORMAT);
-    if (NULL == options->format) {
-        ereport(ERROR, (errcode(ERRCODE_FDW_ERROR), errmsg("No \"format\" option provided.")));
-    }
 
     return options;
 }
@@ -1569,4 +1568,204 @@ char* rebuildLocationOption(char* regionCode, char* location)
             errmsg("The rebuild region string: %s.", rebuildLocation)));
 
     return rebuildLocation;
+}
+
+void CheckGetServerIpAndPort(const char *Address, List **AddrList, bool IsCheck, int real_addr_max)
+{
+    char *Str = NULL;
+    char *Delimiter = NULL;
+    char *SeparaterStr = NULL;
+    char *tmp_token = NULL;
+    HdfsServerAddress *ServerAddress = NULL;
+    int addressCounter = 0;
+    int addressMaxNum = (real_addr_max == -1 ? 2 : real_addr_max);
+    errno_t rc = 0;
+
+    Assert(Address != NULL);
+    Str = (char *)palloc0(strlen(Address) + 1);
+    rc = strncpy_s(Str, strlen(Address) + 1, Address, strlen(Address));
+    securec_check(rc, "\0", "\0");
+
+    /* Frist, check address stirng, the ' ' could not exist */
+    if (strstr(Str, " ") != NULL) {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("The address option exists illegal character: \'%c\'", ' ')));
+    }
+
+    if (strlen(Str) == 0) {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("No address is specified for the server.")));
+    }
+
+    /* Check the address string, the first and last character could not be a character ',' */
+    if (Str[strlen(Str) - 1] == ',' || *Str == ',') {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("The address option exists illegal character: \'%c\'", ',')));
+    }
+
+    /* Now, we obtain ip string and port string */
+    /* Separater Str use a ',' delimiter, for example xx.xx.xx.xx:xxxx,xx.xx.xx.xx:xxxx */
+    Delimiter = ",";
+    SeparaterStr = strtok_r(Str, Delimiter, &tmp_token);
+    while (SeparaterStr != NULL) {
+        char *AddrPort = NULL;
+        int PortLen = 0;
+
+        if (++addressCounter > addressMaxNum) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                     errmsg("The count of address \"%s\" must be not greater than %d.", Address, addressMaxNum)));
+        }
+
+        /* Judge ipv6 format or ipv4 format,like fe80::7888:bf24:e381:27:25000 */
+        if (strstr(SeparaterStr, "::") != NULL) {
+            ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                            errmsg("Unsupport ipv6 foramt")));
+        } else if ((AddrPort = strstr(SeparaterStr, ":")) != NULL) {
+            /* Deal with ipv4 format, like xx.xx.xx.xx:xxxx
+             * Get SeparaterStr is "xx.xx.xx.xx" and AddrPort is xxxx.
+             * Because the original SeparaterStr transform "xx.xx.xx.xx\0xxxxx"
+             */
+            *AddrPort++ = '\0';
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                            errmsg("The incorrect address format")));
+        }
+
+        /* Check ip validity  */
+        (void)DirectFunctionCall1(inet_in, CStringGetDatum(SeparaterStr));
+
+        /* Check port validity */
+        if (AddrPort != NULL) {
+            PortLen = strlen(AddrPort);
+        }
+        if (PortLen != 0) {
+            char *PortStr = AddrPort;
+            while (*PortStr) {
+                if (isdigit(*PortStr)) {
+                    PortStr++;
+                } else {
+                    ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                                    errmsg("The address option exists illegal character: \'%c\'", *PortStr)));
+                }
+            }
+            int portVal = pg_strtoint32(AddrPort);
+            if (portVal > 65535) {
+                ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                                errmsg("The port value is out of range: \'%s\'", AddrPort)));
+            }
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                            errmsg("The incorrect address format")));
+        }
+
+        /* If IsCheck is false, get port and ip, Otherwise, only check validity of ip and port. */
+        if (!IsCheck) {
+            ServerAddress = (HdfsServerAddress *)palloc0(sizeof(HdfsServerAddress));
+            ServerAddress->HdfsIp = SeparaterStr;
+            ServerAddress->HdfsPort = AddrPort;
+            *AddrList = lappend(*AddrList, ServerAddress);
+        }
+
+        SeparaterStr = strtok_r(NULL, Delimiter, &tmp_token);
+    }
+}
+
+
+void CheckFoldernameOrFilenamesOrCfgPtah(const char *OptStr, char *OptType)
+{
+    const char *Errorchar = NULL;
+    char BeginChar;
+    char EndChar;
+    uint32 i = 0;
+
+    Assert(OptStr != NULL);
+    Assert(OptType != NULL);
+
+    /* description: remove the hdfs info. */
+    if (strlen(OptStr) == 0) {
+        if (pg_strncasecmp(OptType, OPTION_NAME_FOLDERNAME, NAMEDATALEN) == 0) {
+            ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                            errmsg("No folder path is specified for the foreign table.")));
+        } else if (pg_strncasecmp(OptType, OPTION_NAME_FILENAMES, NAMEDATALEN) == 0) {
+            ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                            errmsg("No file path is specified for the foreign table.")));
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                            errmsg("No hdfscfg path is specified for the server.")));
+        }
+    }
+    size_t optStrLen = strlen(OptStr);
+    for (i = 0; i < optStrLen; i++) {
+        if (OptStr[i] == ' ') {
+            if (i == 0 || (i - 1 > 0 && OptStr[i - 1] != '\\')) {
+                ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                                errmsg("There is an illegal character \'%c\' in the option %s.", OptStr[i], OptType)));
+            }
+        }
+    }
+    BeginChar = *OptStr;
+    EndChar = *(OptStr + strlen(OptStr) - 1);
+    if (BeginChar == ',' || EndChar == ',') {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("There is an illegal character \'%c\' in the option %s.", ',', OptType)));
+    }
+    if (0 == pg_strcasecmp(OptType, OPTION_NAME_FILENAMES) && EndChar == '/') {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("The option %s should not be end with \'%c\'.", OptType, EndChar)));
+    }
+
+    Errorchar = strstr(OptStr, ",");
+    if (Errorchar && 0 == pg_strcasecmp(OptType, OPTION_NAME_FOLDERNAME)) {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("Only a folder path is allowed for the foreign table.")));
+    }
+    if (Errorchar && 0 == pg_strcasecmp(OptType, OPTION_NAME_CFGPATH)) {
+        ereport(ERROR, (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmodule(MOD_DFS),
+                        errmsg("Only a hdfscfg path is allowed for the server.")));
+    }
+
+    /*
+     * The path must be an absolute path.
+     */
+    if (!is_absolute_path(OptStr)) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_OBJECT_DEFINITION), errmodule(MOD_DFS),
+                        errmsg("The path \"%s\" must be an absolute path.", OptStr)));
+    }
+}
+
+FDWUpperRelCxt* InitFDWUpperPlan(PlannerInfo* root, RelOptInfo* baseRel, Plan* localPlan)
+{
+    if (baseRel == NULL || baseRel->fdwroutine == NULL ||
+        baseRel->fdwroutine->GetForeignUpperPaths == NULL) {
+        return NULL;
+    }
+
+    if (IS_STREAM_PLAN) {
+        return NULL;
+    }
+
+    FDWUpperRelCxt* ufdwCxt = (FDWUpperRelCxt*)palloc0(sizeof(FDWUpperRelCxt));
+    ufdwCxt->root = root;
+    ufdwCxt->currentRel = baseRel;
+
+    /* these will definitely be used, create it early. */
+    ufdwCxt->spjExtra = (SPJPathExtraData*)palloc0(sizeof(SPJPathExtraData));
+    ufdwCxt->finalExtra = (FinalPathExtraData*)palloc0(sizeof(FinalPathExtraData));
+
+    ufdwCxt->spjExtra->targetList = localPlan->targetlist;
+    AdvanceFDWUpperPlan(ufdwCxt, UPPERREL_INIT, localPlan);
+
+    return ufdwCxt;
+}
+
+void AdvanceFDWUpperPlan(FDWUpperRelCxt* ufdwCxt, UpperRelationKind stage, Plan* localPlan)
+{
+    if (ufdwCxt->currentRel == NULL || ufdwCxt->currentRel->fdwroutine == NULL ||
+        ufdwCxt->currentRel->fdwroutine->GetForeignUpperPaths == NULL) {
+        ufdwCxt->state = FDW_UPPER_REL_END;
+        return;
+    }
+
+    ufdwCxt->currentRel->fdwroutine->GetForeignUpperPaths(ufdwCxt, stage, localPlan);
 }

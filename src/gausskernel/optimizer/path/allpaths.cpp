@@ -65,7 +65,7 @@ const int max_parallel_maintenance_workers = 32;
 
 static bool check_func_walker(Node* node, bool* found);
 static bool check_func(Node* node);
-static void set_base_rel_sizes(PlannerInfo* root);
+
 static void set_base_rel_pathlists(PlannerInfo* root);
 static void set_correlated_rel_pathlist(PlannerInfo* root, RelOptInfo* rel);
 static void set_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti, RangeTblEntry* rte);
@@ -305,7 +305,7 @@ RelOptInfo* make_one_rel(PlannerInfo* root, List* joinlist)
  * We do this in a separate pass over the base rels so that rowcount
  * estimates are available for parameterized path generation.
  */
-static void set_base_rel_sizes(PlannerInfo* root)
+extern void set_base_rel_sizes(PlannerInfo* root, bool onlyRelatinalTable)
 {
     int rti;
 
@@ -322,7 +322,12 @@ static void set_base_rel_sizes(PlannerInfo* root)
         if (rel->reloptkind != RELOPT_BASEREL)
             continue;
 
-        set_rel_size(root, rel, rti, root->simple_rte_array[rti]);
+        RangeTblEntry *tbl = root->simple_rte_array[rti];
+        if (onlyRelatinalTable && tbl->rtekind != RTE_RELATION) {
+            continue;
+        }
+
+        set_rel_size(root, rel, rti, tbl);
 
         /* Try inlist2join optimization */
         inlist2join_qrw_optimization(root, rti);
@@ -561,7 +566,7 @@ static void set_base_rel_pathlists(PlannerInfo* root)
                     Cost rescan_startup_cost;
                     Cost rescan_total_cost;
 
-                    if (check_param_expr((Node*)(rel->reltargetlist))) {
+                    if (check_param_expr((Node*)(rel->reltarget->exprs))) {
                         ereport(ERROR,
                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                 errmsg("Unsupported param cross stream")));
@@ -859,17 +864,37 @@ static void set_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti, Rang
 #endif
 }
 
-static void SetPlainReSizeWithPruningRatio(RelOptInfo *rel, double pruningRatio)
+static void SetPlainReSizeWithPruningRatio(RelOptInfo *rel, double pruningRatio, PlannerInfo* root)
 {
     ListCell *cell = NULL;
     IndexOptInfo *index = NULL;
+    RangeTblEntry *rte = root->simple_rte_array[rel->relid];
 
     Assert(rel->isPartitionedTable);
-    rel->pages = clamp_row_est(rel->pages * pruningRatio);
+    double pruningPages = clamp_row_est(rel->pages * pruningRatio);
+
+    ereport(DEBUG2, (errmodule(MOD_OPT),
+                     errmsg("Computing partition table relpages: %s, Pre-Pruning Pages: %lf,  pruningRatio: %lf, Pages "
+                            "after pruning: %lf",
+                            rte->relname, rel->pages, pruningRatio, pruningPages)));
+
+    rel->pages = pruningPages;
 
     foreach (cell, rel->indexlist){
         index = (IndexOptInfo *) lfirst(cell);
-        index->pages = clamp_row_est(index->pages * pruningRatio);
+        double indexPages = index->pages;
+        if (u_sess->attr.attr_sql.partition_page_estimation) {
+            if (!index->isGlobal) {
+                index->pages = clamp_row_est(index->pages * pruningRatio);
+            }
+        } else {
+            index->pages = clamp_row_est(index->pages * pruningRatio);
+        }
+        ereport(DEBUG2,
+                (errmodule(MOD_OPT),
+                 errmsg("Computing partition index relpages: %s, Pre-Pruning Pages: %lf,  pruningRatio: %lf, Pages "
+                        "after pruning: %lf",
+                        get_rel_name(index->indexoid), indexPages, pruningRatio, index->pages)));
     }
 }
 
@@ -878,20 +903,23 @@ static void SetPlainReSizeWithPruningRatio(RelOptInfo *rel, double pruningRatio)
  */
 static bool IsPbeSinglePartition(Relation rel, RelOptInfo* relInfo)
 {
-    if (relInfo->pruning_result->paramArg == NULL) {
+    if (relInfo->pruning_result->paramArg == NULL || relInfo->pruning_result->paramArg->paramkind != PARAM_EXTERN) {
+        relInfo->pruning_result->isPbeSinlePartition = false;
         return false;
     }
     if (RelationIsSubPartitioned(rel)) {
+        relInfo->pruning_result->isPbeSinlePartition = false;
         return false;
     }
-    if (rel->partMap->type != PART_TYPE_RANGE) {
-        return false;
+    if (rel->partMap->type == PART_TYPE_RANGE || rel->partMap->type == PART_TYPE_INTERVAL) {
+        RangePartitionMap *partMap = (RangePartitionMap *)rel->partMap;
+        int partKeyNum = partMap->partitionKey->dim1;
+        if (partKeyNum > 1) {
+            relInfo->pruning_result->isPbeSinlePartition = false;
+            return false;
+        }
     }
-    RangePartitionMap* partMap = (RangePartitionMap*)rel->partMap;
-    int partKeyNum = partMap->partitionKey->dim1;
-    if (partKeyNum > 1) {
-        return false;
-    }
+
     if (relInfo->pruning_result->isPbeSinlePartition) {
         return true;
     }
@@ -910,13 +938,10 @@ static void set_plain_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry
         double pruningRatio = 1.0;
 
         /* get pruning result */
-        if (rte->isContainPartition) {
-            rel->pruning_result = singlePartitionPruningForRestrictInfo(rte->partitionOid, relation);
-        } else if (rte->isContainSubPartition) {
-            rel->pruning_result =
-                SingleSubPartitionPruningForRestrictInfo(rte->subpartitionOid, relation, rte->partitionOid);
-        } else {
+        if (rte->partitionOidList == NIL) {
             rel->pruning_result = partitionPruningForRestrictInfo(root, rte, relation, rel->baserestrictinfo);
+        } else {
+            rel->pruning_result = PartitionPruningForPartitionList(rte, relation);
         }
 
         Assert(rel->pruning_result);
@@ -929,10 +954,29 @@ static void set_plain_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry
             bms_num_members(rel->pruning_result->intervalSelectedPartitions);
         }
 
-
-        if (relation->partMap != NULL && PartitionMapIsRange(relation->partMap)) {
-            RangePartitionMap *partMmap = (RangePartitionMap *)relation->partMap;
-            pruningRatio = (double)rel->partItrs / partMmap->rangeElementsNum;
+        if (u_sess->attr.attr_sql.partition_page_estimation) {
+            /* If pruning exists in the partition, estimate the number of pages in the partition after pruning. */
+            if (relation->partMap != NULL && rel->pruning_result != NULL) {
+                int partItrs = 0;
+                int nparts = 0;
+                if (RelationIsSubPartitioned(relation)) {
+                    ListCell *cell = NULL;
+                    foreach (cell, rel->pruning_result->ls_selectedSubPartitions) {
+                        SubPartitionPruningResult *subPartPruningResult = (SubPartitionPruningResult *)lfirst(cell);
+                        partItrs += bms_num_members(subPartPruningResult->bm_selectedSubPartitions);
+                    }
+                    nparts = GetSubPartitionNumber(relation);
+                } else {
+                    partItrs = rel->partItrs;
+                    nparts = getPartitionNumber(relation->partMap);
+                }
+                pruningRatio = 1.0 * partItrs / nparts;
+            }
+        } else {
+            if (relation->partMap != NULL && PartitionMapIsRange(relation->partMap)) {
+                RangePartitionMap *partMmap = (RangePartitionMap *)relation->partMap;
+                pruningRatio = (double)rel->partItrs / partMmap->rangeElementsNum;
+            }
         }
 
         heap_close(relation, NoLock);
@@ -941,7 +985,7 @@ static void set_plain_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry
          * refresh pages/tuples since executor will skip some page
          * scan with pruning info
          */
-        SetPlainReSizeWithPruningRatio(rel, pruningRatio);
+        SetPlainReSizeWithPruningRatio(rel, pruningRatio, root);
     }
     /*
      * Test any partial indexes of rel for applicability.  We must do this
@@ -952,16 +996,6 @@ static void set_plain_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry
     if (rte->tablesample == NULL) {
         /* Mark rel with estimated output rows, width, etc */
         set_baserel_size_estimates(root, rel);
-
-        /*
-         * Check to see if we can extract any restriction conditions from join
-         * quals that are OR-of-AND structures.  If so, add them to the rel's
-         * restriction list, and redo the above steps.
-         */
-        if (create_or_index_quals(root, rel)) {
-            check_partial_indexes(root, rel);
-            set_baserel_size_estimates(root, rel);
-        }
     } else {
         /* Sampled relation */
         set_tablesample_rel_size(root, rel, rte);
@@ -1128,7 +1162,7 @@ static void set_plain_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblE
                             rel->baserestrictinfo = lappend(rel->baserestrictinfo, restrict);
                     }
                 }
-                if (vector_engine_unsupport_expression_walker((Node*)rel->reltargetlist))
+                if (vector_engine_unsupport_expression_walker((Node*)rel->reltarget->exprs))
                     has_vecengine_unsupport_expr = true;
 
                 if (rel->orientation == REL_TIMESERIES_ORIENTED) {
@@ -1180,9 +1214,6 @@ static void set_plain_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblE
                 (errmodule(MOD_OPT),
                     errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
                     errmsg("could not open relation with OID %u", relId)));
-        }
-        if (RelationIsDfsStore(relation)) {
-            rte->inh = true;
         }
 
         RelationClose(relation);
@@ -1434,30 +1465,33 @@ static void set_append_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, R
         /*
          * CE failed, so finish copying/modifying targetlist and join quals.
          *
-         * Note: the resulting childrel->reltargetlist may contain arbitrary
-         * expressions, which normally would not occur in a reltargetlist.
+         * Note: the resulting childrel->reltarget->exprs may contain arbitrary
+         * expressions, which normally would not occur in a rel's targetlist.
          * That is okay because nothing outside of this routine will look at
-         * the child rel's reltargetlist.  We do have to cope with the case
+         * the child rel's targetlist.  We do have to cope with the case
          * while constructing attr_widths estimates below, though.
+         * Normally, a rel's targetlist would only include Vars and
+		 * PlaceHolderVars.)  XXX we do not bother to update the cost or width
+		 * fields of childrel->reltarget; not clear if that would be useful.
          */
         childrel->joininfo = (List*)adjust_appendrel_attrs(root, (Node*)rel->joininfo, appinfo);
-        childrel->reltargetlist = (List*)adjust_appendrel_attrs(root, (Node*)rel->reltargetlist, appinfo);
+        childrel->reltarget->exprs = (List*)adjust_appendrel_attrs(root, (Node*)rel->reltarget->exprs, appinfo);
 
         /*
          * When childrel's targetlist got changed, we should adjust itersting
          * keys accrodingly
          */
         if (childRTE->subquery != NULL) {
-            Assert(list_length(childrel->reltargetlist) == list_length(rel->reltargetlist));
+            Assert(list_length(childrel->reltarget->exprs) == list_length(rel->reltarget->exprs));
             childrel->rel_dis_keys.matching_keys =
                 (List*)replace_node_clause((Node*)childrel->rel_dis_keys.matching_keys,
-                    (Node*)rel->reltargetlist,
-                    (Node*)childrel->reltargetlist,
+                    (Node*)rel->reltarget->exprs,
+                    (Node*)childrel->reltarget->exprs,
                     RNC_COPY_NON_LEAF_NODES);
             childrel->rel_dis_keys.superset_keys =
                 (List*)replace_node_clause((Node*)childrel->rel_dis_keys.superset_keys,
-                    (Node*)rel->reltargetlist,
-                    (Node*)childrel->reltargetlist,
+                    (Node*)rel->reltarget->exprs,
+                    (Node*)childrel->reltarget->exprs,
                     RNC_COPY_NON_LEAF_NODES);
         }
 
@@ -1504,7 +1538,7 @@ static void set_append_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, R
         parent_global_rows += childrel->rows;
         parent_tuples += RELOPTINFO_LOCAL_FIELD(root, childrel, tuples);
         parent_global_tuples += childrel->tuples;
-        parent_size += childrel->width * RELOPTINFO_LOCAL_FIELD(root, childrel, rows);
+        parent_size += childrel->reltarget->width * RELOPTINFO_LOCAL_FIELD(root, childrel, rows);
 
         /*
          * Accumulate per-column estimates too.  We need not do anything
@@ -1512,9 +1546,9 @@ static void set_append_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, R
          * isn't a Var, or we didn't record a width estimate for it, we
          * have to fall back on a datatype-based estimate.
          *
-         * By construction, child's reltargetlist is 1-to-1 with parent's.
+         * By construction, child's reltarget is 1-to-1 with parent's.
          */
-        forboth(parentvars, rel->reltargetlist, childvars, childrel->reltargetlist)
+        forboth(parentvars, rel->reltarget->exprs, childvars, childrel->reltarget->exprs)
         {
             Var* parentvar = (Var*)lfirst(parentvars);
             Node* childvar = (Node*)lfirst(childvars);
@@ -1548,7 +1582,7 @@ static void set_append_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, R
         parent_global_tuples = clamp_row_est(parent_global_tuples);
 
         rel->rows = parent_global_rows;
-        rel->width = (int)rint(parent_size / parent_rows);
+        rel->reltarget->width = (int)rint(parent_size / parent_rows);
         for (i = 0; i < nattrs; i++)
             rel->attr_widths[i] = (int32)rint(parent_attrsizes[i] / parent_rows);
 
@@ -2157,7 +2191,7 @@ static void set_dummy_rel_pathlist(RelOptInfo* rel)
     rel->tuples = 1;
     /* Set dummy size estimates --- we leave attr_widths[] as zeroes */
     rel->rows = 0;
-    rel->width = 0;
+    rel->reltarget->width = 0;
 
     /* Discard any pre-existing paths; no further need for them */
     rel->pathlist = NIL;
@@ -2190,6 +2224,15 @@ static bool has_multiple_baserels(PlannerInfo* root)
     return false;
 }
 
+static bool has_rownum(Query* query)
+{
+    if (query == NULL) {
+        return false;
+    }
+
+    return expression_contains_rownum((Node*)query->targetList);
+}
+
 static bool can_push_qual_into_subquery(PlannerInfo* root,
                                                 RestrictInfo* rinfo,
                                                 RangeTblEntry* rte,
@@ -2212,6 +2255,10 @@ static bool can_push_qual_into_subquery(PlannerInfo* root,
     }
 
     if (!qual_pushdown_in_partialpush(root->parse, subquery, clause)){
+        return false;
+    }
+
+    if (has_rownum(subquery)) {
         return false;
     }
 
@@ -2962,7 +3009,7 @@ static void set_cte_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* 
                 bool found = false;
                 int resno = lfirst_int(cell1);
 
-                foreach (cell2, rel->reltargetlist) {
+                foreach (cell2, rel->reltarget->exprs) {
                     Var* relvar = locate_distribute_var((Expr*)lfirst(cell2));
 
                     if (relvar != NULL && relvar->varattno == resno) {
@@ -3450,7 +3497,8 @@ static void check_output_expressions(Query* subquery, bool* unsafeColumns)
             continue;
 
         /* Functions returning sets are unsafe (point 1) */
-        if (expression_returns_set((Node*)tle->expr)) {
+        if (expression_returns_set((Node*)tle->expr) ||
+            (subquery->hasTargetSRFs && expression_returns_set((Node*)tle->expr))) {
             unsafeColumns[tle->resno] = true;
             continue;
         }
@@ -3680,7 +3728,8 @@ static void subquery_push_qual(Query* subquery, RangeTblEntry* rte, Index rti, N
          */
         if (levelsup == 0)
         {
-            qual = ResolveNew(qual, rti, 0, rte, subquery->targetList, CMD_SELECT, 0, &subquery->hasSubLinks);
+            qual = ReplaceVarsFromTargetList(qual, rti, 0, rte, subquery->targetList, REPLACEVARS_REPORT_ERROR,
+                                             0, &subquery->hasSubLinks);
         }
         else
         {
@@ -3768,9 +3817,17 @@ static void make_partiterator_pathkey(
         return;
     }
 
+    if (RelationIsSubPartitioned(relation)) {
+        return;
+    }
+
     if (rel->partItrs <= 1) {
         /* inherit pathkeys if pruning result is <= 1 */
         itrpath->path.pathkeys = pathkeys;
+        return;
+    }
+
+    if (relation->partMap->type != PART_TYPE_RANGE && relation->partMap->type != PART_TYPE_INTERVAL) {
         return;
     }
 
@@ -4031,6 +4088,7 @@ static Path* create_partiterator_path(PlannerInfo* root, RelOptInfo* rel, Path* 
             itrpath->subPath = path;
             itrpath->path.pathtype = T_PartIterator;
             itrpath->path.parent = rel;
+            itrpath->path.pathtarget = rel->reltarget;
             itrpath->path.param_info = path->param_info;
             itrpath->path.pathkeys = NIL;
             itrpath->itrs = rel->partItrs;
@@ -4038,6 +4096,8 @@ static Path* create_partiterator_path(PlannerInfo* root, RelOptInfo* rel, Path* 
             itrpath->path.startup_cost = path->startup_cost;
             itrpath->path.total_cost = path->total_cost;
             itrpath->path.dop = path->dop;
+            itrpath->partType = relation->partMap->type;
+            itrpath->path.hint_value = path->hint_value;
 
             /* scan parttition from lower boundary to upper boundary by default */
             itrpath->direction = ForwardScanDirection;

@@ -17,13 +17,14 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "access/dfs/dfs_insert.h"
 #include "access/sysattr.h"
+#include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/gs_db_privilege.h"
 #include "catalog/gs_encrypted_proc.h"
 #include "catalog/gs_matview.h"
+#include "catalog/gs_matview_dependency.h"
 #include "catalog/gs_model.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -43,6 +44,7 @@
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_directory.h"
+#include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
@@ -87,6 +89,7 @@
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/matview.h"
 #include "commands/proclang.h"
@@ -110,6 +113,7 @@
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/palloc.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
 #include "datasource/datasource.h"
@@ -156,9 +160,9 @@ static const Oid object_classes[MAX_OCLASS] = {
     PgJobRelationId,                 /* OCLASS_PG_JOB */
     PublicationRelationId,           /* OCLASS_PUBLICATION */
     PublicationRelRelationId,        /* OCLASS_PUBLICATION_REL */
-    SubscriptionRelationId           /* OCLASS_SUBSCRIPTION */
+    SubscriptionRelationId,           /* OCLASS_SUBSCRIPTION */
+    EventTriggerRelationId,          /* OCLASS_EVENT_TRIGGER */
 #ifdef PGXC
-    ,
     PgxcClassRelationId /* OCLASS_PGXCCLASS */
 #endif
 
@@ -182,9 +186,143 @@ static bool object_address_present_add_flags(const ObjectAddress* object, int fl
 static bool stack_address_present_add_flags(const ObjectAddress* object, int flags, ObjectAddressStack* stack);
 static void getRelationDescription(StringInfo buffer, Oid relid);
 static void getOpFamilyDescription(StringInfo buffer, Oid opfid);
-static void PreCheckForDfsTable(ObjectAddresses* targetObjects);
+static void MarkMlogColumnAsInvalidOid(ObjectAddresses* addresses);
+
 extern char* pg_get_viewdef_worker(Oid viewoid, int prettyFlags, int wrapColumn);
 extern char* pg_get_functiondef_worker(Oid funcid, int* headerlines);
+
+ /*
+  * Go through the objects given running the final actions on them, and execute
+  * the actual deletion.
+  */
+static void deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
+                    int flags)
+{
+    int i;
+ 
+    /*
+     * Keep track of objects for event triggers, if necessary.
+     */
+    if (trackDroppedObjectsNeeded()) {
+        for (i = 0; i < targetObjects->numrefs; i++) {
+            const ObjectAddress *thisobj = &targetObjects->refs[i];
+            const ObjectAddressExtra *extra = &targetObjects->extras[i];
+            bool original = false;
+            bool normal = false;
+ 
+            if (extra->flags & DEPFLAG_ORIGINAL)
+                original = true;
+            if (extra->flags & DEPFLAG_NORMAL)
+                normal = true;
+            if (extra->flags & DEPFLAG_REVERSE)
+                normal = true;
+            
+            if (EventTriggerSupportsObjectClass(getObjectClass(thisobj))) {
+                EventTriggerSQLDropAddObject(thisobj, original, normal);
+            }
+        }
+    }
+ 
+    MarkMlogColumnAsInvalidOid(targetObjects);
+
+    /*
+     * Delete all the objects in the proper order.
+     */
+    for (i = 0; i < targetObjects->numrefs; i++) {
+        ObjectAddress *thisobj = targetObjects->refs + i;
+        if (thisobj->objectId != InvalidOid) {
+            deleteOneObject(thisobj, depRel, flags);
+        }
+    }
+}
+
+static bool IsBaseTableInTargets(ObjectAddresses* addresses, Oid baseTblOid)
+{
+    for (int i = 0; i < addresses->numrefs; i++) {
+        ObjectAddress* addr = addresses->refs + i;
+        if (addr->objectId == baseTblOid &&
+            addr->objectSubId == 0) {
+                return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * In the scenario of cascading deletion of tables, anonymous types will be 
+ * associated with deleting fields from the mlog table, resulting in conflicts
+ * with deleting the mlog table when deleting the materialized view. 
+ * Therefore, the associated field deletion operation is marked as invalid, 
+ * and it will not be deleted separately for subsequent deletions
+ */
+static void MarkMlogColumnAsInvalidOid(ObjectAddresses* addresses)
+{
+    /* at least 3 OIDs: a table, a type, and a materialized view.
+     * otherwise, is's unnecessary to check.
+     */
+    const int checkThreshould = 3;
+    if (!addresses || addresses->numrefs < checkThreshould) {
+        return;
+    }
+
+    ArrayOid mlogOids;
+    mlogOids.count = 0;
+    mlogOids.values = (Oid*)palloc0(addresses->numrefs * sizeof(Oid));
+
+    /* get mlog oids */
+    Relation relation = heap_open(MatviewDependencyId, AccessShareLock);
+    for (int i = 0; i < addresses->numrefs; i++) {
+        ObjectAddress* addr = addresses->refs + i;
+        if (addr->objectSubId != 0 ||
+            get_rel_relkind(addr->objectId) != RELKIND_MATVIEW) {
+            continue;
+        }
+
+        /* find mlog oids */
+        TableScanDesc scan;
+        ScanKeyData scanKey;
+        HeapTuple tup = NULL;
+        ScanKeyInit(&scanKey,
+                    Anum_gs_matview_dep_matviewid,
+                    BTEqualStrategyNumber,
+                    F_OIDEQ,
+                    ObjectIdGetDatum(addr->objectId));
+        scan = tableam_scan_begin(relation, SnapshotNow, 1, &scanKey);
+        tup = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+        if (tup != NULL) {
+            Form_gs_matview_dependency matviewDepForm = (Form_gs_matview_dependency)GETSTRUCT(tup);
+            if (IsBaseTableInTargets(addresses, matviewDepForm->relid)) {
+                mlogOids.values[mlogOids.count++] = matviewDepForm->mlogid;
+            }
+        }
+
+        tableam_scan_end(scan);
+    }
+    heap_close(relation, NoLock);
+
+    if (mlogOids.count == 0) {
+        pfree(mlogOids.values);
+        return;
+    }
+
+    /* mark mlog table's columns oids */
+    for (int addrIdx = 0; addrIdx < addresses->numrefs; addrIdx++) {
+        ObjectAddress* addr = addresses->refs + addrIdx;
+        if (addr->classId != RelationRelationId ||
+            addr->objectSubId == 0) {
+            continue; /* is not a table's column */
+        }
+
+        for (int mlogIdx = 0; mlogIdx < mlogOids.count; mlogIdx++) {
+            if (addr->objectId == mlogOids.values[mlogIdx]) {
+                addr->objectId = InvalidOid;
+                break;
+            }
+        }
+    }
+
+    pfree(mlogOids.values);
+}
 
 /*
  * performDeletion: attempt to drop the specified object.  If CASCADE
@@ -204,12 +342,14 @@ extern char* pg_get_functiondef_worker(Oid funcid, int* headerlines);
  * a column default is dropped as an intermediate step while adding a new one,
  * that's an internal operation.  On the other hand, when the we drop something
  * because the user issued a DROP statement against it, that's not internal.
+ * 
+ * PERFORM_DELETION_CONCURRENT_LOCK: perform the drop normally but with a lock
+ * as if it were concurrent. This is used by REINDEX CONCURRENTLY
  */
 void performDeletion(const ObjectAddress* object, DropBehavior behavior, int flags)
 {
     Relation depRel;
     ObjectAddresses* targetObjects = NULL;
-    int i;
 
     /*
      * We save some cycles by opening pg_depend just once and passing the
@@ -247,80 +387,14 @@ void performDeletion(const ObjectAddress* object, DropBehavior behavior, int fla
         /*
         * Delete all the objects in the proper order.
         */
-        for (i = 0; i < targetObjects->numrefs; i++) {
-            ObjectAddress *thisobj = targetObjects->refs + i;
-
-            deleteOneObject(thisobj, &depRel, flags);
-        }
+        /* do the deed */
+        deleteObjectsInList(targetObjects, &depRel, flags);
     }
 
     /* And clean up */
     free_object_addresses(targetObjects);
 
     heap_close(depRel, RowExclusiveLock);
-}
-
-/*
- * Don't allow "drop DFS table" to run inside a transaction block.
- *
- * "DfsDDLIsTopLevelXact" is set in "case T_DropStmt" of
- * standard_ProcessUtility()
- *
- * exception: allow "DROP DFS TABLE" operation in transaction block
- * during redis a table.
- */
-static void PreCheckForDfsTable(ObjectAddresses* targetObjects)
-{
-    if (IS_PGXC_COORDINATOR && !IsConnFromCoord() && false == u_sess->attr.attr_sql.enable_cluster_resize) {
-        for (int i = 0; i < targetObjects->numrefs; i++) {
-            ObjectAddress* thisobj = targetObjects->refs + i;
-
-            if (RelationRelationId == thisobj->classId) {
-                char relKind = get_rel_relkind(thisobj->objectId);
-
-                if (relKind != RELKIND_INDEX && 0 == thisobj->objectSubId) {
-                    if (RelationIsPaxFormatByOid(thisobj->objectId))
-                        PreventTransactionChain(u_sess->exec_cxt.DfsDDLIsTopLevelXact, "DROP DFS TABLE");
-                }
-            }
-        }
-    }
-}
-
-static void PreDropForDfsTable(ObjectAddresses* targetObjects)
-{
-    if (!(IS_PGXC_DATANODE))
-        return;
-
-    for (int i = 0; i < targetObjects->numrefs; i++) {
-        ObjectAddress* thisobj = targetObjects->refs + i;
-
-        if (RelationRelationId == thisobj->classId) {
-            char relKind = get_rel_relkind(thisobj->objectId);
-
-            if (relKind != RELKIND_INDEX && 0 == thisobj->objectSubId) {
-                Oid relid = thisobj->objectId;
-                Relation rel;
-
-                if (!OidIsValid(relid))
-                    continue;
-
-                // open relation
-                rel = try_relation_open(relid, AccessShareLock);
-                if (NULL == rel)
-                    continue;
-
-                // check DFS table
-                if (RelationIsPAXFormat(rel)) {
-                    // get DFS file name,  DFS file size from DFSDESC
-                    DFSDescHandler handler(MAX_LOADED_DFSDESC, rel->rd_att->natts, rel);
-                    SaveDfsFilelist(rel, &handler);
-                }
-
-                relation_close(rel, AccessShareLock);
-            }
-        }
-    }
 }
 
 /*
@@ -404,30 +478,15 @@ void performMultipleDeletions(const ObjectAddresses* objects, DropBehavior behav
         reportDependentObjects(targetObjects, behavior, NOTICE, ((objects->numrefs == 1) ? objects->refs : NULL));
     }
 
-    /*
-     * Don't allow "drop DFS table" to run inside a transaction block.
-     *
-     * "DfsDDLIsTopLevelXact" is set in "case T_DropStmt" of
-     * standard_ProcessUtility()
-     */
-    PreCheckForDfsTable(targetObjects);
-
-    /*
-     * write down the delete file name and size for DFS table
-     * must called after the all delete objects are locked.
-     */
-    PreDropForDfsTable(targetObjects);
-
     MemoryContext oldCxt = CurrentMemoryContext;
     MemoryContext objDelCxt = AllocSetContextCreate(CurrentMemoryContext, "ObjectDeleteContext", ALLOCSET_SMALL_MINSIZE,
                                                     ALLOCSET_SMALL_INITSIZE, ALLOCSET_SMALL_MAXSIZE);
     /*
      * Delete all the objects in the proper order.
      */
-    for (i = 0; i < targetObjects->numrefs; i++) {
+    if (i > 0) {
         (void)MemoryContextSwitchTo(objDelCxt);
-        ObjectAddress* thisobj = targetObjects->refs + i;
-        deleteOneObject(thisobj, &depRel, flags);
+        deleteObjectsInList(targetObjects, &depRel, flags);
         MemoryContextReset(objDelCxt);
     }
 
@@ -983,11 +1042,13 @@ void reportDependentObjects(
                                 "cannot drop %s cascadely during upgrade because it may contain user data", objDesc)));
             }
             if (strstr(objDesc, "encrypted column") != NULL) {
+                char* desc = getObjectDescription(&extra->dependee);
                 ereport(ERROR, (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
                     errmsg("cannot drop %s cascadely because encrypted column depend on it.",
-                    getObjectDescription(origObject)),
+                    desc),
                     errhint("we have to drop %s, ... before drop %s cascadely.", objDesc,
-                    getObjectDescription(origObject))));
+                    desc)));
+                pfree_ext(desc);
             }
 
             if (numReportedClient < MAX_REPORTED_DEPS || u_sess->attr.attr_common.IsInplaceUpgrade) {
@@ -1181,9 +1242,10 @@ static void doDeletion(const ObjectAddress* object, int flags)
 
             if (relKind == RELKIND_INDEX || relKind == RELKIND_GLOBAL_INDEX) {
                 bool concurrent = (((uint32)flags & PERFORM_DELETION_CONCURRENTLY) == PERFORM_DELETION_CONCURRENTLY);
+                bool concurrent_lock_mode = (((uint32)flags & PERFORM_DELETION_CONCURRENTLY_LOCK) == PERFORM_DELETION_CONCURRENTLY_LOCK);
 
                 Assert(object->objectSubId == 0);
-                index_drop(object->objectId, concurrent);
+                index_drop(object->objectId, concurrent, concurrent_lock_mode);/*change for index concurrent*/
             } else {
                 /*
                  * relation_open() must be before the heap_drop_with_catalog(). If you reload
@@ -1461,6 +1523,10 @@ static void doDeletion(const ObjectAddress* object, int flags)
         case OCLASS_SYNONYM:
             RemoveSynonymById(object->objectId);
             break;
+        case OCLASS_EVENT_TRIGGER:
+            RemoveEventTriggerById(object->objectId);
+            break;
+
         case OCLASS_DB4AI_MODEL:
             remove_model_by_oid(object->objectId);
             break;
@@ -1673,7 +1739,7 @@ static bool find_expr_references_walker(Node* node, find_expr_references_context
             ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                     errmsg("invalid varlevelsup %u", var->varlevelsup)));
         rtable = (List*)list_nth(context->rtables, var->varlevelsup);
-        if (var->varno <= 0 || var->varno > (Index)list_length(rtable))
+        if (var->varno == 0 || var->varno > (Index)list_length(rtable))
             ereport(ERROR,
                 (errmodule(MOD_OPT), errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid varno %u", var->varno)));
 
@@ -1941,12 +2007,13 @@ static bool find_expr_references_walker(Node* node, find_expr_references_context
          */
         if (query->commandType == CMD_INSERT || query->commandType == CMD_UPDATE) {
             RangeTblEntry* rte = NULL;
+            int resultRelation = linitial_int(query->resultRelations);
 
-            if (query->resultRelation <= 0 || query->resultRelation > list_length(query->rtable))
+            if (resultRelation <= 0 || resultRelation > list_length(query->rtable))
                 ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("invalid resultRelation %d", query->resultRelation)));
+                        errmsg("invalid resultRelation %d", resultRelation)));
 
-            rte = rt_fetch(query->resultRelation, query->rtable);
+            rte = rt_fetch(resultRelation, query->rtable);
             if (rte->rtekind == RTE_RELATION) {
                 foreach (lc, query->targetList) {
                     TargetEntry* tle = (TargetEntry*)lfirst(lc);
@@ -2203,6 +2270,23 @@ void add_exact_object_address(const ObjectAddress* object, ObjectAddresses* addr
     addrs->numrefs++;
 }
 
+void add_type_object_address(List *typOidList, ObjectAddresses* objects)
+{
+    ObjectAddress obj;
+
+    if (typOidList == NULL) {
+        return;
+    }
+
+    foreach_cell(cell, typOidList) {
+        Oid typid = *(Oid *)lfirst(cell);
+        obj.classId = TypeRelationId;
+        obj.objectId = typid;
+        obj.objectSubId = 0;
+        add_exact_object_address(&obj, objects);
+    }
+}
+
 /*
  * Add an entry to an ObjectAddresses array.
  *
@@ -2446,6 +2530,8 @@ ObjectClass getObjectClass(const ObjectAddress* object)
 
         case DbPrivilegeId:
             return OCLASS_DB_PRIVILEGE;
+        case EventTriggerRelationId:
+            return OCLASS_EVENT_TRIGGER;
 
         case ExtensionRelationId:
             return OCLASS_EXTENSION;
@@ -3094,6 +3180,19 @@ char* getObjectDescription(const ObjectAddress* object)
             appendStringInfo(&buffer, _("extension %s"), extname);
             break;
         }
+
+        case OCLASS_EVENT_TRIGGER: {
+            HeapTuple	tup;
+
+            tup = SearchSysCache1(EVENTTRIGGEROID,
+                    ObjectIdGetDatum(object->objectId));
+            if (!HeapTupleIsValid(tup))
+                elog(ERROR, "cache lookup failed for event trigger %u",
+                    object->objectId);
+            appendStringInfo(&buffer, _("event trigger %s"),
+                NameStr(((Form_pg_event_trigger) GETSTRUCT(tup))->evtname));
+            ReleaseSysCache(tup);
+        } break;
 
         case OCLASS_GLOBAL_SETTING:
             get_global_setting_description(&buffer, object);

@@ -341,7 +341,15 @@ int plpgsql_pkg_add_unknown_var_to_namespace(List* name)
     bool isSamePkg = false;
     PLpgSQL_datum* datum = GetPackageDatum(name, &isSamePkg);
     if (datum != NULL) {
-        return plpgsql_build_pkg_variable(name, datum, isSamePkg);
+        /*
+         * The current memory context is temp context, when this function is called by yylex_inparam etc,
+         * so we should swtich to function context.
+         * If add package var, plpgsql_ns_additem will swtich to package context.
+         */
+        MemoryContext oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_cxt);
+        int varno = plpgsql_build_pkg_variable(name, datum, isSamePkg);
+        (void)MemoryContextSwitchTo(oldCxt);
+        return varno;
     } else {
         return -1;
     }
@@ -385,7 +393,7 @@ extern bool plpgsql_check_opexpr_colocate(
             Expr* qual_expr = (Expr*)lfirst(opexpr_cell);
 
             /* Check all opexpr with distribute column */
-            expr = pgxc_check_distcol_opexpr(query->resultRelation, attnum2, (OpExpr*)qual_expr);
+            expr = pgxc_check_distcol_opexpr(linitial_int(query->resultRelations), attnum2, (OpExpr*)qual_expr);
             if (expr == NULL) {
                 is_colocate = false;
                 continue;
@@ -1117,6 +1125,7 @@ PLpgSQL_package* plpgsql_pkg_compile(Oid pkgOid, bool for_validator, bool isSpec
         }
     }
     PLpgSQL_compile_context* save_compile_context = u_sess->plsql_cxt.curr_compile_context;
+    Oid old_value = saveCallFromPkgOid(pkgOid);
     PG_TRY();
     {
         if (!pkg_valid) {
@@ -1173,6 +1182,7 @@ PLpgSQL_package* plpgsql_pkg_compile(Oid pkgOid, bool for_validator, bool isSpec
         ReleaseSysCache(pkg_tup);
         pkg_tup = NULL;
     }
+    restoreCallFromPkgOid(old_value);
     /*
      * Finally return the compiled function
      */

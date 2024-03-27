@@ -11,13 +11,16 @@
 <refsynopsisdiv>
 <synopsis>
 ALTER TABLE [ IF EXISTS ] { table_name  [*] | ONLY table_name | ONLY ( table_name  )}
-    action [, ... ];
+    { action [, ... ] | reset_clause };
 
 where action can be:
+    row_clause    |
     add_clause    |
     drop_clause   |
     split_clause  |
     truncate_clause
+where row_clause can be:
+{ ENABLE | DISABLE } ROW MOVEMENT
 where add_clause can be:
 ADD { partition_less_than_item | partition_list_item } [ ( subpartition_definition_list ) ]
 MODIFY PARTITION partition_name ADD subpartition_definition
@@ -26,7 +29,7 @@ PARTITION partition_name VALUES LESS THAN ( partition_value | MAXVALUE ) [ TABLE
 where partition_list_item can be:
 PARTITION partition_name VALUES ( partition_value [, ...] | DEFAULT ) [ TABLESPACE tablespacename ]
 where subpartition_definition_list can be:
-SUBPARTITION subpartition_name [ VALUES LESS THAN ( partition_value | MAXVALUE ) | VALUES ( partition_value [, ...] | DEFAULT )]  [ TABLESPACE tablespace ]
+SUBPARTITION subpartition_name { VALUES LESS THAN ( partition_value | MAXVALUE ) | VALUES ( partition_value [, ...] | DEFAULT ) }  [ TABLESPACE tablespace ]
 where drop_clause can be:
 DROP PARTITION  { partition_name | FOR (  partition_value )  } [ UPDATE GLOBAL INDEX ]
 DROP SUBPARTITION  { subpartition_name | FOR (  partition_value, subpartition_value )  } [ UPDATE GLOBAL INDEX ]
@@ -37,7 +40,8 @@ AT ( subpartition_value ) INTO ( SUBPARTITION subpartition_name [ TABLESPACE tab
 VALUES ( subpartition_value ) INTO ( SUBPARTITION subpartition_name [ TABLESPACE tablespacename ] , SUBPARTITION subpartition_name [ TABLESPACE tablespacename ] )
 where truncate_clause can be:
 TRUNCATE SUBPARTITION { subpartition_name } [ UPDATE GLOBAL INDEX ]
-NOTICE: 'ALTER TABLE SUBPARTITION' is only avaliable in CENTRALIZED mode!
+where reset_clause can be:
+RESET PARTITION;
 </synopsis>
 </refsynopsisdiv>
 </refentry>

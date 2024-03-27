@@ -695,7 +695,7 @@
 #define PG_VERSION "9.2.4"
 
 /* openGauss version as a string */
-#define OPENGAUSS_VERSION "3.0.0"
+#define OPENGAUSS_VERSION "5.0.1"
 
 /* Gaussdb version as a string*/
 #define DEF_GS_VERSION "(GaussDB A 8.0.0 build 21f07aff) compiled at 2020-03-17 10:59:07 commit 7431 last mr 12039 debug"
@@ -869,6 +869,9 @@
  *    and larger than XLOG_BLCKSZ (preferably, a great deal larger than
  *       XLOG_BLCKSZ). Changing XLOG_SEG_SIZE requires an initdb. */
 #define XLOG_SEG_SIZE (16 * 1024 * 1024)
+
+/* Number of max alloc xlog segment in extreme_rto, default 4 */
+#define MAX_ALLOC_SEGNUM 4
 
 /* Number of bits in a file offset, on hosts where this is settable. */
 /* #undef _FILE_OFFSET_BITS */

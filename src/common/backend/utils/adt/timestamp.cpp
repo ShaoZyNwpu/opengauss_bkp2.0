@@ -35,6 +35,7 @@
 #include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "utils/formatting.h"
+#include "common/int.h"
 
 #ifdef PGXC
 #include "pgxc/pgxc.h"
@@ -251,8 +252,13 @@ Datum timestamp_in(PG_FUNCTION_ARGS)
         dterr = ParseDateTime(str, workbuf, sizeof(workbuf), field, ftype, MAXDATEFIELDS, &nf);
         if (dterr == 0)
             dterr = DecodeDateTime(field, ftype, nf, &dtype, tm, &fsec, &tz);
-        if (dterr != 0)
-            DateTimeParseError(dterr, str, "timestamp");
+        if (dterr != 0) {
+            DateTimeParseError(dterr, str, "timestamp", fcinfo->can_ignore);
+            /*
+             * if error ignorable, function DateTimeParseError reports warning instead, then return current timestamp.
+             */
+            PG_RETURN_TIMESTAMP(GetCurrentTimestamp());
+        }
 
         switch (dtype) {
             case DTK_DATE:
@@ -455,8 +461,11 @@ Datum smalldatetime_in(PG_FUNCTION_ARGS)
             dterr = DecodeDateTime(field, ftype, nf, &dtype, tm, &fsec, &tz);
             fsec = 0;
         }
-        if (dterr != 0)
-            DateTimeParseError(dterr, str, "smalldatetime");
+        if (dterr != 0) {
+            DateTimeParseError(dterr, str, "smalldatetime", fcinfo->can_ignore);
+            /* if error ignorable, return epoch time as result */
+            GetEpochTime(tm);
+        }
         if (tm->tm_sec >= 30) {
             sign = 1;
         }
@@ -767,8 +776,13 @@ Datum timestamptz_in(PG_FUNCTION_ARGS)
     dterr = ParseDateTime(str, workbuf, sizeof(workbuf), field, ftype, MAXDATEFIELDS, &nf);
     if (dterr == 0)
         dterr = DecodeDateTime(field, ftype, nf, &dtype, tm, &fsec, &tz);
-    if (dterr != 0)
-        DateTimeParseError(dterr, str, "timestamp with time zone");
+    if (dterr != 0) {
+        DateTimeParseError(dterr, str, "timestamp with time zone", fcinfo->can_ignore);
+        /*
+         * if error ignorable, function DateTimeParseError reports warning instead, then return current timestamp.
+         */
+        PG_RETURN_TIMESTAMP(GetCurrentTimestamp());
+    }
 
     switch (dtype) {
         case DTK_DATE:
@@ -929,7 +943,7 @@ Datum interval_in(PG_FUNCTION_ARGS)
 #endif
     int32        typmod = PG_GETARG_INT32(2);
     Interval     *result = NULL;
-    result = char_to_interval(str, typmod);
+    result = char_to_interval(str, typmod, fcinfo->can_ignore);
 
     AdjustIntervalForTypmod(result, typmod);
 
@@ -2600,9 +2614,7 @@ Datum interval_justify_interval(PG_FUNCTION_ARGS)
 #else
     TMODULO(result->time, wholeday, (double)SECS_PER_DAY);
 #endif
-    if (MAX_INT32 - result->day > wholeday) {
-        result->day += wholeday;
-    } else {
+    if (pg_add_s32_overflow(result->day, wholeday, &result->day)) {
         ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE), errmsg("timestamp out of range")));
     }
 
@@ -5077,6 +5089,7 @@ struct pg_tm* GetDateDetail(const char* dateString)
 
     strLength = strlen(dateString);
 
+    int decimalPointIndex = -1;
     for (i = 0; i < strLength; i++) {
         if (' ' == dateString[i]) {
             if (spaceCount >= 5) {
@@ -5085,12 +5098,24 @@ struct pg_tm* GetDateDetail(const char* dateString)
             }
             spacePosition[spaceCount] = i;
             spaceCount++;
+        } else if ('.' == dateString[i]) {
+            if (decimalPointIndex != -1) {
+                pfree(tm);
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("the format is not correct")));
+            }
+            decimalPointIndex = i;
         }
     }
     /* there is no space in the date-string*/
     if (0 == spaceCount) {
-        /* assume that the string is this kind of fommat like "19900304123045"*/
-        if (DATE_WITHOUT_SPC_LEN == strLength) {
+        /*
+         * assume that the string is this kind of fommat like "19900304123045",
+         * or like "19900304123045.345" with decimal format of second
+         */
+#define DECIMAL_POINT_INDEX_IN_NO_SPACE_INPUT 14
+        if ((DATE_WITHOUT_SPC_LEN == strLength && decimalPointIndex == -1)
+            /* in condition like '19900304123045.345', make sure decimal point in position behind 'yyyymmddhhminss' */
+            || (DATE_WITHOUT_SPC_LEN < strLength && decimalPointIndex == DECIMAL_POINT_INDEX_IN_NO_SPACE_INPUT)) {
             SplitWholeStrWithoutSeparator(dateString, tm);
         }
         /* there is only specific date in the string but no time information in the string*/
@@ -5107,7 +5132,8 @@ struct pg_tm* GetDateDetail(const char* dateString)
         errno_t rc = strncpy_s(dateStr, DATESTR_LEN, dateString, spacePosition[0]);
         securec_check(rc, "\0", "\0");
         /* get the specific time*/
-        rc = strncpy_s(timeStr, TIMESTR_LEN, dateString + spacePosition[0] + 1, strLength - spacePosition[0]);
+        int count = strLength - spacePosition[0] <= TIMESTR_LEN ? strLength - spacePosition[0] : TIMESTR_LEN - 1;
+        rc = strncpy_s(timeStr, TIMESTR_LEN, dateString + spacePosition[0] + 1, count);
         securec_check(rc, "\0", "\0");
 
         AnalyseDate(dateStr, tm);
@@ -5147,7 +5173,8 @@ void SplitWholeStrWithoutSeparator(const char* dateString, struct pg_tm* tm)
     strLength = strlen(dateString);
 
     for (i = 0; i < strLength; i++) {
-        if (dateString[i] < '0' || dateString[i] > '9') {
+        /* '.' will not count as nonDigit since we are now compatible with input format "19900304123045.345" */
+        if ((dateString[i] < '0' || dateString[i] > '9') && dateString[i] != '.') {
             nonDigitCount++;
         }
     }
@@ -5168,7 +5195,9 @@ void SplitWholeStrWithoutSeparator(const char* dateString, struct pg_tm* tm)
         rc = strncpy_s(minute, UNIT_LEN, dateString + FOUR_DIGIT_LEN + TWO_DIGIT_LEN * 3, TWO_DIGIT_LEN);
         securec_check(rc, "\0", "\0");
         /* get second*/
-        rc = strncpy_s(second, UNIT_LEN, dateString + FOUR_DIGIT_LEN + TWO_DIGIT_LEN * 4, TWO_DIGIT_LEN);
+        int secondLength = (int)strlen(dateString + FOUR_DIGIT_LEN + TWO_DIGIT_LEN * 4);
+        int count = UNIT_LEN <= secondLength ? UNIT_LEN - 1 : secondLength;
+        rc = strncpy_s(second, UNIT_LEN, dateString + FOUR_DIGIT_LEN + TWO_DIGIT_LEN * 4, count);
         securec_check(rc, "\0", "\0");
 
         tm->tm_year = atoi(year);
@@ -5176,7 +5205,7 @@ void SplitWholeStrWithoutSeparator(const char* dateString, struct pg_tm* tm)
         tm->tm_mday = atoi(day);
         tm->tm_hour = atoi(hour);
         tm->tm_min = atoi(minute);
-        tm->tm_sec = atoi(second);
+        tm->tm_sec = (int)round(atof(second));
     } else {
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("the format is not correct")));
     }
@@ -5302,6 +5331,7 @@ void AnalyseTime(const char* timeString, struct pg_tm* tm_time)
     int i;
 
     int timeSeparatorCount = 0;
+    int decimalPointCount = 0;
     int timeSeparatorPosition[5] = {0};
 
     if (NULL == timeString || NULL == tm_time) {
@@ -5310,7 +5340,12 @@ void AnalyseTime(const char* timeString, struct pg_tm* tm_time)
     }
     strLength = strlen(timeString);
     for (i = 0; i < strLength; i++) {
-        if (timeString[i] < '0' || timeString[i] > '9') {
+        if (timeString[i] == '.') {
+            decimalPointCount++;
+            if (decimalPointCount > 1) {
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("the format is not correct")));
+            }
+        } else if (timeString[i] < '0' || timeString[i] > '9') {
             timeSeparatorPosition[timeSeparatorCount] = i;
             timeSeparatorCount++;
             if (timeSeparatorCount > 5) {
@@ -5374,13 +5409,9 @@ void SplitTimestrBySeparator(const char* timeString, int strLength, const int* s
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("the format is not correct")));
         return;
     }
-    if (MINLEN_TIME > strLength || MAXLEN_TIME < strLength) {
-        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("the time is not correct!")));
-    }
     /* check the position of the oparator .1 and 2 are the posiible position of the first separator*/
-    else if (1 != separatorPosition[0] && 2 != separatorPosition[0]) {
+    if (1 != separatorPosition[0] && 2 != separatorPosition[0]) {
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("the hour is invalid!")));
-
     }
     /* 3 ,4 and 5 are the posiible position of the second separator*/
     else if (3 != separatorPosition[1] && 4 != separatorPosition[1] && 5 != separatorPosition[1]) {
@@ -5398,13 +5429,13 @@ void SplitTimestrBySeparator(const char* timeString, int strLength, const int* s
         errorno = strncpy_s(second,
             strLength - separatorPosition[1],
             timeString + separatorPosition[1] + 1,
-            strLength - separatorPosition[1] - 1);
+            strLength - separatorPosition[1] - 1 < UNIT_LEN ? strLength - separatorPosition[1] - 1 : UNIT_LEN);
         securec_check(errorno, "\0", "\0");
 
         /* transfer char to int*/
         tm_time->tm_hour = atoi(hour);
         tm_time->tm_min = atoi(minute);
-        tm_time->tm_sec = atoi(second);
+        tm_time->tm_sec = (int)round(atof(second));
     }
 }
 
@@ -5839,4 +5870,48 @@ void WalReplicationTimestampToString(WalReplicationTimestampInfo *timeStampInfo,
     rc = memcpy_s(timeStampInfo->heartbeatStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(heartbeat),
                   MAXTIMESTAMPLEN + 1);
     securec_check(rc, "\0", "\0");
+}
+
+/*
+ * to_timestamp(double precision)
+ * Convert UNIX epoch to timestamptz.
+ */
+Datum float8_timestamptz(PG_FUNCTION_ARGS)
+{
+    float8 seconds = PG_GETARG_FLOAT8(0);
+    TimestampTz result;
+
+    /* Deal with NaN and infinite inputs ... */
+    if (isnan(seconds)) {
+        ereport(ERROR, (errmsg("timestamp cannot be NaN")));
+    }
+
+    if (isinf(seconds)) {
+        if (seconds < 0) {
+            TIMESTAMP_NOBEGIN(result);
+        } else {
+            TIMESTAMP_NOEND(result);
+        }
+    } else {
+        /* Out of range? */
+        if (seconds < (float8) SECS_PER_DAY * (DATETIME_MIN_JULIAN - UNIX_EPOCH_JDATE) ||
+            seconds >= (float8) SECS_PER_DAY * (TIMESTAMP_END_JULIAN - UNIX_EPOCH_JDATE)) {
+            ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                            errmsg("timestamp out of range: \"%g\"", seconds)));
+        }
+
+        /* Convert UNIX epoch to Postgres epoch */
+        seconds -= ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
+
+        seconds = rint(seconds * USECS_PER_SEC);
+        result = (int64) seconds;
+
+        /* Recheck in case roundoff produces something just out of range */
+        if (!IS_VALID_TIMESTAMP(result)) {
+            ereport(ERROR, (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+                            errmsg("timestamp out of range: \"%g\"", PG_GETARG_FLOAT8(0))));
+        }
+    }
+
+    PG_RETURN_TIMESTAMP(result);
 }

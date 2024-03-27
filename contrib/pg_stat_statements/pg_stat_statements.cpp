@@ -223,12 +223,14 @@ static void pgss_ExecutorStart(QueryDesc* queryDesc, int eflags);
 static void pgss_ExecutorRun(QueryDesc* queryDesc, ScanDirection direction, long count);
 static void pgss_ExecutorFinish(QueryDesc* queryDesc);
 static void pgss_ExecutorEnd(QueryDesc* queryDesc);
-static void pgss_ProcessUtility(Node* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel,
+static void pgss_ProcessUtility(processutility_context* processutility_cxt,
     DestReceiver* dest,
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
-    char* completionTag);
+    char* completionTag,
+    ProcessUtilityContext context,
+    bool isCTAS);
 static uint32 pgss_hash_fn(const void* key, Size keysize);
 static int pgss_match_fn(const void* key1, const void* key2, Size keysize);
 static uint32 pgss_hash_string(const char* str);
@@ -722,13 +724,17 @@ static void pgss_ExecutorEnd(QueryDesc* queryDesc)
 /*
  * ProcessUtility hook
  */
-static void pgss_ProcessUtility(Node* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel,
+static void pgss_ProcessUtility(processutility_context* processutility_cxt,
     DestReceiver* dest,
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
-    char* completionTag)
+    char* completionTag,
+    ProcessUtilityContext context,
+    bool isCTAS)
 {
+    Node* parsetree = processutility_cxt->parse_tree;
+    const char* queryString = processutility_cxt->query_string;
     /*
      * If it's an EXECUTE statement, we don't track it and don't increment the
      * nesting level.  This allows the cycles to be charged to the underlying
@@ -754,25 +760,23 @@ static void pgss_ProcessUtility(Node* parsetree, const char* queryString, ParamL
         PG_TRY();
         {
             if (prev_ProcessUtility)
-                prev_ProcessUtility(parsetree,
-                    queryString,
-                    params,
-                    isTopLevel,
+                prev_ProcessUtility(processutility_cxt,
                     dest,
 #ifdef PGXC
                     sentToRemote,
 #endif /* PGXC */
-                    completionTag);
+                    completionTag,
+                    context,
+                    isCTAS);
             else
-                standard_ProcessUtility(parsetree,
-                    queryString,
-                    params,
-                    isTopLevel,
+                standard_ProcessUtility(processutility_cxt,
                     dest,
 #ifdef PGXC
                     sentToRemote,
 #endif /* PGXC */
-                    completionTag);
+                    completionTag,
+                    context,
+                    isCTAS);
             nested_level--;
         }
         PG_CATCH();
@@ -817,25 +821,23 @@ static void pgss_ProcessUtility(Node* parsetree, const char* queryString, ParamL
         pgss_store(queryString, queryId, INSTR_TIME_GET_MILLISEC(duration), rows, &bufusage, NULL);
     } else {
         if (prev_ProcessUtility)
-            prev_ProcessUtility(parsetree,
-                queryString,
-                params,
-                isTopLevel,
+            prev_ProcessUtility(processutility_cxt,
                 dest,
 #ifdef PGXC
                 sentToRemote,
 #endif /* PGXC */
-                completionTag);
+                completionTag,
+                context,
+                isCTAS);
         else
-            standard_ProcessUtility(parsetree,
-                queryString,
-                params,
-                isTopLevel,
+            standard_ProcessUtility(processutility_cxt,
                 dest,
 #ifdef PGXC
                 sentToRemote,
 #endif /* PGXC */
-                completionTag);
+                completionTag,
+                context,
+                isCTAS);
     }
 }
 
@@ -1858,7 +1860,7 @@ static void fill_in_constant_lengths(pgssJumbleState* jstate, const char* query)
     locs = jstate->clocations;
 
     /* initialize the flex scanner --- should match raw_parser() */
-    yyscanner = scanner_init(query, &yyextra, ScanKeywords, NumScanKeywords);
+    yyscanner = scanner_init(query, &yyextra, &ScanKeywords, ScanKeywordTokens);
 
     /* Search for each constant, in sequence */
     for (i = 0; i < jstate->clocations_count; i++) {

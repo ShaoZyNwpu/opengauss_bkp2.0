@@ -22,7 +22,6 @@
  * -------------------------------------------------------------------------
  */
 #include "access/xact.h"
-#include "access/genam.h"
 #include "access/heapam.h"
 #include "access/tableam.h"
 #include "access/sysattr.h"
@@ -277,7 +276,7 @@ static bool verify_column_name(Oid relid, const char *colname)
         /* verify column */
         if (tbl_rel->rd_att != NULL) {
             for (int i = 0; i < tbl_rel->rd_att->natts && !is_found; ++i) {
-                Form_pg_attribute attr = tbl_rel->rd_att->attrs[i];
+                Form_pg_attribute attr = &tbl_rel->rd_att->attrs[i];
                 is_found = (strcasecmp(attr->attname.data, colname) == 0);
             }
         }

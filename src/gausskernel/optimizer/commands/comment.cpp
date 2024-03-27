@@ -108,10 +108,10 @@ static AclResult CheckObjectCommentPrivilege(const CommentStmt* stmt, Oid object
  * This routine is used to add the associated comment into
  * pg_description for the object specified by the given SQL command.
  */
-void CommentObject(CommentStmt* stmt)
+ObjectAddress CommentObject(CommentStmt* stmt)
 {
-    ObjectAddress address;
     Relation relation;
+    ObjectAddress address = InvalidObjectAddress;
 
     /*
      * When loading a dump, we may see a COMMENT ON DATABASE for the old name
@@ -127,7 +127,7 @@ void CommentObject(CommentStmt* stmt)
 
         if (!OidIsValid(get_database_oid(database, true))) {
             ereport(WARNING, (errcode(ERRCODE_UNDEFINED_DATABASE), errmsg("database \"%s\" does not exist", database)));
-            return;
+            return address;
         }
     }
 
@@ -200,6 +200,8 @@ void CommentObject(CommentStmt* stmt)
      */
     if (relation != NULL)
         relation_close(relation, NoLock);
+
+    return address;
 }
 
 /*
@@ -448,4 +450,17 @@ char* GetComment(Oid oid, Oid classoid, int32 subid)
     heap_close(description, AccessShareLock);
 
     return comment;
+}
+
+void CreateNonColumnComment(Oid oid, List *options, Oid objectType)
+{
+    ListCell *cell = NULL;
+    foreach (cell, options) {
+        void *pointer = lfirst(cell);
+        if (IsA(pointer, CommentStmt)) {
+            CommentStmt *commentStmt = (CommentStmt *)pointer;
+            CreateComments(oid, objectType, 0, commentStmt->comment);
+            break;
+        }
+    }
 }

@@ -73,6 +73,8 @@
 #include "catalog/pg_job_proc.h"
 #include "job/job_shmem.h"
 #include "job/job_worker.h"
+#include "instruments/gs_stack.h"
+#include "executor/executor.h"
 
 /*****************************************************************************
  *					 PRIVATE FIELD DEFINE
@@ -105,6 +107,7 @@ bool IsJobWorkerProcess(void)
  */
 static void SetupSignalHook(void)
 {
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGHUP, SIG_IGN);
     (void)gspqsignal(SIGQUIT, quickdie);
     (void)gspqsignal(SIGTERM, die);
@@ -208,6 +211,12 @@ void JobExecuteWorkerMain()
     InitVecFuncMap();
 
     (void)MemoryContextSwitchTo(t_thrd.mem_cxt.msg_mem_cxt);
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /* forbid smp in job worker thread */
+    AutoDopControl dopControl;
+    dopControl.CloseSmp();
+#endif
 
     /* If an exception is encountered, processing resumes here. */
     int curTryCounter;
@@ -323,7 +332,7 @@ void JobExecuteWorkerMain()
     pgstat_report_activity(STATE_RUNNING, NULL);
 
     /* Reset some flag related to stream. */
-    ResetStreamEnv();
+    ResetSessionEnv();
 
     t_thrd.role = JOB_WORKER;
 
@@ -343,6 +352,9 @@ void JobExecuteWorkerMain()
     (void)MemoryContextSwitchTo(t_thrd.mem_cxt.msg_mem_cxt);
 
     SetProcessingMode(NormalProcessing);
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+    LoadSqlPlugin();
+#endif
 
     /* execute job procedure */
     elog(LOG, "Job is running, worker: %lu, job id: %d", t_thrd.proc_cxt.MyProcPid, job_id);

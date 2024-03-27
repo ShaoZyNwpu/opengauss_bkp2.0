@@ -25,8 +25,10 @@
 #include "opfusion/opfusion_insert.h"
 
 #include "access/tableam.h"
+#include "catalog/pg_partition_fn.h"
 #include "catalog/storage_gtt.h"
 #include "commands/matview.h"
+#include "commands/sequence.h"
 #include "executor/node/nodeModifyTable.h"
 #include "parser/parse_coerce.h"
 
@@ -34,7 +36,8 @@ void InsertFusion::InitGlobals()
 {
     m_c_global = (InsertFusionGlobalVariable*)palloc0(sizeof(InsertFusionGlobalVariable));
 
-    m_global->m_reloid = getrelid(linitial_int(m_global->m_planstmt->resultRelations), m_global->m_planstmt->rtable);
+    m_global->m_reloid = getrelid(linitial_int((List*)linitial(m_global->m_planstmt->resultRelations)),
+                                  m_global->m_planstmt->rtable);
     ModifyTable* node = (ModifyTable*)m_global->m_planstmt->planTree;
     BaseResult* baseresult = (BaseResult*)linitial(node->plans);
     List* targetList = baseresult->plan.targetlist;
@@ -46,6 +49,7 @@ void InsertFusion::InitGlobals()
     m_global->m_natts = RelationGetDescr(rel)->natts;
     m_global->m_is_bucket_rel = RELATION_OWN_BUCKET(rel);
     m_global->m_tupDesc = CreateTupleDescCopy(RelationGetDescr(rel));
+    m_global->m_tupDesc->td_tam_ops = GetTableAmRoutine(m_global->m_table_type);
     heap_close(rel, AccessShareLock);
 
     /* init param func const */
@@ -104,11 +108,12 @@ void InsertFusion::InitGlobals()
 }
 void InsertFusion::InitLocals(ParamListInfo params)
 {
-    m_c_local.m_estate = CreateExecutorState();
+    m_c_local.m_estate = CreateExecutorStateForOpfusion(m_local.m_localContext, m_local.m_tmpContext);
     m_c_local.m_estate->es_range_table = m_global->m_planstmt->rtable;
+    m_c_local.m_estate->es_plannedstmt = m_global->m_planstmt;
     m_local.m_reslot = MakeSingleTupleTableSlot(m_global->m_tupDesc);
     if (m_global->m_table_type == TAM_USTORE) {
-        m_local.m_reslot->tts_tupslotTableAm = TAM_USTORE;
+        m_local.m_reslot->tts_tam_ops = TableAmUstore;
     }
     m_local.m_values = (Datum*)palloc0(m_global->m_natts * sizeof(Datum));
     m_local.m_isnull = (bool*)palloc0(m_global->m_natts * sizeof(bool));
@@ -178,6 +183,64 @@ void InsertFusion::refreshParameterIfNecessary()
     }
 }
 
+extern HeapTuple searchPgPartitionByParentIdCopy(char parttype, Oid parentId);
+Datum ComputePartKeyExprTuple(Relation rel, EState *estate, TupleTableSlot *slot, Relation partRel, char* partExprKeyStr)
+{
+    Relation pgPartition = NULL;
+    HeapTuple partitionedTuple = NULL;
+    bool isnull = false;
+    Datum newval = 0;
+    Node* partkeyexpr = NULL;
+    Relation tmpRel = NULL;
+    if (partExprKeyStr && pg_strcasecmp(partExprKeyStr, "") != 0) {
+        partkeyexpr = (Node*)stringToNode_skip_extern_fields(partExprKeyStr);                      
+    } else {
+        ereport(ERROR, (errcode(ERRCODE_PARTITION_ERROR), errmsg("The partition expr key can't be null for table %s", NameStr(rel->rd_rel->relname))));
+    }
+    (void)lockNextvalWalker(partkeyexpr, NULL);
+    ExprState *exprstate = ExecPrepareExpr((Expr *)partkeyexpr, estate);
+    ExprContext *econtext;
+    econtext = GetPerTupleExprContext(estate);
+    econtext->ecxt_scantuple = slot;
+    isnull = false;
+    newval = ExecEvalExpr(exprstate, econtext, &isnull, NULL);
+    Const** boundary = NULL;
+    if (PointerIsValid(partRel))
+        tmpRel = partRel;
+    else
+        tmpRel = rel;
+
+    if (tmpRel->partMap->type == PART_TYPE_RANGE)
+        boundary = ((RangePartitionMap*)(tmpRel->partMap))->rangeElements[0].boundary;
+    else if (tmpRel->partMap->type == PART_TYPE_LIST)
+        boundary = ((ListPartitionMap*)(tmpRel->partMap))->listElements[0].boundary[0].values;
+    else if (tmpRel->partMap->type == PART_TYPE_HASH)
+        boundary = ((HashPartitionMap*)(tmpRel->partMap))->hashElements[0].boundary;
+    else
+        ereport(ERROR, (errcode(ERRCODE_PARTITION_ERROR), errmsg("Unsupported partition type : %d", tmpRel->partMap->type)));
+
+    if (!isnull)
+        newval = datumCopy(newval, boundary[0]->constbyval, boundary[0]->constlen);
+    return newval;
+}
+
+static void ExecReleaseResource(Tuple tuple, TupleTableSlot *slot, ResultRelInfo *result_rel_info, EState *estate,
+                                Relation bucket_rel, Relation rel, Partition part, Relation partRel)
+{
+    tableam_tops_free_tuple(tuple);
+    (void)ExecClearTuple(slot);
+    ExecCloseIndices(result_rel_info);
+    ExecDoneStepInFusion(estate);
+    if (bucket_rel != NULL) {
+        bucketCloseRelation(bucket_rel);
+    }
+    if (RELATION_IS_PARTITIONED(rel) && part != NULL) {
+        partitionClose(rel, part, RowExclusiveLock);
+        releaseDummyRelation(&partRel);
+    }
+}
+
+
 unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_info)
 {
     /*******************
@@ -196,12 +259,19 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
      * step 2: begin insert *
      ************************/
     Tuple tuple = tableam_tops_form_tuple(m_global->m_tupDesc, m_local.m_values,
-        m_local.m_isnull, tableam_tops_get_tuple_type(rel));
+        m_local.m_isnull, rel->rd_tam_ops);
     Assert(tuple != NULL);
     if (RELATION_IS_PARTITIONED(rel)) {
         m_c_local.m_estate->esfRelations = NULL;
-        partOid = heapTupleGetPartitionId(rel, tuple);
-        part = partitionOpen(rel, partOid, RowExclusiveLock);
+        int partitionno = INVALID_PARTITION_NO;
+        m_local.m_reslot->tts_tuple = tuple;
+        partOid = getPartitionIdFromTuple(rel, tuple, m_c_local.m_estate, m_local.m_reslot, &partitionno, false, m_c_local.m_estate->es_plannedstmt->hasIgnore);
+        if (m_c_local.m_estate->es_plannedstmt->hasIgnore && partOid == InvalidOid) {
+            ExecReleaseResource(tuple, m_local.m_reslot, result_rel_info, m_c_local.m_estate, bucket_rel, rel, part,
+                                partRel);
+            return 0;
+        }
+        part = PartitionOpenWithPartitionno(rel, partOid, partitionno, RowExclusiveLock);
         partRel = partitionGetRelation(rel, part);
     }
 
@@ -225,27 +295,60 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
     }
 
     if (rel->rd_att->constr) {
-        ExecConstraints(result_rel_info, m_local.m_reslot, m_c_local.m_estate);
+        /*
+         * If values violate constraints, directly return.
+         */
+        if(!ExecConstraints(result_rel_info, m_local.m_reslot, m_c_local.m_estate, true)) {
+            if (u_sess->utils_cxt.sql_ignore_strategy_val != SQL_OVERWRITE_NULL) {
+                ExecReleaseResource(tuple, m_local.m_reslot, result_rel_info, m_c_local.m_estate, bucket_rel, rel, part,
+                                    partRel);
+                return 0;
+            }
+            tuple = ReplaceTupleNullCol(RelationGetDescr(result_rel_info->ri_RelationDesc), m_local.m_reslot);
+            /* Double check constraints in case that new val in column with not null constraints
+             * violated check constraints */
+            ExecConstraints(result_rel_info, m_local.m_reslot, m_c_local.m_estate, true);
+        }
+        tuple = ExecAutoIncrement(rel, m_c_local.m_estate, m_local.m_reslot, tuple);
+        if (tuple != m_local.m_reslot->tts_tuple) {
+            tableam_tops_free_tuple(tuple);
+            tuple = m_local.m_reslot->tts_tuple;
+        }
     }
     Relation destRel = RELATION_IS_PARTITIONED(rel) ? partRel : rel;
     Relation target_rel = (bucket_rel == NULL) ? destRel : bucket_rel;
     if (rel_isblockchain && (!RelationIsUstoreFormat(rel))) {
         HeapTuple tmp_tuple = (HeapTuple)tuple;
         MemoryContext old_context = MemoryContextSwitchTo(m_local.m_tmpContext);
-        tuple = set_user_tuple_hash(tmp_tuple, target_rel);
+        tuple = set_user_tuple_hash(tmp_tuple, target_rel, NULL);
         (void)ExecStoreTuple(tuple, m_local.m_reslot, InvalidBuffer, false);
         m_local.m_ledger_hash_exist = hist_table_record_insert(target_rel, (HeapTuple)tuple, &m_local.m_ledger_relhash);
         (void)MemoryContextSwitchTo(old_context);
         tableam_tops_free_tuple(tmp_tuple);
     }
-    (void)tableam_tuple_insert(bucket_rel == NULL ? destRel : bucket_rel, tuple, mycid, 0, NULL);
 
+    /* check unique constraint first if SQL has keyword IGNORE */
+    bool isgpi = false;
+    ConflictInfoData conflictInfo;
+    Oid conflictPartOid = InvalidOid;
+    int2 conflictBucketid = InvalidBktId;
+    if (m_c_local.m_estate->es_plannedstmt && m_c_local.m_estate->es_plannedstmt->hasIgnore &&
+        !ExecCheckIndexConstraints(m_local.m_reslot, m_c_local.m_estate, target_rel, part, &isgpi, bucketid,
+                                   &conflictInfo, &conflictPartOid, &conflictBucketid)) {
+        ereport(WARNING, (errmsg("duplicate key value violates unique constraint in table \"%s\"",
+                                 RelationGetRelationName(target_rel))));
+        ExecReleaseResource(tuple, m_local.m_reslot, result_rel_info, m_c_local.m_estate, bucket_rel, rel, part,
+                            partRel);
+        return 0;
+    }
+
+    (void)tableam_tuple_insert(bucket_rel == NULL ? destRel : bucket_rel, tuple, mycid, 0, NULL);
     if (!RELATION_IS_PARTITIONED(rel)) {
         /* try to insert tuple into mlog-table. */
         if (rel != NULL && rel->rd_mlogoid != InvalidOid) {
             /* judge whether need to insert into mlog-table */
             HeapTuple htuple = NULL;
-            if (rel->rd_tam_type == TAM_USTORE) {
+            if (rel->rd_tam_ops == TableAmUstore) {
                 htuple = UHeapToHeap(rel->rd_att, (UHeapTuple)tuple);
                 insert_into_mlog_table(rel, rel->rd_mlogoid, htuple, &htuple->t_self,
                     GetCurrentTransactionId(), 'I');
@@ -269,25 +372,13 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
 
     list_free_ext(recheck_indexes);
 
-    tableam_tops_free_tuple(tuple);
-
-    (void)ExecClearTuple(m_local.m_reslot);
+    if (result_rel_info->ri_WithCheckOptions != NIL)
+        ExecWithCheckOptions(result_rel_info, m_local.m_reslot, m_c_local.m_estate);
 
     /****************
      * step 3: done *
      ****************/
-    ExecCloseIndices(result_rel_info);
-
-
-    ExecDoneStepInFusion(m_c_local.m_estate);
-
-    if (bucket_rel != NULL) {
-        bucketCloseRelation(bucket_rel);
-    }
-    if (RELATION_IS_PARTITIONED(rel)) {
-        partitionClose(rel, part, RowExclusiveLock);
-        releaseDummyRelation(&partRel);
-    }
+    ExecReleaseResource(tuple, m_local.m_reslot, result_rel_info, m_c_local.m_estate, bucket_rel, rel, part, partRel);
 
     return 1;
 }
@@ -306,33 +397,58 @@ bool InsertFusion::execute(long max_rows, char* completionTag)
     InitResultRelInfo(result_rel_info, rel, 1, 0);
 
     if (result_rel_info->ri_RelationDesc->rd_rel->relhasindex) {
-        ExecOpenIndices(result_rel_info, false);
+        ExecOpenIndices(result_rel_info, true);
     }
 
     init_gtt_storage(CMD_INSERT, result_rel_info);
     m_c_local.m_estate->es_result_relation_info = result_rel_info;
-
+    m_c_local.m_estate->es_plannedstmt = m_global->m_planstmt;
     refreshParameterIfNecessary();
+
+    ModifyTable* node = (ModifyTable*)(m_global->m_planstmt->planTree);
+    PlanState* ps = NULL;
+    if (node->withCheckOptionLists != NIL) {
+        Plan* plan = (Plan*)linitial(node->plans);
+        ps = ExecInitNode(plan, m_c_local.m_estate, 0);
+        List* wcoList = (List*)linitial(node->withCheckOptionLists);
+        List* wcoExprs = NIL;
+        ListCell* ll = NULL;
+
+        foreach(ll, wcoList) {
+            WithCheckOption* wco = (WithCheckOption*)lfirst(ll);
+            ExprState* wcoExpr = ExecInitExpr((Expr*)wco->qual, ps);
+            wcoExprs = lappend(wcoExprs, wcoExpr);
+        }
+
+        result_rel_info->ri_WithCheckOptions = wcoList;
+        result_rel_info->ri_WithCheckOptionExprs = wcoExprs;
+    }
 
     /************************
      * step 2: begin insert *
      ************************/
 
-    (this->*(m_global->m_exec_func_ptr))(rel, result_rel_info);
+    unsigned long nprocessed = (this->*(m_global->m_exec_func_ptr))(rel, result_rel_info);
     heap_close(rel, RowExclusiveLock);
 
     /****************
      * step 3: done *
      ****************/
+    if (ps != NULL) {
+        ExecEndNode(ps);
+    }
     success = true;
     m_local.m_isCompleted = true;
     if (m_local.m_ledger_hash_exist && !IsConnFromApp()) {
         errorno = snprintf_s(completionTag, COMPLETION_TAG_BUFSIZE, COMPLETION_TAG_BUFSIZE - 1,
-            "INSERT 0 1 %lu\0", m_local.m_ledger_relhash);
+            "INSERT 0 %ld %lu\0", nprocessed, m_local.m_ledger_relhash);
     } else {
-        errorno = snprintf_s(completionTag, COMPLETION_TAG_BUFSIZE, COMPLETION_TAG_BUFSIZE - 1, "INSERT 0 1");
+        errorno =
+            snprintf_s(completionTag, COMPLETION_TAG_BUFSIZE, COMPLETION_TAG_BUFSIZE - 1, "INSERT 0 %ld", nprocessed);
     }
     securec_check_ss(errorno, "\0", "\0");
-
+    FreeExecutorStateForOpfusion(m_c_local.m_estate);
+    u_sess->statement_cxt.current_row_count = nprocessed;
+    u_sess->statement_cxt.last_row_count = u_sess->statement_cxt.current_row_count;
     return success;
 }

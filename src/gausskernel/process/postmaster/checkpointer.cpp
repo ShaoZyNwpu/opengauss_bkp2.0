@@ -40,6 +40,7 @@
 #include <sys/time.h>
 
 #include "access/xlog_internal.h"
+#include "access/xlog.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -50,6 +51,7 @@
 #include "storage/ipc.h"
 #include "storage/lock/lwlock.h"
 #include "storage/smgr/knl_usync.h"
+#include "storage/smgr/relfilenode_hash.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/smgr/smgr.h"
@@ -58,6 +60,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "gssignal/gs_signal.h"
+#include "postmaster/pagewriter.h"
 
 /* ----------
  * Shared memory area for communication between checkpointer and backends
@@ -191,6 +194,7 @@ void CheckpointerMain(void)
      * want to wait for the backends to exit, whereupon the postmaster will
      * tell us it's okay to shut down (via SIGUSR2).
      */
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGHUP, ChkptSigHupHandler);   /* set flag to read config
                                                      * file */
     (void)gspqsignal(SIGINT, ReqCheckpointHandler); /* request checkpoint */
@@ -293,6 +297,9 @@ void CheckpointerMain(void)
         AtEOXact_Files();
         AtEOXact_HashTables(false);
 
+        /* release compression ctx */
+        crps_destory_ctxs();
+
         /* Warn any waiting backends that the checkpoint failed. */
         if (t_thrd.checkpoint_cxt.ckpt_active) {
             /* use volatile pointer to prevent code rearrangement */
@@ -354,6 +361,9 @@ void CheckpointerMain(void)
      * sleeping.
      */
     g_instance.proc_base->checkpointerLatch = &t_thrd.proc->procLatch;
+
+    /* init compression ctx for page compression */
+    crps_create_ctxs(CHECKPOINT_THREAD);
 
     pgstat_report_appname("CheckPointer");
     pgstat_report_activity(STATE_IDLE, NULL);
@@ -423,6 +433,10 @@ void CheckpointerMain(void)
             
             /* Close down the database */
             ShutdownXLOG(0, 0);
+
+            /* release compression ctx */
+            crps_destory_ctxs();
+
             /* Normal exit from the checkpointer is here */
             proc_exit(0); /* done */
         }
@@ -528,7 +542,7 @@ void CheckpointerMain(void)
                 } else {
                     CheckPointBuffers(flags, true);
                 }
-            } else if (!do_restartpoint) {
+            } else if (!do_restartpoint && !DORADO_STANDBY_CLUSTER_MAINSTANDBY_NODE) {
                 CreateCheckPoint(flags);
                 ckpt_performed = true;
                 if (!bgwriter_first_startup && CheckFpwBeforeFirstCkpt()) {
@@ -613,8 +627,13 @@ void CheckpointerMain(void)
          * Emergency bailout if postmaster has died.  This is to avoid the
          * necessity for manual cleanup of all postmaster children.
          */
-        if (rc & WL_POSTMASTER_DEATH)
+        if (rc & WL_POSTMASTER_DEATH) {
+
+            /* release compression ctx */
+            crps_destory_ctxs();
+
             gs_thread_exit(1);
+        }
     }
 }
 
@@ -796,7 +815,7 @@ static bool IsCheckpointOnSchedule(double progress)
     if (!RecoveryInProgress()) {
         recptr = GetInsertRecPtr();
         elapsed_xlogs = (((double)(recptr - t_thrd.checkpoint_cxt.ckpt_start_recptr)) / XLogSegSize) /
-                        u_sess->attr.attr_storage.CheckPointSegments;
+                        XLogSegmentsNum(u_sess->attr.attr_storage.CheckPointSegments);
 
         if (progress < elapsed_xlogs) {
             t_thrd.checkpoint_cxt.ckpt_cached_elapsed = elapsed_xlogs;
@@ -852,6 +871,10 @@ static void chkpt_quickdie(SIGNAL_ARGS)
      * should ensure the postmaster sees this as a crash, too, but no harm in
      * being doubly sure.)
      */
+
+    /* release compression ctx */
+    crps_destory_ctxs();
+
     exit(2);
 }
 
@@ -1215,11 +1238,12 @@ int getDuplicateRequest(CheckpointerRequest *requests, int num_requests, bool *s
     securec_check(rc, "\0", "\0");
     ctl.keysize = sizeof(CheckpointerRequest);
     ctl.entrysize = sizeof(struct CheckpointerSlotMapping);
-    ctl.hash = tag_hash;
+    ctl.hash = CheckpointerRequestHash;
+    ctl.match = CheckpointerRequestMatch;
     ctl.hcxt = CurrentMemoryContext;
 
     htab = hash_create("CompactRequestQueue", num_requests, &ctl,
-        HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+        HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
 
     /*
      * The basic idea here is that a request can be skipped if it's followed

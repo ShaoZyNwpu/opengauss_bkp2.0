@@ -33,8 +33,10 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
 #include "parser/parse_relation.h"
+#include "parser/parsetree.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rewriteManip.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteSupport.h"
 #include "optimizer/nodegroups.h"
 #include "utils/acl.h"
@@ -43,6 +45,7 @@
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
 #include "utils/syscache.h"
+#include "foreign/foreign.h"
 #ifdef PGXC
 #include "pgxc/execRemote.h"
 #include "tcop/utility.h"
@@ -50,6 +53,19 @@
 static void checkViewTupleDesc(TupleDesc newdesc, TupleDesc olddesc);
 
 InSideView query_from_view_hook = NULL;
+
+/*---------------------------------------------------------------------
+ * Validator for "check_option" reloption on views. The allowed values
+ * are "local" and "cascaded".
+ */
+void validateWithCheckOption(const char *value)
+{
+    if (value == NULL || (pg_strcasecmp(value, "local") != 0 && pg_strcasecmp(value, "cascaded") != 0)) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("invalid value for \"check_option\" option"),
+                errdetail("Valid values are \"local\", and \"cascaded\".")));
+    }
+}
 
 static void setEncryptedColumnRef(ColumnDef *def, TargetEntry *tle)
 {
@@ -78,19 +94,20 @@ static void setEncryptedColumnRef(ColumnDef *def, TargetEntry *tle)
 /* ---------------------------------------------------------------------
  * DefineVirtualRelation
  *
- * Create the "view" relation. `DefineRelation' does all the work,
- * we just provide the correct arguments ... at least when we're
- * creating a view.  If we're updating an existing view, we have to
- * work harder.
+ * Create a view relation and use the rules system to store the query
+ * for the view.
  * ---------------------------------------------------------------------
  */
-static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, List* options, ObjectType relkind)
+static ObjectAddress DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, List* options, ObjectType relkind,
+                                    ViewStmt* stmt, Query* viewParse)
 {
     Oid viewOid;
     LOCKMODE lockmode;
     CreateStmt* createStmt = makeNode(CreateStmt);
     List* attrList = NIL;
     ListCell* t = NULL;
+    char* definer = stmt->definer;
+    bool is_alter = stmt->is_alter;
 
     /*
      * create a list of ColumnDef nodes based on the names and types of the
@@ -111,6 +128,7 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
             def->storage = 0;
             def->cmprs_mode = ATT_CMPR_NOCOMPRESS; /* dont compress */
             def->raw_default = NULL;
+            def->update_default = NULL;
             def->cooked_default = NULL;
             def->collClause = NULL;
             def->collOid = exprCollation((Node*)tle->expr);
@@ -148,12 +166,17 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
     lockmode = replace ? AccessExclusiveLock : NoLock;
     (void)RangeVarGetAndCheckCreationNamespace(relation, lockmode, &viewOid, RELKIND_VIEW);
     
+    if (!OidIsValid(viewOid) && is_alter) {
+        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("view \"%s\" does not exist", relation->relname)));
+    }
+
     bool flag = OidIsValid(viewOid) && replace;
     if (flag) {
         Relation rel;
         TupleDesc descriptor;
         List* atcmds = NIL;
         AlterTableCmd* atcmd = NULL;
+        ObjectAddress address;
 
         /*
          * During inplace upgrade, if we are doing rolling back, the old-versioned
@@ -195,14 +218,37 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
         if (!u_sess->attr.attr_common.IsInplaceUpgrade)
             checkViewTupleDesc(descriptor, rel->rd_att);
 
-        /*
-         * The new options list replaces the existing options list, even if
-         * it's empty.
+        /* 
+         * set definer by AlterTameCmd
          */
-        atcmd = makeNode(AlterTableCmd);
-        atcmd->subtype = AT_ReplaceRelOptions;
-        atcmd->def = (Node*)options;
-        atcmds = lappend(atcmds, atcmd);
+        if (definer != NULL) {
+            /* Get owner to check the permissions. */
+            Oid ownerOid = get_role_oid(definer, false);
+            bool isOwnerChange = false;
+            if (!OidIsValid(ownerOid)) {
+                ownerOid = GetUserId();
+            } else if (ownerOid != GetUserId()) {
+                isOwnerChange = true;
+            }
+            
+            if (isOwnerChange && !is_alter) {
+                /* Check namespace permissions. */
+                AclResult aclresult;
+                Oid namespaceId = RangeVarGetAndCheckCreationNamespace(relation, NoLock, NULL, relkind);
+                aclresult = pg_namespace_aclcheck(namespaceId, ownerOid, ACL_CREATE);
+                bool anyResult = false;
+                if (aclresult != ACLCHECK_OK && !IsSysSchema(namespaceId)) {
+                    anyResult = CheckRelationCreateAnyPrivilege(ownerOid, relkind);
+                }
+                if (aclresult != ACLCHECK_OK && !anyResult) {
+                    aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(namespaceId));
+                }
+            }
+            atcmd = makeNode(AlterTableCmd);
+            atcmd->subtype = AT_ChangeOwner;
+            atcmd->name = definer;
+            atcmds = lappend(atcmds, atcmd);
+        }
 
         /*
          * If new attributes have been added, we must add pg_attribute entries
@@ -231,24 +277,71 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
             for (int dropcolno = rel->rd_att->natts - 1; dropcolno >= list_length(attrList); dropcolno--) {
                 atcmd = makeNode(AlterTableCmd);
                 atcmd->subtype = AT_DropColumn;
-                atcmd->name = rel->rd_att->attrs[dropcolno]->attname.data;
+                atcmd->name = rel->rd_att->attrs[dropcolno].attname.data;
                 atcmd->behavior = DROP_RESTRICT;
                 atcmd->missing_ok = true;
                 atcmds = lappend(atcmds, atcmd);
             }
         }
 
+        if (atcmds) {
+            AlterTableInternal(viewOid, atcmds, true);
+
+            /* Make the new view columns visible */
+            CommandCounterIncrement();
+        }
+
+        /*
+         * Update the query for the view.
+         *
+         * Note that we must do this before updating the view options, because
+         * the new options may not be compatible with the old view query (for
+         * example if we attempt to add the WITH CHECK OPTION, we require that
+         * the new view be automatically updatable, but the old view may not
+         * have been).
+         */
+        StoreViewQuery(viewOid, viewParse, replace);
+
+        /* Make the new view query visible */
+        CommandCounterIncrement();
+
+         /*
+          * Finally update the view options.
+          *
+          * The new options list replaces the existing options list, even if
+          * it's empty.
+          */
+        atcmd = makeNode(AlterTableCmd);
+        atcmd->subtype = AT_ReplaceRelOptions;
+        atcmd->def = (Node*)options;
+        atcmds = list_make1(atcmd);
+
         /* OK, let's do it. */
         AlterTableInternal(viewOid, atcmds, true);
+        /*
+         * There is very little to do here to update the view's dependencies.
+         * Most view-level dependency relationships, such as those on the
+         * owner, schema, and associated composite type, aren't changing.
+         * Because we don't allow changing type or collation of an existing
+         * view column, those dependencies of the existing columns don't
+         * change either, while the AT_AddColumnToView machinery took care of
+         * adding such dependencies for new view columns.  The dependencies of
+         * the view's query could have changed arbitrarily, but that was dealt
+         * with inside StoreViewQuery.  What remains is only to check that
+         * view replacement is allowed when we're creating an extension.
+         */
+        ObjectAddressSet(address, RelationRelationId, viewOid);
+
+        recordDependencyOnCurrentExtension(&address, true);
 
         /*
          * Seems okay, so return the OID of the pre-existing view.
          */
         relation_close(rel, NoLock); /* keep the lock! */
 
-        return viewOid;
+        return address;
     } else {
-        Oid relid;
+        ObjectAddress address;   
 
         /*
          * now set the parameters for keys/inheritance etc. All of these are
@@ -263,6 +356,15 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
         createStmt->oncommit = ONCOMMIT_NOOP;
         createStmt->tablespacename = NULL;
         createStmt->if_not_exists = false;
+        createStmt->charset = PG_INVALID_ENCODING;
+        Oid ownerOid = InvalidOid;
+
+        /* 
+         * get oid by user name
+         */
+        if (definer != NULL) {
+            ownerOid = get_role_oid(definer, false);
+        }
 
         /*
          * finally create the relation (this will error out if there's an
@@ -270,12 +372,19 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
          * is false).
          */
         if (relkind == OBJECT_CONTQUERY) {
-            relid = DefineRelation(createStmt, RELKIND_CONTQUERY, InvalidOid);
+            address = DefineRelation(createStmt, RELKIND_CONTQUERY, ownerOid, NULL);
         } else {
-            relid = DefineRelation(createStmt, RELKIND_VIEW, InvalidOid);
+            address = DefineRelation(createStmt, RELKIND_VIEW, ownerOid, NULL);
         }
-        Assert(relid != InvalidOid);
-        return relid;
+        Assert(address.objectId != InvalidOid);
+
+        /* Make the new view relation visible */
+        CommandCounterIncrement();
+
+        /* Store the query for the view */
+        StoreViewQuery(address.objectId, viewParse, replace);
+
+        return address;
     }
 }
 
@@ -293,8 +402,8 @@ static void checkViewTupleDesc(TupleDesc newdesc, TupleDesc olddesc)
         ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION), errmsg("cannot drop columns from view")));
     /* we can ignore tdhasoid */
     for (i = 0; i < olddesc->natts; i++) {
-        Form_pg_attribute newattr = newdesc->attrs[i];
-        Form_pg_attribute oldattr = olddesc->attrs[i];
+        Form_pg_attribute newattr = &newdesc->attrs[i];
+        Form_pg_attribute oldattr = &olddesc->attrs[i];
 
         /* XXX msg not right, but we don't support DROP COL on view anyway */
         if (newattr->attisdropped != oldattr->attisdropped)
@@ -434,10 +543,13 @@ static void CreateMvCommand(ViewStmt* stmt, const char* queryString)
     pfree_ext(members);
 
     /* Recurse for anything else */
-    ProcessUtility((Node *)step,
-            queryStringinfo,
-            NULL,
-            false,
+    processutility_context proutility_cxt;
+    proutility_cxt.parse_tree = (Node*)step;
+    proutility_cxt.query_string = queryStringinfo;
+    proutility_cxt.readOnlyTree = false;
+    proutility_cxt.params = NULL;
+    proutility_cxt.is_top_level = false;
+    ProcessUtility(&proutility_cxt,
             None_Receiver,
             true,
             NULL);
@@ -447,24 +559,58 @@ static void CreateMvCommand(ViewStmt* stmt, const char* queryString)
 #endif
 
 /*
+ * Check the base relation of view whether is a MySQL foreign table
+ * for WITH CHECK OPTION.
+ *
+ * Return true if it is, false means that it isn't or the view could not
+ * be auto-updatable.
+ */
+bool CheckMySQLFdwForWCO(Query* viewquery)
+{
+    RangeTblRef* rtr = NULL;
+
+    if (list_length(viewquery->jointree->fromlist) != 1) {
+        return false;
+    }
+
+    rtr = (RangeTblRef*)linitial(viewquery->jointree->fromlist);
+    if (!IsA(rtr, RangeTblRef)) {
+        return false;
+    }
+
+    RangeTblEntry* base_rte = rt_fetch(rtr->rtindex, viewquery->rtable);
+
+    if (base_rte->relkind == RELKIND_FOREIGN_TABLE) {
+        return isMysqlFDWFromTblOid(base_rte->relid);
+    } else if (base_rte->relkind == RELKIND_VIEW) {
+        /* recursive check for view */
+        Relation base_rel = try_relation_open(base_rte->relid, AccessShareLock);
+        bool res = CheckMySQLFdwForWCO(get_view_query(base_rel));
+        relation_close(base_rel, AccessShareLock);
+        return res;
+    }
+
+    return false;
+}
+
+/*
  * DefineView
  *		Execute a CREATE VIEW command.
  */
-Oid DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool isFirstNode)
+ObjectAddress DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool isFirstNode)
 {
     Query* viewParse = NULL;
-    Oid viewOid = InvalidOid;
     RangeVar* view = NULL;
+    ListCell* cell = NULL;
+    bool check_option;
+    ObjectAddress address;
 
     /*
      * Run parse analysis to convert the raw parse tree to a Query.  Note this
      * also acquires sufficient locks on the source table(s).
-     *
-     * Since parse analysis scribbles on its input, copy the raw parse tree;
-     * this ensures we don't corrupt a prepared statement, for example.
      */
     if (!IsA(stmt->query, Query)) {
-        viewParse = parse_analyze((Node*)copyObject(stmt->query), queryString, NULL, 0);
+        viewParse = parse_analyze(stmt->query, queryString, NULL, 0);
     } else {
         viewParse = (Query *)stmt->query;
     }
@@ -499,6 +645,51 @@ Oid DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool i
 #ifdef ENABLE_MULTIPLE_NODES
     validate_streaming_engine_status((Node*) stmt);
 #endif
+
+    /*
+     * If the user specified the WITH CHECK OPTION, add it to the list of
+     * reloptions.
+     */
+    if (stmt->withCheckOption == LOCAL_CHECK_OPTION)
+        stmt->options = lappend(stmt->options, makeDefElem("check_option", (Node*)makeString("local")));
+    else if (stmt->withCheckOption == CASCADED_CHECK_OPTION)
+        stmt->options = lappend(stmt->options, makeDefElem("check_option", (Node*)makeString("cascaded")));
+
+    /*
+    * Check that the view is auto-updatable if WITH CHECK OPTION was
+    * specified.
+    */
+    check_option = false;
+
+    foreach(cell, stmt->options) {
+        DefElem* defel = (DefElem*)lfirst(cell);
+
+        if (pg_strcasecmp(defel->defname, "check_option") == 0)
+            check_option = true;
+    }
+
+    /*
+     * If the check option is specified, look to see if the view is
+     * actually auto-updatable or not.
+     */
+    if (check_option) {
+        const char *view_updatable_error = view_query_is_auto_updatable(viewParse, true);
+
+        if (view_updatable_error)
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("WITH CHECK OPTION is supported only on auto-updatable views"),
+                    errhint("%s", view_updatable_error)));
+
+        /* 
+         * Views based on MySQL foreign table is not allowed to add check option,
+         * because returning clause which check option dependend on is not supported
+         * on MySQL.
+         */
+        if (CheckMySQLFdwForWCO(viewParse))
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("WITH CHECK OPTION is not supported on views that base on MySQL foreign table")));
+    }
+
     /*
      * If a list of column names was given, run through and insert these into
      * the actual query tree. - thomas 2000-03-08
@@ -556,15 +747,17 @@ Oid DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool i
 #endif
 
      if (stmt->relkind == OBJECT_MATVIEW) {
+        Oid viewOid = InvalidOid;
         /* Relation Already Created */
         (void)RangeVarGetAndCheckCreationNamespace(view, NoLock, &viewOid, RELKIND_MATVIEW);
-
+        ObjectAddressSet(address, RelationRelationId, viewOid);
 #ifdef ENABLE_MULTIPLE_NODES
         /* try to send CREATE MATERIALIZED VIEW to DNs, Only consider PGXC now. */
         if (IS_PGXC_COORDINATOR && !IsConnFromCoord() && !send_remote) {
             CreateMvCommand(stmt, queryString);
         }
 #endif
+        StoreViewQuery(viewOid, viewParse, stmt->replace);
      } else {
         /*
          * Create the view relation
@@ -572,7 +765,8 @@ Oid DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool i
          * NOTE: if it already exists and replace is false, the xact will be
          * aborted.
          */
-        viewOid = DefineVirtualRelation(view, viewParse->targetList, stmt->replace, stmt->options, stmt->relkind);
+        address = DefineVirtualRelation(view, viewParse->targetList, stmt->replace, stmt->options,
+                                        stmt->relkind, stmt, viewParse);
 
         /*
          * The relation we have just created is not visible to any other commands
@@ -582,9 +776,7 @@ Oid DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool i
         CommandCounterIncrement();
     }
 
-    StoreViewQuery(viewOid, viewParse, stmt->replace);
-
-    return viewOid;
+    return address;
 }
 
 bool IsViewTemp(ViewStmt* stmt, const char* queryString)

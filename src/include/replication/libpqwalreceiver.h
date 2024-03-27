@@ -25,6 +25,8 @@
 #ifndef LIBPQWALRECEIVER_H
 #define LIBPQWALRECEIVER_H
 
+#include "utils/tuplestore.h"
+
 typedef struct LibpqrcvConnectParam {
     char* conninfo;
     XLogRecPtr startpoint;
@@ -35,10 +37,38 @@ typedef struct LibpqrcvConnectParam {
     bool logical;
     uint32 protoVersion;    /* Logical protocol version */
     List *publicationNames; /* String list of publications */
+    bool binary;            /* Ask publisher to use binary */
+    bool useSnapshot;       /* Use snapshot or not */
 }LibpqrcvConnectParam;
 
-extern int32 pg_atoi(char* s, int size, int c);
-extern int32 pg_strtoint32(const char* s);
+/*
+ * Status of walreceiver query execution.
+ *
+ * We only define statuses that are currently used.
+ */
+typedef enum {
+    WALRCV_ERROR,        /* There was error when executing the query. */
+    WALRCV_OK_COMMAND,   /* Query executed utility or replication command. */
+    WALRCV_OK_TUPLES,    /* Query returned tuples. */
+    WALRCV_OK_COPY_IN,   /* Query started COPY FROM. */
+    WALRCV_OK_COPY_OUT,  /* Query started COPY TO. */
+    WALRCV_OK_COPY_BOTH, /* Query started COPY BOTH replication protocol. */
+} WalRcvExecStatus;
+
+/*
+ * Return value for walrcv_query, returns the status of the execution and
+ * tuples if any.
+ */
+typedef struct WalRcvExecResult {
+    WalRcvExecStatus status;
+    int sqlstate;
+    char *err;
+    Tuplestorestate *tuplestore;
+    TupleDesc tupledesc;
+} WalRcvExecResult;
+
+extern int32 pg_atoi(char* s, int size, int c, bool can_ignore = false);
+extern int32 pg_strtoint32(const char* s, bool can_ignore = false);
 /* Prototypes for interface functions */
 extern bool libpqrcv_connect_for_TLI(TimeLineID* timeLineID, char* conninfo);
 extern bool libpqrcv_connect(char* conninfo, XLogRecPtr* startpoint, char* slotname, int channel_identifier);
@@ -48,10 +78,12 @@ extern void libpqrcv_disconnect(void);
 extern void HaSetRebuildRepInfoError(HaRebuildReason reason);
 extern void SetObsRebuildReason(HaRebuildReason reason);
 extern void libpqrcv_check_conninfo(const char *conninfo);
-extern bool libpqrcv_command(const char *cmd, char **err, int *sqlstate);
+extern WalRcvExecResult* libpqrcv_exec(const char *cmd, const int nRetTypes, const Oid *retTypes);
 
 extern void IdentifyRemoteSystem(bool checkRemote);
-extern void CreateRemoteReplicationSlot(XLogRecPtr startpoint, const char* slotname, bool isLogical);
+extern void CreateRemoteReplicationSlot(XLogRecPtr startpoint, const char* slotname, bool isLogical, XLogRecPtr *lsn,
+                                        bool useSnapshot = false, CommitSeqNo *csn = NULL);
 extern void StartRemoteStreaming(const LibpqrcvConnectParam *options);
+extern ServerMode IdentifyRemoteMode();
 
 #endif

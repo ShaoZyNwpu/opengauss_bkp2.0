@@ -138,6 +138,8 @@ struct TableCreateSupport {
     bool compressPreAllocChunks;
     bool compressByteConvert;
     bool compressDiffConvert;
+    bool is_orientation_row;
+    bool is_storage_type_ustore;
 };
 
 inline bool HasCompressOption(TableCreateSupport *tableCreateSupport)
@@ -146,7 +148,6 @@ inline bool HasCompressOption(TableCreateSupport *tableCreateSupport)
            tableCreateSupport->compressPreAllocChunks || tableCreateSupport->compressByteConvert ||
            tableCreateSupport->compressDiffConvert;
 }
-
 /* 
  * The following are the table append modes currently supported.
  * on: mark the table on-line scaleout mode, when it is set, later data write by append mode.
@@ -293,6 +294,7 @@ extern void ForbidToSetOptionsForColTbl(List* options);
 extern void ForbidToSetTdeOptionsForNonTdeTbl(List* options);
 extern void ForbidToAlterOptionsForTdeTbl(List* options);
 extern void ForbidToSetOptionsForUstoreTbl(List *options);
+extern void ForbidToSetOptionsForNotUstoreTbl(List *options);
 extern void ForbidToSetOptionsForRowTbl(List* options);
 extern void ForbidUserToSetDefinedOptions(List* options);
 extern void ForbidUserToSetDefinedIndexOptions(List* options);
@@ -303,6 +305,7 @@ void RowTblCheckCompressionOption(List *options, int8 rowCompress = REL_CMPRS_PA
 void RowTblCheckHashBucketOption(List* options, StdRdOptions* std_opt);
 void ForbidUserToSetCompressedOptions(List *options);
 void SetOneOfCompressOption(DefElem* defElem, TableCreateSupport *tableCreateSupport);
+bool ReadBoolFromDefElem(DefElem* defElem);
 void CheckCompressOption(TableCreateSupport *tableCreateSupport);
 void ForbidUserToSetCompressedOptions(List *options);
 #endif /* RELOPTIONS_H */

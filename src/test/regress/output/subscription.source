@@ -17,7 +17,9 @@ Description: change the definition of a subscription
 Syntax:
 ALTER SUBSCRIPTION name CONNECTION 'conninfo'
 ALTER SUBSCRIPTION name SET PUBLICATION publication_name [, ...]
+ALTER SUBSCRIPTION name REFRESH PUBLICATION [ WITH ( refresh_option [= value] [, ... ] ) ]
 ALTER SUBSCRIPTION name ENABLE
+ALTER SUBSCRIPTION name DISABLE
 ALTER SUBSCRIPTION name SET ( subscription_parameter [= value] [, ... ] )
 ALTER SUBSCRIPTION name OWNER TO new_owner
 ALTER SUBSCRIPTION name RENAME TO new_name
@@ -37,7 +39,17 @@ SELECT pg_delete_audit('1012-11-10', '3012-11-11');
 
 --enable publication and subscription audit
 \! @abs_bindir@/gs_guc reload -D @abs_srcdir@/tmp_check/datanode1/ -c "audit_system_object=16777215" > /dev/null 2>&1
+select pg_sleep(1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
 --- prepare
+\! echo $GAUSSHOME | xargs -I{} rm -f {}/bin/subscription.key.cipher
+\! echo $GAUSSHOME | xargs -I{} rm -f {}/bin/subscription.key.rand
+\! echo $GAUSSHOME | xargs -I{} @abs_bindir@/gs_guc generate -S 123456@pwd -D {}/bin -o subscription > /dev/null 2>&1 ; echo $?
+0
 \! echo $OLDGAUSSHOME | xargs -I{} rm -f {}/bin/subscription.key.cipher
 \! echo $OLDGAUSSHOME | xargs -I{} rm -f {}/bin/subscription.key.rand
 \! echo $OLDGAUSSHOME | xargs -I{} @abs_bindir@/gs_guc generate -S 123456@pwd -D {}/bin -o subscription > /dev/null 2>&1 ; echo $?
@@ -60,8 +72,10 @@ LINE 1: CREATE SUBSCRIPTION testsub PUBLICATION foo;
                                     ^
 -- fail - could not connect to the publisher
 create subscription testsub2 connection 'host=abc' publication pub;
+ERROR:  The number of host and port are inconsistent.
+create subscription testsub2 connection 'host=abc port=12345' publication pub;
 WARNING:  apply worker could not connect to the remote server
-ERROR:  could not connect to the publisher
+ERROR:  Failed to connect to publisher.
 set client_min_messages to error;
 -- fail - syntax error, invalid connection string syntax: missing "="
 CREATE SUBSCRIPTION testsub CONNECTION 'testconn' PUBLICATION testpub;
@@ -70,16 +84,26 @@ ERROR:  invalid connection string syntax
 CREATE SUBSCRIPTION testsub CONNECTION 'dbname=doesnotexist' PUBLICATION testpub WITH (create_slot=false);
 ERROR:  unrecognized subscription parameter: create_slot
 CREATE SUBSCRIPTION testsub CONNECTION 'dbname=doesnotexist' PUBLICATION testpub WITH (ENABLED=false, slot_name='testsub', synchronous_commit=off);
+ERROR:  invalid connection string syntax, missing host and port
+CREATE SUBSCRIPTION testsub CONNECTION 'dbname=doesnotexist' PUBLICATION testpub WITH (CONNECT=false, slot_name='testsub', synchronous_commit=off);
 -- create SUBSCRIPTION with conninfo in two single quote, used to check mask string bug
 CREATE SUBSCRIPTION testsub_maskconninfo CONNECTION 'host=''1.2.3.4'' port=''12345'' user=''username'' dbname=''postgres'' password=''password_1234''' PUBLICATION testpub WITH (ENABLED=false, slot_name='testsub', synchronous_commit=off);
+ERROR:  Failed to connect to publisher.
+CREATE SUBSCRIPTION testsub_maskconninfo CONNECTION 'host=''1.2.3.4'' port=''12345'' user=''username'' dbname=''postgres'' password=''password_1234''' PUBLICATION testpub WITH (CONNECT=false, slot_name='testsub', synchronous_commit=off);
+-- fail - The number of host and port are inconsistent
+create subscription sub1 connection 'dbname=postgres user=pubusr password=Huawei@123 host=192.168.0.38,192.168.0.38,192.168.0.38 port=14001,14501' publication pub1;
+ERROR:  The number of host and port are inconsistent.
+-- fail - a maximum of 9 servers are supported
+create subscription sub1 connection 'dbname=postgres user=pubusr password=Huawei@123 host=192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38,192.168.0.38 port=14001,14501' publication pub1;
+ERROR:  Currently, a maximum of 9 servers are supported.
 -- alter connection
 ALTER SUBSCRIPTION testsub CONNECTION 'host=''1.2.3.4'' port=''12345'' user=''username'' dbname=''postgres'' password=''password_1234''';
 ALTER SUBSCRIPTION testsub CONNECTION 'dbname=does_not_exist';
 reset client_min_messages;
-select subname, pg_get_userbyid(subowner) as Owner, subenabled, subconninfo, subpublications from pg_subscription where subname='testsub';
- subname |           owner           | subenabled |      subconninfo       | subpublications 
----------+---------------------------+------------+------------------------+-----------------
- testsub | regress_subscription_user | f          | dbname=does_not_exist  | {testpub}
+select subname, pg_get_userbyid(subowner) as Owner, subenabled, subconninfo, subpublications, subbinary from pg_subscription where subname='testsub';
+ subname |           owner           | subenabled |      subconninfo       | subpublications | subbinary 
+---------+---------------------------+------------+------------------------+-----------------+-----------
+ testsub | regress_subscription_user | f          | dbname=does_not_exist  | {testpub}       | f
 (1 row)
 
 --- alter subscription
@@ -122,6 +146,33 @@ ALTER SUBSCRIPTION testsub SET (slot_name='testsub');
 ERROR:  Currently enabled=false, cannot change slot_name to a non-null value.
 -- alter owner
 ALTER SUBSCRIPTION testsub owner to regress_subscription_user2;
+-- alter subbinary to true
+ALTER SUBSCRIPTION testsub SET (binary=true);
+select subname, subbinary from pg_subscription where subname='testsub';
+ subname | subbinary 
+---------+-----------
+ testsub | t
+(1 row)
+
+-- set subskiplsn
+ALTER SUBSCRIPTION testsub SET (skiplsn = '0/ABCDEF');
+select subname, subskiplsn from pg_subscription where subname='testsub';
+ subname | subskiplsn 
+---------+------------
+ testsub | 0/ABCDEF
+(1 row)
+
+ALTER SUBSCRIPTION testsub SET (skiplsn = '0/ABCDEFGH');
+ERROR:  invalid input syntax for type pg_lsn: "0/ABCDEFGH"
+ALTER SUBSCRIPTION testsub SET (skiplsn = 'none');
+select subname, subskiplsn from pg_subscription where subname='testsub';
+ subname | subskiplsn 
+---------+------------
+ testsub | 0/0
+(1 row)
+
+-- disable test
+ALTER SUBSCRIPTION testsub DISABLE;
 --rename
 ALTER SUBSCRIPTION testsub rename to testsub_rename;
 --- inside a transaction block
@@ -134,8 +185,7 @@ COMMIT;
 -- -- active SUBSCRIPTION
 BEGIN;
 ALTER SUBSCRIPTION testsub_rename ENABLE;
-WARNING:  apply worker could not connect to the remote server
-ERROR:  could not connect to the publisher
+ERROR:  invalid connection string syntax, missing host and port
 select subname, subenabled from pg_subscription  where subname='testsub_rename';
 ERROR:  current transaction is aborted, commands ignored until end of transaction block, firstChar[Q]
 ALTER SUBSCRIPTION testsub_rename SET (ENABLED=false);
@@ -143,13 +193,38 @@ ERROR:  current transaction is aborted, commands ignored until end of transactio
 select subname, subenabled from pg_subscription  where subname='testsub_rename';
 ERROR:  current transaction is aborted, commands ignored until end of transaction block, firstChar[Q]
 COMMIT;
+BEGIN;
+ALTER SUBSCRIPTION testsub_rename REFRESH PUBLICATION;
+ERROR:  ALTER SUBSCRIPTION ... REFRESH cannot run inside a transaction block
+COMMIT;
+-- success, password len with 999
+CREATE SUBSCRIPTION sub_len_999 CONNECTION 'host=192.16''''8.1.50 port=5432 user=foo dbname=foodb password=xxin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*lei' PUBLICATION insert_only WITH (connect = false);
+WARNING:  tables were not subscribed, you will have to run ALTER SUBSCRIPTION ... REFRESH PUBLICATION to subscribe the tables
+-- fail, password len with 1000
+CREATE SUBSCRIPTION sub_len_1000 CONNECTION 'host=192.16''''8.1.50 port=5432 user=foo dbname=foodb password=xxin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leid' PUBLICATION insert_only WITH (enabled = false);
+ERROR:  Password can't contain more than 999 characters.
+-- fail, set password len with 1000
+ALTER SUBSCRIPTION sub_len_999 SET (conninfo='host=192.16''''8.1.50 port=5432 user=foo dbname=foodb password=xxin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leid');
+ERROR:  Password can't contain more than 999 characters.
+-- fail, set password len with 1000
+ALTER SUBSCRIPTION sub_len_999 CONNECTION 'host=192.16''''8.1.50 port=5432 user=foo dbname=foodb password=xxin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leideyipi@123xin!@#$%^&*(!@#@$%^&*!@#$%^&*leid';
+ERROR:  Password can't contain more than 999 characters.
+--- permission
+CREATE ROLE normal_user LOGIN PASSWORD 'Abcdef@123';
+SET SESSION AUTHORIZATION 'normal_user' PASSWORD 'Abcdef@123';
+ALTER SUBSCRIPTION testsub_rename rename to testsub;
+ERROR:  must be owner of subscription testsub_rename
+DETAIL:  N/A
+SET SESSION AUTHORIZATION 'regress_subscription_user' PASSWORD 'Abcdef@123';
 --- drop subscription
 DROP SUBSCRIPTION IF EXISTS testsub_rename;
 DROP SUBSCRIPTION IF EXISTS testsub_maskconninfo;
+DROP SUBSCRIPTION IF EXISTS sub_len_999;
 --- cleanup
 RESET SESSION AUTHORIZATION;
 DROP ROLE regress_subscription_user;
 DROP ROLE regress_subscription_user2;
+DROP ROLE normal_user;
 -- built-in function test
 select pg_replication_origin_create('origin_test');
  pg_replication_origin_create 
@@ -268,11 +343,11 @@ ERROR:  could not find tuple for replication origin 'origin_test'
 CONTEXT:  referenced column: pg_replication_origin_session_setup
 drop table t_origin_test;
 SELECT object_name,detail_info FROM pg_query_audit('2022-01-13 9:30:00', '2031-12-12 22:00:00') where type = 'ddl_publication_subscription' order by time;
-     object_name      |                                                                                                                  detail_info                                                                                                                  
-----------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     object_name      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             detail_info                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+----------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  testsub              | DROP SUBSCRIPTION IF EXISTS testsub;
- testsub              | CREATE SUBSCRIPTION testsub CONNECTION **********************PUBLICATION testpub WITH (ENABLED=false, slot_name='testsub', synchronous_commit=off);
- testsub_maskconninfo | CREATE SUBSCRIPTION testsub_maskconninfo CONNECTION ***************************************************************************************************PUBLICATION testpub WITH (ENABLED=false, slot_name='testsub', synchronous_commit=off);
+ testsub              | CREATE SUBSCRIPTION testsub CONNECTION **********************PUBLICATION testpub WITH (CONNECT=false, slot_name='testsub', synchronous_commit=off);
+ testsub_maskconninfo | CREATE SUBSCRIPTION testsub_maskconninfo CONNECTION ***************************************************************************************************PUBLICATION testpub WITH (CONNECT=false, slot_name='testsub', synchronous_commit=off);
  testsub              | ALTER SUBSCRIPTION testsub CONNECTION '*************************************************************************************************;
  testsub              | ALTER SUBSCRIPTION testsub CONNECTION '**********************;
  testsub              | ALTER SUBSCRIPTION testsub SET PUBLICATION testpub2, testpub3;
@@ -281,10 +356,16 @@ SELECT object_name,detail_info FROM pg_query_audit('2022-01-13 9:30:00', '2031-1
  testsub_maskconninfo | ALTER SUBSCRIPTION testsub_maskconninfo SET (conninfo='*************************************************************************************************************************;
  testsub              | ALTER SUBSCRIPTION testsub SET (synchronous_commit=on);
  testsub              | ALTER SUBSCRIPTION testsub owner to regress_subscription_user2;
+ testsub              | ALTER SUBSCRIPTION testsub SET (binary=true);
+ testsub              | ALTER SUBSCRIPTION testsub SET (skiplsn = '0/ABCDEF');
+ testsub              | ALTER SUBSCRIPTION testsub SET (skiplsn = 'none');
+ testsub              | ALTER SUBSCRIPTION testsub DISABLE;
  testsub              | ALTER SUBSCRIPTION testsub rename to testsub_rename;
+ sub_len_999          | CREATE SUBSCRIPTION sub_len_999 CONNECTION *********************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************PUBLICATION insert_only WITH (connect = false);
  testsub_rename       | DROP SUBSCRIPTION IF EXISTS testsub_rename;
  testsub_maskconninfo | DROP SUBSCRIPTION IF EXISTS testsub_maskconninfo;
-(14 rows)
+ sub_len_999          | DROP SUBSCRIPTION IF EXISTS sub_len_999;
+(20 rows)
 
 --clear audit log
 SELECT pg_delete_audit('1012-11-10', '3012-11-11');
@@ -294,3 +375,9 @@ SELECT pg_delete_audit('1012-11-10', '3012-11-11');
 (1 row)
 
 \! @abs_bindir@/gs_guc reload -D @abs_srcdir@/tmp_check/datanode1/ -c "audit_system_object" > /dev/null 2>&1
+select pg_sleep(1);
+ pg_sleep 
+----------
+ 
+(1 row)
+

@@ -38,6 +38,8 @@
 
 static Oid lookup_agg_function(List* fnName, int nargs, Oid* input_types, Oid* rettype);
 
+typedef bool (*aggIsSupportedFunc)(const char* aggName);
+
 static void InternalAggIsSupported(const char *aggName)
 {
     static const char *supportList[] = {
@@ -47,7 +49,22 @@ static void InternalAggIsSupported(const char *aggName)
         "json_agg",
         "json_object_agg",
         "st_summarystatsagg",
-        "st_union"
+        "st_union",
+        "wm_concat",
+        "group_concat",
+        "json_objectagg",
+        "json_arrayagg"
+#ifndef ENABLE_MULTIPLE_NODES
+        ,
+        "st_collect",
+        "st_clusterintersecting",
+        "st_clusterwithin",
+        "st_polygonize",
+        "st_makeline",
+        "st_asmvt",
+        "st_asgeobuf",
+        "st_asflatgeobuf"
+#endif
     };
 
     uint len = lengthof(supportList);
@@ -57,17 +74,43 @@ static void InternalAggIsSupported(const char *aggName)
         }
     }
 
+    if (u_sess->hook_cxt.aggIsSupportedHook != NULL &&
+        ((aggIsSupportedFunc)(u_sess->hook_cxt.aggIsSupportedHook))(aggName)) {
+        return;
+    }
+
     ereport(ERROR,
             (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
                 errmsg("unsafe use of pseudo-type \"internal\""),
                 errdetail("Transition type can not be \"internal\".")));
 }
+void CheckAggregateCreatePrivilege(Oid aggNamespace, const char* aggName)
+{
+    if (!isRelSuperuser() &&
+        (aggNamespace == PG_CATALOG_NAMESPACE ||
+        aggNamespace == PG_PUBLIC_NAMESPACE)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("permission denied to create aggregate \"%s\"", aggName),
+            errhint("must be %s to create a aggregate in %s schema.",
+            g_instance.attr.attr_security.enablePrivilegesSeparate ? "initial user" : "sysadmin",
+            get_namespace_name(aggNamespace))));
+    }
 
+    if (!IsInitdb && !u_sess->attr.attr_common.IsInplaceUpgrade &&
+        !g_instance.attr.attr_common.allow_create_sysobject &&
+        IsSysSchema(aggNamespace)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied to create aggregate \"%s\"", aggName),
+                errhint("not allowd to create a aggregate in %s schema when allow_create_sysobject is off.",
+                    get_namespace_name(aggNamespace))));
+    }
+}
 /*
  * AggregateCreate
  * aggKind, aggregation function kind, 'n' for normal aggregation, 'o' for ordered set aggregation.
  */
-void AggregateCreate(const char* aggName, Oid aggNamespace, char aggKind, Oid* aggArgTypes, int numArgs, 
+ObjectAddress AggregateCreate(const char* aggName, Oid aggNamespace, char aggKind, Oid* aggArgTypes, int numArgs, 
                      List* aggtransfnName,
 #ifdef PGXC
     List* aggcollectfnName,
@@ -305,13 +348,15 @@ void AggregateCreate(const char* aggName, Oid aggNamespace, char aggKind, Oid* a
             aclcheck_error_type(aclresult, finaltype);
     }
 
+    CheckAggregateCreatePrivilege(aggNamespace, aggName);
+
     /*
      * Everything looks okay.  Try to create the pg_proc entry for the
      * aggregate.  (This could fail if there's already a conflicting entry.)
      * Fenced mode is not supportted for create aggregate, so set false for
      * argument fenced.
      */
-    procOid = ProcedureCreate(aggName,
+    myself = ProcedureCreate(aggName,
         aggNamespace,
         InvalidOid,
         false,                                /* A db compatible*/
@@ -345,7 +390,7 @@ void AggregateCreate(const char* aggName, Oid aggNamespace, char aggKind, Oid* a
         false,
         false,
         NULL);                               /* default value for proisprocedure */
-
+     procOid = myself.objectId;
     /*
      * Okay to create the pg_aggregate entry.
      */
@@ -427,6 +472,7 @@ void AggregateCreate(const char* aggName, Oid aggNamespace, char aggKind, Oid* a
         referenced.objectSubId = 0;
         recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
     }
+    return myself;
 }
 
 /*

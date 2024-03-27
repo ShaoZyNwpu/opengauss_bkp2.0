@@ -22,6 +22,7 @@
 #include "access/tableam.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_db_privilege.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_constraint.h"
@@ -87,7 +88,7 @@
 /* Local function prototypes */
 static void ConvertTriggerToFK(CreateTrigStmt* stmt, Oid funcoid);
 static void SetTriggerFlags(TriggerDesc* trigdesc, const Trigger* trigger);
-static HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRelInfo* relinfo, Oid targetPartitionOid,
+HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRelInfo* relinfo, Oid targetPartitionOid,
     int2 bucketid, ItemPointer tid, LockTupleMode lockmode, TupleTableSlot** newSlot);
 static void ReleaseFakeRelation(Relation relation, Partition part, Relation* fakeRelation);
 static bool TriggerEnabled(EState* estate, ResultRelInfo* relinfo, Trigger* trigger, TriggerEvent event,
@@ -112,6 +113,8 @@ inline bool IsReplicatedRelationWithoutPK(Relation rel, AttrNumber* indexed_col,
 }
 #endif
 
+extern HeapTuple SearchUserHostName(const char* userName, Oid* oid);
+
 /*
  * Create a trigger.  Returns the OID of the created trigger.
  *
@@ -135,10 +138,10 @@ inline bool IsReplicatedRelationWithoutPK(Relation rel, AttrNumber* indexed_col,
  * relation, as well as ACL_EXECUTE on the trigger function.  For internal
  * triggers the caller must apply any required permission checks.
  *
- * Note: can return InvalidOid if we decided to not create a trigger at all,
+ * Note: can return  InvalidObjectAddress if we decided to not create a trigger at all,
  * but a foreign-key constraint.  This is a kluge for backwards compatibility.
  */
-Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid refRelOid, Oid constraintOid,
+ObjectAddress CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid refRelOid, Oid constraintOid,
     Oid indexOid, bool isInternal)
 {
     uint16 tgtype;
@@ -166,6 +169,9 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
     Oid constrrelid = InvalidOid;
     ObjectAddress myself, referenced;
     Oid tg_owner = 0;
+    Oid proownerid = InvalidOid;
+    bool is_inline_procedural_func = false;
+    int ret = 0;
 
     if (OidIsValid(relOid))
         rel = heap_open(relOid, AccessExclusiveLock);
@@ -252,15 +258,36 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
         }
     }
 
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        Oid curuser = GetUserId();
+        if (stmt->definer) {
+            HeapTuple roletuple = SearchUserHostName(stmt->definer, NULL);
+            if (!HeapTupleIsValid(roletuple)) {
+                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" is not exists", stmt->definer)));
+            }
+            proownerid = HeapTupleGetOid(roletuple);
+            ReleaseSysCache(roletuple);
+        }
+        else {
+            proownerid = curuser;
+        }
+        if (!systemDBA_arg(curuser) && proownerid != curuser)
+            ereport (ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), 
+                    errmsg("only system administrator can user definer other user ,others user definer self")));
+    }
     /* permission checks */
     if (!isInternal) {
+        bool anyResult = false;
+        if (!IsSysSchema(RelationGetNamespace(rel))) {
+            anyResult = HasSpecAnyPriv(GetUserId(), CREATE_ANY_TRIGGER, false);
+        }
         aclresult = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(), ACL_TRIGGER);
-        if (aclresult != ACLCHECK_OK)
+        if (aclresult != ACLCHECK_OK && anyResult != true)
             aclcheck_error(aclresult, ACL_KIND_CLASS, RelationGetRelationName(rel));
 
         if (OidIsValid(constrrelid)) {
             aclresult = pg_class_aclcheck(constrrelid, GetUserId(), ACL_TRIGGER);
-            if (aclresult != ACLCHECK_OK)
+            if (aclresult != ACLCHECK_OK && anyResult != true)
                 aclcheck_error(aclresult, ACL_KIND_CLASS, get_rel_name(constrrelid));
         }
     }
@@ -314,7 +341,7 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
         addRTEtoQuery(pstate, rte, false, true, true);
 
         /* Transform expression.  Copy to be sure we don't modify original */
-        whenClause = transformWhereClause(pstate, (Node*)copyObject(stmt->whenClause), "WHEN");
+        whenClause = transformWhereClause(pstate, (Node*)copyObject(stmt->whenClause), EXPR_KIND_TRIGGER_WHEN, "WHEN");
         /* we have to fix its collations too */
         assign_expr_collations(pstate, whenClause);
 
@@ -408,6 +435,143 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
     }
 
     /*
+     * Generate the trigger's OID now, so that we can use it in the name if
+     * needed.
+     */
+    tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
+
+    trigoid = GetNewOid(tgrel);
+
+    /*
+     * If trigger is internally generated, modify the provided trigger name to
+     * ensure uniqueness by appending the trigger OID.	(Callers will usually
+     * supply a simple constant trigger name in these cases.)
+     */
+    if (isInternal) {
+        errno_t rc = EOK;
+        rc = snprintf_s(
+            internaltrigname, sizeof(internaltrigname), sizeof(internaltrigname) - 1, "%s_%u", stmt->trigname, trigoid);
+        securec_check_ss(rc, "\0", "\0");
+        trigname = internaltrigname;
+    } else {
+        /* user-defined trigger; use the specified trigger name as-is */
+        trigname = stmt->trigname;
+    }
+
+    /*
+     * Scan pg_trigger for existing triggers on relation.  We do this only to
+     * give a nice error message if there's already a trigger of the same
+     * name.  (The unique index on tgrelid/tgname would complain anyway.) We
+     * can skip this for internally generated triggers, since the name
+     * modification above should be sufficient.
+     *
+     * NOTE that this is cool only because we have AccessExclusiveLock on the
+     * relation, so the trigger set won't be changing underneath us.
+     */
+    if (!isInternal) {
+        if (stmt->funcSource != NULL && u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+            ScanKeyInit(
+                &key, Anum_pg_trigger_tgname, BTEqualStrategyNumber, F_NAMEEQ, CStringGetDatum(trigname));
+            tgscan = systable_beginscan(tgrel, TriggerNameIndexId, true, NULL, 1, &key);
+            if (HeapTupleIsValid(tuple = systable_getnext(tgscan))) {
+                if (stmt->if_not_exists) {
+                    ereport(NOTICE,
+                        (errmsg("trigger \"%s\" already exists, skipping",
+                            trigname)));
+                    systable_endscan(tgscan);
+                    heap_close(tgrel, RowExclusiveLock);
+                    heap_close(rel, NoLock);
+                    myself.classId = TriggerRelationId;
+                    myself.objectId = trigoid;
+                    myself.objectSubId = 0;                    
+                    return myself;
+                }
+                else {
+                    systable_endscan(tgscan);
+                    heap_close(tgrel, RowExclusiveLock);
+                    heap_close(rel, NoLock);
+                    ereport(ERROR,
+                        (errcode(ERRCODE_DUPLICATE_OBJECT),
+                        errmsg("trigger \"%s\" already exists",
+                            trigname)));
+                }
+            }
+            systable_endscan(tgscan);
+        } else {
+            ScanKeyInit(
+            &key, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
+            tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true, NULL, 1, &key);
+            while (HeapTupleIsValid(tuple = systable_getnext(tgscan))) {
+                Form_pg_trigger pg_trigger = (Form_pg_trigger)GETSTRUCT(tuple);
+                if (namestrcmp(&(pg_trigger->tgname), trigname) == 0) {
+                    systable_endscan(tgscan);
+                    heap_close(tgrel, RowExclusiveLock);
+                    heap_close(rel, NoLock);
+                    ereport(ERROR,
+                        (errcode(ERRCODE_DUPLICATE_OBJECT),
+                        errmsg("trigger \"%s\" for relation \"%s\" already exists",
+                            trigname,
+                            RelationGetRelationName(rel))));
+                }
+            }
+            systable_endscan(tgscan);
+        }
+    }
+
+    /*
+     * Build the new pg_trigger tuple.
+     */
+    errno_t rc = memset_s(nulls, sizeof(nulls), false, sizeof(nulls));
+    securec_check(rc, "", "");
+    
+    if (stmt->funcSource != NULL && u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        values[Anum_pg_trigger_tgfbody -1] = CStringGetTextDatum(stmt->funcSource->bodySrc);
+        CreateFunctionStmt* n = makeNode(CreateFunctionStmt);
+        n->isOraStyle = false;
+        n->isPrivate = false;
+        n->replace = false;
+        n->definer = stmt->definer;
+        size_t funcNameLen = strlen(stmt->trigname) + strlen(stmt->relation->relname) + strlen("__inlinefunc") + 1;
+        char* funcNameTmp = (char*)palloc(funcNameLen);
+        ret = snprintf_s(funcNameTmp,funcNameLen, funcNameLen-1, "%s_%s_inlinefunc",stmt->trigname,stmt->relation->relname);
+        securec_check_ss(ret, "\0", "\0");
+        n->funcname = list_make1(makeString(funcNameTmp));
+        n->parameters = NULL;
+        n->returnType = makeTypeName("trigger");
+        const char* inlineProcessDesc = " return NEW;end";
+        size_t bodySrcTempSize = strlen(stmt->funcSource->bodySrc) + strlen(inlineProcessDesc);
+        char* bodySrcTemp = (char*)palloc(bodySrcTempSize);
+        int last_end = -1;
+        for (int i = bodySrcTempSize - 3; i > 0; i--) {
+            if (pg_strncasecmp(stmt->funcSource->bodySrc + i, "end", strlen("end")) == 0) {
+                last_end = i;
+                break;
+            }
+        }
+        if (last_end < 1){
+            ereport(ERROR, (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                    errmsg("trigger function body has syntax error")));
+        }
+        ret = memcpy_s(bodySrcTemp, bodySrcTempSize, stmt->funcSource->bodySrc, last_end);
+        securec_check_c(ret, "\0", "\0");
+        bodySrcTemp[last_end] = '\0';
+        ret = strcat_s(bodySrcTemp, bodySrcTempSize, inlineProcessDesc);
+        securec_check_c(ret, "\0", "\0");
+        n->options = lappend(n->options, makeDefElem("as", (Node*)list_make1(makeString(bodySrcTemp))));
+        n->options = lappend(n->options, makeDefElem("language", (Node*)makeString("plpgsql")));
+        n->withClause = NIL;
+        n->isProcedure = false;
+        size_t queryStringLen = strlen(bodySrcTemp) + strlen(funcNameTmp) + strlen("create function  returns trigger ") + 1;
+        char *queryString = (char*)palloc(queryStringLen);
+        ret = snprintf_s(queryString, queryStringLen, queryStringLen - 1, "create function %s returns trigger %s", bodySrcTemp,funcNameTmp);
+        securec_check_ss(ret, "\0", "\0");
+        CreateFunction(n, queryString, InvalidOid);
+        stmt->funcname = n->funcname;
+        is_inline_procedural_func = true;
+    } else {
+        nulls[Anum_pg_trigger_tgfbody - 1] = true;
+    }
+    /*
      * Find and validate the trigger function.
      */
     funcoid = LookupFuncName(stmt->funcname, 0, fargtypes, false);
@@ -433,10 +597,11 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
                 (errmsg("changing return type of function %s from \"opaque\" to \"trigger\"",
                     NameListToString(stmt->funcname))));
             SetFunctionReturnType(funcoid, TRIGGEROID);
-        } else
+        } else {
             ereport(ERROR,
                 (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
                     errmsg("function %s must return type \"trigger\"", NameListToString(stmt->funcname))));
+        }
     }
 
     /*
@@ -455,7 +620,7 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
 
         ConvertTriggerToFK(stmt, funcoid);
 
-        return InvalidOid;
+        return InvalidObjectAddress;
     }
 
     /*
@@ -496,62 +661,6 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
             NULL); /* @hdfs informational constraint */
     }
 
-    /*
-     * Generate the trigger's OID now, so that we can use it in the name if
-     * needed.
-     */
-    tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
-
-    trigoid = GetNewOid(tgrel);
-
-    /*
-     * If trigger is internally generated, modify the provided trigger name to
-     * ensure uniqueness by appending the trigger OID.	(Callers will usually
-     * supply a simple constant trigger name in these cases.)
-     */
-    if (isInternal) {
-        errno_t rc = EOK;
-        rc = snprintf_s(
-            internaltrigname, sizeof(internaltrigname), sizeof(internaltrigname) - 1, "%s_%u", stmt->trigname, trigoid);
-        securec_check_ss(rc, "\0", "\0");
-        trigname = internaltrigname;
-    } else {
-        /* user-defined trigger; use the specified trigger name as-is */
-        trigname = stmt->trigname;
-    }
-
-    /*
-     * Scan pg_trigger for existing triggers on relation.  We do this only to
-     * give a nice error message if there's already a trigger of the same
-     * name.  (The unique index on tgrelid/tgname would complain anyway.) We
-     * can skip this for internally generated triggers, since the name
-     * modification above should be sufficient.
-     *
-     * NOTE that this is cool only because we have AccessExclusiveLock on the
-     * relation, so the trigger set won't be changing underneath us.
-     */
-    if (!isInternal) {
-        ScanKeyInit(
-            &key, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
-        tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true, NULL, 1, &key);
-        while (HeapTupleIsValid(tuple = systable_getnext(tgscan))) {
-            Form_pg_trigger pg_trigger = (Form_pg_trigger)GETSTRUCT(tuple);
-            if (namestrcmp(&(pg_trigger->tgname), trigname) == 0)
-                ereport(ERROR,
-                    (errcode(ERRCODE_DUPLICATE_OBJECT),
-                        errmsg("trigger \"%s\" for relation \"%s\" already exists",
-                            trigname,
-                            RelationGetRelationName(rel))));
-        }
-        systable_endscan(tgscan);
-    }
-
-    /*
-     * Build the new pg_trigger tuple.
-     */
-    errno_t rc = memset_s(nulls, sizeof(nulls), false, sizeof(nulls));
-    securec_check(rc, "", "");
-
     values[Anum_pg_trigger_tgrelid - 1] = ObjectIdGetDatum(RelationGetRelid(rel));
     values[Anum_pg_trigger_tgname - 1] = DirectFunctionCall1(namein, CStringGetDatum(trigname));
     values[Anum_pg_trigger_tgfoid - 1] = ObjectIdGetDatum(funcoid);
@@ -564,6 +673,64 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
     values[Anum_pg_trigger_tgdeferrable - 1] = BoolGetDatum(stmt->deferrable);
     values[Anum_pg_trigger_tginitdeferred - 1] = BoolGetDatum(stmt->initdeferred);
 
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        struct pg_tm tm;
+        fsec_t fsec;
+        GetCurrentTimeUsec(&tm, &fsec, NULL);
+        size_t timeLen = 21;
+        char* timeNum = (char*)palloc(timeLen);
+        ret = snprintf_s(timeNum, timeLen, timeLen - 1,"%d%02d%02d%02d%02d%02d%06d",
+                tm.tm_year, tm.tm_mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, fsec);
+        securec_check_ss(ret, "\0", "\0");
+        char * needTestName = stmt->trgordername;
+        values[Anum_pg_trigger_tgtime - 1] = DirectFunctionCall1(namein, CStringGetDatum(timeNum));
+        if(needTestName != NULL) {
+            size_t trigger_orderLen = strlen("precedes") + 1;
+            char* trigger_order = (char*)palloc(trigger_orderLen);
+            values[Anum_pg_trigger_tgordername - 1] = DirectFunctionCall1(namein, CStringGetDatum(stmt->trgordername));
+            if (stmt->is_follows){
+                ret = snprintf_s(trigger_order,trigger_orderLen,trigger_orderLen - 1,"follows");
+                securec_check_ss(ret, "\0", "\0");
+                values[Anum_pg_trigger_tgorder - 1] = DirectFunctionCall1(namein, CStringGetDatum(trigger_order));
+            }else if(stmt->trgordername != NULL){
+                ret = snprintf_s(trigger_order,trigger_orderLen,trigger_orderLen - 1, "precedes");
+                securec_check_ss(ret, "\0", "\0");
+                values[Anum_pg_trigger_tgorder - 1] = DirectFunctionCall1(namein, CStringGetDatum(trigger_order));
+            }
+            bool is_find = false;
+            if (!isInternal) {
+                ScanKeyInit(
+                    &key, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(RelationGetRelid(rel)));
+                tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true, NULL, 1, &key);
+                while (HeapTupleIsValid(tuple = systable_getnext(tgscan))) {
+                    Form_pg_trigger pg_trigger = (Form_pg_trigger)GETSTRUCT(tuple);
+                    if (namestrcmp(&(pg_trigger->tgname), needTestName) == 0) {
+                        if (pg_trigger->tgtype == tgtype) {
+                            is_find = true;
+                            break;
+                        } else {
+                            ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT),
+                                errmsg("trigger \"%s\" type is not same as current trigger",
+                                    needTestName)));
+                        }
+                    }
+                }
+                systable_endscan(tgscan);
+                if (!is_find) {
+                    ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT),
+                        errmsg("trigger \"%s\" for table \"%s\" is not exists",
+                            needTestName,RelationGetRelationName(rel))));
+                }
+            }
+        } else {
+            values[Anum_pg_trigger_tgordername - 1] = DirectFunctionCall1(namein, CStringGetDatum(""));
+            values[Anum_pg_trigger_tgorder - 1] = DirectFunctionCall1(namein, CStringGetDatum(""));
+        }
+    } else {
+        values[Anum_pg_trigger_tgordername - 1] = DirectFunctionCall1(namein, CStringGetDatum(""));
+        values[Anum_pg_trigger_tgorder - 1] = DirectFunctionCall1(namein, CStringGetDatum(""));
+        values[Anum_pg_trigger_tgtime - 1] = DirectFunctionCall1(namein, CStringGetDatum(""));
+    }
     if (stmt->args) {
         ListCell* le = NULL;
         char* args = NULL;
@@ -643,7 +810,12 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
         nulls[Anum_pg_trigger_tgqual - 1] = true;
 
     /* set trigger owner */
-    tg_owner = GetUserId();
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        tg_owner = proownerid;
+    }
+    else {
+        tg_owner = GetUserId();
+    }
     if (OidIsValid(tg_owner)) {
         values[Anum_pg_trigger_tgowner - 1] = ObjectIdGetDatum(tg_owner);
     } else {
@@ -709,6 +881,13 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
     referenced.objectId = funcoid;
     referenced.objectSubId = 0;
     recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+
+    if (is_inline_procedural_func) {
+        recordDependencyOn(&referenced, &myself, DEPENDENCY_AUTO);
+    }
+    else {
+        recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+    }
 
     if (isInternal && OidIsValid(constraintOid)) {
         /*
@@ -781,7 +960,7 @@ Oid CreateTrigger(CreateTrigStmt* stmt, const char* queryString, Oid relOid, Oid
     /* Keep lock on target rel until end of xact */
     heap_close(rel, NoLock);
 
-    return trigoid;
+    return myself;
 }
 
 /*
@@ -1018,15 +1197,19 @@ static void ConvertTriggerToFK(CreateTrigStmt* stmt, Oid funcoid)
         fkcon->initially_valid = true;
 
         /* ... and execute it */
-        ProcessUtility((Node*)atstmt,
-            "(generated ALTER TABLE ADD FOREIGN KEY command)",
-            NULL,
-            false,
+        processutility_context proutility_cxt;
+        proutility_cxt.parse_tree = (Node*)atstmt;
+        proutility_cxt.query_string = "(generated ALTER TABLE ADD FOREIGN KEY command)";
+        proutility_cxt.readOnlyTree = false;
+        proutility_cxt.params = NULL;
+        proutility_cxt.is_top_level = false;
+        ProcessUtility(&proutility_cxt,
             None_Receiver,
 #ifdef PGXC
             false,
 #endif /* PGXC */
-            NULL);
+            NULL,
+            PROCESS_UTILITY_GENERATED);
 
         /* Remove the matched item from the list */
         u_sess->tri_cxt.info_list = list_delete_ptr(u_sess->tri_cxt.info_list, info);
@@ -1145,6 +1328,53 @@ Oid get_trigger_oid(Oid relid, const char* trigname, bool missing_ok)
     return oid;
 }
 
+Oid get_trigger_oid_b(const char* trigname, Oid* reloid, bool missing_ok)
+{
+    Relation tgrel;
+    ScanKeyData skey;
+    SysScanDesc tgscan;
+    HeapTuple tup;
+    Oid oid;
+    int count = 0;
+
+    /*
+     * Find the trigger, verify permissions, set up object address
+     */
+    tgrel = heap_open(TriggerRelationId, AccessShareLock);
+
+    ScanKeyInit(&skey, Anum_pg_trigger_tgname, BTEqualStrategyNumber, F_NAMEEQ, CStringGetDatum(trigname));
+
+    tgscan = systable_beginscan(tgrel, TriggerNameIndexId, true, NULL, 1, &skey);
+
+    while (HeapTupleIsValid(tup = systable_getnext(tgscan))) {
+        count ++;
+        if (count == 1) {
+            Form_pg_trigger pg_trigger = (Form_pg_trigger)GETSTRUCT(tup);
+            *reloid = pg_trigger->tgrelid;
+            oid = HeapTupleGetOid(tup);
+        } else if (count > 1) {
+            systable_endscan(tgscan);
+            heap_close(tgrel, AccessShareLock);
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("trigger named \"%s\" has more than one trigger, please use drop trigger on syntax", trigname)));
+        }
+    }
+    if (count == 0) {
+        if (!missing_ok) {
+            systable_endscan(tgscan);
+            heap_close(tgrel, AccessShareLock);
+            ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("trigger \"%s\" does not exist", trigname)));
+        }
+        oid = InvalidOid;
+    }
+
+    systable_endscan(tgscan);
+    heap_close(tgrel, AccessShareLock);
+    return oid;
+}
 /*
  * Perform permissions and integrity checks before acquiring a relation lock.
  */
@@ -1163,9 +1393,15 @@ static void RangeVarCallbackForRenameTrigger(
         form->relkind != RELKIND_CONTQUERY)
         ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a table or view", rv->relname)));
 
-    /* you must own the table to rename one of its triggers */
-    if (!pg_class_ownercheck(relid, GetUserId()))
-        aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS, rv->relname);
+    /* you must own the table or have ALTER ANY TRIGGER to rename one of its triggers */
+    bool ownerResult = pg_class_ownercheck(relid, GetUserId());
+    bool anyResult = false;
+    if (!ownerResult && !IsSysSchema(form->relnamespace)) {
+        anyResult = HasSpecAnyPriv(GetUserId(), ALTER_ANY_TRIGGER, false);
+    }
+    if (!ownerResult && !anyResult) {
+        aclcheck_error(ACLCHECK_NO_PRIV, ACL_KIND_CLASS, rv->relname);
+    }
     if (!g_instance.attr.attr_common.allowSystemTableMods && !u_sess->attr.attr_common.IsInplaceUpgrade &&
         IsSystemClass(form))
         ereport(ERROR,
@@ -1188,7 +1424,7 @@ static void RangeVarCallbackForRenameTrigger(
  *		modify tgname in trigger tuple
  *		update row in catalog
  */
-void renametrig(RenameStmt* stmt)
+ObjectAddress renametrig(RenameStmt* stmt)
 {
     Relation targetrel;
     Relation tgrel;
@@ -1196,7 +1432,8 @@ void renametrig(RenameStmt* stmt)
     SysScanDesc tgscan;
     ScanKeyData key[2];
     Oid relid;
-
+    ObjectAddress address;
+    Oid      tgoid = InvalidOid;    
     /*
      * Look up name, check permissions, and acquire lock (which we will NOT
      * release until end of transaction).
@@ -1245,7 +1482,7 @@ void renametrig(RenameStmt* stmt)
          * Update pg_trigger tuple with new tgname.
          */
         tuple = (HeapTuple)tableam_tops_copy_tuple(tuple); /* need a modifiable copy */
-
+        tgoid = HeapTupleGetOid(tuple);
         (void)namestrcpy(&((Form_pg_trigger)GETSTRUCT(tuple))->tgname, stmt->newname);
 
         simple_heap_update(tgrel, &tuple->t_self, tuple);
@@ -1267,6 +1504,7 @@ void renametrig(RenameStmt* stmt)
                     RelationGetRelationName(targetrel))));
     }
 
+    ObjectAddressSet(address, TriggerRelationId, tgoid);
     systable_endscan(tgscan);
 
     heap_close(tgrel, RowExclusiveLock);
@@ -1275,6 +1513,7 @@ void renametrig(RenameStmt* stmt)
      * Close rel, but keep exclusive lock!
      */
     relation_close(targetrel, NoLock);
+    return address;
 }
 
 /*
@@ -1411,6 +1650,18 @@ void RelationBuildTriggers(Relation relation)
     tgrel = heap_open(TriggerRelationId, AccessShareLock);
     tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true, NULL, 1, &skey);
 
+    struct TriggerNameInfo {
+        char* follows_name;
+        char* precedes_name;
+        char* trg_name;
+        char* time; 
+    };
+    TriggerNameInfo* tgNameInfos = NULL;
+    bool is_has_follows = false;
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        tgNameInfos = (TriggerNameInfo*)palloc(maxtrigs*sizeof(TriggerNameInfo));
+    }
+
     while (HeapTupleIsValid(htup = systable_getnext(tgscan))) {
         Form_pg_trigger pg_trigger = (Form_pg_trigger)GETSTRUCT(htup);
         Trigger* build = NULL;
@@ -1420,6 +1671,33 @@ void RelationBuildTriggers(Relation relation)
         if (numtrigs >= maxtrigs) {
             maxtrigs *= 2;
             triggers = (Trigger*)repalloc(triggers, maxtrigs * sizeof(Trigger));
+            if (DB_IS_CMPT(B_FORMAT)) {
+                tgNameInfos = (TriggerNameInfo *)repalloc(tgNameInfos, maxtrigs * sizeof(TriggerNameInfo));
+            }
+        }
+        if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+            TriggerNameInfo *tgNameInfo = &(tgNameInfos[numtrigs]);
+
+            char* trigname = DatumGetCString(DirectFunctionCall1(nameout, NameGetDatum(&pg_trigger->tgname)));
+            char* tgordername = DatumGetCString(fastgetattr(htup, Anum_pg_trigger_tgordername, tgrel->rd_att, &isnull));
+            char* tgorder = DatumGetCString(fastgetattr(htup, Anum_pg_trigger_tgorder, tgrel->rd_att, &isnull));
+            char* tgtime = DatumGetCString(fastgetattr(htup, Anum_pg_trigger_tgtime, tgrel->rd_att, &isnull));
+            if (strcmp(tgorder, "follows") == 0) {
+                tgNameInfo->follows_name = tgordername;
+                tgNameInfo->precedes_name = NULL;
+                is_has_follows = true;
+            }
+            else if (strcmp(tgorder, "precedes") == 0) {
+                tgNameInfo->follows_name = NULL;
+                tgNameInfo->precedes_name = tgordername;
+                is_has_follows = true;
+            }
+            else {
+                tgNameInfo->follows_name = NULL;
+                tgNameInfo->precedes_name = NULL;
+            }
+            tgNameInfo->trg_name = trigname;
+            tgNameInfo->time = tgtime;
         }
         build = &(triggers[numtrigs]);
         build->tgoid = HeapTupleGetOid(htup);
@@ -1479,6 +1757,71 @@ void RelationBuildTriggers(Relation relation)
         numtrigs++;
     }
 
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        int n = numtrigs;
+        int gap = n;
+        while (gap > 1) {
+            gap = gap/2;
+            int i;
+            for (i = 0;i < n - gap; i++) {
+                int end = i;
+                char* tmp = tgNameInfos[end+gap].time;
+                TriggerNameInfo temp = tgNameInfos[end+gap];
+                Trigger tgtmp = triggers[end+gap];
+                while (end >= 0) {
+                    if (strcmp(tmp, tgNameInfos[end].time)<0) {
+                        tgNameInfos[end+gap] = tgNameInfos[end];
+                        triggers[end+gap] = triggers[end];
+                        end -= gap;
+                    }
+                    else 
+                        break;
+                }
+                tgNameInfos[end+gap] = temp;
+                triggers[end+gap] = tgtmp;
+            }
+        }
+        if (is_has_follows) {
+            for (int i = 0; i < numtrigs -1;i++) {
+                int end = i;
+                TriggerNameInfo temp = tgNameInfos[end+1];
+                Trigger tgtmp = triggers[end+1];
+                char* find_name = NULL;
+                bool is_follows = false;
+                if (temp.follows_name != NULL) {
+                    is_follows = true;
+                    find_name = temp.follows_name;
+                }
+                else if (temp.precedes_name != NULL) {
+                    find_name = temp.precedes_name;
+                }
+                else
+                    continue;
+                while (end >= 0) {
+                    if (strcmp(tgNameInfos[end].trg_name, find_name)!=0) {
+                        tgNameInfos[end+1] = tgNameInfos[end];
+                        triggers[end+1] = triggers[end];
+                        end--;
+                    }
+                    else {
+                        if(is_follows == false)
+                        {
+                            tgNameInfos[end+1] = tgNameInfos[end];
+                            triggers[end+1] = triggers[end];
+                            end--;
+                        }
+                        break;
+                    }
+                }
+                tgNameInfos[end+1] = temp;
+                triggers[end+1] = tgtmp;
+            }
+        }
+    }
+    if (tgNameInfos != NULL)
+    {
+        pfree_ext(tgNameInfos);
+    }
     systable_endscan(tgscan);
     heap_close(tgrel, AccessShareLock);
 
@@ -1719,6 +2062,7 @@ static HeapTuple ExecCallTriggerFunc(
     PgStat_FunctionCallUsage fcusage;
     Datum result;
     Oid old_uesr = 0;
+    Oid save_old_uesr = 0;
     int save_sec_context = 0;
     bool saved_is_allow_commit_rollback = false;
     bool need_reset_err_msg;
@@ -1754,6 +2098,7 @@ static HeapTuple ExecCallTriggerFunc(
      * the tuple cycle.
      */
     MemoryContext oldContext = MemoryContextSwitchTo(per_tuple_context);
+    save_old_uesr = GetOldUserId(false);
 
     /* get trigger owner and make sure current user is trigger owner when execute trigger-func */
     GetUserIdAndSecContext(&old_uesr, &save_sec_context);
@@ -1761,7 +2106,9 @@ static HeapTuple ExecCallTriggerFunc(
     if (trigger_owner == InvalidTgOwnerId) {
         ereport(LOG, (errmsg("old system table pg_trigger does not have tgowner column, use old default permission")));
     } else {
-        SetUserIdAndSecContext(trigger_owner, (int)((uint32)save_sec_context | SECURITY_LOCAL_USERID_CHANGE));
+        SetOldUserId(old_uesr, false);
+        SetUserIdAndSecContext(trigger_owner,
+            (int)((uint32)save_sec_context | SECURITY_LOCAL_USERID_CHANGE | SENDER_LOCAL_USERID_CHANGE));
         u_sess->exec_cxt.is_exec_trigger_func = true;
     }
     /*
@@ -1780,6 +2127,10 @@ static HeapTuple ExecCallTriggerFunc(
     {
         stp_reset_xact_state_and_err_msg(saved_is_allow_commit_rollback, need_reset_err_msg);
         u_sess->tri_cxt.MyTriggerDepth--;
+
+        SetOldUserId(save_old_uesr, false);
+        /* reset current user */
+        SetUserIdAndSecContext(old_uesr, save_sec_context);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -1789,6 +2140,7 @@ static HeapTuple ExecCallTriggerFunc(
 
     pgstat_end_function_usage(&fcusage, true);
 
+    SetOldUserId(save_old_uesr, false);
     /* reset current user */
     SetUserIdAndSecContext(old_uesr, save_sec_context);
     u_sess->exec_cxt.is_exec_trigger_func = false;
@@ -2659,7 +3011,7 @@ void ExecASTruncateTriggers(EState* estate, ResultRelInfo* relinfo)
             NULL);
 }
 
-static HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRelInfo* relinfo, Oid targetPartitionOid,
+HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRelInfo* relinfo, Oid targetPartitionOid,
     int2 bucketid, ItemPointer tid, LockTupleMode lockmode, TupleTableSlot** newSlot)
 {
     Relation relation = relinfo->ri_RelationDesc;
@@ -2680,7 +3032,7 @@ static HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRe
     }
 
     if (RelationIsUstoreFormat(relation)) {
-        TupleTableSlot *slot = MakeSingleTupleTableSlot(relation->rd_att, false, TAM_USTORE);
+        TupleTableSlot *slot = MakeSingleTupleTableSlot(relation->rd_att, false, TableAmUstore);
         UHeapTuple utuple;
 
         UHeapTupleData uheaptupdata;
@@ -2712,7 +3064,7 @@ static HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRe
              * lock inplacetuple for update
              */
             inplacetest = tableam_tuple_lock(RELATION_IS_PARTITIONED(relation) ? fakeRelation : relation, utuple,
-                &buffer, estate->es_output_cid, LockTupleExclusive, false, &tmfd, false, false, false,
+                &buffer, estate->es_output_cid, LockTupleExclusive, LockWaitBlock, &tmfd, false, false, false,
                 estate->es_snapshot, tid, false);
 
             switch (inplacetest) {
@@ -2821,16 +3173,16 @@ static HeapTuple GetTupleForTrigger(EState* estate, EPQState* epqstate, ResultRe
             /*
              * lock tuple for update
              */
-ltrmark:;
+ltrmark:
             tuple.t_self = *tid;
             test = tableam_tuple_lock(fakeRelation,
                 &tuple,
                 &buffer,
                 estate->es_output_cid,
                 lockmode,
-                false,
+                LockWaitBlock,
                 &tmfd,
-                false,       // fake params below are for uheap implementation
+                true,       // fake params below are for uheap implementation
                 false, false, NULL, NULL, false);
             switch (test) {
                 case TM_SelfUpdated:

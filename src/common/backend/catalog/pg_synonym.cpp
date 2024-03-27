@@ -29,6 +29,7 @@
 #include "access/sysattr.h"
 #include "lib/stringinfo.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_db_privilege.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_synonym.h"
@@ -45,10 +46,36 @@
 #include "utils/rel.h"
 #include "access/heapam.h"
 #include "miscadmin.h"
+#include "client_logic/client_logic.h"
 
 static Oid SynonymCreate(
     Oid synNamespace, const char* synName, Oid synOwner, const char* objSchema, const char* objName, bool replace);
 static void SynonymDrop(Oid synNamespace, char* synName, DropBehavior behavior, bool missing);
+
+void CheckCreateSynonymPrivilege(Oid synNamespace, const char* synName)
+{
+    if (!isRelSuperuser() &&
+        (synNamespace == PG_CATALOG_NAMESPACE ||
+        synNamespace == PG_PUBLIC_NAMESPACE ||
+        synNamespace == PG_DB4AI_NAMESPACE)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied to create synonym \"%s\"", synName),
+                errhint("must be %s to create a synonym in %s schema.",
+                    g_instance.attr.attr_security.enablePrivilegesSeparate ? "initial user" : "sysadmin",
+                    get_namespace_name(synNamespace))));
+    }
+
+    if (!IsInitdb && !u_sess->attr.attr_common.IsInplaceUpgrade &&
+        !g_instance.attr.attr_common.allow_create_sysobject &&
+        IsSysSchema(synNamespace)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied to create synonym \"%s\"", synName),
+                errhint("not allowd to create a synonym in %s schema when allow_create_sysobject is off.",
+                    get_namespace_name(synNamespace))));
+    }
+}
 
 /*
  * CREATE SYNONYM
@@ -73,19 +100,15 @@ void CreateSynonym(CreateSynonymStmt* stmt)
 
     /* Check we have creation rights in namespace. */
     aclResult = pg_namespace_aclcheck(synNamespace, GetUserId(), ACL_CREATE);
-
-    if (aclResult != ACLCHECK_OK) {
+    bool anyResult = false;
+    if (aclResult != ACLCHECK_OK && !IsSysSchema(synNamespace)) {
+        anyResult = HasSpecAnyPriv(GetUserId(), CREATE_ANY_SYNONYM, false);
+    }
+    if (aclResult != ACLCHECK_OK && !anyResult) {
         aclcheck_error(aclResult, ACL_KIND_NAMESPACE, get_namespace_name(synNamespace));
     }
 
-    if (synNamespace == PG_PUBLIC_NAMESPACE && !isRelSuperuser()) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                errmsg("permission denied to create synonym \"%s\"", synName),
-                errhint("must be %s to create a synonym in public schema.",
-                    g_instance.attr.attr_security.enablePrivilegesSeparate  ? "initial user" : "sysadmin")));
-    }
-
+    CheckCreateSynonymPrivilege(synNamespace, synName);
     /* Deconstruct the referenced qualified-name. */
     DeconstructQualifiedName(stmt->objName, &objSchema, &objName);
 
@@ -94,8 +117,21 @@ void CreateSynonym(CreateSynonymStmt* stmt)
         objSchema = get_namespace_name(GetOidBySchemaName());
     }
 
-    /* Main entry to create a synonym */
-    SynonymCreate(synNamespace, synName, GetUserId(), objSchema, objName, stmt->replace);
+    /* 
+     * Check synonym name to ensure that it doesn't conflict with existing view, table, function, and procedure.
+     */
+    if (get_relname_relid(synName, synNamespace) != InvalidOid || get_func_oid(synName, synNamespace, NULL) != InvalidOid) {
+        ereport(ERROR, (errmsg("synonym name is already used by an existing object")));
+    }
+
+    if (IsFullEncryptedRel(objSchema, objName)) {
+        ereport(ERROR, (errmsg("Unsupport to CREATE SYNONYM for encryption table.")));
+    } else if (IsFuncProcOnEncryptedRel(objSchema, objName)) {
+        ereport(ERROR, (errmsg("Unsupport to CREATE SYNONYM for encryption procedure or function.")));
+    } else {
+        /* Main entry to create a synonym */
+        SynonymCreate(synNamespace, synName, GetUserId(), objSchema, objName, stmt->replace);
+    }
 }
 
 /*
@@ -111,8 +147,8 @@ void DropSynonym(DropSynonymStmt* stmt)
     synNamespace = QualifiedNameGetCreationNamespace(stmt->synName, &synName);
     Assert(OidIsValid(synNamespace));
 
-    /* Check we have drop privilege in namespace */
-    aclResult = pg_namespace_aclcheck(synNamespace, GetUserId(), ACL_CREATE);
+    /* Check we have usage privilege in namespace */
+    aclResult = pg_namespace_aclcheck(synNamespace, GetUserId(), ACL_USAGE);
     if (aclResult != ACLCHECK_OK) {
         aclcheck_error(aclResult, ACL_KIND_NAMESPACE, get_namespace_name(synNamespace));
     }
@@ -201,13 +237,11 @@ static Oid SynonymCreate(
     /* update the index if any */
     CatalogUpdateIndexes(rel, tuple);
 
+    ObjectAddressSet(myself, PgSynonymRelationId, HeapTupleGetOid(tuple));
+
     /* record the dependencies, for the first create. */
     if (!isUpdate) {
         /* dependency on namespace of synonym object */
-        myself.classId = PgSynonymRelationId;
-        myself.objectId = HeapTupleGetOid(tuple);
-        myself.objectSubId = 0;
-
         referenced.classId = NamespaceRelationId;
         referenced.objectId = synNamespace;
         referenced.objectSubId = 0;
@@ -216,6 +250,8 @@ static Oid SynonymCreate(
         /* dependency on owner of synonym object */
         recordDependencyOnOwner(myself.classId, myself.objectId, synOwner);
     }
+
+    recordDependencyOnCurrentExtension(&myself, isUpdate);
 
     heap_freetuple(tuple);
     heap_close(rel, RowExclusiveLock);
@@ -249,9 +285,15 @@ static void SynonymDrop(Oid synNamespace, char* synName, DropBehavior behavior, 
 
     Oid synOid = HeapTupleGetOid(tuple);
     Form_pg_synonym synForm = (Form_pg_synonym)GETSTRUCT(tuple);
-    /* Allow DROP to either synonym owner or schema owner. */
-    if (!pg_synonym_ownercheck(synOid, GetUserId()) && !pg_namespace_ownercheck(synForm->synnamespace, GetUserId())) {
-        aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS, NameStr(synForm->synname));
+    /* Allow DROP to either synonym owner or schema owner or user having DROP ANY SYNONYM privilege. */
+    bool ownerResult = pg_synonym_ownercheck(synOid, GetUserId()) ||
+        pg_namespace_ownercheck(synForm->synnamespace, GetUserId());
+    bool anyResult = false;
+    if (!ownerResult && !IsSysSchema(synForm->synnamespace)) {
+        anyResult = HasSpecAnyPriv(GetUserId(), DROP_ANY_SYNONYM, false);
+    }
+    if (!ownerResult && !anyResult) {
+        aclcheck_error(ACLCHECK_NO_PRIV, ACL_KIND_CLASS, NameStr(synForm->synname));
     }
     ReleaseSysCache(tuple);
 
@@ -268,12 +310,13 @@ static void SynonymDrop(Oid synNamespace, char* synName, DropBehavior behavior, 
 /*
  * ALTER Synonym name OWNER TO newowner
  */
-void AlterSynonymOwner(List* name, Oid newOwnerId)
+ObjectAddress AlterSynonymOwner(List* name, Oid newOwnerId)
 {
     HeapTuple tuple = NULL;
     Relation rel = NULL;
-    Oid synNamespace;
+    Oid synNamespace, synOid;
     char* synName = NULL;
+    ObjectAddress address;
 
     /* Convert list of synonym names to a synName and a synNamespace. */
     synNamespace = QualifiedNameGetCreationNamespace(name, &synName);
@@ -286,6 +329,7 @@ void AlterSynonymOwner(List* name, Oid newOwnerId)
         heap_close(rel, RowExclusiveLock);
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("synonym \"%s\" does not exist", synName)));
     }
+    synOid = HeapTupleGetOid(tuple);
     Form_pg_synonym synForm = (Form_pg_synonym)GETSTRUCT(tuple);
 
     /*
@@ -319,11 +363,13 @@ void AlterSynonymOwner(List* name, Oid newOwnerId)
         CatalogUpdateIndexes(rel, tuple);
 
         /* Update owner dependency reference. */
-        changeDependencyOnOwner(PgSynonymRelationId, HeapTupleGetOid(tuple), newOwnerId);
+        changeDependencyOnOwner(PgSynonymRelationId, synOid, newOwnerId);
     }
 
     heap_freetuple_ext(tuple);
     heap_close(rel, RowExclusiveLock);
+    ObjectAddressSet(address, PgSynonymRelationId, synOid);
+    return address;
 }
 
 /*
@@ -474,6 +520,7 @@ char* CheckReferencedObject(Oid relOid, RangeVar* objVar, const char* synName)
         case RELKIND_CONTQUERY:
         case RELKIND_FOREIGN_TABLE:
         case RELKIND_STREAM:
+        case RELKIND_MATVIEW:
             break;
         case RELKIND_COMPOSITE_TYPE:
             appendStringInfo(

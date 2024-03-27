@@ -75,6 +75,7 @@ typedef enum
     IDEN_CREATE,
     IDEN_OR,
     IDEN_REPLACE,
+    IDEN_DEFINER,
     IDEN_PROCEDURE,
     IDEN_RETURN,
     IDEN_RETURNS,
@@ -91,7 +92,8 @@ typedef enum
     IDEN_SCROLL,
     IDEN_DETERMINISTIC,
 	IDEN_PACKAGE,
-    IDEN_BUTT,
+    IDEN_SELECT,
+    IDEN_BUTT
 }GramIdentify;
 
 /*
@@ -145,6 +147,9 @@ typedef struct PsqlScanStateData
 						   For sql like "Declare foo CURSOR XXX, butt_num is 1.
 						   Using this we can judge if the sql is a DECLARE CURSOR stmt */
 	bool		include_ora_comment; /* dont igore comment when ture, such as single line comment after function/procedure param */
+    bool is_b_format;
+	char *delimiter_name;
+	bool is_end_state;   /* judge end state */
 } PsqlScanStateData;
 
 static PsqlScanState cur_state;	/* current state while active */
@@ -195,6 +200,7 @@ static void analyze_state(const char* text,PsqlScanState state);
 static int upperstrcmp(const char *str1,const char *str2);
 static  GramIdentify keywordRead(const char* text);
 static bool IsTranscationTokens(char* yytext, char* token);
+static bool judge_end_state(const char* text);
 
 #define YY_DECL int yylex(PsqlScanState lex_param)
 
@@ -655,6 +661,13 @@ other			.
 						RESET_XP_STATUS();
 						return LEXRES_SEMI;
 					}
+
+					if (cur_state->is_b_format == true ) {
+						if (strstr(yytext, cur_state->delimiter_name) != NULL && strcmp(";" ,cur_state->delimiter_name) != 0) {
+							RESET_XP_STATUS();
+							return LEXRES_SEMI;
+						}
+					}
 				}
 	}
 
@@ -741,6 +754,11 @@ other			.
 <xd>{xdstop}	{
 					BEGIN(INITIAL);
 					ECHO;
+					if (cur_state->is_end_state) {
+						RESET_XP_STATUS() ;
+						cur_state->is_end_state = false;
+						return LEXRES_SEMI;
+					}
 				}
 <xui>{xuistop1}	{
 					yyless(1);
@@ -756,6 +774,12 @@ other			.
 				}
 <xd,xui>{xdinside}	{
 					ECHO;
+					if ((lex_param->begin_state == BEGIN_CURSOR || 
+							( !lex_param->declare_encountered && cur_state->paren_depth == 0))
+							&& judge_end_state(yytext))
+					{
+						cur_state->is_end_state = true;
+					}
 				}
 
 {xufailed}	{
@@ -795,9 +819,13 @@ other			.
 
 ";"				{
 					ECHO;
-					
-					if (lex_param->begin_state == BEGIN_CURSOR || 
+					bool is_end = true;
+					if (cur_state->is_b_format && strcmp(yytext , cur_state->delimiter_name) != 0) {
+						is_end = false;
+					}
+					if ((lex_param->begin_state == BEGIN_CURSOR || 
 						(!lex_param->declare_encountered && cur_state->paren_depth == 0))
+					     && is_end == true)
 					{
 							RESET_XP_STATUS();
 							return LEXRES_SEMI;
@@ -888,6 +916,13 @@ other			.
 
 {self}			{
 					ECHO;
+					if ((lex_param->begin_state == BEGIN_CURSOR || 
+							( !lex_param->declare_encountered && cur_state->paren_depth == 0))
+							&& judge_end_state(yytext))
+					{
+						RESET_XP_STATUS() ;
+						return LEXRES_SEMI;
+					}
 				}
 
 {operator}		{
@@ -942,6 +977,13 @@ other			.
 						yyless(nchars);
 					}
 					ECHO;
+					if ((lex_param->begin_state == BEGIN_CURSOR || 
+							( !lex_param->declare_encountered && cur_state->paren_depth == 0))
+							&& judge_end_state(yytext))
+					{
+						RESET_XP_STATUS() ;
+						return LEXRES_SEMI;
+					}
 				}
 
 {param}			{
@@ -982,6 +1024,13 @@ other			.
 {identifier}	{
 					ECHO;
 					analyze_state(yytext,(PsqlScanStateData*)lex_param);
+					if ((lex_param->begin_state == BEGIN_CURSOR || 
+							( !lex_param->declare_encountered && cur_state->paren_depth == 0))
+							&& judge_end_state(yytext))
+					{
+						RESET_XP_STATUS() ;
+						return LEXRES_SEMI;
+					}
 				}
 
 {other}			{
@@ -1372,7 +1421,9 @@ psql_scan_setup(PsqlScanState state,
 PsqlScanResult
 psql_scan(PsqlScanState state,
 		  PQExpBuffer query_buf,
-		  promptStatus_t *prompt)
+		  promptStatus_t *prompt,
+		  bool is_b_format,
+		  char* delimiter_name)
 {
 	PsqlScanResult result;
 	int			lexresult;
@@ -1390,6 +1441,15 @@ psql_scan(PsqlScanState state,
 		yy_switch_to_buffer(state->scanbufhandle);
 
 	BEGIN(state->start_state);
+	state->is_b_format = is_b_format;
+	state->is_end_state = false;
+	if (is_b_format) {
+		if (state->delimiter_name) {
+			free(state->delimiter_name);
+			state->delimiter_name = NULL;
+		}
+		state->delimiter_name = pg_strdup(delimiter_name);
+	}
 
 	/* And lex. */
 	lexresult = yylex((PsqlScanStateData*)state);
@@ -1521,6 +1581,10 @@ psql_scan_finish(PsqlScanState state)
 		free(state->scanbuf);
 	}
 	state->scanbuf = NULL;
+	if (state->delimiter_name) {
+		free(state->delimiter_name);
+	}
+	state->delimiter_name = NULL;
 }
 
 /*
@@ -1552,6 +1616,12 @@ psql_scan_reset(PsqlScanState state)
 	state->begin_state = BEGIN_UNDEFINED;
 	state->butt_num = 0;
 	state->declare_encountered = false;
+	state->is_b_format = false;
+	state->is_end_state = false;
+	if (state->delimiter_name) {
+		free(state->delimiter_name);
+	}
+	state->delimiter_name = NULL;
 }
 
 /*
@@ -2059,6 +2129,14 @@ static bool IsTranscationTokens(char* yytext, char* token)
     return false;
 }
 
+static bool judge_end_state(const char* text)
+{	
+	if (cur_state->is_b_format == true) {
+		return (strcmp(yytext, cur_state->delimiter_name) ==0);
+	}
+	return false;
+}
+
 /*
  * escape_variable --- process :'VARIABLE' or :"VARIABLE"
  *
@@ -2146,6 +2224,8 @@ keywordRead(const char* text)
 		return IDEN_OR;
 	else if (!upperstrcmp(text, "replace"))
 		return IDEN_REPLACE;
+	else if (!upperstrcmp(text, "definer"))
+		return IDEN_DEFINER;
 	else if (!upperstrcmp(text, "procedure"))
 		return IDEN_PROCEDURE;
     else if (!upperstrcmp(text, "package"))
@@ -2178,6 +2258,8 @@ keywordRead(const char* text)
 		return IDEN_CURSOR;
 	else if (!upperstrcmp(text, "deterministic"))
 		return IDEN_DETERMINISTIC;
+	else if (!upperstrcmp(text, "select"))
+		return IDEN_SELECT;
 	else 
 		return IDEN_BUTT;
 }
@@ -2193,6 +2275,9 @@ analyze_state(const char* text,PsqlScanStateData* state)
 	GramIdentify keyValue = IDEN_BUTT;
 	/*don't need to read identify*/
 	if (0 == state->count_to_read)
+		return;
+	/*if we set delimiter to other word, don`t let Begin(xp) work*/
+	if (state->is_b_format && state->delimiter_name && strcmp(state->delimiter_name, ";") != 0)
 		return;
 	state->count_to_read--;  
 	keyValue = keywordRead(text);
@@ -2216,6 +2301,7 @@ analyze_state(const char* text,PsqlScanStateData* state)
 	{
 		case IDEN_CREATE:
 			state->gram_state[IDEN_OR] = true;
+			state->gram_state[IDEN_DEFINER] = true;
 			state->gram_state[IDEN_PROCEDURE] = true;
 			state->gram_state[IDEN_FUNCTION] = true;
 			state->gram_state[IDEN_TRIGGER] = true;
@@ -2224,18 +2310,42 @@ analyze_state(const char* text,PsqlScanStateData* state)
 			break;
 		case IDEN_OR:
 			state->gram_state[IDEN_REPLACE] = true;
+			state->gram_state[IDEN_DEFINER] = true;
 			state->count_to_read++;
 			break;
 		case IDEN_REPLACE:
+			state->gram_state[IDEN_DEFINER] = true;
 			state->gram_state[IDEN_PROCEDURE] = true;
 			state->gram_state[IDEN_FUNCTION] = true;
 			state->gram_state[IDEN_PACKAGE] = true;
 			state->gram_state[IDEN_TRIGGER] = true;
 			state->count_to_read++;
 			break;
+		case IDEN_DEFINER:
+			state->gram_state[IDEN_PROCEDURE] = true;
+			state->gram_state[IDEN_FUNCTION] = true;
+			state->gram_state[IDEN_PACKAGE] = true;
+			state->gram_state[IDEN_TRIGGER] = true;
+			state->count_to_read++;
+			state->count_to_read = -1;
+			break;
 		case IDEN_PROCEDURE:
+			if (state->declare_encountered && state->begin_state == BEGIN_UNDEFINED) {
+				/*
+				 * declare_encountered is true means we have met a 'declare' already, sql may like
+				 * 'create trigger declare on declare execute procedure xx', 'declare' should be treat as an identifier
+				 * not a keyword. PROCEDURE is a reserve keyword, so it must be a keyword not a identifier.
+				 */
+				state->declare_encountered = false;
+				state->gram_state[IDEN_PROCEDURE] = false;
+				state->gram_state[IDEN_DECLARE] = false;
+				break;
+			}
 			state->gram_state[IDEN_AS] = true;
 			state->gram_state[IDEN_IS] = true;
+			if (state->is_b_format) {
+  				state->gram_state[IDEN_SELECT] = true;
+			}
 			state->include_ora_comment = true;
 			state->count_to_read = -1;
 			break;
@@ -2260,7 +2370,8 @@ analyze_state(const char* text,PsqlScanStateData* state)
                         /* for example:RETURN INTEGER DETERMINISTIC RETURNS NULL ON NULL INPUT  */
 			state->gram_state[IDEN_AS] = true;
 			state->gram_state[IDEN_IS] = true;
-			state->count_to_read = 6;
+			/* change into -1 ,to avoid goto Begin(xp) without as or is*/
+			state->count_to_read = -1;
 			break;
 		case IDEN_RETURNS:
 			break;
@@ -2270,6 +2381,12 @@ analyze_state(const char* text,PsqlScanStateData* state)
 			state->include_ora_comment = true;
 			state->count_to_read = -1;
 			break;
+		case IDEN_SELECT:
+			/*close door of as and is when create procedure select,to ensure not goto Begin(xp)*/
+			state->gram_state[IDEN_AS] = false;
+                        state->gram_state[IDEN_IS] = false;
+			state->count_to_read = -1;
+                        break;
 		case IDEN_AS:
 		case IDEN_IS:
 			state->count_to_read = 0;
@@ -2289,6 +2406,7 @@ analyze_state(const char* text,PsqlScanStateData* state)
 			state->gram_state[IDEN_BINARY] = true;
 			state->gram_state[IDEN_INSENSITIVE] = true;
 			state->gram_state[IDEN_NO] = true;
+			state->gram_state[IDEN_PROCEDURE] = true;
 			state->declare_encountered = true;
 			break;
 		case IDEN_BEGIN:

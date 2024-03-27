@@ -23,6 +23,7 @@
 #include "optimizer/streamplan.h"
 #include "utils/lsyscache.h"
 #include "parser/parsetree.h"
+#include "parser/parse_merge.h"
 #include "utils/syscache.h"
 #include "pgxc/locator.h"
 
@@ -125,15 +126,15 @@ static void stream_walker_query_insertinto_rep(Query* query, shipping_context *c
     if (!cxt->current_shippable) {
         return;
     }
-    if (query->commandType != CMD_INSERT || query->resultRelation == 0 ||
-        !IsLocatorReplicated(rt_fetch(query->resultRelation, query->rtable)->locator_type)) {
+    if (query->commandType != CMD_INSERT || linitial2_int(query->resultRelations) == 0 ||
+        !IsLocatorReplicated(rt_fetch(linitial_int(query->resultRelations), query->rtable)->locator_type)) {
         return;
     }
     ListCell *lc = NULL;
     int index = 0;
     foreach(lc, query->rtable) {
         index++;
-        if (index == query->resultRelation) {
+        if (index == linitial_int(query->resultRelations)) {
             continue;
         }
         RangeTblEntry *rte = rt_fetch(index, query->rtable);
@@ -258,6 +259,13 @@ static void stream_walker_query_merge(Query* query, shipping_context *cxt)
                     cxt->current_shippable = false;
                 }
             }
+#ifndef ENABLE_MULTIPLE_NODES
+            /* if insert or update has subquery, do not use smp */
+            if (contain_subquery_walker((Node*)mc, NULL)) {
+                cxt->current_shippable = false;
+                break;
+            }
+#endif
         }
     }
 }
@@ -266,8 +274,8 @@ static void stream_walker_query_upsert(Query *query, shipping_context *cxt)
 {
     if (query->commandType == CMD_INSERT && query->upsertClause != NULL) {
         /* For replicated table in stream, upsertClause cannot contain unshippable expression */
-        if (query->resultRelation &&
-            IsLocatorReplicated(rt_fetch(query->resultRelation, query->rtable)->locator_type)) {
+        if (linitial_int(query->resultRelations) &&
+            IsLocatorReplicated(rt_fetch(linitial_int(query->resultRelations), query->rtable)->locator_type)) {
             bool saved_disallow_volatile_func_shippable = cxt->disallow_volatile_func_shippable;
             cxt->disallow_volatile_func_shippable = true;
             if (expression_tree_walker((Node *)query->upsertClause, (bool (*)())stream_walker, (void *)cxt)) {
@@ -285,9 +293,9 @@ static void stream_walker_query_rtable(Query* query, shipping_context *cxt)
     }
 
     if (query->commandType != CMD_SELECT && 
-        query->resultRelation <= list_length(query->rtable) &&
-        rel_contain_unshippable_feature((RangeTblEntry*)list_nth(query->rtable, query->resultRelation - 1),
-                                         cxt, query->commandType)) {
+        linitial_int(query->resultRelations) <= list_length(query->rtable) &&
+        rel_contain_unshippable_feature((RangeTblEntry*)list_nth(query->rtable,
+            linitial_int(query->resultRelations) - 1), cxt, query->commandType)) {
             cxt->current_shippable = false;
     }
 }
@@ -361,7 +369,8 @@ static void stream_walker_query_jointree(Query* query, shipping_context *cxt)
         expression_tree_walker((Node*)query->jointree->fromlist, (bool (*)())stream_walker, (void *)cxt)) {
         cxt->current_shippable = false;
     }
-    if (query->jointree != NULL && stream_walker((Node*)query->jointree->quals, (void *)cxt)) {
+    if (query->jointree != NULL &&
+        contain_unsupport_expression((Node*)query->jointree->quals, (void *)cxt)) {
         cxt->current_shippable = false;
     }
 }
@@ -817,8 +826,14 @@ static bool table_contain_unsupport_feature(Oid relid, Query* query)
 
 static bool contain_unsupport_function(Oid funcId)
 {
-    if (funcId >= FirstNormalObjectId)
+    if (funcId >= FirstNormalObjectId) {
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+        if (u_sess->hook_cxt.aggSmpHook != NULL) {
+            return ((aggSmpFunc)(u_sess->hook_cxt.aggSmpHook))(funcId);
+        }
+#endif
         return true;
+    }
 
     for (uint i = 0; i < lengthof(unsupport_func); i++) {
         if (funcId == unsupport_func[i])
@@ -890,8 +905,8 @@ static bool contain_unsupport_expression(Node* expr, void* context)
             if (winfunc->winfnoid == ROWNUMBERFUNCOID) {
                 foreach (temp, cxt->query_list) {
                     Query* query = (Query*)lfirst(temp);
-                    if (query->resultRelation &&
-                        GetLocatorType(rt_fetch(query->resultRelation, query->rtable)->relid) == 'R') {
+                    if (linitial2_int(query->resultRelations) &&
+                        GetLocatorType(rt_fetch(linitial_int(query->resultRelations), query->rtable)->relid) == 'R') {
                         sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
                             NOTPLANSHIPPING_LENGTH,
                             "row_number() can not be shipped when INSERT/UPDATE/DELETE a replication table");
@@ -899,6 +914,18 @@ static bool contain_unsupport_expression(Node* expr, void* context)
                         cxt->current_shippable = false;
                     }
                 }
+            }
+        } break;
+        case T_OpExpr: {
+            OpExpr* op = (OpExpr*)expr;
+            if (contain_unsupport_expression((Node*)op->args, context)) {
+                cxt->current_shippable = false;
+            }
+        } break;
+        case T_BoolExpr: {
+            BoolExpr* be = (BoolExpr*)expr;
+            if (contain_unsupport_expression((Node*)be->args, context)) {
+                cxt->current_shippable = false;
             }
         } break;
         case T_FuncExpr: {
@@ -928,7 +955,13 @@ static bool contain_unsupport_expression(Node* expr, void* context)
                 }
             }
         } break;
-
+        case T_Rownum: {
+            sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                NOTPLANSHIPPING_LENGTH,
+                "Rownum can not be shipped.");
+            securec_check_ss_c(sprintf_rc, "\0", "\0");
+            cxt->current_shippable = false;
+        } break;
         default:
             /* Record return type is not stream supported */
             if (exprType(expr) == RECORDOID) {

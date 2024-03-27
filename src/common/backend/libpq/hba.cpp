@@ -42,6 +42,10 @@
 #include "utils/memutils.h"
 #include "commands/user.h"
 #include "libpq/crypt.h"
+#include "catalog/pg_authid.h"
+#include "catalog/indexing.h"
+#include "utils/fmgroids.h"
+#include "utils/builtins.h"
 
 
 #define atooid(x) ((Oid)strtoul((x), NULL, 10))
@@ -1365,7 +1369,6 @@ static void check_hba_replication(hbaPort* port)
     ListCell* line = NULL;
     HbaLine* hba = NULL;
     bool gotRepl = false;
-    int ret;
 
     hba = (HbaLine*)palloc0(sizeof(HbaLine));
     /* we do not bother local connection with GSS authentification */
@@ -1373,17 +1376,9 @@ static void check_hba_replication(hbaPort* port)
         goto DIRECT_TRUST;
     }
 
-    /* get replication method */
-    ret = pthread_rwlock_rdlock(&hba_rwlock);
-    if (ret != 0) {
-        pfree_ext(hba);
-        ereport(ERROR,
-            (errcode(ERRCODE_CONFIG_FILE_ERROR),
-                errmsg("get hba rwlock failed when check hba replication, return value:%d", ret)));
-    }
-
     /* hba_rwlock will be released when ereport ERROR or FATAL. */
     PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    (void)pthread_rwlock_rdlock(&hba_rwlock);
     foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
         /* 
          * memory copy here will not copy pointer types like List* and char*, 
@@ -1412,8 +1407,8 @@ static void check_hba_replication(hbaPort* port)
     }
 
     copy_hba_line(hba);
-    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     (void)pthread_rwlock_unlock(&hba_rwlock);
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
 
 DIRECT_TRUST:
     /* cannot get invalid method, trust as default. */
@@ -1538,16 +1533,9 @@ static void check_hba(hbaPort* port)
     }
 #endif
     hba = (HbaLine*)palloc0(sizeof(HbaLine));
-    int ret = pthread_rwlock_rdlock(&hba_rwlock);
-    if (ret != 0) {
-        pfree_ext(hba);
-        ereport(ERROR,
-            (errcode(ERRCODE_CONFIG_FILE_ERROR),
-                errmsg("get hba rwlock failed when check hba config, return value:%d", ret)));
-    }
-
     /* hba_rwlock will be released when ereport ERROR or FATAL. */
     PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    (void)pthread_rwlock_rdlock(&hba_rwlock);
     foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
         /* the value of char* types in HbaLine will be copied to session memctx by copy_hba_line() in the end */
         errno_t rc = memcpy_s(hba, sizeof(HbaLine), lfirst(line), sizeof(HbaLine));
@@ -1711,8 +1699,8 @@ static void check_hba(hbaPort* port)
     }
     copy_hba_line(hba);
     port->hba = hba;
-    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     (void)pthread_rwlock_unlock(&hba_rwlock);
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
 }
 
 /*
@@ -1734,6 +1722,7 @@ bool load_hba(void)
     ListCell *line = NULL, *line_num = NULL;
     List* new_parsed_lines = NIL;
     bool ok = true;
+    bool retVal = false;
     MemoryContext linecxt;
     MemoryContext oldcxt;
     MemoryContext hbacxt;
@@ -1804,28 +1793,29 @@ bool load_hba(void)
         return false;
     }
 
-    /* Any ERROR will become PANIC errors when holding rwlock of hba_rwlock. */
+    /* hba_rwlock will be released when ereport ERROR or FATAL. */
+    PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     int ret = pthread_rwlock_wrlock(&hba_rwlock);
     if (ret == 0) {
-        /* hba_rwlock will be released when ereport ERROR or FATAL. */
-        PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
         /* Loaded new file successfully, replace the one we use */
         if (g_instance.libpq_cxt.parsed_hba_context != NULL) {
             MemoryContextDelete(g_instance.libpq_cxt.parsed_hba_context);
         }
         g_instance.libpq_cxt.parsed_hba_context = hbacxt;
         g_instance.libpq_cxt.comm_parsed_hba_lines = new_parsed_lines;
-        PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
         (void)pthread_rwlock_unlock(&hba_rwlock);
         check_old_hba(false);
-        return true;
+        retVal = true;
     } else {
         MemoryContextDelete(hbacxt);
         ereport(WARNING,
             (errcode(ERRCODE_CONFIG_FILE_ERROR),
                 errmsg("get hba rwlock failed when load hba config, return value:%d", ret)));
-        return false;
+        retVal = false;
     }
+
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    return retVal;
 }
 
 void check_old_hba(bool need_old_hba)
@@ -2150,7 +2140,7 @@ void hba_getauthmethod(hbaPort* port)
 #ifdef ENABLE_MULTIPLE_NODES
     if (IsDSorHaWalSender() ) {
 #else        
-    if (IsDSorHaWalSender() && (is_node_internal_connection(port) || AM_WAL_HADR_SENDER)) {
+    if ((IsDSorHaWalSender() && is_node_internal_connection(port)) || AM_WAL_HADR_SENDER || (t_thrd.role == SW_SENDER)) {
 #endif        
         check_hba_replication(port);
     } else {
@@ -2314,20 +2304,11 @@ bool is_cluster_internal_IP(sockaddr peer_addr)
     rc = memcpy_s(&raddr->addr, sizeof(sockaddr_storage), &peer_addr, sizeof(sockaddr));
     securec_check(rc, "\0", "\0");
 
-    ListCell* line = NULL;
-    HbaLine* hba = NULL;
-
-    int ret = pthread_rwlock_rdlock(&hba_rwlock);
-    if (ret != 0) {
-        ereport(LOG,
-            (errcode(ERRCODE_CONFIG_FILE_ERROR),
-                errmsg("get hba rwlock failed when check cluster internal ip, return value:%d", ret)));
-        free(raddr);
-        return false;
-    }
-
     /* hba_rwlock will be released when ereport ERROR or FATAL. */
     PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    ListCell* line = NULL;
+    HbaLine* hba = NULL;
+    (void)pthread_rwlock_rdlock(&hba_rwlock);
     foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
         hba = (HbaLine*)lfirst(line);
         /* check connection type */
@@ -2339,8 +2320,8 @@ bool is_cluster_internal_IP(sockaddr peer_addr)
         }
     }
 
-    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     (void)pthread_rwlock_unlock(&hba_rwlock);
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     free(raddr);
     return isInternalIP;
 }
@@ -2374,18 +2355,11 @@ bool check_ip_whitelist(hbaPort* port, char* ip, unsigned int ip_len)
         return true;
     }
 
-    ListCell* line = NULL;
-    HbaLine* hba = NULL;
-    int ret = pthread_rwlock_rdlock(&hba_rwlock);
-    if (ret != 0) {
-        ereport(LOG,
-            (errcode(ERRCODE_CONFIG_FILE_ERROR),
-                errmsg("get hba rwlock failed when check ip whitelist, return value:%d", ret)));
-        return false;
-    }
-
     /* hba_rwlock will be released when ereport ERROR or FATAL. */
     PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    ListCell* line = NULL;
+    HbaLine* hba = NULL;
+    (void)pthread_rwlock_rdlock(&hba_rwlock);
     foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
         hba = (HbaLine*)lfirst(line);
         if (hba->auth_method != uaReject) {
@@ -2396,8 +2370,107 @@ bool check_ip_whitelist(hbaPort* port, char* ip, unsigned int ip_len)
         }
     }
 
-    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     (void)pthread_rwlock_unlock(&hba_rwlock);
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     return isWhitelistIP;
 }
 
+int CompareUserHostName(char* s1, char* s2)
+{
+    char* tmp1 = strchr(s1, '%');
+    char* tmp2 = strchr(s2, '%');
+    if (tmp1 && tmp2) {
+        if ((tmp1 - s1) > (tmp2 - s2))
+            return 1;
+        else if ((tmp1 - s1) < (tmp2 - s2))
+            return -1;
+        else
+            return CompareUserHostName(tmp1+1, tmp2+1);
+    } else if (tmp1) {
+        return -1;
+    } else if (tmp2) {
+        return 1;
+    } else {
+        return (strlen(s1) > strlen(s2));
+    }
+}
+
+char* MatchOtherUserHostName(const char* rolname, char* userHostName)
+{
+    char* firstPrivName = NULL;
+    Relation relation = heap_open(AuthIdRelationId, AccessShareLock);
+    SysScanDesc scan = systable_beginscan(relation, InvalidOid, false, NULL, 0, NULL);
+    HeapTuple tup = NULL;
+    bool result = false;
+    while (HeapTupleIsValid((tup = systable_getnext(scan)))) {
+        auto auth = (Form_pg_authid)GETSTRUCT(tup);
+        result = (GenericMatchText(userHostName, strlen(userHostName), NameStr(auth->rolname), strlen(NameStr(auth->rolname))) == 1);
+        if (result) {
+            char* matchName = pstrdup(NameStr(auth->rolname));
+            if (!firstPrivName || CompareUserHostName(matchName, firstPrivName) == 1)
+                firstPrivName = matchName;
+            else
+                pfree_ext(matchName);
+        }
+    }
+    systable_endscan(scan);
+    heap_close(relation, AccessShareLock);
+    return firstPrivName;
+}
+
+char* GenUserHostName(hbaPort* port, const char* role, char** localhost)
+{
+    if (!port)
+        ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("The MyProcPort can't be NULL")));
+    char remoteHostname[NI_MAXHOST] = {0};
+    int userLen = strlen(role);
+    char userHostName[NI_MAXHOST+userLen] = {0};
+    inet_net_ntop(AF_INET, &((struct sockaddr_in*)(&port->raddr.addr))->sin_addr,
+                  ((const struct sockaddr*)(&port->raddr.addr))->sa_family == AF_INET ? 32 : 128,
+                  remoteHostname,
+                  sizeof(remoteHostname));
+    errno_t rc = snprintf_s(userHostName, sizeof(userHostName), sizeof(userHostName) - 1, "%s@%s", role, remoteHostname);
+    securec_check_ss(rc, "", "");
+    char* returnUserHost = pstrdup(userHostName);
+    if (pg_strcasecmp(remoteHostname, "127.0.0.1") == 0) {
+        rc = snprintf_s(userHostName, sizeof(userHostName), sizeof(userHostName) - 1, "%s@localhost", role);
+        securec_check_ss(rc, "", "");
+        *localhost = pstrdup(userHostName);
+    }
+    return returnUserHost;
+}
+
+extern char* GetDatabaseCompatibility(const char* dbname);
+HeapTuple SearchUserHostName(const char* userName, Oid* oid)
+{
+    char* userHostName = NULL;
+    HeapTuple roleTup = NULL;
+    if (u_sess->attr.attr_common.b_compatibility_user_host_auth && (!OidIsValid(u_sess->proc_cxt.MyDatabaseId) || u_sess->proc_cxt.check_auth) && u_sess->proc_cxt.MyProcPort) {
+        bool isBFormat = false;
+        char* dbCompatibility = GetDatabaseCompatibility(u_sess->proc_cxt.MyProcPort->database_name);
+        if (dbCompatibility)
+            isBFormat = (pg_strcasecmp(dbCompatibility, "B") == 0);
+        if (isBFormat) {
+            char* localhost = NULL;
+            userHostName = GenUserHostName(u_sess->proc_cxt.MyProcPort, userName, &localhost);
+            roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(userHostName));
+            if (localhost && !roleTup) {
+                roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(localhost));
+                pfree_ext(localhost);
+            }
+            if (!roleTup) {
+                char* matchName = MatchOtherUserHostName(userName, userHostName);
+                if (matchName) {
+                    roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(matchName));
+                    pfree_ext(matchName);
+                }
+            }
+        }
+    }
+    if (!roleTup) {
+        roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(userName));
+    }
+    if (roleTup && oid)
+        *oid = HeapTupleGetOid(roleTup);
+    return roleTup;
+}

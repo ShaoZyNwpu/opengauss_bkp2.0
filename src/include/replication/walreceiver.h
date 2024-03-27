@@ -44,14 +44,16 @@
 #ifdef ENABLE_MULTIPLE_NODES
 #define AM_HADR_CN_WAL_RECEIVER (t_thrd.postmaster_cxt.HaShmData->is_cross_region && \
             t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && IS_PGXC_COORDINATOR)
+
+#define IS_MULTI_DISASTER_RECOVER_MODE \
+    (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && \
+    g_instance.attr.attr_common.stream_cluster_run_mode == RUN_MODE_STANDBY)
+#else
+#define IS_MULTI_DISASTER_RECOVER_MODE false
 #endif
 
 #define AM_HADR_WAL_RECEIVER (t_thrd.postmaster_cxt.HaShmData->is_cross_region && \
             t_thrd.postmaster_cxt.HaShmData->is_hadr_main_standby)
-
-#define IS_DISASTER_RECOVER_MODE \
-    (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && \
-    g_instance.attr.attr_common.stream_cluster_run_mode == RUN_MODE_STANDBY)
 
 #define IS_CN_DISASTER_RECOVER_MODE \
     (IS_PGXC_COORDINATOR && t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && \
@@ -225,6 +227,7 @@ typedef struct WalRcvData {
     XLogRecPtr lastReceivedBarrierLSN;
     XLogRecPtr lastSwitchoverBarrierLSN;
     XLogRecPtr targetSwitchoverBarrierLSN;
+    bool isMasterInstanceReady;
     bool isFirstTimeAccessStorage;
     bool isPauseByTargetBarrier;
     Latch* obsArchLatch;
@@ -238,10 +241,10 @@ typedef struct WalReceiverFunc {
     bool (*walrcv_receive)(int timeout, unsigned char* type, char** buffer, int* len);
     void (*walrcv_send)(const char *buffer, int nbytes);
     void (*walrcv_disconnect)();
-    bool (*walrcv_command)(const char *cmd, char **err, int *sqlstate);
+    WalRcvExecResult* (*walrcv_exec)(const char *cmd, const int nRetTypes, const Oid *retTypes);
     void (*walrcv_identify_system)();
     void (*walrcv_startstreaming)(const LibpqrcvConnectParam *options);
-    void (*walrcv_create_slot)(const LibpqrcvConnectParam *options);
+    void (*walrcv_create_slot)(const LibpqrcvConnectParam *options, XLogRecPtr *lsn, CommitSeqNo *csn);
 } WalReceiverFunc;
 
 #define WalRcvIsOnline()                                                              \
@@ -258,7 +261,7 @@ extern XLogRecPtr latestValidRecord;
 extern pg_crc32 latestRecordCrc;
 extern uint32 latestRecordLen;
 
-extern const char *g_reserve_param[RESERVE_SIZE];
+extern const char *g_reserve_param[];
 extern bool ws_dummy_data_writer_use_file;
 extern THR_LOCAL uint32 ws_dummy_data_read_file_num;
 
@@ -339,5 +342,22 @@ static inline void WalRcvCtlReleaseExitLock(void)
     /* use volatile pointer to prevent code rearrangement */
     volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
     SpinLockRelease(&walrcv->exitLock);
+}
+
+static inline void walrcv_clear_result(WalRcvExecResult *walres)
+{
+    if (!walres)
+        return;
+
+    if (walres->err)
+        pfree(walres->err);
+
+    if (walres->tuplestore)
+        tuplestore_end(walres->tuplestore);
+
+    if (walres->tupledesc)
+        FreeTupleDesc(walres->tupledesc);
+
+    pfree(walres);
 }
 #endif /* _WALRECEIVER_H */

@@ -35,6 +35,7 @@
 #include "catalog/pg_authid.h"
 #include "utils/snapmgr.h"
 #include "postmaster/snapcapturer.h"
+#include "postmaster/cfs_shrinker.h"
 #include "postmaster/rbcleaner.h"
 
 const int RESOURCE_POOL_HASH_SIZE = 32;
@@ -57,8 +58,9 @@ static bool IsBackgroundXact()
 {
     if (IsJobSchedulerProcess() || t_thrd.role == WLM_WORKER || t_thrd.role == WLM_MONITOR ||
         !OidIsValid(u_sess->wlm_cxt->wlm_params.rpdata.rpoid) || t_thrd.role == AUTOVACUUM_WORKER ||
-        t_thrd.role == WLM_ARBITER || IsJobSnapshotProcess() || 
-        (IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsRbCleanerProcess() || IsRbWorkerProcess()) ||
+        t_thrd.role == WLM_ARBITER || IsJobSnapshotProcess() ||
+        (IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsRbCleanerProcess() || IsRbWorkerProcess() ||
+         IsCfsShrinkerProcess()) ||
         strncmp(u_sess->attr.attr_common.application_name, "gs_clean", strlen("gs_clean")) == 0) {
         return true;
     }
@@ -428,7 +430,7 @@ Datum get_instr_workload_info(PG_FUNCTION_ARGS)
 
         funcctx = SRF_FIRSTCALL_INIT();
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-        tupdesc = CreateTemplateTupleDesc(INSTR_WORKLOAD_ATTRUM, false, TAM_HEAP);
+        tupdesc = CreateTemplateTupleDesc(INSTR_WORKLOAD_ATTRUM, false);
 
         create_tuple_entry(tupdesc);
 

@@ -34,7 +34,7 @@
 #include "utils/relfilenodemap.h"
 #include "postmaster/bgworker.h"
 #include "storage/lmgr.h"
-#ifdef USE_ASSERT_CHECKING
+#if defined(USE_ASSERT_CHECKING) && !defined(ENABLE_MEMORY_CHECK)
 class LSCCloseCheck {
 public:
     LSCCloseCheck()
@@ -43,7 +43,8 @@ public:
     }
     ~LSCCloseCheck()
     {
-        Assert(!EnableGlobalSysCache() || m_lsc_closed || g_instance.distribute_test_param_instance->elevel == PANIC);
+        Assert(!EnableGlobalSysCache() || m_lsc_closed || t_thrd.role == DMS_WORKER ||
+                g_instance.distribute_test_param_instance->elevel == PANIC);
     }
     void setCloseFlag(bool value)
     {
@@ -62,6 +63,9 @@ void ReLoadLSCWhenWaitMission()
     }
     LocalSysDBCache *lsc = t_thrd.lsc_cxt.lsc;
     if (unlikely(lsc == NULL)) {
+        return;
+    }
+    if (IsTransactionOrTransactionBlock()) {
         return;
     }
     if (lsc->GetMyGlobalDBEntry() != NULL && lsc->GetMyGlobalDBEntry()->m_isDead) {
@@ -103,30 +107,6 @@ bool CheckMyDatabaseMatch()
         return true;
     }
 }
-char *GetMyDatabasePath()
-{
-    if (EnableLocalSysCache()) {
-        return t_thrd.lsc_cxt.lsc->my_database_path;
-    } else {
-        return u_sess->proc_cxt.DatabasePath;
-    }
-}
-Oid GetMyDatabaseId()
-{
-    if (EnableLocalSysCache()) {
-        return t_thrd.lsc_cxt.lsc->my_database_id;
-    } else {
-        return u_sess->proc_cxt.MyDatabaseId;
-    }
-}
-Oid GetMyDatabaseTableSpace()
-{
-    if (EnableLocalSysCache()) {
-        return t_thrd.lsc_cxt.lsc->my_database_tablespace;
-    } else {
-        return u_sess->proc_cxt.MyDatabaseTableSpace;
-    }
-}
 
 bool IsGotPoolReload()
 {
@@ -138,11 +118,11 @@ bool IsGotPoolReload()
 }
 void ResetGotPoolReload(bool value)
 {
+    if (!t_thrd.int_cxt.ignoreSessionBackendSignal) {
+        u_sess->sig_cxt.got_pool_reload = value;
+    }
     if (EnableLocalSysCache()) {
-        u_sess->sig_cxt.got_pool_reload = value;
         t_thrd.lsc_cxt.lsc->got_pool_reload = value;
-    } else {
-        u_sess->sig_cxt.got_pool_reload = value;
     }
 }
 
@@ -217,6 +197,8 @@ void CreateLocalSysDBCache()
 
     Assert(t_thrd.lsc_cxt.lsc == NULL);
     t_thrd.lsc_cxt.lsc = New(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DEFAULT))LocalSysDBCache();
+    /* set true first to use t_thrd.lsc_cxt.local_sysdb_resowner out of transaction */
+    t_thrd.lsc_cxt.enable_lsc = true;
     /* use this object to invalid gsc, only work with timeseries worker */
     t_thrd.lsc_cxt.lsc->CreateDBObject();
     t_thrd.lsc_cxt.FetchTupleFromCatCList = GetTupleFromLscCatList;
@@ -225,15 +207,21 @@ void CreateLocalSysDBCache()
     if (!t_thrd.lsc_cxt.enable_lsc) {
         t_thrd.lsc_cxt.FetchTupleFromCatCList = GetTupleFromSessCatList;
         t_thrd.lsc_cxt.lsc->is_closed = true;
-#ifdef USE_ASSERT_CHECKING
+#if defined(USE_ASSERT_CHECKING) && !defined(ENABLE_MEMORY_CHECK)
         lsc_close_check.setCloseFlag(true);
-#endif
     } else {
-#ifdef USE_ASSERT_CHECKING
         lsc_close_check.setCloseFlag(false);
 #endif
     }
 }
+
+#if defined(USE_ASSERT_CHECKING) && !defined(ENABLE_MEMORY_CHECK)
+void CloseLSCCheck()
+{
+    lsc_close_check.setCloseFlag(true);
+}
+#endif
+
 static void ReleaseBadPtrList(bool isCommit);
 static void ThreadNodeGroupCallback(Datum arg, int cacheid, uint32 hashvalue)
 {
@@ -266,7 +254,7 @@ MemoryContext LocalMyDBCacheMemCxt()
 extern MemoryContext LocalGBucketMapMemCxt()
 {
     if (EnableLocalSysCache()) {
-        return t_thrd.lsc_cxt.lsc->lsc_mydb_memcxt;
+        return t_thrd.lsc_cxt.lsc->lsc_share_memcxt;
     } else {
         return SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR);
     }
@@ -358,6 +346,14 @@ static void ClearMyDBOfRelMapCxt(knl_u_relmap_context *relmap_cxt)
     /* since clear when switchdb, just set their memcxt lsc_mydb_cxt */
     relmap_cxt->RelfilenodeMapHash = NULL;
     relmap_cxt->UHeapRelfilenodeMapHash = NULL;
+    relmap_cxt->PartfilenodeMapHash = NULL;
+}
+
+static void ResetRelMapCxt(knl_u_relmap_context *relmap_cxt)
+{
+    ClearMyDBOfRelMapCxt(relmap_cxt);
+    relmap_cxt->shared_map->magic = 0;
+    relmap_cxt->shared_map->num_mappings = 0;
 }
 
 struct HTAB *GetTableSpaceCacheHash()
@@ -470,12 +466,12 @@ knl_u_relmap_context *GetRelMapCxt()
 
 void LocalSysDBCache::LocalSysDBCacheReleaseGlobalReSource(bool is_commit)
 {
-    ResourceOwnerReleaseRWLock(local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseGlobalCatCList(local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseGlobalCatCTup(local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseGlobalBaseEntry(local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseGlobalDBEntry(local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseGlobalIsExclusive(local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseRWLock(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseGlobalCatCList(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseGlobalCatCTup(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseGlobalBaseEntry(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseGlobalDBEntry(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseGlobalIsExclusive(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
 }
 
 void LocalSysDBCache::LocalSysDBCacheReleaseCritialReSource(bool include_shared)
@@ -492,7 +488,7 @@ void LocalSysDBCache::LocalSysDBCacheReleaseCritialReSource(bool include_shared)
 
     rdlock_info.count = 0;
 
-    tabdefcache.ResetInitFlag();
+    tabdefcache.ResetInitFlag(include_shared);
     partdefcache.ResetInitFlag();
     systabcache.ResetInitFlag(include_shared);
 
@@ -500,8 +496,31 @@ void LocalSysDBCache::LocalSysDBCacheReleaseCritialReSource(bool include_shared)
     SetThreadDefExclusive(IS_THREAD_POOL_STREAM || IsBgWorkerProcess());
 }
 
-/* switch db, alter db */
-bool LocalSysDBCache::LocalSysDBCacheNeedClearMyDB(Oid db_id, const char *db_name)
+bool LocalSysDBCache::DBStandbyChanged()
+{
+    /* for standby, we cannot recognize whether event of alter db rename happened */
+    bool isStandby = t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || (ENABLE_DMS && SS_STANDBY_MODE);
+    if (unlikely(isStandby && my_database_id != InvalidOid)) {
+        if (unlikely(my_database_id != u_sess->proc_cxt.MyDatabaseId)) {
+            return true;
+        }
+        Assert(u_sess->proc_cxt.MyDatabaseId != InvalidOid);
+        HeapTuple tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(my_database_id));
+        if (unlikely(!HeapTupleIsValid(tup))) {
+            return true;
+        }
+        Form_pg_database dbform = (Form_pg_database)GETSTRUCT(tup);
+        if (unlikely(strcmp(my_database_name, NameStr(dbform->datname)) != 0 ||
+            my_database_tablespace != dbform->dattablespace)) {
+            ReleaseSysCache(tup);
+            return true;
+        }
+        ReleaseSysCache(tup);
+    }
+    return false;
+}
+
+bool LocalSysDBCache::DBNotMatch(Oid db_id, const char *db_name)
 {
     if (likely(db_name != NULL && db_id == InvalidOid)) {
         if (strcmp(my_database_name, db_name) != 0) {
@@ -523,6 +542,11 @@ bool LocalSysDBCache::LocalSysDBCacheNeedClearMyDB(Oid db_id, const char *db_nam
                     strcmp(t_thrd.proc_cxt.MyProgName, "BootStrap") == 0
             ));
     }
+    return false;
+}
+
+bool LocalSysDBCache::LockAndAttachDBFailed()
+{
     /* it is a weird design that we need access mydatabaseid before initsession.
      * but for GSC mode, we do need aquire lock when cache hit and there are invalid msgs
      * with session uninited and so u_sess->proc_cxt.MyDatabaseId is InvalidOid.
@@ -535,20 +559,13 @@ bool LocalSysDBCache::LocalSysDBCacheNeedClearMyDB(Oid db_id, const char *db_nam
     Assert(m_global_db != NULL);
     /* if u_sess->proc_cxt.MyDatabaseId is InvalidOid, the session's status is uninit
      * we will call SetDatabase to rewrite it.
-     * but beofre SetDatabase, we need the dbid to Accept Invalid msg */
-    bool lock_db_advance = u_sess->proc_cxt.MyDatabaseId == InvalidOid && IS_THREAD_POOL_WORKER;
+     * but before SetDatabase, we need the dbid to Accept Invalid msg */
+    bool lock_db_advance = u_sess->proc_cxt.MyDatabaseId == InvalidOid;
+    Assert(!lock_db_advance || IS_THREAD_POOL_WORKER);
 
     /* cache hit, when initsession, we lock db to avoid alter db */
     if (lock_db_advance) {
-        Assert(u_sess->proc_cxt.MyDatabaseTableSpace == InvalidOid);
-        Assert(u_sess->proc_cxt.DatabasePath == NULL);
         Assert(t_thrd.proc->databaseId == InvalidOid);
-
-        u_sess->proc_cxt.MyDatabaseId = my_database_id;
-        u_sess->proc_cxt.MyDatabaseTableSpace = my_database_tablespace;
-        /* use refer not copy, it will be rewritten when initsession */
-        u_sess->proc_cxt.DatabasePath = my_database_path;
-
         /* we dont want to accept inval msg here, so use LockSharedObjectForSession to avoid it. */
         LockSharedObjectForSession(DatabaseRelationId, my_database_id, 0, RowExclusiveLock);
         t_thrd.proc->databaseId = my_database_id;
@@ -557,102 +574,134 @@ bool LocalSysDBCache::LocalSysDBCacheNeedClearMyDB(Oid db_id, const char *db_nam
         /* when we acquired the dblock, alter db transaction happened, and we should clear cache of mydb. */
         if (m_global_db->m_isDead) {
             t_thrd.proc->databaseId = InvalidOid;
-            u_sess->proc_cxt.MyDatabaseId = InvalidOid;
-            u_sess->proc_cxt.MyDatabaseTableSpace = InvalidOid;
-            u_sess->proc_cxt.DatabasePath = NULL;
             return true;
-        }
-    } else if (m_global_db->m_isDead) {
-        return true;
-    }
+        } else {
+            Assert(u_sess->proc_cxt.MyDatabaseTableSpace == InvalidOid);
+            Assert(u_sess->proc_cxt.DatabasePath == NULL);
 
+            u_sess->proc_cxt.MyDatabaseId = my_database_id;
+            u_sess->proc_cxt.MyDatabaseTableSpace = my_database_tablespace;
+            /* use refer not copy, it will be rewritten when initsession */
+            u_sess->proc_cxt.DatabasePath = my_database_path;
+        }
+    }
     return false;
 }
 
-/* clear cache of mydb memcxt */
-void LocalSysDBCache::LocalSysDBCacheClearMyDB(Oid db_id, const char *db_name)
+/* switch db, alter db */
+bool LocalSysDBCache::LocalSysDBCacheNeedClearMyDB(Oid db_id, const char *db_name)
 {
-    LocalSysDBCacheReleaseCritialReSource(false);
+    if (DBNotMatch(db_id, db_name)) {
+        return true;
+    }
 
+    if (m_global_db->m_isDead) {
+        return true;
+    }
+
+    Assert(u_sess->proc_cxt.MyDatabaseId == InvalidOid || u_sess->proc_cxt.MyDatabaseId == my_database_id);
+    if (LockAndAttachDBFailed()) {
+        return true;
+    }
+    Assert(u_sess->proc_cxt.MyDatabaseId == my_database_id);
+    return false;
+}
+
+void LocalSysDBCache::LocalSysDBCacheResetMyDBStat()
+{
     TypeCacheHash = NULL;
     SMgrRelationHash = NULL;
     VfdCache = NULL;
     SizeVfdCache = 0;
     Assert(nfile == 0);
     nfile = 0;
+
+    bad_ptr_obj.ResetInitFlag();
 
     my_database_id = InvalidOid;
     my_database_tablespace = InvalidOid;
     my_database_name[0] = '\0';
     dlist_init(&unowned_reln);
     pfree_ext(my_database_path);
-    ClearMyDBOfRelMapCxt(&relmap_cxt);
+
     UnRegisterRelCacheCallBack(&inval_cxt, TypeCacheRelCallback);
     UnRegisterRelCacheCallBack(&inval_cxt, RelfilenodeMapInvalidateCallback);
-    UnRegisterRelCacheCallBack(&inval_cxt, UHeapRelfilenodeMapInvalidateCallback);
+    UnRegisterRelCacheCallBack(&inval_cxt, PartfilenodeMapInvalidateCallback);
+}
+
+/* clear cache of mydb memcxt */
+void LocalSysDBCache::LocalSysDBCacheClearMyDB()
+{
+    LocalSysDBCacheReleaseCritialReSource(false);
+    LocalSysDBCacheResetMyDBStat();
+
+    ClearMyDBOfRelMapCxt(&relmap_cxt);
     MemoryContextResetAndDeleteChildren(lsc_mydb_memcxt);
 
-    is_inited = false;
+    ResetInitStatus();
     rel_index_rule_space = 0;
 }
 
-void LocalSysDBCache::LocalSysDBCacheReSet()
-{
-    LocalSysDBCacheReleaseCritialReSource(true);
-
-    /* reset flag */
-    abort_count = 0;
-    my_database_id = InvalidOid;
-    my_database_tablespace = InvalidOid;
-    my_database_name[0] = '\0';
-    my_database_path = NULL;
-    SMgrRelationHash = NULL;
-    TableSpaceCacheHash = NULL;
-    TypeCacheHash = NULL;
-    VfdCache = NULL;
-    SizeVfdCache = 0;
-    Assert(nfile == 0);
-    nfile = 0;
-    dlist_init(&unowned_reln);
-    bad_ptr_obj.ResetInitFlag();
-
-    /* unregist callback who cache is on lsc */
-    UnRegisterRelCacheCallBack(&inval_cxt, TypeCacheRelCallback);
-    UnRegisterRelCacheCallBack(&inval_cxt, RelfilenodeMapInvalidateCallback);
-    UnRegisterSysCacheCallBack(&inval_cxt, TABLESPACEOID, InvalidateTableSpaceCacheCallback);
-
-    MemoryContextDelete(lsc_mydb_memcxt);
-    MemoryContextDelete(lsc_share_memcxt);
-    lsc_share_memcxt =
-        AllocSetContextCreate(lsc_top_memcxt, "LocalSysCacheShareMemoryContext", ALLOCSET_DEFAULT_MINSIZE,
-                              ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE, STANDARD_CONTEXT);
-
-    lsc_mydb_memcxt =
-        AllocSetContextCreate(lsc_top_memcxt, "LocalSysCacheMyDBMemoryContext", ALLOCSET_DEFAULT_MINSIZE,
-                              ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE, STANDARD_CONTEXT);
-
-    MemoryContext old = MemoryContextSwitchTo(lsc_share_memcxt);
-    knl_u_relmap_init(&relmap_cxt);
-    MemoryContextSwitchTo(old);
-
-    rel_index_rule_space = 0;
-    is_inited = false;
-    is_closed = false;
-    is_lsc_catbucket_created = false;
-}
-
-bool LocalSysDBCache::LocalSysDBCacheNeedReBuild()
+bool LocalSysDBCache::LocalSysDBCacheNeedCleanCache()
 {
     /* we have recovered from startup, redo may dont tell us inval msgs, so discard all lsc */
     if (unlikely(!recovery_finished && g_instance.global_sysdbcache.recovery_finished)) {
+        recovery_finished = g_instance.global_sysdbcache.recovery_finished;
         return true;
     } else if (!g_instance.global_sysdbcache.hot_standby) {
         /* for standby, if not hot, the cache may be invalid */
         return true;
     }
 
+    if (StreamThreadAmI()) {
+        return true;
+    }
+    return false;
+}
+
+void LocalSysDBCache::LocalSysDBCacheCleanCache()
+{
+    Assert(!IsTransactionOrTransactionBlock());
+    /* clean mydb cache */
+    LocalSysDBCacheClearMyDB();
+
+    /* clean shared cache */
+    systabcache.ResetCatalogCaches();
+    relmap_cxt.shared_map->magic = 0;
+    relmap_cxt.shared_map->num_mappings = 0;
+    if (TableSpaceCacheHash != NULL) {
+        InvalidateTableSpaceCacheCallback(0, TABLESPACEOID, 0);
+    }
+    /* gbucketmap dont need be cleaned, because it is checked by searchsyscache when accessed */
+}
+
+void LocalSysDBCache::LocalSysDBCacheReSet()
+{
+    LocalSysDBCacheReleaseCritialReSource(true);
+    LocalSysDBCacheResetMyDBStat();
+    abort_count = 0;
+    TableSpaceCacheHash = NULL;
+
+    /* unregist callback who cache is on lsc */
+    UnRegisterSysCacheCallBack(&inval_cxt, TABLESPACEOID, InvalidateTableSpaceCacheCallback);
+    MemoryContextResetAndDeleteChildren(lsc_mydb_memcxt);
+    MemoryContextResetAndDeleteChildren(lsc_share_memcxt);
+
+    ResetRelMapCxt(&relmap_cxt);
+    rel_index_rule_space = 0;
+    ResetInitStatus();
+    is_closed = false;
+    is_lsc_catbucket_created = false;
+}
+
+bool LocalSysDBCache::LocalSysDBCacheNeedReBuild()
+{
+    /* we have not finished the init section */
+    if (unlikely(init_status == LscIniting)) {
+        return true;
+    }
     /* we assum 1kb memory leaked once */
-    if (unlikely(abort_count > (uint64)g_instance.attr.attr_memory.local_syscache_threshold)) {
+    if (unlikely(abort_count > (uint64)u_sess->attr.attr_memory.local_syscache_threshold)) {
         return true;
     }
 
@@ -663,7 +712,7 @@ bool LocalSysDBCache::LocalSysDBCacheNeedReBuild()
         ((AllocSet)u_sess->cache_mem_cxt)->totalSpace +
         rel_index_rule_space;
 
-    uint64 memory_upper_limit = ((uint64)g_instance.attr.attr_memory.local_syscache_threshold) << 10;
+    uint64 memory_upper_limit = ((uint64)u_sess->attr.attr_memory.local_syscache_threshold) << 10;
 
     return total_space * (1 - MAX_LSC_FREESIZE_RATIO) > memory_upper_limit;
 }
@@ -702,7 +751,7 @@ bool LocalSysDBCache::LocalSysDBCacheNeedSwapOut()
         AllocSetContextUsedSpace((AllocSet)u_sess->cache_mem_cxt) +
         rel_index_rule_space;
     uint64 memory_upper_limit =
-        (((uint64)g_instance.attr.attr_memory.local_syscache_threshold) << 10) * cur_swapout_ratio;
+        (((uint64)u_sess->attr.attr_memory.local_syscache_threshold) << 10) * cur_swapout_ratio;
     bool need_swapout = used_space > memory_upper_limit;
 
     /* swapout until memory used space is from MAX_LSC_SWAPOUT_RATIO=90% to MIN_LSC_SWAPOUT_RATIO=70% */
@@ -720,9 +769,9 @@ void LocalSysDBCache::CloseLocalSysDBCache()
         return;
     }
     LocalSysDBCacheReleaseCritialReSource(true);
-    is_inited = false;
+    ResetInitStatus();
     is_closed = true;
-#ifdef USE_ASSERT_CHECKING
+#if defined(USE_ASSERT_CHECKING) && !defined(ENABLE_MEMORY_CHECK)
     lsc_close_check.setCloseFlag(true);
 #endif
 }
@@ -730,28 +779,26 @@ void LocalSysDBCache::CloseLocalSysDBCache()
 /* every cache knowes whether it is inited */
 void LocalSysDBCache::ClearSysCacheIfNecessary(Oid db_id, const char *db_name)
 {
+    t_thrd.lsc_cxt.xact_seqno++;
+
     CreateCatBucket();
-    if (unlikely(!is_inited)) {
+    if (unlikely(init_status == LscNotInit)) {
         return;
     }
+    Assert(!IsTransactionOrTransactionBlock());
     /* rebuild if memory gt double of threshold */
     if (unlikely(LocalSysDBCacheNeedReBuild())) {
-        recovery_finished = g_instance.global_sysdbcache.recovery_finished;
         LocalSysDBCacheReBuild();
         return;
     }
-
-    if (LocalSysDBCacheNeedClearMyDB(db_id, db_name)) {
-        LocalSysDBCacheClearMyDB(db_id, db_name);
-        return;
+    Assert(init_status == LscInitfinished);
+    if (unlikely(LocalSysDBCacheNeedCleanCache())) {
+        LocalSysDBCacheCleanCache();
+    } else if (LocalSysDBCacheNeedClearMyDB(db_id, db_name)) {
+        LocalSysDBCacheClearMyDB();
     }
 
-    /* only thread who switch sess need clean smgr block info */
-    /* actually, ts task_producter need do this too, but those code need restructure. ts is discarded */
-    if (IS_THREAD_POOL_WORKER) {
-        smgrcleanblocknumall();
-    }
-    g_instance.global_sysdbcache.Refresh(m_global_db);
+    g_instance.global_sysdbcache.Refresh();
 }
 
 void LocalSysDBCache::CreateDBObject()
@@ -773,17 +820,12 @@ void LocalSysDBCache::CreateDBObject()
     partdefcache.CreateDefBucket();
     knl_u_inval_init(&inval_cxt);
     dlist_init(&unowned_reln);
+    knl_u_relmap_init(&relmap_cxt);
     MemoryContextSwitchTo(old);
     if (IS_PGXC_COORDINATOR) {
         CacheRegisterThreadSyscacheCallback(PGXCGROUPOID, ThreadNodeGroupCallback, (Datum)0);
     }
-    /* init t_thrd resource owner */
-    local_sysdb_resowner =
-        ResourceOwnerCreate(NULL, "InitLocalSysCache", lsc_top_memcxt);
 
-    old = MemoryContextSwitchTo(lsc_share_memcxt);
-    knl_u_relmap_init(&relmap_cxt);
-    MemoryContextSwitchTo(old);
     m_shared_global_db = g_instance.global_sysdbcache.GetSharedGSCEntry();
     rel_index_rule_space = 0;
     is_lsc_catbucket_created = false;
@@ -836,7 +878,7 @@ void LocalSysDBCache::InitThreadDatabase(Oid db_id, const char *db_name, Oid db_
     } else if (my_database_id != InvalidOid) {
         /* we has lock db and set thrd.proc.dbid, this should never happened */
         Assert(false);
-        ereport(FATAL, (errno, errmsg("lsc has some error, please try again!")));
+        ereport(ERROR, (errno, errmsg("lsc has some error, please try again!")));
     }
     Assert(db_id == u_sess->proc_cxt.MyDatabaseId);
     Assert(my_database_id == InvalidOid);
@@ -851,20 +893,66 @@ void LocalSysDBCache::InitThreadDatabase(Oid db_id, const char *db_name, Oid db_
     SetDatabaseName(db_name);
 }
 
-void LocalSysDBCache::InitSessionDatabase(Oid db_id, const char *db_name, Oid db_tabspc)
+void LocalSysDBCache::FixWrongCacheStat(Oid db_id, Oid db_tabspc)
 {
-    if (m_global_db != NULL && m_global_db->m_isDead) {
-        ereport(FATAL, (errno, errmsg("It is too later to fix syscache, please try again!")));
+    if (!(
+            unlikely(m_global_db != NULL && m_global_db->m_isDead) ||
+            unlikely(my_database_id != db_id && my_database_id != InvalidOid)
+        )) {
         return;
     }
+
+    /* my_database_id != db_id only happened at standby node, and the case is event of alter db rename */
+    Assert((m_global_db != NULL && m_global_db->m_isDead) || DBStandbyChanged());
+
+    Oid old_db_id = u_sess->proc_cxt.MyDatabaseId;
+    Oid old_db_tabspc = u_sess->proc_cxt.MyDatabaseTableSpace;
+    Assert(old_db_id == db_id && old_db_tabspc == db_tabspc);
+
+    /* DatabasePath is not inited now, but it may point to lsc.my_database_path */
+    Assert(u_sess->proc_cxt.DatabasePath == NULL || u_sess->proc_cxt.DatabasePath == my_database_path);
+    if (u_sess->proc_cxt.DatabasePath == my_database_path) {
+        u_sess->proc_cxt.DatabasePath = NULL;
+    }
+
+    /* we need to init shared rels, which check the follow
+     * for now, we reset them to zero, but clearmydb dont clear shared rels is better
+     * whatever, we dont care error when init, if we failed, the sess will exit, the old status does not matter */
+    u_sess->proc_cxt.MyDatabaseId = InvalidOid;
+    u_sess->proc_cxt.MyDatabaseTableSpace = InvalidOid;
+
+    /* only for standby, we cannot recognize alter db rename event
+     * otherwise, it should not happen */
+    Assert(t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || (ENABLE_DMS && SS_STANDBY_MODE));
+
+    LocalSysDBCacheClearMyDB();
+    InitFileAccess();
+    t_thrd.lsc_cxt.lsc->StartInit();
+    t_thrd.lsc_cxt.lsc->tabdefcache.Init();
+    t_thrd.lsc_cxt.lsc->tabdefcache.InitPhase2();
+    t_thrd.lsc_cxt.lsc->systabcache.Init();
+    u_sess->proc_cxt.MyDatabaseId = old_db_id;
+    u_sess->proc_cxt.MyDatabaseTableSpace = old_db_tabspc;
+}
+
+void LocalSysDBCache::InitSessionDatabase(Oid db_id, const char *db_name, Oid db_tabspc)
+{
+    FixWrongCacheStat(db_id, db_tabspc);
+
     Assert(db_id != InvalidOid);
-    if (!is_inited) {
+    Assert(init_status == LscIniting);
+    if (my_database_id != db_id) {
+        /* this branch means cache miss */
+        Assert(my_database_id == InvalidOid);
+        Assert(my_database_tablespace == InvalidOid);
+        Assert(my_database_name[0] == '\0');
         my_database_id = db_id;
         if (db_name != NULL && !IsBootstrapProcessingMode()) {
             SetDatabaseName(db_name);
         }
         my_database_tablespace = db_tabspc;
     } else {
+        /* this branch means cache hit */
         Assert(my_database_id == db_id);
         Assert(my_database_tablespace == db_tabspc);
         Assert(strcmp(my_database_name, db_name) == 0);
@@ -874,7 +962,6 @@ void LocalSysDBCache::InitSessionDatabase(Oid db_id, const char *db_name, Oid db
 void LocalSysDBCache::InitDatabasePath(const char *db_path)
 {
     Assert(db_path != NULL);
-    Assert(strcmp(u_sess->proc_cxt.DatabasePath, db_path) == 0);
     if (my_database_path == NULL) {
         my_database_path = MemoryContextStrdup(lsc_share_memcxt, db_path);
     } else if (strcmp(my_database_path, db_path) != 0) {
@@ -883,14 +970,12 @@ void LocalSysDBCache::InitDatabasePath(const char *db_path)
     }
 }
 
-void LocalSysDBCache::Init()
+void LocalSysDBCache::InitDBRef()
 {
-    Assert(!is_inited);
     Assert(m_global_db == NULL);
     Assert(my_database_id != InvalidOid);
     Assert(my_database_id == u_sess->proc_cxt.MyDatabaseId);
     m_global_db = g_instance.global_sysdbcache.GetGSCEntry(my_database_id, my_database_name);
-    is_inited = true;
 }
 
 void LocalSysDBCache::InitRelMapPhase2()
@@ -925,8 +1010,8 @@ void LocalSysDBCache::InvalidateGlobalRelMap(bool shared, Oid db_id, RelMapFile 
         Assert(m_shared_global_db != NULL);
         GlobalSysDBCacheEntry *global_db = m_shared_global_db;
         global_db->m_relmapCache->UpdateBy(rel_map);
-    } else if (!is_inited) {
-        Assert(m_global_db == NULL && !is_inited);
+    } else if (m_global_db == NULL) {
+        Assert(init_status != LscInitfinished);
         GlobalSysDBCacheEntry *entry = g_instance.global_sysdbcache.FindTempGSCEntry(db_id);
         if (entry == NULL) {
             return;
@@ -960,7 +1045,6 @@ LocalSysDBCache::LocalSysDBCache()
     VfdCache = NULL;
     SizeVfdCache = 0;
     nfile = 0;
-    local_sysdb_resowner = NULL;
 
     abort_count = 0;
 
@@ -972,24 +1056,26 @@ LocalSysDBCache::LocalSysDBCache()
 
     is_lsc_catbucket_created = false;
     is_closed = false;
-    is_inited = false;
-#ifdef USE_ASSERT_CHECKING
+    ResetInitStatus();
+#if defined(USE_ASSERT_CHECKING) && !defined(ENABLE_MEMORY_CHECK)
     lsc_close_check.setCloseFlag(false);
 #endif
 }
 
 void AtEOXact_SysDBCache(bool is_commit)
 {
+    ResourceOwnerReleasePthreadMutex(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
     if (!EnableLocalSysCache()) {
+        ResourceOwnerReleaseRelationRef(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
         return;
     }
     Assert(t_thrd.lsc_cxt.lsc != NULL);
-    ResourceOwnerReleaseLocalCatCList(t_thrd.lsc_cxt.lsc->local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseLocalCatCTup(t_thrd.lsc_cxt.lsc->local_sysdb_resowner, is_commit);
-    ResourceOwnerReleaseRelationRef(t_thrd.lsc_cxt.lsc->local_sysdb_resowner, is_commit);
-    ResourceOwnerReleasePartitionRef(t_thrd.lsc_cxt.lsc->local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseLocalCatCList(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseLocalCatCTup(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
+    ResourceOwnerReleaseRelationRef(t_thrd.lsc_cxt.local_sysdb_resowner, is_commit);
 
     t_thrd.lsc_cxt.lsc->LocalSysDBCacheReleaseGlobalReSource(is_commit);
+    Assert(CurrentResourceOwnerIsEmpty(t_thrd.lsc_cxt.local_sysdb_resowner));
 
     ReleaseBadPtrList(is_commit);
     if (!is_commit) {
@@ -999,17 +1085,6 @@ void AtEOXact_SysDBCache(bool is_commit)
     t_thrd.lsc_cxt.lsc->rdlock_info.count = 0;
 
     t_thrd.lsc_cxt.lsc->SetThreadDefExclusive(IS_THREAD_POOL_STREAM || IsBgWorkerProcess());
-}
-
-void ReBuildLSC()
-{
-    if (!EnableLocalSysCache()) {
-        return;
-    }
-    if (t_thrd.lsc_cxt.lsc == NULL || t_thrd.lsc_cxt.lsc->is_closed) {
-        return;
-    }
-    t_thrd.lsc_cxt.lsc->LocalSysDBCacheReBuild();
 }
 
 void AppendBadPtr(void *elem)
@@ -1115,4 +1190,28 @@ void ReleaseAllGSCRdConcurrentLock()
         ReleaseGSCTableReadLock(t_thrd.lsc_cxt.lsc->rdlock_info.has_concurrent_lock[cur_index],
             t_thrd.lsc_cxt.lsc->rdlock_info.concurrent_lock[cur_index]);
     }
+}
+
+/* clean smgr_targblock after transaction, do it when access smgr lazily */
+
+void TryFreshSmgrCache(struct SMgrRelationData *smgr)
+{
+    /* do nothing if GSC mode is off */
+    if (!EnableLocalSysCache()) {
+        return;
+    }
+
+    /* do nothing if not a threadpool worker */
+    if (!IS_THREAD_POOL_WORKER) {
+        return;
+    }
+
+    /* matched */
+    if (likely(smgr->xact_seqno == t_thrd.lsc_cxt.xact_seqno)) {
+        return;
+    }
+
+    smgr->xact_seqno = t_thrd.lsc_cxt.xact_seqno;
+    /* reset it and so caller will reload smgr_targblock */
+    smgr->smgr_targblock = InvalidBlockNumber;
 }

@@ -82,3 +82,44 @@ drop table force_vector_test5;
 drop table force_vector_test6;
 drop function func_add_sql;
 drop schema force_vector_engine cascade;
+
+-- test bpcharlen in pg compatibility
+create database pg_length_cmpt_db with dbcompatibility 'PG';
+\c pg_length_cmpt_db
+set try_vector_engine_strategy='force';
+create table force_vt_tb1 (a char(10),b varchar(10));
+insert into force_vt_tb1 values('零0','零1二3');
+insert into force_vt_tb1 values('','');
+insert into force_vt_tb1 values('0','0');
+explain(costs off) select length(a),a from force_vt_tb1 order by 1;
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+
+set try_vector_engine_strategy='off';
+explain(costs off) select length(a),a from force_vt_tb1 order by 1;
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+
+-- test with column table in codegen case
+create table force_vt_tb1_col (a char(10),b varchar(10)) with (orientation=column);
+insert into force_vt_tb1_col values('零0','零1二3');
+insert into force_vt_tb1_col values('','');
+insert into force_vt_tb1_col values('0','0');
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+set enable_codegen to true;
+set codegen_cost_threshold to 0;
+select length(a),a,length(b),b from force_vt_tb1 order by 1;
+
+drop table force_vt_tb1;
+drop table force_vt_tb1_col;
+\c regression;
+drop database pg_length_cmpt_db;
+
+-- Do not use vectorization engine
+create table force_vector_sysdomain(a information_schema.cardinal_number, b int);
+insert into force_vector_sysdomain values(10, 20);
+select a,b from force_vector_sysdomain;
+set try_vector_engine_strategy='force';
+select a,b from force_vector_sysdomain;
+set try_vector_engine_strategy='optimal';
+select a,b from force_vector_sysdomain;
+drop table force_vector_sysdomain;
+set try_vector_engine_strategy='off';

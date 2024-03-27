@@ -355,6 +355,7 @@ void ClientAuthentication(Port* port)
     char token[TOKEN_LENGTH + 1] = {0};
     errno_t rc = EOK;
     int retval = 0;
+    bool needCheckLockStatus = false;
 
     /*
      * Get the authentication method to use for this frontend/database
@@ -617,6 +618,7 @@ void ClientAuthentication(Port* port)
             }
             sendAuthRequest(port, AUTH_REQ_MD5);
             status = recv_and_check_password_packet(port);
+            needCheckLockStatus = true;
             break;
         /* Database Security:  Support SHA256.*/
         case uaSHA256:
@@ -645,6 +647,7 @@ void ClientAuthentication(Port* port)
                 sendAuthRequest(port, AUTH_REQ_SM3);
             }
             status = recv_and_check_password_packet(port);
+            needCheckLockStatus = true;
             break;
         case uaPAM:
 #ifdef USE_PAM
@@ -691,7 +694,7 @@ void ClientAuthentication(Port* port)
     }
 
     /* Database Security: Support lock/unlock account */
-    if (!AM_NOT_HADR_SENDER) {
+    if (!AM_NOT_HADR_SENDER && needCheckLockStatus) {
         /*
          * Disable immediate response to SIGTERM/SIGINT/timeout interrupts as there are
          * some cache and memory operations which can not be interrupted. And nothing will
@@ -703,7 +706,8 @@ void ClientAuthentication(Port* port)
         if (IsRoleExist(port->user_name) && GetRoleOid(port->user_name) != INITIAL_USER_ID) {
             Oid roleid = GetRoleOid(port->user_name);
             USER_STATUS rolestatus;
-            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE ||
+                (ENABLE_DMS && !SS_OFFICIAL_PRIMARY)) {
                 rolestatus = GetAccountLockedStatusFromHashTable(roleid);
             } else {
                 rolestatus = GetAccountLockedStatus(roleid);
@@ -711,7 +715,8 @@ void ClientAuthentication(Port* port)
             if (UNLOCK_STATUS != rolestatus) {
                 errno_t errorno = EOK;
                 bool unlocked = false;
-                if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+                if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE ||
+                    (ENABLE_DMS && !SS_OFFICIAL_PRIMARY)) {
                     unlocked = UnlockAccountToHashTable(roleid, false, false);
                 } else {
                     unlocked = TryUnlockAccount(roleid, false, false);
@@ -735,7 +740,8 @@ void ClientAuthentication(Port* port)
                         (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("The account has been locked.")));
                 }
             } else if (status == STATUS_OK) {
-                if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+                if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE ||
+                    (ENABLE_DMS && !SS_OFFICIAL_PRIMARY)) {
                     (void)UnlockAccountToHashTable(roleid, false, true);
                 } else {
                     (void)TryUnlockAccount(roleid, false, true);
@@ -744,7 +750,8 @@ void ClientAuthentication(Port* port)
 
             /* if password is not right, send signal to try lock the account*/
             if (status == STATUS_WRONG_PASSWORD) {
-                if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+                if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE ||
+                    (ENABLE_DMS && !SS_OFFICIAL_PRIMARY)) {
                     UpdateFailCountToHashTable(roleid, 1, false);
                 } else {
                     TryLockAccount(roleid, 1, false);
@@ -2361,7 +2368,7 @@ int GssClientAuth(int socket, char* server_host)
         return -1;
     }
 
-    if (server_host == NULL || strlen(server_host) <= 0) {
+    if (server_host == NULL || strlen(server_host) == 0) {
         errno = EINVAL;
         return -1;
     }
@@ -2500,7 +2507,7 @@ int GssServerAuth(int socket, const char* krb_keyfile)
         return -1;
     }
 
-    if (krb_keyfile == NULL || strlen(krb_keyfile) <= 0) {
+    if (krb_keyfile == NULL || strlen(krb_keyfile) == 0) {
         errno = EINVAL;
         return -1;
     }
@@ -3646,7 +3653,7 @@ static
     Assert(port->ssl);
 
     /* Make sure we have received a username in the certificate */
-    if (port->peer_cn == NULL || strlen(port->peer_cn) <= 0) {
+    if (port->peer_cn == NULL || strlen(port->peer_cn) == 0) {
         ereport(LOG,
             (errmsg("certificate authentication failed for user \"%s\": client certificate contains no user name",
                 port->user_name)));

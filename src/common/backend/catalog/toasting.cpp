@@ -205,9 +205,9 @@ static bool create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid, Da
      * toast :-(.  This is essential for chunk_data because type bytea is
      * toastable; hit the other two just to be sure.
      */
-    tupdesc->attrs[0]->attstorage = 'p';
-    tupdesc->attrs[1]->attstorage = 'p';
-    tupdesc->attrs[2]->attstorage = 'p';
+    tupdesc->attrs[0].attstorage = 'p';
+    tupdesc->attrs[1].attstorage = 'p';
+    tupdesc->attrs[2].attstorage = 'p';
 
     /*
      * Toast tables for regular relations go in pg_toast; those for temp
@@ -441,7 +441,7 @@ bool CreateToastTableForSubPartition(Relation partRel, Oid subPartOid, Datum rel
         create_toast_table(subPartRel, InvalidOid, InvalidOid, reloptions, true, (partLockMode == AccessShareLock));
 
     releaseDummyRelation(&subPartRel);
-    partitionClose(partRel, partition, partLockMode);
+    partitionClose(partRel, partition, NoLock);
 
     return result;
 }
@@ -450,7 +450,8 @@ bool CreateToastTableForPartitioneOfSubpartTable(Relation rel, Oid partOid, Datu
 {
     bool result = false;
     ListCell *cell = NULL;
-    Partition part = partitionOpen(rel, partOid, partLockMode);
+    LOCKMODE partlock = partLockMode > ShareUpdateExclusiveLock ? ShareUpdateExclusiveLock : partLockMode;
+    Partition part = partitionOpen(rel, partOid, partlock);
     Relation partRel = partitionGetRelation(rel, part);
 
     List *partitionList = relationGetPartitionOidList(partRel);
@@ -460,7 +461,7 @@ bool CreateToastTableForPartitioneOfSubpartTable(Relation rel, Oid partOid, Datu
     }
 
     releaseDummyRelation(&partRel);
-    partitionClose(rel, part, partLockMode);
+    partitionClose(rel, part, NoLock);
 
     return result;
 }
@@ -525,7 +526,7 @@ static bool needs_toast_table(Relation rel)
     bool maxlength_unknown = false;
     bool has_toastable_attrs = false;
     TupleDesc tupdesc;
-    Form_pg_attribute* att = NULL;
+    FormData_pg_attribute* att = NULL;
     int32 tuple_length;
     int i;
 
@@ -548,19 +549,19 @@ static bool needs_toast_table(Relation rel)
     att = tupdesc->attrs;
 
     for (i = 0; i < tupdesc->natts; i++) {
-        if (att[i]->attisdropped)
+        if (att[i].attisdropped)
             continue;
-        data_length = att_align_nominal(data_length, att[i]->attalign);
-        if (att[i]->attlen > 0) {
+        data_length = att_align_nominal(data_length, att[i].attalign);
+        if (att[i].attlen > 0) {
             /* Fixed-length types are never toastable */
-            data_length += att[i]->attlen;
+            data_length += att[i].attlen;
         } else {
-            int32 maxlen = type_maximum_size(att[i]->atttypid, att[i]->atttypmod);
+            int32 maxlen = type_maximum_size(att[i].atttypid, att[i].atttypmod);
             if (maxlen < 0)
                 maxlength_unknown = true;
             else
                 data_length += maxlen;
-            if (att[i]->attstorage != 'p')
+            if (att[i].attstorage != 'p')
                 has_toastable_attrs = true;
         }
     }
@@ -646,7 +647,7 @@ static bool binary_upgrade_is_next_part_toast_pg_type_oid_valid()
     return true;
 }
 
-static void InitTempToastNamespace(void)
+static void InitLobTempToastNamespace(void)
 {
     char toastNamespaceName[NAMEDATALEN];
     char PGXCNodeNameSimplified[NAMEDATALEN];
@@ -677,6 +678,10 @@ static void InitTempToastNamespace(void)
     if (RecoveryInProgress())
         ereport(ERROR,
             (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION), errmsg("cannot create temporary tables during recovery")));
+
+    if (SSIsServerModeReadOnly()) {
+        ereport(ERROR, (errmsg("cannot create temporary tables at Standby with DMS enabled")));
+    }
 
     timeLineId = get_controlfile_timeline();
     tempID = __sync_add_and_fetch(&gt_tempID_seed, 1);
@@ -723,15 +728,16 @@ static void InitTempToastNamespace(void)
     toastspaceId = get_namespace_oid(toastNamespaceName, true);
     if (OidIsValid(toastspaceId)) {
         ereport(ERROR,
-            (errcode(ERRCODE_CACHE_LOOKUP_FAILED), 
-                errmsg("toast Namespace Named %s has existed, please drop it and try again", toastNamespaceName)));
+            (errcode(ERRCODE_INTERNAL_ERROR),
+                errmsg("lob toast namespace named %s has existed!", toastNamespaceName)));
     }
 
     create_stmt = makeNode(CreateSchemaStmt);
     create_stmt->authid = bootstrap_username;
     create_stmt->schemaElts = NULL;
     create_stmt->schemaname = toastNamespaceName;
-    create_stmt->temptype = Temp_Toast;
+    create_stmt->temptype = Temp_Lob_Toast;
+    create_stmt->charset = PG_INVALID_ENCODING;
     rc = memset_s(str, sizeof(str), 0, sizeof(str));
     securec_check(rc, "", "");
     ret = snprintf_s(str,
@@ -741,16 +747,23 @@ static void InitTempToastNamespace(void)
         toastNamespaceName,
         bootstrap_username);
     securec_check_ss(ret, "\0", "\0");
-    ProcessUtility((Node*)create_stmt, str, NULL, false, None_Receiver, false, NULL);
+
+    processutility_context proutility_cxt;
+    proutility_cxt.parse_tree = (Node*)create_stmt;
+    proutility_cxt.query_string = str;
+    proutility_cxt.readOnlyTree = false;
+    proutility_cxt.params = NULL;
+    proutility_cxt.is_top_level = false;
+    ProcessUtility(&proutility_cxt, None_Receiver, false, NULL, PROCESS_UTILITY_GENERATED);
 
     /* Advance command counter to make namespace visible */
     CommandCounterIncrement();
-    if (!OidIsValid(u_sess->catalog_cxt.myTempToastNamespace)) {
+
+    if (!OidIsValid(u_sess->catalog_cxt.myLobTempToastNamespace)) {
         ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("Temp toast namespace create failed")));
+            (errcode(ERRCODE_INTERNAL_ERROR),
+                errmsg("lob temp toast namespace create failed!")));
     }
-    u_sess->catalog_cxt.baseSearchPathValid = false;
 }
 
 bool create_toast_by_sid(Oid *toastOid)
@@ -766,8 +779,8 @@ bool create_toast_by_sid(Oid *toastOid)
     int16 coloptions[2];
     errno_t rc = EOK;
     uint64 session_id = 0;
-    if (OidIsValid(u_sess->plsql_cxt.ActiveLobToastOid)) {
-        *toastOid = u_sess->plsql_cxt.ActiveLobToastOid;
+    if (OidIsValid(u_sess->catalog_cxt.ActiveLobToastOid)) {
+        *toastOid = u_sess->catalog_cxt.ActiveLobToastOid;
         return false;
     }
 
@@ -790,15 +803,13 @@ bool create_toast_by_sid(Oid *toastOid)
      * toast :-(.  This is essential for chunk_data because type bytea is
      * toastable; hit the other two just to be sure.
      */
-    tupdesc->attrs[0]->attstorage = 'p';
-    tupdesc->attrs[1]->attstorage = 'p';
-    tupdesc->attrs[2]->attstorage = 'p';
-    if (OidIsValid(u_sess->catalog_cxt.myTempToastNamespace)) {
-        namespaceid = GetTempToastNamespace();
-    } else {
-        InitTempToastNamespace();
-        namespaceid = GetTempToastNamespace();
+    tupdesc->attrs[0].attstorage = 'p';
+    tupdesc->attrs[1].attstorage = 'p';
+    tupdesc->attrs[2].attstorage = 'p';
+    if (!OidIsValid(u_sess->catalog_cxt.myLobTempToastNamespace)) {
+        InitLobTempToastNamespace();
     }
+    namespaceid = u_sess->catalog_cxt.myLobTempToastNamespace;
 
     StorageType storage_type = HEAP_DISK;
     Datum reloptions = (Datum)0;
@@ -893,8 +904,26 @@ bool create_toast_by_sid(Oid *toastOid)
         false);
 
     heap_close(toast_rel, NoLock);
-    u_sess->plsql_cxt.ActiveLobToastOid = toast_relid;
+    u_sess->catalog_cxt.ActiveLobToastOid = toast_relid;
     *toastOid = toast_relid;
+
+    ObjectAddress referenced;
+    ObjectAddress toastobject;
+
+    toastobject.classId = RelationRelationId;
+    toastobject.objectId = toast_relid;
+    toastobject.objectSubId = 0;
+
+    if (u_sess->attr.attr_common.IsInplaceUpgrade && toastobject.objectId < FirstBootstrapObjectId) {
+        recordPinnedDependency(&toastobject);
+    } else {
+        referenced.classId = NamespaceRelationId;
+        referenced.objectId = namespaceid;
+        referenced.objectSubId = 0;
+
+        recordDependencyOn(&toastobject, &referenced, DEPENDENCY_INTERNAL);
+    }
+
     /*
      * Make changes visible
      */

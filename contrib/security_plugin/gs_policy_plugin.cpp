@@ -97,7 +97,6 @@ PG_MODULE_MAGIC;
 
 extern "C" void _PG_init(void);
 extern "C" void _PG_fini(void);
-extern "C" void set_gsaudit_prehook(ProcessUtility_hook_type func);
 
 #define POLICY_STR_BUFF_LEN 512
 #define POLICY_TMP_BUFF_LEN 256
@@ -140,6 +139,7 @@ static THR_LOCAL MngEventsVector *mng_events = NULL;
 using StrMap = gs_stl::gs_map<gs_stl::gs_string, masking_result>;
 
 static void gsaudit_next_PostParseAnalyze_hook(ParseState *pstate, Query *query);
+
 static void destroy_local_parameter();
 static void destory_thread_variables()
 {
@@ -410,18 +410,16 @@ bool verify_copy_command_is_reparsed(List* parsetree_list, const char* query_str
                                      gs_stl::gs_string& replaced_query_string)
 {
     /* do nothing when enable_security_policy is off */
-    if (!u_sess->attr.attr_security.Enable_Security_Policy || !is_masking_policy_exist()) {
-        return false;
-    }
+    bool is_exist = (!u_sess->attr.attr_security.Enable_Security_Policy ||
+        !is_masking_policy_exist());
+    if (is_exist) return false;
     ListCell* item = NULL;
     foreach(item, parsetree_list) {
         Node* parsetree = (Node *) lfirst(item);
         if (nodeTag(parsetree) == T_CopyStmt) {
             CopyStmt* stmt = (CopyStmt*)parsetree;
-            if (stmt->is_from || stmt->query) {
-                return false;
-            }
-
+            bool is_from_query = (stmt->is_from || stmt->query);
+            if (is_from_query) return false;
             /* verify policies */
             IPV6 ip;
             get_remote_addr(&ip);
@@ -433,10 +431,8 @@ bool verify_copy_command_is_reparsed(List* parsetree_list, const char* query_str
                     checkSecurityPolicyFilter_hook(filter_item, &policy_ids);
                 }
             }
-            if (policy_ids.empty() && !check_audit_policy_filter(&filter_item, &policy_ids)) {
-                return false;
-            }
-
+            bool is_empty_filter = (policy_ids.empty() && !check_audit_policy_filter(&filter_item, &policy_ids));
+            if (is_empty_filter) return false;
             gs_stl::gs_string replace_buffer("(select ");
 
             char replace_name[POLICY_TMP_BUFF_LEN] = {0};
@@ -519,30 +515,6 @@ void set_result_set_function(const PolicyLabelItem &func)
     }
 }
 
-/*
- * check exchange partition list contains masked table.
- * For given AlterTableCmd list, check whether ordinary
- * tables have bound masking policies.
- */
-static bool exchange_partition_with_masked_table(List *cmds)
-{
-    if (cmds == NIL) {
-        return false;
-    }
-    ListCell *lc = NULL;
-    foreach (lc, cmds) {
-        AlterTableCmd *cmd = (AlterTableCmd*)lfirst(lc);
-        if (cmd->subtype == AT_ExchangePartition && cmd->exchange_with_rel != NULL) {
-            Oid relid = RangeVarGetRelid(cmd->exchange_with_rel, NoLock, true);
-            if (is_masked_relation(relid)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
 static void gsaudit_next_PostParseAnalyze_hook(ParseState *pstate, Query *query)
 {
     /* do nothing when enable_security_policy is off */
@@ -559,7 +531,7 @@ static void gsaudit_next_PostParseAnalyze_hook(ParseState *pstate, Query *query)
         enable_dml_auditing = true;
     }
 
-    if (u_sess->proc_cxt.IsInnerMaintenanceTools || (t_thrd.role != WORKER && t_thrd.role != THREADPOOL_WORKER) ||
+    if (u_sess->proc_cxt.IsNoMaskingInnerTools || (t_thrd.role != WORKER && t_thrd.role != THREADPOOL_WORKER) ||
         (!enable_dml_auditing && !is_masking_policy_exist())) {
         if (next_post_parse_analyze_hook) {
             next_post_parse_analyze_hook(pstate, query);
@@ -656,9 +628,24 @@ static void gsaudit_next_PostParseAnalyze_hook(ParseState *pstate, Query *query)
             /* For ALTER TABLE EXCHANGE, will not allowed if the ordinary table(it's columns) has masking policy.*/
             if (query->utilityStmt != NULL && nodeTag(query->utilityStmt) == T_AlterTableStmt) {
                 AlterTableStmt *alter_table = (AlterTableStmt *)(query->utilityStmt);
-                if (exchange_partition_with_masked_table(alter_table->cmds)) {
-                    ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("ALTER TABLE EXCHANGE can not execute with masked ordinary table.")));
+                Oid relid = RangeVarGetRelid(alter_table->relation, NoLock, true);
+
+                ListCell *lc = NULL;
+                foreach (lc, alter_table->cmds) {
+                    AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lc);
+                    if (cmd->subtype == AT_ExchangePartition) {
+                        Assert(PointerIsValid(cmd->exchange_with_rel));
+                        if (is_masked_relation(relid)) {
+                            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("ALTER TABLE EXCHANGE can not execute with masked partition table.")));
+                        }
+
+                        Oid ordTableOid = RangeVarGetRelid(cmd->exchange_with_rel, NoLock, true);
+                        if (is_masked_relation(ordTableOid)) {
+                            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("ALTER TABLE EXCHANGE can not execute with masked ordinary table.")));
+                        }
+                    }
                 }
             }
             break;
@@ -712,7 +699,14 @@ static inline bool get_prepare_command_object_name(Node *parsetree, RangeVar *&r
         }
         case T_UpdateStmt: {
             UpdateStmt *_stmt = (UpdateStmt *)parsetree;
-            rel = _stmt->relation;
+            ListCell *l = NULL;
+            foreach (l, _stmt->relationClause) {
+                Node *n = (Node *)lfirst(l);
+                if (IsA(n, RangeVar)) {
+                    rel = (RangeVar *)n;
+                    return true;
+                }
+            }
             return true;
         }
         case T_SelectStmt: {
@@ -733,7 +727,7 @@ static inline bool get_prepare_command_object_name(Node *parsetree, RangeVar *&r
         }
         case T_DeleteStmt: {
             DeleteStmt *_stmt = (DeleteStmt *)parsetree;
-            rel = _stmt->relation;
+            rel = (RangeVar*)linitial(_stmt->relations);
             return true;
         }
         default:
@@ -811,19 +805,19 @@ static void light_unified_audit_executor(const Query *query)
     access_audit_policy_run(query->rtable, query->commandType);
 }
 
-static void gsaudit_ProcessUtility_hook(Node *parsetree, const char *queryString, ParamListInfoData *params,
-    bool isTopLevel, DestReceiver *dest, bool sentToRemote, char *completionTag, bool isCTAS = false)
+static void gsaudit_ProcessUtility_hook(processutility_context* processutility_cxt,
+    DestReceiver *dest, bool sentToRemote, char *completionTag, ProcessUtilityContext context,bool isCTAS = false)
 {
     /* do nothing when enable_security_policy is off */
     if (!u_sess->attr.attr_security.Enable_Security_Policy || !IsConnFromApp() ||
         u_sess->proc_cxt.IsInnerMaintenanceTools || IsConnFromCoord() ||
         !is_audit_policy_exist_load_policy_info()) {
         if (next_ProcessUtility_hook) {
-            next_ProcessUtility_hook(parsetree, queryString, params, isTopLevel, dest, sentToRemote, completionTag,
-                false);
+            next_ProcessUtility_hook(processutility_cxt, dest, sentToRemote, completionTag,
+                context, false);
         } else {
-            standard_ProcessUtility(parsetree, queryString, params, isTopLevel, dest, sentToRemote, completionTag,
-                false);
+            standard_ProcessUtility(processutility_cxt, dest, sentToRemote, completionTag,
+                context, false);
         }
         return;
     }
@@ -837,6 +831,7 @@ static void gsaudit_ProcessUtility_hook(Node *parsetree, const char *queryString
         checkSecurityPolicyFilter_hook(filter_item, &security_policy_ids);
     }
     RenameMap renamed_objects;
+    Node* parsetree = processutility_cxt->parse_tree;
     if (parsetree != NULL) {
         switch (nodeTag(parsetree)) {
             case T_PlannedStmt: {
@@ -1615,11 +1610,11 @@ static void gsaudit_ProcessUtility_hook(Node *parsetree, const char *queryString
     PG_TRY();
     {
         if (next_ProcessUtility_hook) {
-            next_ProcessUtility_hook(parsetree, queryString, params, isTopLevel, dest, sentToRemote, completionTag,
-                false);
+            next_ProcessUtility_hook(processutility_cxt, dest, sentToRemote, completionTag,
+                context, false);
         } else {
-            standard_ProcessUtility(parsetree, queryString, params, isTopLevel, dest, sentToRemote, completionTag,
-                false);
+            standard_ProcessUtility(processutility_cxt, dest, sentToRemote, completionTag,
+                context, false);
         }
         flush_access_logs(AUDIT_OK);
         send_mng_events(AUDIT_OK);
@@ -1782,7 +1777,7 @@ void install_audit_hook()
      * preserve the chains.
      */
     next_ExecutorStart_hook = ExecutorStart_hook;
-    set_gsaudit_prehook(ProcessUtility_hook);
+    next_ProcessUtility_hook = ProcessUtility_hook;
 
     /*
      * Install audit hooks, the interface for GaussDB kernel user as below
@@ -1820,15 +1815,6 @@ void install_label_hook()
     if (IS_PGXC_COORDINATOR || IS_SINGLE_NODE) {
         verify_label_hook = is_label_exist;
     }
-}
-
-/*
- * This function is used for setting prev_ProcessUtility to rewrite
- * standard_ProcessUtility by other extension.
- */
-void set_gsaudit_prehook(ProcessUtility_hook_type func)
-{
-    next_ProcessUtility_hook = func;
 }
 
 /*

@@ -134,6 +134,7 @@ typedef enum {
 
 #define MarkInnerTuple(inner_tuple_slot, merge_state) ExecCopySlot((merge_state)->mj_MarkedTupleSlot, (inner_tuple_slot))
 
+static TupleTableSlot* ExecMergeJoin(PlanState* state);
 /*
  * MJExamineQuals
  *
@@ -420,7 +421,7 @@ static TupleTableSlot* MJFillOuter(MergeJoinState* node)
         ExprDoneCond isDone;
 
         MJ_printf("ExecMergeJoin: returning outer fill tuple\n");
-
+                        
         TupleTableSlot* result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
 
         if (isDone != ExprEndResult) {
@@ -549,13 +550,17 @@ static void ExecMergeTupleDump(MergeJoinState* merge_state)
  *		ExecMergeJoin
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
+static TupleTableSlot* ExecMergeJoin(PlanState* state)
 {
+    MergeJoinState* node = castNode(MergeJoinState, state);
     bool qual_result = false;
     int compare_result;
     TupleTableSlot* inner_tuple_slot = NULL;
     TupleTableSlot* outer_tuple_slot = NULL;
+    ExprDoneCond isDone;
 
+    CHECK_FOR_INTERRUPTS();
+    
     /*
      * get information from node
      */
@@ -574,7 +579,6 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
      */
     if (node->js.ps.ps_TupFromTlist) {
         TupleTableSlot* result = NULL;
-        ExprDoneCond isDone;
 
         result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
         if (isDone == ExprMultipleResult)
@@ -782,12 +786,9 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                         break;
                     }
 
-                    /*
-                     * In a semijoin, we'll consider returning the first
-                     * match, but after that we're done with this outer tuple.
-                     */
-                    if (node->js.jointype == JOIN_SEMI)
+                    if (node->js.single_match) {
                         node->mj_JoinState = EXEC_MJ_NEXTOUTER;
+                    }
 
                     qual_result = (other_qual == NIL || ExecQual(other_qual, econtext, false));
                     MJ_DEBUG_QUAL(other_qual, qual_result);
@@ -797,7 +798,6 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                          * qualification succeeded.  now form the desired
                          * projection tuple and return the slot containing it.
                          */
-                        ExprDoneCond isDone;
 
                         MJ_printf("ExecMergeJoin: returning tuple\n");
 
@@ -1040,16 +1040,11 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                      * forcing the merge clause to never match, so we never
                      * get here.
                      */
-                    ExecRestrPos(inner_plan);
+                    if (!node->mj_SkipMarkRestore) {
+                        ExecRestrPos(inner_plan);
+                        node->mj_InnerTupleSlot = inner_tuple_slot;
+                    }
 
-                    /*
-                     * ExecRestrPos probably should give us back a new Slot,
-                     * but since it doesn't, use the marked slot.  (The
-                     * previously returned mj_InnerTupleSlot cannot be assumed
-                     * to hold the required tuple.)
-                     */
-                    node->mj_InnerTupleSlot = inner_tuple_slot;
-                    /* we need not do MJEvalInnerValues again */
                     node->mj_JoinState = EXEC_MJ_JOINTUPLES;
                 } else {
                     /* ----------------
@@ -1146,7 +1141,10 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                 MJ_DEBUG_COMPARE(compare_result);
 
                 if (compare_result == 0) {
-                    ExecMarkPos(inner_plan);
+                    if (!node->mj_SkipMarkRestore) {
+                        ExecMarkPos(inner_plan);
+                    }
+
                     if (node->mj_InnerTupleSlot == NULL) {
                         ereport(ERROR,
                                 (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
@@ -1407,6 +1405,7 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
     MergeJoinState* merge_state = makeNode(MergeJoinState);
     merge_state->js.ps.plan = (Plan*)node;
     merge_state->js.ps.state = estate;
+    merge_state->js.ps.ExecProcNode = ExecMergeJoin;
 
     /*
      * Miscellaneous initialization
@@ -1426,35 +1425,26 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
     /*
      * initialize child expressions
      */
-    merge_state->js.ps.targetlist = (List*)ExecInitExpr((Expr*)node->join.plan.targetlist, (PlanState*)merge_state);
+    merge_state->js.ps.targetlist =
+        (List*)ExecInitExpr((Expr*)node->join.plan.targetlist, (PlanState*)merge_state);
     merge_state->js.ps.qual = (List*)ExecInitExpr((Expr*)node->join.plan.qual, (PlanState*)merge_state);
     merge_state->js.jointype = node->join.jointype;
     merge_state->js.joinqual = (List*)ExecInitExpr((Expr*)node->join.joinqual, (PlanState*)merge_state);
     merge_state->js.nulleqqual = (List*)ExecInitExpr((Expr*)node->join.nulleqqual, (PlanState*)merge_state);
     merge_state->mj_ConstFalseJoin = false;
-    /* merge_clauses are handled below */
-    /*
-     * initialize child nodes
-     *
-     * inner child must support MARK/RESTORE.
-     */
-    outerPlanState(merge_state) = ExecInitNode(outerPlan(node), estate, eflags);
-    innerPlanState(merge_state) = ExecInitNode(innerPlan(node), estate, eflags | EXEC_FLAG_MARK);
 
-    /*
-     * For certain types of inner child nodes, it is advantageous to issue
-     * MARK every time we advance past an inner tuple we will never return to.
-     * For other types, MARK on a tuple we cannot return to is a waste of
-     * cycles.	Detect which case applies and set mj_ExtraMarks if we want to
-     * issue "unnecessary" MARK calls.
-     *
-     * Currently, only Material wants the extra MARKs, and it will be helpful
-     * only if eflags doesn't specify REWIND.
-     */
-    if (IsA(innerPlan(node), Material) && (eflags & EXEC_FLAG_REWIND) == 0)
+    Assert(node->join.joinqual == NIL || !node->skip_mark_restore);
+    merge_state->mj_SkipMarkRestore = node->skip_mark_restore;
+
+    outerPlanState(merge_state) = ExecInitNode(outerPlan(node), estate, eflags);
+    innerPlanState(merge_state) =
+        ExecInitNode(innerPlan(node), estate, merge_state->mj_SkipMarkRestore ? eflags : (eflags | EXEC_FLAG_MARK));
+
+    if (IsA(innerPlan(node), Material) && (eflags & EXEC_FLAG_REWIND) == 0 && !merge_state->mj_SkipMarkRestore) {
         merge_state->mj_ExtraMarks = true;
-    else
+    } else {
         merge_state->mj_ExtraMarks = false;
+    }
 
     /*
      * tuple table initialization
@@ -1463,6 +1453,8 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
 
     merge_state->mj_MarkedTupleSlot = ExecInitExtraTupleSlot(estate);
     ExecSetSlotDescriptor(merge_state->mj_MarkedTupleSlot, ExecGetResultType(innerPlanState(merge_state)));
+
+    merge_state->js.single_match = (node->join.inner_unique || node->join.jointype == JOIN_SEMI);
 
     switch (node->join.jointype) {
         case JOIN_INNER:
@@ -1524,10 +1516,8 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
      * result table tuple slot for merge join contains virtual tuple, so the
      * default tableAm type is set to HEAP.
      */
-    ExecAssignResultTypeFromTL(&merge_state->js.ps, TAM_HEAP);
-
+    ExecAssignResultTypeFromTL(&merge_state->js.ps, TableAmHeap);
     ExecAssignProjectionInfo(&merge_state->js.ps, NULL);
-
     /*
      * preprocess the merge clauses
      */
@@ -1567,7 +1557,6 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
 void ExecEndMergeJoin(MergeJoinState* node)
 {
     MJ1_printf("ExecEndMergeJoin: %s\n", "ending node processing");
-
     /*
      * Free the exprcontext
      */
@@ -1576,6 +1565,7 @@ void ExecEndMergeJoin(MergeJoinState* node)
     /*
      * clean out the tuple table
      */
+
     (void)ExecClearTuple(node->js.ps.ps_ResultTupleSlot);
     (void)ExecClearTuple(node->mj_MarkedTupleSlot);
 

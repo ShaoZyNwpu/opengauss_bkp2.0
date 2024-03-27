@@ -18,7 +18,7 @@ SO_MAJOR_VERSION= 6
 SO_MINOR_VERSION= 4
 
 override CPPFLAGS := -I../include -I$(top_srcdir)/src/common/interfaces/ecpg/include \
-	-I$(libpq_srcdir) -I$(top_builddir)/src/common/port $(CPPFLAGS)
+	-I$(libpq_srcdir) -I$(top_builddir)/src/common/port -DFRONTEND $(CPPFLAGS)
 override CFLAGS += $(PTHREAD_CFLAGS)
 
 override CPPFLAGS := $(filter-out -fPIE, $(CPPFLAGS)) -fPIC
@@ -52,6 +52,10 @@ ifeq ($(PORTNAME), win32)
 # Link to shfolder.dll instead of shell32.dll
 SHLIB_LINK += -lshfolder
 endif
+
+execute.o: gram.hpp
+gram.hpp:
+	$(MAKE) -C $(top_builddir)/src/common/interfaces/libpq/frontend_parser gram.hpp
 
 all: all-lib
 

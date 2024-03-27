@@ -58,14 +58,45 @@ bool IsPostmasterEnvironment = false;
 bool open_join_children = true;
 bool will_shutdown = false;
 
-/* hard-wired binary version number */
-const uint32 GRAND_VERSION_NUM = 92605;
+/********************************************
+ * 1.HARD-WIRED BINARY VERSION NUMBER
+ *
+ *    version num range detail for openGauss:
+ *      version | start at | release at | reserve to
+ *      --------+----------+------------+------------
+ *       1.0.X  |  00000   |   92072    |   92086   
+ *       1.1.X  |  92087   |   92298    |   92298   
+ *       2.0.X  |  92298   |   92298    |   92303   
+ *       2.1.X  |  92304   |   92421    |   92423   
+ *       3.0.X  |  92424   |   92605    |   92655   
+ *       3.1.X  |    -     |     -      |     -     
+ *       5.0.X  |  92656   |   92848    |   92898   
+ *       NEXT   |  92899   |     ?      |     ?     
+ *
+ ********************************************/
+const uint32 GRAND_VERSION_NUM = 92854;
 
+/********************************************
+ * 2.VERSION NUM FOR EACH FEATURE
+ *   Please write indescending order.
+ ********************************************/
+const uint32 SRF_FUSION_VERSION_NUM = 92847;
+const uint32 INNER_UNIQUE_VERSION_NUM = 92845;
+const uint32 PARTITION_ENHANCE_VERSION_NUM = 92844;
+const uint32 SELECT_INTO_FILE_VERSION_NUM = 92844;
+const uint32 SELECT_INTO_VAR_VERSION_NUM = 92834;
+#ifdef ENABLE_LITE_MODE
+const uint32 DOLPHIN_ENABLE_DROP_NUM = 92853; /* 5.0.1 ver */
+#else
+const uint32 DOLPHIN_ENABLE_DROP_NUM = 92830; /* 3.1.0 ver */
+#endif
+const uint32 SQL_PATCH_VERSION_NUM = 92675;
 const uint32 PREDPUSH_SAME_LEVEL_VERSION_NUM = 92522;
 const uint32 UPSERT_WHERE_VERSION_NUM = 92514;
 const uint32 FUNC_PARAM_COL_VERSION_NUM = 92500;
 const uint32 SUBPARTITION_VERSION_NUM = 92436;
 const uint32 PBESINGLEPARTITION_VERSION_NUM = 92523;
+const uint32 LARGE_SEQUENCE_VERSION_NUM = 92511;
 const uint32 DEFAULT_MAT_CTE_NUM = 92429;
 const uint32 MATERIALIZED_CTE_NUM = 92424;
 const uint32 HINT_ENHANCEMENT_VERSION_NUM = 92359;
@@ -97,16 +128,32 @@ const uint32 RELMAP_4K_VERSION_NUM = 92403;
 const uint32 TDE_VERSION_NUM = 92407;
 const uint32 SWCB_VERSION_NUM = 92427;
 const uint32 COMMENT_ROWTYPE_TABLEOF_VERSION_NUM = 92513;
+const uint32 V5R2C00_ADVANCE_CATALOG_XMIN_VERSION_NUM = 92525;
 const uint32 PRIVS_DIRECTORY_VERSION_NUM = 92460;
 const uint32 COMMENT_RECORD_PARAM_VERSION_NUM = 92484;
 const uint32 SCAN_BATCH_MODE_VERSION_NUM = 92568;
 const uint32 PUBLICATION_VERSION_NUM = 92580;
+const uint32 SUBSCRIPTION_BINARY_VERSION_NUM = 92656;
+const uint32 PUBLICATION_INITIAL_DATA_VERSION_NAME = 92657;
+const uint32 KEYWORD_IGNORE_COMPART_VERSION_NUM = 92659;
+const uint32 COMMENT_ROWTYPE_NEST_TABLEOF_VERSION_NUM = 92657;
+const uint32 ADVANCE_CATALOG_XMIN_VERSION_NUM = 92659;
+const uint32 LOGICAL_DECODE_FLATTEN_TOAST_VERSION_NUM = 92664;
+const uint32 SWITCH_ROLE_VERSION_NUM = 92668;
+const uint32 PLAN_SELECT_VERSION_NUM = 92826;
+const uint32 REPLACE_INTO_VERSION_NUM = 92828;
+const uint32 PG_AUTHID_PASSWORDEXT_VERSION_NUM = 92830;
+const uint32 SUPPORT_VIEW_AUTO_UPDATABLE = 92838;
+const uint32 INSERT_RIGHT_REF_VERSION_NUM = 92842;
+const uint32 B_DUMP_TRIGGER_VERSION_NUM = 92843;
+const uint32 CHARACTER_SET_VERSION_NUM = 92844;
+const uint32 INDEX_HINT_VERSION_NUM = 92845;
 
 /* Version number of the guc parameter backend_version added in V500R001C20 */
 const uint32 V5R1C20_BACKEND_VERSION_NUM = 92305;
-/* Version number starting from V500R002C10 */
+/* Version number starting from 503.0 */
 const uint32 V5R2C00_START_VERSION_NUM = 92350;
-/* Version number of the guc parameter backend_version added in V500R002C10 */
+/* Version number of the guc parameter backend_version added in 503.0 */
 const uint32 V5R2C00_BACKEND_VERSION_NUM = 92412;
 
 const uint32 ANALYZER_HOOK_VERSION_NUM = 92592;
@@ -116,12 +163,13 @@ const uint32 SUPPORT_HASH_XLOG_VERSION_NUM = 92603;
 uint32 volatile WorkingGrandVersionNum = GRAND_VERSION_NUM;
 
 const uint32 INVALID_INVISIBLE_TUPLE_VERSION = 92605;
-
 const uint32 ENHANCED_TUPLE_LOCK_VERSION_NUM = 92583;
+const uint32 CREATE_FUNCTION_DEFINER_VERSION = 92658;
 
 const uint32 TWOPHASE_FILE_VERSION = 92414;
 const uint32 HASUID_VERSION_NUM = 92550;
 const uint32 WAIT_N_TUPLE_LOCK_VERSION_NUM = 92573;
+const uint32 SKIP_LOCKED_VERSION_NUM = 92829;
 
 const uint32 PARALLEL_DECODE_VERSION_NUM = 92556;
 
@@ -135,9 +183,33 @@ const uint32 DISASTER_READ_VERSION_NUM = 92592;
 
 const uint32 PITR_INIT_VERSION_NUM = 92599;
 
+const uint32 MULTI_PARTITIONS_VERSION_NUM = 92825;
+
+const uint32 CSN_TIME_BARRIER_VERSION = 92801;
+const uint32 MULTI_MODIFY_VERSION_NUM = 92814;
+const uint32 COMMENT_SUPPORT_VERSION_NUM = 92662;
+const uint32 ON_UPDATE_TIMESTAMP_VERSION_NUM = 92664;
+
+const uint32 STANDBY_STMTHIST_VERSION_NUM = 92827;
+const uint32 MAT_VIEW_RECURSIVE_VERSION_NUM = 92833;
+
+const uint32 NEGETIVE_BOOL_VERSION_NUM = 92835;
+
+const uint32 FDW_SUPPORT_JOIN_AGG_VERSION_NUM = 92839;
+
+const uint32 UNION_NULL_VERSION_NUM = 92841;
+
+const uint32 CREATE_INDEX_IF_NOT_EXISTS_VERSION_NUM = 92843;
+const uint32 EVENT_VERSION_NUM = 92844;
+
+const uint32 SLOW_SQL_VERSION_NUM = 92844;
+const uint32 CREATE_TABLE_AS_VERSION_NUM = 92845;
 #ifdef PGXC
 bool useLocalXid = false;
 #endif
+
+/* allow to store tables in segment storage while initdb */
+bool EnableInitDBSegment = false;
 
 /*
  *     EarlyBindingTLSVariables

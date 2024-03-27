@@ -75,7 +75,7 @@ typedef struct CheckPointUndo
     CommitSeqNo next_csn;
     uint64 length;
     TransactionId recent_global_xmin;
-    uint64 oldestXidInUndo;
+    uint64 globalRecycleXid;
     /* you can add more attributes here */
 } CheckPointUndo;
 
@@ -234,6 +234,9 @@ typedef struct ControlFileData {
     bool          float4ByVal;       /* float4 pass-by-value? */
     bool          float8ByVal;       /* float8, int8, etc pass-by-value? */
 
+    /* flag indicating bootstrap relations stored in segment or not */
+    bool          bootstrap_segment;
+
     /* CRC of all above ... MUST BE LAST! */
     pg_crc32c     crc;
 } ControlFileData;
@@ -252,6 +255,12 @@ typedef struct LsnXlogFlushData {
  * message instead of a read error if it's looking at an incompatible file.
  */
 #define PG_CONTROL_SIZE        8192
+
+#define MIN_INSTANCEID   0
+#define MAX_INSTANCEID   63
+#define REFORMER_CTL_INSTANCEID (MAX_INSTANCEID + 1)  /* the last page id of pg_control file */
+#define INVALID_INSTANCEID -1
+#define MAX_INSTANCEID_LEN 3     /* max string len of instance id */ 
 
 #define PG_LSNXLOGFLUSHCHK_FILESIZE        512
 extern uint32 get_controlfile_timeline(void);

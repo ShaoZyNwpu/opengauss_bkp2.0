@@ -15,7 +15,6 @@
  *
  * -------------------------------------------------------------------------
  */
-#include "access/dfs/dfs_query.h"
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
@@ -24,6 +23,7 @@
 
 #include "access/skey.h"
 #include "access/transam.h"
+#include "access/sysattr.h"
 #include "bulkload/foreignroutine.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
@@ -81,6 +81,7 @@
 #define EQUALJOINVARRATIO ((2.0) / (3.0))
 
 static Plan* create_plan_recurse(PlannerInfo* root, Path* best_path);
+static List* build_path_tlist(PlannerInfo* root, Path* path);
 static Plan* create_scan_plan(PlannerInfo* root, Path* best_path);
 static List* build_relation_tlist(RelOptInfo* rel);
 static bool use_physical_tlist(PlannerInfo* root, RelOptInfo* rel);
@@ -90,12 +91,12 @@ static Plan* create_append_plan(PlannerInfo* root, AppendPath* best_path);
 static Plan* create_merge_append_plan(PlannerInfo* root, MergeAppendPath* best_path);
 static BaseResult* create_result_plan(PlannerInfo* root, ResultPath* best_path);
 static void adjust_scan_targetlist(ResultPath* best_path, Plan* subplan);
+static Plan* create_projection_plan(PlannerInfo* root, ProjectionPath* best_path);
+static ProjectSet* create_project_set_plan(PlannerInfo* root, ProjectSetPath* best_path);
 static Material* create_material_plan(PlannerInfo* root, MaterialPath* best_path);
 static Plan* create_unique_plan(PlannerInfo* root, UniquePath* best_path);
 static SeqScan* create_seqscan_plan(PlannerInfo* root, Path* best_path, List* tlist, List* scan_clauses);
 static CStoreScan* create_cstorescan_plan(PlannerInfo* root, Path* best_path, List* tlist, List* scan_clauses);
-static DfsScan* create_dfsscan_plan(PlannerInfo* root, Path* best_path, List* tlist, List* scan_clauses,
-    bool indexFlag = false, List* excludedCol = NIL, bool indexOnly = false);
 #ifdef ENABLE_MULTIPLE_NODES
 static TsStoreScan* create_tsstorescan_plan(PlannerInfo* root, Path* best_path, List* tlist, List* scan_clauses);
 #endif   /* ENABLE_MULTIPLE_NODES */
@@ -120,9 +121,9 @@ static HashJoin* create_hashjoin_plan(PlannerInfo* root, HashPath* best_path, Pl
 static Node* replace_nestloop_params(PlannerInfo* root, Node* expr);
 static Node* replace_nestloop_params_mutator(Node* node, PlannerInfo* root);
 static void process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params);
-static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path);
+static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path, Bitmapset** prefixkeys);
 static List* fix_indexorderby_references(PlannerInfo* root, IndexPath* index_path);
-static Node* fix_indexqual_operand(Node* node, IndexOptInfo* index, int indexcol);
+static Node* fix_indexqual_operand(Node* node, IndexOptInfo* index, int indexcol, Bitmapset** prefixkeys);
 static List* get_switched_clauses(List* clauses, Relids outerrelids);
 static List* order_qual_clauses(PlannerInfo* root, List* clauses);
 static void copy_path_costsize(Plan* dest, Path* src);
@@ -132,7 +133,6 @@ static CStoreScan* make_cstorescan(List* qptlist, List* qpqual, Index scanrelid)
 #ifdef ENABLE_MULTIPLE_NODES
 static TsStoreScan* make_tsstorescan(List* qptlist, List* qpqual, Index scanrelid);
 #endif   /* ENABLE_MULTIPLE_NODES */
-static DfsScan* make_dfsscan(List* qptlist, List* qpqual, Index scanrelid, List* privateList, int dop);
 
 static PartIterator* create_partIterator_plan(
     PlannerInfo* root, PartIteratorPath* pIterpath, GlobalPartIterator* gpIter);
@@ -141,16 +141,14 @@ static Plan* setBucketInfoParam(PlannerInfo* root, Plan* plan, RelOptInfo* rel);
 Plan* create_globalpartInterator_plan(PlannerInfo* root, PartIteratorPath* pIterpath);
 
 static IndexScan* make_indexscan(List* qptlist, List* qpqual, Index scanrelid, Oid indexid, List* indexqual,
-    List* indexqualorig, List* indexorderby, List* indexorderbyorig, ScanDirection indexscandir);
+    List* indexqualorig, List* indexorderby, List* indexorderbyorig, ScanDirection indexscandir, double indexselectivity, bool is_partial);
 static IndexOnlyScan* make_indexonlyscan(List* qptlist, List* qpqual, Index scanrelid, Oid indexid, List* indexqual,
-    List* indexorderby, List* indextlist, ScanDirection indexscandir);
+    List* indexqualorig, List* indexorderby, List* indextlist, ScanDirection indexscandir, double indexselectivity, bool is_partial);
 static CStoreIndexScan* make_cstoreindexscan(PlannerInfo* root, Path* best_path, List* qptlist, List* qpqual,
     Index scanrelid, Oid indexid, List* indexqual, List* indexqualorig, List* indexorderby, List* indexorderbyorig,
     List* indextlist, ScanDirection indexscandir, bool indexonly);
-static DfsIndexScan* make_dfsindexscan(PlannerInfo* root, Path* best_path, List* qptlist, List* qpqual, Index scanrelid,
-    Oid indexid, List* indexqual, List* indexqualorig, List* indexorderby, List* indexorderbyorig,
-    IndexOptInfo* indexinfo, ScanDirection indexscandir, bool indexonly);
-static BitmapIndexScan* make_bitmap_indexscan(Index scanrelid, Oid indexid, List* indexqual, List* indexqualorig);
+static BitmapIndexScan* make_bitmap_indexscan(Index scanrelid, Oid indexid, List* indexqual, List* indexqualorig,
+                                              double indexselectivity, bool is_partial);
 static BitmapHeapScan* make_bitmap_heapscan(
     List* qptlist, List* qpqual, Plan* lefttree, List* bitmapqualorig, Index scanrelid);
 static CStoreIndexCtidScan* make_cstoreindex_ctidscan(
@@ -168,21 +166,19 @@ static WorkTableScan* make_worktablescan(List* qptlist, List* qpqual, Index scan
 static BitmapAnd* make_bitmap_and(List* bitmapplans);
 static BitmapOr* make_bitmap_or(List* bitmapplans);
 static NestLoop* make_nestloop(List* tlist, List* joinclauses, List* otherclauses, List* nestParams, Plan* lefttree,
-    Plan* righttree, JoinType jointype);
+    Plan* righttree, JoinType jointype, bool inner_unique);
 static HashJoin* make_hashjoin(List* tlist, List* joinclauses, List* otherclauses, List* hashclauses, Plan* lefttree,
-    Plan* righttree, JoinType jointype);
+    Plan* righttree, JoinType jointype, bool inner_unique);
 static Hash* make_hash(
     Plan* lefttree, Oid skewTable, AttrNumber skewColumn, bool skewInherit, Oid skewColType, int32 skewColTypmod);
 static MergeJoin* make_mergejoin(List* tlist, List* joinclauses, List* otherclauses, List* mergeclauses,
     Oid* mergefamilies, Oid* mergecollations, int* mergestrategies, bool* mergenullsfirst, Plan* lefttree,
-    Plan* righttree, JoinType jointype);
+    Plan* righttree, JoinType jointype, bool inner_unique, bool skip_mark_restore);
 static Plan* prepare_sort_from_pathkeys(PlannerInfo* root, Plan* lefttree, List* pathkeys, Relids relids,
     const AttrNumber* reqColIdx, bool adjust_tlist_in_place, int* p_numsortkeys, AttrNumber** p_sortColIdx,
     Oid** p_sortOperators, Oid** p_collations, bool** p_nullsFirst);
 static EquivalenceMember* find_ec_member_for_tle(EquivalenceClass* ec, TargetEntry* tle, Relids relids);
 static List* fix_cstore_scan_qual(PlannerInfo* root, List* qpqual);
-static List* fix_dfs_index_target_list(
-    PlannerInfo* root, Path* best_path, DfsIndexScan* node, IndexOptInfo* indexinfo, List* plan_qual);
 static List* make_null_eq_clause(List* joinqual, List** otherqual, List* nullinfo);
 static Node* get_null_eq_restrictinfo(Node* restrictinfo, List* nullinfo);
 
@@ -211,6 +207,8 @@ extern bool isSonicHashAggEnable(VecAgg* agg);
 extern void init_plan_cost(Plan* plan);
 
 static PlanRowMark* check_lockrows_permission(PlannerInfo* root, Plan* lefttree);
+
+static bool isPartiteratorElimination(PlannerInfo *root, RelOptInfo *relopt, Plan* plan);
 
 /**
  * @Description: Whether the relation of relOptInfo is delta.
@@ -355,7 +353,6 @@ static Plan* create_plan_recurse(PlannerInfo* root, Path* best_path)
         case T_IndexScan:
         case T_IndexOnlyScan:
         case T_SeqScan:
-        case T_DfsScan:
         case T_BitmapHeapScan:
         case T_TidScan:
         case T_SubqueryScan:
@@ -379,7 +376,20 @@ static Plan* create_plan_recurse(PlannerInfo* root, Path* best_path)
             plan = create_merge_append_plan(root, (MergeAppendPath*)best_path);
             break;
         case T_BaseResult:
-            plan = (Plan*)create_result_plan(root, (ResultPath*)best_path);
+            /* In new expression framework, the BaseResult node need do projection. */
+            if (root->parse->is_flt_frame) {
+                if (IsA(best_path, ProjectionPath)) {
+                    plan = create_projection_plan(root, (ProjectionPath *)best_path);
+                } else {
+                    Assert(IsA(best_path, ResultPath));
+                    plan = (Plan*)create_result_plan(root, (ResultPath*)best_path);
+                }
+            } else {
+                plan = (Plan*)create_result_plan(root, (ResultPath*)best_path);
+            }
+            break;
+        case T_ProjectSet:
+            plan = (Plan *) create_project_set_plan(root, (ProjectSetPath *) best_path);
             break;
         case T_Material:
             plan = (Plan*)create_material_plan(root, (MaterialPath*)best_path);
@@ -403,7 +413,7 @@ static Plan* create_plan_recurse(PlannerInfo* root, Path* best_path)
         default: {
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                    errmsg("unrecognized node type: %d", (int)best_path->pathtype)));
+                    errmsg("create_plan_recurse: unrecognized node type: %d", (int)best_path->pathtype)));
 
             plan = NULL; /* keep compiler quiet */
         } break;
@@ -595,11 +605,10 @@ static Plan* create_scan_plan(PlannerInfo* root, Path* best_path)
      * path that not supported with current Recursive-Execution mode.
      */
     if (STREAM_RECURSIVECTE_SUPPORTED && root->is_under_recursive_cte) {
-        if (best_path->pathtype == T_DfsScan || best_path->pathtype == T_DfsIndexScan ||
-            best_path->pathtype == T_ForeignScan) {
+        if (best_path->pathtype == T_ForeignScan) {
             errno_t sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
                 NOTPLANSHIPPING_LENGTH,
-                "RecursiveUnion contains DFSScan or ForeignScan is not shippable");
+                "RecursiveUnion contains ForeignScan is not shippable");
             securec_check_ss_c(sprintf_rc, "\0", "\0");
 
             mark_stream_unsupport();
@@ -666,9 +675,6 @@ static Plan* create_scan_plan(PlannerInfo* root, Path* best_path)
             plan = (Plan*)create_tsstorescan_plan(root, best_path, tlist, scan_clauses);
             break;
 #endif   /* ENABLE_MULTIPLE_NODES */
-        case T_DfsScan:
-            plan = (Plan*)create_dfsscan_plan(root, best_path, tlist, scan_clauses);
-            break;
         case T_IndexScan:
             if (SUBQUERY_IS_PARAM(root) && PATH_REQ_UPPER(best_path) != NULL) {
                 scan_clauses = list_concat(scan_clauses, rel->subplanrestrictinfo);
@@ -733,7 +739,7 @@ static Plan* create_scan_plan(PlannerInfo* root, Path* best_path)
             ereport(ERROR,
                 (errmodule(MOD_OPT),
                     errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                    errmsg("unrecognized node type: %d", (int)best_path->pathtype)));
+                    errmsg("create_scan_plan: unrecognized node type: %d", (int)best_path->pathtype)));
             plan = NULL; /* keep compiler quiet */
         } break;
     }
@@ -768,7 +774,7 @@ static bool IsScanPath(NodeTag type)
 {
     return (
         type == T_CStoreScan || type == T_CStoreIndexScan || type == T_CStoreIndexHeapScan || type == T_SeqScan ||
-        type == T_DfsScan || type == T_IndexScan || type == T_IndexOnlyScan || type == T_BitmapHeapScan
+        type == T_IndexScan || type == T_IndexOnlyScan || type == T_BitmapHeapScan
     );
 }
 
@@ -796,7 +802,6 @@ static bool ScanQualsViolateNotNullConstr(PlannerInfo* root, RelOptInfo* rel, Pa
     }
     return false;
 }
-
 /*
  * Build a target list (ie, a list of TargetEntry) for a relation.
  */
@@ -815,7 +820,7 @@ static List* build_relation_tlist(RelOptInfo* rel)
         rel = rel->base_rel;
     }
 
-    foreach (v, rel->reltargetlist) {
+    foreach (v, rel->reltarget->exprs) {
         /* Do we really need to copy here?	Not sure */
         Node* node = (Node*)copyObject(lfirst(v));
 
@@ -825,6 +830,79 @@ static List* build_relation_tlist(RelOptInfo* rel)
             resjunk = true;
         }
         tlist = lappend(tlist, makeTargetEntry((Expr*)node, resno, NULL, resjunk));
+        resno++;
+    }
+    return tlist;
+}
+
+
+/*
+ * Build a target list (ie, a list of TargetEntry) for the Path's output.
+ *
+ * This is almost just make_tlist_from_pathtarget(), but we also have to
+ * deal with replacing nestloop params.
+ */
+static List *
+build_path_tlist(PlannerInfo *root, Path *path)
+{
+    List *tlist = NIL;
+    Index *sortgrouprefs = path->pathtarget->sortgrouprefs;
+    int resno = 1;
+    ListCell *v;
+
+    foreach (v, path->pathtarget->exprs) {
+        Node *node = (Node *)lfirst(v);
+        TargetEntry *tle;
+
+        /*
+         * If it's a parameterized path, there might be lateral references in
+         * the tlist, which need to be replaced with Params.  There's no need
+         * to remake the TargetEntry nodes, so apply this to each list item
+         * separately.
+         */
+        if (path->param_info)
+            node = replace_nestloop_params(root, node);
+
+        tle = makeTargetEntry((Expr *)node, resno, NULL, false);
+        if (sortgrouprefs)
+            tle->ressortgroupref = sortgrouprefs[resno - 1];
+
+        tlist = lappend(tlist, tle);
+        resno++;
+    }
+    return tlist;
+}
+
+/*
+ * build_plan_tlist
+ *
+ * This is almost just build_path_tlist()
+ */
+List *
+build_plan_tlist(PlannerInfo *root, PathTarget *pathtarget)
+{
+    List *tlist = NIL;
+    Index *sortgrouprefs = pathtarget->sortgrouprefs;
+    int resno = 1;
+    ListCell *v;
+
+    foreach (v, pathtarget->exprs) {
+        Node *node = (Node *)lfirst(v);
+        TargetEntry *tle;
+
+        /*
+         * If it's a parameterized path, there might be lateral references in
+         * the tlist, which need to be replaced with Params.  There's no need
+         * to remake the TargetEntry nodes, so apply this to each list item
+         * separately.
+         */
+        node = replace_nestloop_params(root, node);
+
+        tle = makeTargetEntry((Expr *)node, resno, NULL, false);
+        if (sortgrouprefs)
+            tle->ressortgroupref = sortgrouprefs[resno - 1];
+
+        tlist = lappend(tlist, tle);
         resno++;
     }
     return tlist;
@@ -1118,7 +1196,7 @@ static Plan* create_join_plan(PlannerInfo* root, JoinPath* best_path)
             ereport(ERROR,
                 (errmodule(MOD_OPT),
                     errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                    errmsg("unrecognized node type: %d", (int)best_path->path.pathtype)));
+                    errmsg("create_join_plan: unrecognized node type: %d", (int)best_path->path.pathtype)));
             plan = NULL; /* keep compiler quiet */
         } break;
     }
@@ -1408,29 +1486,6 @@ static void adjust_scan_targetlist(ResultPath* best_path, Plan* subplan)
         vartar_list = list_union(vartar_list, var_list);
     }
 
-    if (IsA(subplan, DfsScan) && ((DfsScan*)subplan)->privateData != NIL) {
-        /*
-         * We add privatData for hdfs scan which will be pushed down,
-         * if we don't add vars to DfsScan->reltargetlist, privateData will
-         * be mark output vars that related quals as null.
-         *
-         * PREPARE pbe(int,int) SELECT max(col1) FROM t WHERE col2 in ($1,$2);
-         * origin rel->reltargetlist: col1
-         * privateData:
-         * 			-> targetList: col1
-         *			-> columnList: col1, col2
-         *			-> restrictColList: col2
-         * and this will be mark col2 as null when do projection
-         */
-        DfsScan* node = (DfsScan*)subplan;
-        DfsPrivateItem* item = (DfsPrivateItem*)((DefElem*)linitial(node->privateData))->arg;
-
-        item->columnList = list_union(item->columnList, var_list);
-        item->targetList = list_union(item->targetList, var_list);
-        var_list = pull_var_clause((Node*)item->restrictColList, PVC_REJECT_AGGREGATES, PVC_REJECT_PLACEHOLDERS);
-        vartar_list = list_union(vartar_list, var_list);
-    }
-
     /* Pull all exprs to result operator */
     foreach (lc, vartar_list) {
         Assert(IsA(lfirst(lc), Var));
@@ -1445,7 +1500,7 @@ static void adjust_scan_targetlist(ResultPath* best_path, Plan* subplan)
         sub_targetlist = lappend(sub_targetlist, entry);
     }
     subplan->targetlist = sub_targetlist;
-    if (IsA(subplan, PartIterator)) {
+    if (IsA(subplan, PartIterator) || IsA(subplan, BaseResult)) {
         subplan->lefttree->targetlist = subplan->targetlist;
     }
 }
@@ -1478,9 +1533,15 @@ static BaseResult* create_result_plan(PlannerInfo* root, ResultPath* best_path)
             adjust_scan_targetlist(best_path, subplan);
         }
     } else {
-        /* The tlist will be installed later, since we have no RelOptInfo */
-        Assert(best_path->path.parent == NULL);
-        tlist = NIL;
+        if (root->parse->is_flt_frame) {
+            /* This is a bit useless currently, because rel will have empty tlist */
+            tlist = build_path_tlist(root, &best_path->path);
+        } else {
+            /* The tlist will be installed later, since we have no RelOptInfo */
+            Assert(best_path->path.parent == NULL);
+            tlist = NIL;
+        }
+        
     }
 
     /* best_path->quals is just bare clauses */
@@ -1488,6 +1549,89 @@ static BaseResult* create_result_plan(PlannerInfo* root, ResultPath* best_path)
     subquals = order_qual_clauses(root, best_path->pathqual);
 
     return make_result(root, tlist, (Node*)quals, subplan, subquals);
+}
+
+/*
+ * create_projection_plan
+ *
+ *	  Create a plan tree to do a projection step and (recursively) plans
+ *	  for its subpaths.  We may need a Result node for the projection,
+ *	  but sometimes we can just let the subplan do the work.
+ */
+static Plan *
+create_projection_plan(PlannerInfo *root, ProjectionPath *best_path)
+{
+	Plan	   *plan;
+	Plan	   *subplan;
+	List	   *tlist;
+
+	/* Since we intend to project, we don't need to constrain child tlist */
+	subplan = create_plan_recurse(root, best_path->subpath);
+
+	tlist = build_path_tlist(root, &best_path->path);
+
+	/*
+	 * We might not really need a Result node here, either because the subplan
+	 * can project or because it's returning the right list of expressions
+	 * anyway.  Usually create_projection_path will have detected that and set
+	 * dummypp if we don't need a Result; but its decision can't be final,
+	 * because some createplan.c routines change the tlists of their nodes.
+	 * (An example is that create_merge_append_plan might add resjunk sort
+	 * columns to a MergeAppend.)  So we have to recheck here.  If we do
+	 * arrive at a different answer than create_projection_path did, we'll
+	 * have made slightly wrong cost estimates; but label the plan with the
+	 * cost estimates we actually used, not "corrected" ones.  (XXX this could
+	 * be cleaned up if we moved more of the sortcolumn setup logic into Path
+	 * creation, but that would add expense to creating Paths we might end up
+	 * not using.)
+	 */
+	if (is_projection_capable_path(best_path->subpath) ||
+		tlist_same_exprs(tlist, subplan->targetlist))
+	{
+		/* Don't need a separate Result, just assign tlist to subplan */
+		plan = subplan;
+		plan->targetlist = tlist;
+
+		/* Label plan with the estimated costs we actually used */
+		plan->startup_cost = best_path->path.startup_cost;
+		plan->total_cost = best_path->path.total_cost;
+		plan->plan_rows = best_path->path.rows;
+		plan->plan_width = best_path->path.pathtarget->width;
+		/* ... but be careful not to munge subplan's parallel-aware flag */
+	}
+	else
+	{
+		/* We need a Result node */
+		plan = (Plan *) make_result(root, tlist, NULL, subplan, NULL);
+
+		copy_generic_path_info(plan, (Path *) best_path);
+	}
+
+	return plan;
+}
+
+/*
+ * create_project_set_plan
+ *	  Create a ProjectSet plan for 'best_path'.
+ *
+ *	  Returns a Plan node.
+ */
+static ProjectSet *create_project_set_plan(PlannerInfo *root, ProjectSetPath *best_path)
+{
+    ProjectSet *plan;
+    Plan *subplan;
+    List *tlist;
+
+    /* Since we intend to project, we don't need to constrain child tlist */
+    subplan = create_plan_recurse(root, best_path->subpath);
+
+    tlist = build_path_tlist(root, &best_path->path);
+
+    plan = make_project_set(tlist, subplan);
+
+    copy_generic_path_info(&plan->plan, (Path *)best_path);
+
+    return plan;
 }
 
 /*
@@ -1541,6 +1685,17 @@ static Plan* create_unique_plan(PlannerInfo* root, UniquePath* best_path)
     AttrNumber* groupColIdx = NULL;
     int groupColPos;
     ListCell* l = NULL;
+    Oid* groupCollations;
+
+    /* unique plan may push the expr to subplan, if subplan is cstorescan,
+     * and expr in unique plan have some vector engine not support expr, it may cause error.
+     */
+    if (best_path->umethod != UNIQUE_PATH_NOOP && best_path->subpath->pathtype == T_CStoreScan &&
+        vector_engine_unsupport_expression_walker((Node*)best_path->uniq_exprs)) {
+        Path* resPath = (Path*)create_result_path(root, best_path->subpath->parent, NULL, best_path->subpath);
+        ((ResultPath*)resPath)->ispulledupqual = true;
+        best_path->subpath = resPath;
+    }
 
     subplan = create_plan_recurse(root, best_path->subpath);
 
@@ -1677,6 +1832,26 @@ static Plan* create_unique_plan(PlannerInfo* root, UniquePath* best_path)
             groupOperators[groupColPos++] = eq_oper;
         }
 
+        newtlist = subplan->targetlist;
+        numGroupCols = list_length(uniq_exprs);
+        groupCollations = (Oid*)palloc(numGroupCols * sizeof(Oid));
+ 
+        groupColPos = 0;
+        foreach(l, uniq_exprs)
+        {
+            Node* uniqexpr = (Node*)lfirst(l);
+            TargetEntry *tle = NULL;
+ 
+            tle = tlist_member(uniqexpr, newtlist);
+            if (tle == NULL) /* shouldn't happen */
+                ereport(ERROR, (errmodule(MOD_OPT),
+                        errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE),
+                        (errmsg("failed to find unique expression in subplan tlist"))));
+
+            groupCollations[groupColPos] = exprCollation((Node*) tle->expr);
+            groupColPos++;
+        }
+
         /*
          * Since the Agg node is going to project anyway, we can give it the
          * minimum output tlist, without any stuff we might have added to the
@@ -1699,6 +1874,7 @@ static Plan* create_unique_plan(PlannerInfo* root, UniquePath* best_path)
             numGroupCols,
             groupColIdx,
             groupOperators,
+            groupCollations,
             numGroups[0],
             subplan,
             NULL,
@@ -1875,22 +2051,13 @@ static void add_distribute_info(PlannerInfo* root, Plan* scanPlan, Index relInde
         } else {
             List* quals = scanClauses;
 
-            /*
-             * If the type of scanPlan is DfsScan, must use the following opExpressionList
-             * instead of scanClauses which do not include pushdown quals.
-             */
-            if (IsA(scanPlan, DfsScan)) {
-                DfsPrivateItem* item = (DfsPrivateItem*)((DefElem*)linitial(((DfsScan*)scanPlan)->privateData))->arg;
-                quals = item->opExpressionList;
-            }
-
             /* A hashed table may have filter quals, it's exec nodes are not equal to it's data nodes */
             execNodes = GetRelationNodesByQuals(
                     (void*)root->parse, rte->relid, relIndex, (Node*)quals, RELATION_ACCESS_READ, NULL, false);
 
             if (execNodes == NULL) {
                 elog(DEBUG1, "[add_distribute_info] execNodes is NULL. Oid [%u]", rte->relid);
-                Assert(rte->relid < FirstNormalObjectId || IS_PGXC_DATANODE || IsA(scanPlan, DfsScan));
+                Assert(rte->relid < FirstNormalObjectId || IS_PGXC_DATANODE);
 
                 execNodes = makeNode(ExecNodes);
                 Distribution* distribution = ng_get_installation_group_distribution();
@@ -2050,100 +2217,6 @@ static List* fix_tsstore_scan_qual(PlannerInfo* root, List* qpqual)
     return fixed_quals; 
 }
 #endif   /* ENABLE_MULTIPLE_NODES */
-
-/*
- * @Description: Adjust the target list to scan the index table.
- * @IN root: plan information
- * @IN best_path: path information
- * @IN node: DfsIndexScan node
- * @IN indexinfo: index information
- * @IN plan_qual: the qual on the dfsscan
- * @Return: the adjusted target list
- * @See also:
- */
-static List* fix_dfs_index_target_list(
-    PlannerInfo* root, Path* best_path, DfsIndexScan* node, IndexOptInfo* indexinfo, List* plan_qual)
-{
-    ListCell* cell = NULL;
-    List* targetColumns = NIL;
-    List* tlist = NIL;
-    List* indexlist = indexinfo->indextlist;
-    List* targetlist = node->dfsScan->plan.targetlist;
-    Oid indexoid = node->indexid;
-    Relation indexRel = relation_open(indexoid, AccessShareLock);
-    int idxAttNo = indexRel->rd_att->natts;
-    Expr* indexvar = NULL;
-    ListCell* lc = NULL;
-    AttrNumber resno = 1;
-
-    /*
-     * For psort,btree index, we don't scan other columns except tid in the index rel.
-     * Notice : for index-only scan, we should scan the target columns for btree index.
-     */
-    List* vars = NIL;
-    if (node->indexonly && (list_length(targetlist) > 0 || list_length(plan_qual) > 0)) {
-        /* Prepare the primitive target column list. */
-        foreach (cell, targetlist) {
-            TargetEntry* tle = (TargetEntry*)lfirst(cell);
-
-            /* Pull vars from  the targetlist . */
-            vars = pull_var_clause((Node*)tle, PVC_RECURSE_AGGREGATES, PVC_RECURSE_PLACEHOLDERS);
-            foreach (lc, vars) {
-                Var* var = (Var*)lfirst(lc);
-                int varattno = (int)var->varattno;
-
-                if (varattno >= 0) {
-                    targetColumns = lappend_int(targetColumns, varattno);
-                }
-            }
-        }
-
-        list_free_ext(vars);    /* free list before use */
-
-        /* Prepare the primitive vars from quals. */
-        foreach (cell, plan_qual) {
-            Node* expr = (Node*)lfirst(cell);
-
-            /* Pull vars from  the expr. */
-            vars = pull_var_clause(expr, PVC_RECURSE_AGGREGATES, PVC_RECURSE_PLACEHOLDERS);
-            foreach (lc, vars) {
-                Var* var = (Var*)lfirst(lc);
-                int varattno = (int)var->varattno;
-
-                if (varattno >= 0) {
-                    targetColumns = lappend_int(targetColumns, varattno);
-                }
-            }
-        }
-
-        list_free_ext(vars);    /* free list */
-
-        /*
-         * Extract the target entries from indexlist and use the ones which are inside
-         * the primitive target column list to build the adjusted target column list.
-         */
-        for (int col = 0; col < list_length(indexlist); col++) {
-            TargetEntry* tle = (TargetEntry*)list_nth(indexlist, col);
-            Assert(IsA(tle->expr, Var));
-            int pos = ((Var*)tle->expr)->varattno;
-            if (list_member_int(targetColumns, pos)) {
-                Form_pg_attribute att_tup = indexRel->rd_att->attrs[col];
-                indexvar = (Expr*)makeVar(
-                    ((Var*)tle->expr)->varno, col + 1, att_tup->atttypid, att_tup->atttypmod, att_tup->attcollation, 0);
-                tlist = lappend(tlist, makeTargetEntry(indexvar, resno, NULL, false));
-                resno++;
-            }
-        }
-    }
-
-    /* Add tid target column. */
-    Expr* idxVar = (Expr*)makeVar(0, idxAttNo + 1, TIDOID, -1, InvalidOid, 0);
-    tlist = lappend(tlist, makeTargetEntry(idxVar, resno, NULL, false));
-
-    relation_close(indexRel, AccessShareLock);
-
-    return tlist;
-}
 
 /*
  * @Description: set value to array MaxOrMin.
@@ -2326,135 +2399,6 @@ static CStoreScan* create_cstorescan_plan(PlannerInfo* root, Path* best_path, Li
     return scan_plan;
 }
 
-static DfsScan* create_dfsscan_plan(PlannerInfo* root, Path* bestPath, List* tList, List* scanClauses, bool indexFlag,
-    List* excludedCol, bool indexOnly)
-{
-    DfsScan* dfsScan = NULL;
-    Index scanRelid = bestPath->parent->relid;
-    RelOptInfo* rel = bestPath->parent;
-    int columnCount = 0;
-    bool isPartTbl = false;
-    List* partList = NIL;
-    List* hdfsQualColumn = NIL;
-    List* hdfsQual = NIL;
-    double* selectivity = NULL;
-    List* columnList = NIL;
-    List* restrictColumnList = NIL;
-    List* privateList = NIL;
-    Oid dfsTblOid = InvalidOid;
-    Relation dfsRelation = NULL;
-    const char* storeFormat = NULL;
-    List* dfsReadTList = NIL;
-    int dop = SET_DOP(bestPath->dop);
-
-    /* Fetch Relation handler */
-    dfsTblOid = rt_fetch(scanRelid, root->parse->rtable)->relid;
-    dfsRelation = RelationIdGetRelation(dfsTblOid);
-    if (dfsRelation == NULL) {
-        ereport(ERROR,
-            (errmodule(MOD_OPT),
-                errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                errmsg("could not open relation with OID %u", dfsTblOid)));
-    }
-
-    /*
-     * It should be a base rel.
-     */
-    Assert(scanRelid > 0);
-    Assert(bestPath->parent->rtekind == RTE_RELATION);
-
-    /*
-     * Build dfs scan tlist, should only contain columns referenced, one column at least.
-     */
-    if (tList != NIL) {
-        list_free_ext(tList);
-    }
-    tList = build_relation_tlist(bestPath->parent);
-
-    /* Build dfs reader tlist, can contain no columns */
-    dfsReadTList = build_dfs_reader_tlist(tList, excludedCol);
-
-    if (!indexFlag) {
-        /*
-         * Sort clauses into best execution order.
-         */
-        scanClauses = order_qual_clauses(root, scanClauses);
-
-        /*
-         * Reduce RestrictInfo list to bare expressions; ignore pseudoconstants.
-         */
-        scanClauses = extract_actual_clauses(scanClauses, false);
-    }
-
-    if (tList == NIL) {
-        tList = build_one_column_tlist(root, bestPath->parent);
-    }
-
-    /*
-     * As an optimization, we only add columns that are present in the query to the
-     * column mapping hash. we need baserel to find these columns. Because we don't
-     * have access to baserel in executor's callback functions, we get the column list
-     * here and put it into foreign scan node's private list.
-     */
-    restrictColumnList = GetRestrictColumns(scanClauses, rel->max_attr);
-
-    columnList = MergeList(dfsReadTList, restrictColumnList, rel->max_attr);
-
-    /* Check if the relation is partitioned. */
-    if (RelationIsValuePartitioned(dfsRelation)) {
-        isPartTbl = true;
-        partList = ((ValuePartitionMap*)dfsRelation->partMap)->partList;
-    }
-
-    /*
-     * We parse quals which is needed and can be pushed down to orc reader from
-     * scanClauses for each column.
-     */
-    if (u_sess->attr.attr_sql.enable_hdfs_predicate_pushdown && !indexOnly) {
-        columnCount = rel->max_attr;
-        hdfsQualColumn = fix_pushdown_qual(&hdfsQual, &scanClauses, partList);
-        selectivity = (double*)palloc0(sizeof(double) * columnCount);
-        CalculateWeightByColumns(root, hdfsQualColumn, hdfsQual, selectivity, columnCount);
-    }
-
-    /*
-     * Wrapper DfsPrivateItem using DefElem struct.
-     */
-    DfsPrivateItem* item = MakeDfsPrivateItem(
-        columnList, dfsReadTList, restrictColumnList, scanClauses, NULL, hdfsQual, selectivity, columnCount, partList);
-    privateList = list_make1(makeDefElem(DFS_PRIVATE_ITEM, (Node*)item));
-
-    dfsScan = make_dfsscan(tList, scanClauses, scanRelid, privateList, dop);
-    dfsScan->isPartTbl = isPartTbl;
-
-    /*
-     * set store information.
-     */
-    dfsScan->relStoreLocation = bestPath->parent->relStoreLocation;
-
-    /*
-     * We have to *copy* reloptions->orientation instead of assigning pointer
-     * here as dfsRelation is a local relcache entry that may get released later.
-     */
-    storeFormat = (const char*)RelationGetOrientation(dfsRelation);
-    if (storeFormat == NULL) {
-        ereport(ERROR,
-            (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-                errmsg("Unable to get store format for Dfs relation %s", RelationGetRelationName(dfsRelation))));
-    }
-    dfsScan->storeFormat = pstrdup(storeFormat);
-
-    RelationClose(dfsRelation);
-
-#ifdef STREAMPLAN
-    add_distribute_info(root, &dfsScan->plan, scanRelid, bestPath, scanClauses);
-#endif
-
-    copy_path_costsize(&dfsScan->plan, bestPath);
-
-    return dfsScan;
-}
-
 #ifdef ENABLE_MULTIPLE_NODES
 /*
  * create_tsstorescan_plan
@@ -2515,6 +2459,18 @@ static TsStoreScan* create_tsstorescan_plan(PlannerInfo* root, Path* best_path, 
  }
 #endif   /* ENABLE_MULTIPLE_NODES */
 
+static bool clause_relate_to_prefixkey(RestrictInfo* rinfo, IndexOptInfo* index, Bitmapset* prefixkeys)
+{
+    Index relid = index->rel->relid;
+    Bitmapset* columns = NULL;
+
+    if (prefixkeys == NULL || bms_is_empty(prefixkeys) || !bms_is_member(relid, rinfo->clause_relids)) {
+        return false;
+    }
+    pull_varattnos((Node*)rinfo->clause, relid, &columns);
+    return bms_overlap(columns, prefixkeys);
+}
+
 /*
  * create_indexscan_plan
  *	  Returns an indexscan plan for the base relation scanned by 'best_path'
@@ -2538,7 +2494,9 @@ static Scan* create_indexscan_plan(
     List* fixed_indexquals = NIL;
     List* fixed_indexorderbys = NIL;
     List* opquals = NIL;
+	double indexselectivity = best_path->indexselectivity;
     ListCell* l = NULL;
+    Bitmapset *prefixkeys = NULL;
 
     /* it should be a base rel... */
     Assert(baserelid > 0);
@@ -2554,7 +2512,7 @@ static Scan* create_indexscan_plan(
      * The executor needs a copy with the indexkey on the left of each clause
      * and with index Vars substituted for table ones.
      */
-    fixed_indexquals = fix_indexqual_references(root, best_path);
+    fixed_indexquals = fix_indexqual_references(root, best_path, &prefixkeys);
 
     /*
      * Likewise fix up index attr references in the ORDER BY expressions.
@@ -2602,6 +2560,10 @@ static Scan* create_indexscan_plan(
 
         if (list_member_ptr(indexquals, rinfo))
             continue; /* simple duplicate */
+        if (clause_relate_to_prefixkey(rinfo, best_path->indexinfo, prefixkeys)) {
+            qpqual = lappend(qpqual, rinfo);
+            continue;
+        }
         if (is_redundant_derived_clause(rinfo, indexquals))
             continue; /* derived from same EquivalenceClass */
         if (!contain_mutable_functions((Node*)rinfo->clause)) {
@@ -2610,7 +2572,7 @@ static Scan* create_indexscan_plan(
             if (predicate_implied_by(clausel, indexquals))
                 continue; /* provably implied by indexquals */
             if (best_path->indexinfo->indpred) {
-                if (baserelid != (unsigned int)root->parse->resultRelation &&
+                if (baserelid != (unsigned int)linitial2_int(root->parse->resultRelations) &&
                     get_parse_rowmark(root->parse, baserelid) == NULL)
                     if (predicate_implied_by(clausel, best_path->indexinfo->indpred))
                         continue; /* implied by index predicate */
@@ -2655,20 +2617,6 @@ static Scan* create_indexscan_plan(
             best_path->indexinfo->indextlist,
             best_path->indexscandir,
             indexonly);
-    } else if (best_path->path.parent->orientation == REL_PAX_ORIENTED) {
-        scan_plan = (Scan*)make_dfsindexscan(root,
-            &best_path->path,
-            tlist,
-            qpqual,
-            baserelid,
-            indexoid,
-            fixed_indexquals,
-            stripped_indexquals,
-            fixed_indexorderbys,
-            indexorderbys,
-            best_path->indexinfo,
-            best_path->indexscandir,
-            indexonly);
     } else if (best_path->path.parent->orientation == REL_TIMESERIES_ORIENTED) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2680,9 +2628,12 @@ static Scan* create_indexscan_plan(
                 baserelid,
                 indexoid,
                 fixed_indexquals,
+                stripped_indexquals,
                 fixed_indexorderbys,
                 best_path->indexinfo->indextlist,
-                best_path->indexscandir);
+                best_path->indexscandir,
+                indexselectivity,
+                (best_path->indexinfo->indpred != NIL));
         } else {
             scan_plan = (Scan*)make_indexscan(tlist,
                 qpqual,
@@ -2692,7 +2643,9 @@ static Scan* create_indexscan_plan(
                 stripped_indexquals,
                 fixed_indexorderbys,
                 indexorderbys,
-                best_path->indexscandir);
+                best_path->indexscandir,
+                indexselectivity,
+                (best_path->indexinfo->indpred != NIL));
             ((IndexScan*)scan_plan)->is_ustore = best_path->is_ustore;
         }
     }
@@ -2990,7 +2943,12 @@ static Plan* create_bitmap_subplan(PlannerInfo* root, Path* bitmapqual, List** q
             Assert(IsA(iscan, IndexScan));
             /* then convert to a bitmap indexscan */
             plan = (Plan*)make_bitmap_indexscan(
-                iscan->scan.scanrelid, iscan->indexid, iscan->indexqual, iscan->indexqualorig);
+                iscan->scan.scanrelid,
+                iscan->indexid,
+                iscan->indexqual,
+                iscan->indexqualorig,
+                iscan->selectivity,
+                iscan->is_partial);
             ((BitmapIndexScan*)plan)->is_ustore = iscan->is_ustore;
             indexscan = (Plan*)iscan;
         }
@@ -3044,7 +3002,7 @@ static Plan* create_bitmap_subplan(PlannerInfo* root, Path* bitmapqual, List** q
         ereport(ERROR,
             (errmodule(MOD_OPT),
                 errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                errmsg("unrecognized node type: %d", nodeTag(bitmapqual))));
+                errmsg("create_bitmap_subplan: unrecognized node type: %d", nodeTag(bitmapqual))));
         plan = NULL; /* keep compiler quiet */
     }
 
@@ -3324,8 +3282,6 @@ static void ModifyWorktableWtParam(Node* planNode, int oldWtParam, int newWtPara
         case T_IndexScan:
         case T_IndexOnlyScan:
         case T_SeqScan:
-        case T_DfsScan:
-        case T_DfsIndexScan:
         case T_ForeignScan:
         case T_ExtensiblePlan:
         case T_BitmapHeapScan:
@@ -3431,7 +3387,7 @@ static void ModifyWorktableWtParam(Node* planNode, int oldWtParam, int newWtPara
             ereport(ERROR,
                 (errmodule(MOD_OPT),
                     errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                    errmsg("unrecognized node type: %d when modify worktable wtParam.", (int)nodeTag(planNode))));
+                    errmsg("ModifyWorktableWtParam: unrecognized node type: %d when modify worktable wtParam.", (int)nodeTag(planNode))));
             break;
         }
     }
@@ -3477,16 +3433,7 @@ static Plan* create_ctescan_plan(PlannerInfo* root, Path* best_path, List* tlist
      * Find the referenced CTE, and locate the SubPlan previously made for it.
      */
     levelsup = rte->ctelevelsup;
-    cteroot = root;
-    while (levelsup-- > 0) {
-        cteroot = cteroot->parent_root;
-        if (cteroot == NULL) { /* shouldn't happen */
-            ereport(ERROR,
-                (errmodule(MOD_OPT),
-                    errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE),
-                    errmsg("bad levelsup for CTE \"%s\"", rte->ctename)));
-        }
-    }
+    cteroot = get_cte_root(root, levelsup, rte->ctename);
 
     /*
      * Note: cte_plan_ids can be shorter than cteList, if we are still working
@@ -3787,16 +3734,7 @@ static WorkTableScan* create_worktablescan_plan(PlannerInfo* root, Path* best_pa
                 errmsg("bad levelsup for CTE \"%s\"", rte->ctename)));
     }
     levelsup--;
-    cteroot = root;
-    while (levelsup-- > 0) {
-        cteroot = cteroot->parent_root;
-        if (cteroot == NULL) { /* shouldn't happen */
-            ereport(ERROR,
-                (errmodule(MOD_OPT),
-                    errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE),
-                    errmsg("bad levelsup for CTE \"%s\"", rte->ctename)));
-        }
-    }
+    cteroot = get_cte_root(root, levelsup, rte->ctename);
     if (cteroot->wt_param_id < 0) /* shouldn't happen */
         ereport(ERROR,
             (errmodule(MOD_OPT),
@@ -3853,7 +3791,7 @@ static List* build_one_column_tlist(PlannerInfo* root, RelOptInfo* rel)
                   Var* varnode = NULL;
 
                   for (varattno = 0; varattno < maxattrs; varattno++) {
-                      Form_pg_attribute attr = tupdesc->attrs[varattno];
+                      Form_pg_attribute attr = &tupdesc->attrs[varattno];
 
                       if (attr->attisdropped || !IsTypeDistributable(attr->atttypid)) {
                           continue;
@@ -3904,13 +3842,23 @@ static ForeignScan* create_foreignscan_plan(PlannerInfo* root, ForeignPath* best
     Index scan_relid = rel->relid;
     RangeTblEntry* rte = NULL;
     RangeTblEntry* target_rte = NULL;
+    Plan* outer_plan = NULL;
     int i;
 
-    /* it should be a base rel... */
-    Assert(scan_relid > 0);
-    Assert(rel->rtekind == RTE_RELATION);
-    rte = planner_rt_fetch(scan_relid, root);
-    Assert(rte->rtekind == RTE_RELATION);
+    /* transform the child path if any */
+    if (best_path->fdw_outerpath) {
+        outer_plan = create_plan_recurse(root, best_path->fdw_outerpath);
+    }
+
+    /*
+     * If we're scanning a base relation, fetch its OID.  (Irrelevant if
+     * scanning a join relation.)
+     */
+    if (scan_relid > 0) {
+        Assert(rel->rtekind == RTE_RELATION);
+        rte = planner_rt_fetch(scan_relid, root);
+        Assert(rte->rtekind == RTE_RELATION);
+    }
 
     /*
      * Sort clauses into best execution order.	We do this first since the FDW
@@ -3927,7 +3875,7 @@ static ForeignScan* create_foreignscan_plan(PlannerInfo* root, ForeignPath* best
      * For now, error table only support insert statement.
      */
     target_rte = rte;
-    if (root->parse->commandType == CMD_INSERT) {
+    if (scan_relid > 0 && root->parse->commandType == CMD_INSERT) {
         // Confirm whether exists error table.
         DefElem* def = GetForeignTableOptionByName(rte->relid, optErrorRel);
         if (def != NULL) {
@@ -3958,19 +3906,36 @@ static ForeignScan* create_foreignscan_plan(PlannerInfo* root, ForeignPath* best
      * Assign task to the datanodes where target table exists so that
      * the error information will be saved only in these nodes.
      */
-    scan_plan = rel->fdwroutine->GetForeignPlan(root, rel, target_rte->relid, best_path, tlist, scan_clauses);
-    scan_plan->scan_relid = rte->relid;
+    scan_plan = rel->fdwroutine->GetForeignPlan(root, rel, 
+        target_rte == NULL ? scan_relid : target_rte->relid,
+        best_path, tlist, scan_clauses, outer_plan);
 
-    char locator_type = GetLocatorType(rte->relid);
+    scan_plan->scan_relid = (rte == NULL ? scan_relid : rte->relid);
+    /* Copy foreign server OID; likewise, no need to make FDW do this */
+    scan_plan->fs_server = rel->serverid;
+
+    /*
+     * Likewise, copy the relids that are represented by this foreign scan. An
+     * upper rel doesn't have relids set, but it covers all the base relations
+     * participating in the underlying scan, so use root's all_baserels.
+     */
+    if (rel->reloptkind == RELOPT_UPPER_REL) {
+        scan_plan->fs_relids = root->all_baserels;
+    } else {
+        scan_plan->fs_relids = best_path->path.parent->relids;
+    }
+
+    char locator_type = (rte == NULL ? LOCATOR_TYPE_NONE : GetLocatorType(rte->relid));
 
     /*
      * In order to support error table in multi-nodegroup situation,
      * execute foreign scan only on DNs where the insert-targeted table exists.
      * Secondly, find the DNs where the target table lies and set them as the exec_nodes.
      */
-    exec_nodes = GetRelationNodesByQuals(
-        (void*)root->parse, target_rte->relid, scan_relid, (Node*)scan_clauses, RELATION_ACCESS_READ, NULL);
-
+    if (scan_relid > 0) {
+        exec_nodes = GetRelationNodesByQuals((void *)root->parse, target_rte->relid,
+            scan_relid, (Node *)scan_clauses, RELATION_ACCESS_READ, NULL);
+    }
     if (exec_nodes == NULL) {
         /* foreign scan is executed on installation group */
         exec_nodes = ng_get_installation_group_exec_node();
@@ -3996,6 +3961,15 @@ static ForeignScan* create_foreignscan_plan(PlannerInfo* root, ForeignPath* best
     copy_path_costsize(&scan_plan->scan.plan, &best_path->path);
 
     /*
+     * If this is a foreign join, and to make it valid to push down we had to
+     * assume that the current user is the same as some user explicitly named
+     * in the query, mark the finished plan as depending on the current user.
+     */
+    if (rel->useridiscurrent) {
+        root->glob->dependsOnRole = true;
+    }
+
+    /*
      * Replace any outer-relation variables with nestloop params in the qual
      * and fdw_exprs expressions.  We do this last so that the FDW doesn't
      * have to be involved.  (Note that parts of fdw_exprs could have come
@@ -4003,8 +3977,9 @@ static ForeignScan* create_foreignscan_plan(PlannerInfo* root, ForeignPath* best
      * wouldn't work.)
      */
     if (best_path->path.param_info) {
-        scan_plan->scan.plan.qual = (List*)replace_nestloop_params(root, (Node*)scan_plan->scan.plan.qual);
-        scan_plan->fdw_exprs = (List*)replace_nestloop_params(root, (Node*)scan_plan->fdw_exprs);
+        scan_plan->scan.plan.qual = (List *)replace_nestloop_params(root, (Node *)scan_plan->scan.plan.qual);
+        scan_plan->fdw_exprs = (List *)replace_nestloop_params(root, (Node *)scan_plan->fdw_exprs);
+        scan_plan->fdw_recheck_quals = (List *)replace_nestloop_params(root, (Node *)scan_plan->fdw_recheck_quals);
     }
 
     /*
@@ -4013,6 +3988,10 @@ static ForeignScan* create_foreignscan_plan(PlannerInfo* root, ForeignPath* best
      * out of the API presented to FDWs.
      */
     scan_plan->fsSystemCol = false;
+    if (scan_relid == 0) {
+        return scan_plan;
+    }
+
     for (i = rel->min_attr; i < 0; i++) {
         if (!bms_is_empty(rel->attr_needed[i - rel->min_attr])) {
             scan_plan->fsSystemCol = true;
@@ -4164,7 +4143,8 @@ static NestLoop* create_nestloop_plan(PlannerInfo* root, NestPath* best_path, Pl
 #endif
 
     join_plan =
-        make_nestloop(tlist, joinclauses, otherclauses, nestParams, outer_plan, inner_plan, best_path->jointype);
+        make_nestloop(tlist, joinclauses, otherclauses, nestParams,
+                        outer_plan, inner_plan, best_path->jointype, best_path->inner_unique);
 
     /*
      * @hdfs
@@ -4490,7 +4470,9 @@ static MergeJoin* create_mergejoin_plan(PlannerInfo* root, MergePath* best_path,
         mergenullsfirst,
         outer_plan,
         inner_plan,
-        best_path->jpath.jointype);
+        best_path->jpath.jointype,
+        best_path->jpath.inner_unique,
+        best_path->skip_mark_restore);
 
     /*
      * @hdfs
@@ -4545,8 +4527,7 @@ static void search_var_and_mark_bloomfilter(PlannerInfo* root, Expr* expr, Plan*
     }
 
     switch (nodeTag(plan)) {
-        case T_ForeignScan:
-        case T_DfsScan: {
+        case T_ForeignScan: {
             if (IsA(plan, ForeignScan)) {
                 ForeignScan* splan = (VecForeignScan*)plan;
 
@@ -4910,8 +4891,8 @@ static HashJoin* create_hashjoin_plan(PlannerInfo* root, HashPath* best_path, Pl
      * Build the hash node and hash join node.
      */
     hash_plan = make_hash(inner_plan, skewTable, skewColumn, skewInherit, skewColType, skewColTypmod);
-    join_plan = make_hashjoin(
-        tlist, joinclauses, otherclauses, hashclauses, outer_plan, (Plan*)hash_plan, best_path->jpath.jointype);
+    join_plan = make_hashjoin(tlist, joinclauses, otherclauses, hashclauses, outer_plan, (Plan*)hash_plan,
+                              best_path->jpath.jointype, best_path->jpath.inner_unique);
 
     /*
      * @hdfs
@@ -5059,7 +5040,7 @@ static Node* replace_nestloop_params_mutator(Node* node, PlannerInfo* root)
  * Note that we also use root->curOuterRels as an implicit parameter for
  * sanity checks.
  */
-void
+static void
 process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
 {
 	ListCell *lc = NULL;
@@ -5151,7 +5132,7 @@ process_subquery_nestloop_params(PlannerInfo *root, List *subplan_params)
  * with the original; this is needed in case there is a subplan in it (we need
  * two separate copies of the subplan tree, or things will go awry).
  */
-static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path)
+static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path, Bitmapset** prefixkeys)
 {
     IndexOptInfo* index = index_path->indexinfo;
     List* fixed_indexquals = NIL;
@@ -5192,11 +5173,10 @@ static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path)
              */
             if (!bms_equal(rinfo->left_relids, index->rel->relids))
                 CommuteOpExpr(op);
-
             /*
              * Now replace the indexkey expression with an index Var.
              */
-            linitial(op->args) = fix_indexqual_operand((Node*)linitial(op->args), index, indexcol);
+            linitial(op->args) = fix_indexqual_operand((Node*)linitial(op->args), index, indexcol, prefixkeys);
         } else if (IsA(clause, RowCompareExpr)) {
             RowCompareExpr* rc = (RowCompareExpr*)clause;
             Expr* newrc = NULL;
@@ -5234,19 +5214,19 @@ static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path)
             Assert(list_length(rc->largs) == list_length(indexcolnos));
             forboth(lca, rc->largs, lcai, indexcolnos)
             {
-                lfirst(lca) = fix_indexqual_operand((Node*)lfirst(lca), index, lfirst_int(lcai));
+                lfirst(lca) = fix_indexqual_operand((Node*)lfirst(lca), index, lfirst_int(lcai), prefixkeys);
             }
         } else if (IsA(clause, ScalarArrayOpExpr)) {
             ScalarArrayOpExpr* saop = (ScalarArrayOpExpr*)clause;
 
             /* Never need to commute... */
             /* Replace the indexkey expression with an index Var. */
-            linitial(saop->args) = fix_indexqual_operand((Node*)linitial(saop->args), index, indexcol);
+            linitial(saop->args) = fix_indexqual_operand((Node*)linitial(saop->args), index, indexcol, prefixkeys);
         } else if (IsA(clause, NullTest)) {
             NullTest* nt = (NullTest*)clause;
 
             /* Replace the indexkey expression with an index Var. */
-            nt->arg = (Expr*)fix_indexqual_operand((Node*)nt->arg, index, indexcol);
+            nt->arg = (Expr*)fix_indexqual_operand((Node*)nt->arg, index, indexcol, prefixkeys);
         } else
             ereport(ERROR,
                 (errmodule(MOD_OPT),
@@ -5258,6 +5238,7 @@ static List* fix_indexqual_references(PlannerInfo* root, IndexPath* index_path)
 
     return fixed_indexquals;
 }
+
 
 /*
  * fix_indexorderby_references
@@ -5304,7 +5285,7 @@ static List* fix_indexorderby_references(PlannerInfo* root, IndexPath* index_pat
             /*
              * Now replace the indexkey expression with an index Var.
              */
-            linitial(op->args) = fix_indexqual_operand((Node*)linitial(op->args), index, indexcol);
+            linitial(op->args) = fix_indexqual_operand((Node*)linitial(op->args), index, indexcol, NULL);
         } else
             ereport(ERROR,
                 (errmodule(MOD_OPT),
@@ -5327,7 +5308,7 @@ static List* fix_indexorderby_references(PlannerInfo* root, IndexPath* index_pat
  * Most of the code here is just for sanity cross-checking that the given
  * expression actually matches the index column it's claimed to.
  */
-static Node* fix_indexqual_operand(Node* node, IndexOptInfo* index, int indexcol)
+static Node* fix_indexqual_operand(Node* node, IndexOptInfo* index, int indexcol, Bitmapset** prefixkeys)
 {
     Var* result = NULL;
     int pos;
@@ -5374,6 +5355,13 @@ static Node* fix_indexqual_operand(Node* node, IndexOptInfo* index, int indexcol
                 indexkey = (Node*)lfirst(indexpr_item);
                 if (indexkey && IsA(indexkey, RelabelType))
                     indexkey = (Node*)((RelabelType*)indexkey)->arg;
+                if (indexkey && IsA(indexkey, PrefixKey)) {
+                    indexkey = (Node*)((PrefixKey*)indexkey)->arg;
+                    if (prefixkeys != NULL) {
+                        *prefixkeys = bms_add_member(*prefixkeys,
+                            ((Var*)indexkey)->varattno - FirstLowInvalidHeapAttributeNumber);
+                    }
+                }
                 if (equal(node, indexkey)) {
                     result = makeVar(INDEX_VAR,
                         indexcol + 1,
@@ -5567,9 +5555,17 @@ static List* order_qual_clauses(PlannerInfo* root, List* clauses)
  */
 static void copy_generic_path_info(Plan *dest, Path *src)
 {
-    dest->startup_cost = src->startup_cost;
-    dest->total_cost = src->total_cost;
-    dest->plan_rows = src->rows;
+    if (src) {
+        dest->startup_cost = src->startup_cost;
+        dest->total_cost = src->total_cost;
+        dest->plan_rows = src->rows;
+        dest->plan_width = src->pathtarget->width;
+    } else {
+        dest->startup_cost = 0;
+        dest->total_cost = 0;
+        dest->plan_rows = 0;
+        dest->plan_width = 0;
+    }
 }
 
 /*
@@ -5582,7 +5578,7 @@ static void copy_path_costsize(Plan* dest, Path* src)
         dest->startup_cost = src->startup_cost;
         dest->total_cost = src->total_cost;
         set_plan_rows(dest, src->rows, src->multiple);
-        dest->plan_width = src->parent->width;
+        dest->plan_width = src->parent->reltarget->width;
         dest->innerdistinct = src->innerdistinct;
         dest->outerdistinct = src->outerdistinct;
     } else {
@@ -5652,45 +5648,6 @@ static CStoreScan* make_cstorescan(List* qptlist, List* qpqual, Index scanrelid)
     return node;
 }
 
-/*
- * Brief        : Makea DfsScan node.
- * Input        : tList, the target list.
- *                qual, the qual list.
- *                scanRelId, the relation index in range table entry.
- *                privateList, Wrapper DfsPrivateItem using DefElem struct.
- * Output       : None.
- * Return Value : Return the DfsScan..
- * Notes        : None.
- */
-static DfsScan* make_dfsscan(List* tList, List* qual, Index scanReId, List* privateList, int dop)
-{
-    DfsScan* node = makeNode(DfsScan);
-    Plan* plan = &node->plan;
-
-    /*
-     * cost should be inserted by caller.
-     */
-    plan->targetlist = tList;
-    plan->qual = qual;
-    plan->lefttree = NULL;
-    plan->righttree = NULL;
-    plan->vec_output = true;
-
-    node->scanrelid = scanReId;
-    node->privateData = privateList;
-
-    /* dfs memory estimate. */
-    /* Since dfsscan cannot be accurately estimated, it can only be given a const value. but in the SMP state, the
-     * dop at this time will change during the optimization phase. Therefore the min max value is not estimated
-     * here and they should be specially processed of mem_info.mimMem and maxMem. It is given separately
-     * in the AssignMemOpConsumption() in memctl.cpp.
-     */
-    node->mem_info.opMem = u_sess->opt_cxt.op_work_mem;
-    node->mem_info.regressCost = 0;
-
-    return node;
-}
-
 #ifdef ENABLE_MULTIPLE_NODES
 static TsStoreScan* make_tsstorescan(List* qptlist, List* qpqual, Index scanrelid)
 {
@@ -5719,7 +5676,7 @@ static TsStoreScan* make_tsstorescan(List* qptlist, List* qpqual, Index scanreli
 #endif   /* ENABLE_MULTIPLE_NODES */
 
 static IndexScan* make_indexscan(List* qptlist, List* qpqual, Index scanrelid, Oid indexid, List* indexqual,
-    List* indexqualorig, List* indexorderby, List* indexorderbyorig, ScanDirection indexscandir)
+    List* indexqualorig, List* indexorderby, List* indexorderbyorig, ScanDirection indexscandir, double indexselectivity, bool is_partial)
 {
     IndexScan* node = makeNode(IndexScan);
     Plan* plan = &node->scan.plan;
@@ -5736,12 +5693,13 @@ static IndexScan* make_indexscan(List* qptlist, List* qpqual, Index scanrelid, O
     node->indexorderby = indexorderby;
     node->indexorderbyorig = indexorderbyorig;
     node->indexorderdir = indexscandir;
-
+    node->selectivity = indexselectivity;
+    node->is_partial = is_partial;
     return node;
 }
 
 static IndexOnlyScan* make_indexonlyscan(List* qptlist, List* qpqual, Index scanrelid, Oid indexid, List* indexqual,
-    List* indexorderby, List* indextlist, ScanDirection indexscandir)
+    List* indexqualorig, List* indexorderby, List* indextlist, ScanDirection indexscandir, double indexselectivity, bool is_partial)
 {
     IndexOnlyScan* node = makeNode(IndexOnlyScan);
     Plan* plan = &node->scan.plan;
@@ -5754,10 +5712,12 @@ static IndexOnlyScan* make_indexonlyscan(List* qptlist, List* qpqual, Index scan
     node->scan.scanrelid = scanrelid;
     node->indexid = indexid;
     node->indexqual = indexqual;
+    node->indexqualorig = indexqualorig;
     node->indexorderby = indexorderby;
     node->indextlist = indextlist;
     node->indexorderdir = indexscandir;
-
+    node->selectivity = indexselectivity;
+    node->is_partial = is_partial;
     return node;
 }
 
@@ -5816,76 +5776,8 @@ static CStoreIndexScan* make_cstoreindexscan(PlannerInfo* root, Path* best_path,
     return node;
 }
 
-static DfsIndexScan* make_dfsindexscan(PlannerInfo* root, Path* best_path, List* qptlist, List* qpqual, Index scanrelid,
-    Oid indexid, List* indexqual, List* indexqualorig, List* indexorderby, List* indexorderbyorig,
-    IndexOptInfo* indexinfo, ScanDirection indexscandir, bool indexonly)
-{
-    DfsIndexScan* node = makeNode(DfsIndexScan);
-    Plan* plan = &node->scan.plan;
-    plan->lefttree = NULL;
-    plan->righttree = NULL;
-    plan->vec_output = true;
-    Path sort_path;
-
-    node->scan.scanrelid = scanrelid;
-    node->indexid = indexid;
-    node->indextlist = indexinfo->indextlist;
-    node->indexqual = indexqual;
-    node->indexqualorig = indexqualorig;
-    node->indexorderby = indexorderby;
-    node->indexorderbyorig = indexorderbyorig;
-    node->indexorderdir = indexscandir;
-    node->relStoreLocation = best_path->parent->relStoreLocation;
-    node->cstorequal = fix_cstore_scan_qual(root, indexqual);
-
-    /* For dfs index scan, we don't use the actual column data of the index rel, unless it is index-only scan. */
-    if (indexonly) {
-        node->dfsScan = create_dfsscan_plan(root, best_path, qptlist, qpqual, true, indexinfo->indextlist, true);
-    } else {
-        node->dfsScan = create_dfsscan_plan(root, best_path, qptlist, qpqual, true, NIL, false);
-    }
-
-    node->indexonly = indexonly;
-    plan->qual = node->dfsScan->plan.qual;
-    plan->targetlist = node->dfsScan->plan.targetlist;
-    node->indexScantlist = fix_dfs_index_target_list(root, best_path, node, indexinfo, plan->qual);
-
-    /* cacultate the mem info of cstoreindexscan. */
-    int maxBatchRows = MAX_BATCH_ROWS;
-    double rows = 0;
-    int width = sizeof(Datum); /* the size of ctid */
-    if (indexonly) {
-        rows = maxBatchRows;
-        cost_sort(&sort_path,
-            NIL,
-            best_path->total_cost,
-            rows,
-            width,
-            0.0,
-            u_sess->opt_cxt.op_work_mem,
-            0.0,
-            root->glob->vectorized,
-            SET_DOP(best_path->dop),
-            &node->scan.mem_info);
-    } else {
-        rows = PATH_LOCAL_ROWS(best_path);
-        cost_sort(&sort_path,
-            NIL,
-            best_path->total_cost,
-            rows,
-            width,
-            0.0,
-            u_sess->opt_cxt.op_work_mem,
-            0.0,
-            root->glob->vectorized,
-            SET_DOP(best_path->dop),
-            &node->scan.mem_info);
-    }
-
-    return node;
-}
-
-static BitmapIndexScan* make_bitmap_indexscan(Index scanrelid, Oid indexid, List* indexqual, List* indexqualorig)
+static BitmapIndexScan* make_bitmap_indexscan(Index scanrelid, Oid indexid, List* indexqual, List* indexqualorig,
+                                              double indexselectivity, bool is_partial)
 {
     BitmapIndexScan* node = makeNode(BitmapIndexScan);
     Plan* plan = &node->scan.plan;
@@ -5899,6 +5791,8 @@ static BitmapIndexScan* make_bitmap_indexscan(Index scanrelid, Oid indexid, List
     node->indexid = indexid;
     node->indexqual = indexqual;
     node->indexqualorig = indexqualorig;
+    node->selectivity = indexselectivity;
+    node->is_partial = is_partial;
 
     return node;
 }
@@ -6060,6 +5954,12 @@ Plan* create_globalpartInterator_plan(PlannerInfo* root, PartIteratorPath* pIter
             index_path->parent->partItrs_for_index_unusable =
                 bms_num_members(index_path->parent->pruning_result_for_index_unusable->bm_rangeSelectedPartitions);
         }
+        /* For gplan, it is not possible to determine which partitions are valid or invalid. */
+        if (usable_type == INDEXES_PARTIAL_USABLE && index_path->parent->pruning_result->expr != NULL) {
+            usable_type = INDEXES_NONE_USABLE;
+            index_path->parent->partItrs_for_index_unusable = index_path->parent->partItrs;
+            index_path->parent->partItrs_for_index_usable = 0;
+        }
 
         switch (usable_type) {
             case INDEXES_FULL_USABLE: {
@@ -6128,6 +6028,11 @@ Plan* create_globalpartInterator_plan(PlannerInfo* root, PartIteratorPath* pIter
         gpIter->curItrs = pIterpath->subPath->parent->partItrs;
         gpIter->pruningResult = pIterpath->subPath->parent->pruning_result;
         plan = (Plan*)create_partIterator_plan(root, pIterpath, gpIter);
+    }
+
+    if (isPartiteratorElimination(root, pIterpath->subPath->parent, plan)) {
+        plan = plan->lefttree;
+        ((Scan *)plan)->partition_iterator_elimination = true;
     }
 
     return plan;
@@ -6278,8 +6183,8 @@ static WorkTableScan* make_worktablescan(List* qptlist, List* qpqual, Index scan
     return node;
 }
 
-ForeignScan* make_foreignscan(
-    List* qptlist, List* qpqual, Index scanrelid, List* fdw_exprs, List* fdw_private, RemoteQueryExecType type)
+ForeignScan *make_foreignscan(List *qptlist, List *qpqual, Index scanrelid, List *fdw_exprs, List *fdw_private,
+    List *fdw_scan_tlist, List *fdw_recheck_quals, Plan *outer_plan, RemoteQueryExecType type)
 {
     ForeignScan* node = makeNode(ForeignScan);
 
@@ -6288,17 +6193,29 @@ ForeignScan* make_foreignscan(
     /* cost will be filled in by create_foreignscan_plan */
     plan->targetlist = qptlist;
     plan->qual = qpqual;
-    plan->lefttree = NULL;
+    plan->lefttree = outer_plan;
     plan->righttree = NULL;
     plan->exec_type = type;
     plan->distributed_keys = NIL;
 #ifdef ENABLE_MULTIPLE_NODES
-    plan->distributed_keys =
         lappend(plan->distributed_keys, makeVar(0, InvalidAttrNumber, InvalidOid, -1, InvalidOid, 0));
 #endif
     node->scan.scanrelid = scanrelid;
+
+    /* these may be overridden by the FDW's PlanDirectModify callback. */
+    node->operation = CMD_SELECT;
+    node->resultRelation = 0;
+
+    /* fs_server will be filled in by create_foreignscan_plan */
+    node->fs_server = InvalidOid;
     node->fdw_exprs = fdw_exprs;
     node->fdw_private = fdw_private;
+    node->fdw_scan_tlist = fdw_scan_tlist;
+    node->fdw_recheck_quals = fdw_recheck_quals;
+
+    /* fs_relids will be filled in by create_foreignscan_plan */
+    node->fs_relids = NULL;
+
     /* fsSystemCol will be filled in by create_foreignscan_plan */
     node->fsSystemCol = false;
 
@@ -6515,7 +6432,7 @@ static CStoreIndexOr* make_cstoreindex_or(List* ctidplans)
 }
 
 static NestLoop* make_nestloop(List* tlist, List* joinclauses, List* otherclauses, List* nestParams, Plan* lefttree,
-    Plan* righttree, JoinType jointype)
+    Plan* righttree, JoinType jointype, bool inner_unique)
 {
     NestLoop* node = makeNode(NestLoop);
     Plan* plan = &node->join.plan;
@@ -6526,6 +6443,7 @@ static NestLoop* make_nestloop(List* tlist, List* joinclauses, List* otherclause
     plan->lefttree = lefttree;
     plan->righttree = righttree;
     node->join.jointype = jointype;
+    node->join.inner_unique = inner_unique;
     node->join.joinqual = joinclauses;
     node->nestParams = nestParams;
 
@@ -6689,7 +6607,7 @@ HashJoin* create_direct_hashjoin(
     }
 
     hash_plan = (Plan*)make_hash(innerPlan, skewTable, skewColumn, skewInherit, skewColType, skewColTypmod);
-    join_plan = make_hashjoin(tlist, joinClauses, NIL, hashclauses, outerPlan, hash_plan, joinType);
+    join_plan = make_hashjoin(tlist, joinClauses, NIL, hashclauses, outerPlan, hash_plan, joinType, false);
 
     /* estimate the mem_info for join_plan,  refered to the function initial_cost_hashjoin */
     estimate_directHashjoin_Cost(root, hashclauses, outerPlan, hash_plan, join_plan);
@@ -6771,7 +6689,8 @@ Plan* create_direct_scan(PlannerInfo* root, List* tlist, RangeTblEntry* realResu
     dummyRel->reloptkind = rel->reloptkind;
     dummyRel->isPartitionedTable = rel->isPartitionedTable;
     dummyRel->rows = rel->rows;
-    dummyRel->width = rel->width;
+    dummyRel->reltarget = create_empty_pathtarget();
+    dummyRel->reltarget->width = rel->reltarget->width;
     dummyRel->pages = rel->pages;
     dummyRel->tuples = rel->tuples;
     dummyRel->multiple = rel->multiple;
@@ -6901,7 +6820,7 @@ Plan* create_direct_righttree(
 }
 
 static HashJoin* make_hashjoin(List* tlist, List* joinclauses, List* otherclauses, List* hashclauses, Plan* lefttree,
-    Plan* righttree, JoinType jointype)
+    Plan* righttree, JoinType jointype, bool inner_unique)
 {
     HashJoin* node = makeNode(HashJoin);
     Plan* plan = &node->join.plan;
@@ -6913,6 +6832,7 @@ static HashJoin* make_hashjoin(List* tlist, List* joinclauses, List* otherclause
     plan->righttree = righttree;
     node->hashclauses = hashclauses;
     node->join.jointype = jointype;
+    node->join.inner_unique = inner_unique;
     node->join.joinqual = joinclauses;
 
     return node;
@@ -6952,7 +6872,7 @@ static Hash* make_hash(
 
 static MergeJoin* make_mergejoin(List* tlist, List* joinclauses, List* otherclauses, List* mergeclauses,
     Oid* mergefamilies, Oid* mergecollations, int* mergestrategies, bool* mergenullsfirst, Plan* lefttree,
-    Plan* righttree, JoinType jointype)
+    Plan* righttree, JoinType jointype, bool inner_unique, bool skip_mark_restore)
 {
     MergeJoin* node = makeNode(MergeJoin);
     Plan* plan = &node->join.plan;
@@ -6962,13 +6882,42 @@ static MergeJoin* make_mergejoin(List* tlist, List* joinclauses, List* otherclau
     plan->qual = otherclauses;
     plan->lefttree = lefttree;
     plan->righttree = righttree;
+    node->skip_mark_restore = skip_mark_restore;
     node->mergeclauses = mergeclauses;
     node->mergeFamilies = mergefamilies;
     node->mergeCollations = mergecollations;
     node->mergeStrategies = mergestrategies;
     node->mergeNullsFirst = mergenullsfirst;
     node->join.jointype = jointype;
+    node->join.inner_unique = inner_unique;
     node->join.joinqual = joinclauses;
+
+    return node;
+}
+
+/*
+ * make_project_set
+ *	  Build a ProjectSet plan node
+ */
+ProjectSet *make_project_set(List *tlist, Plan *subplan)
+{
+    ProjectSet *node = makeNode(ProjectSet);
+    Plan *plan = &node->plan;
+
+
+#ifdef STREAMPLAN
+    if (IS_STREAM_PLAN && subplan) {
+        inherit_plan_locator_info(plan, subplan);
+    } else {
+        plan->exec_type = EXEC_ON_ALL_NODES;
+        plan->exec_nodes = ng_get_default_computing_group_exec_node();
+    }
+#endif //STREAMPLAN
+
+    plan->targetlist = tlist;
+    plan->qual = NIL;
+    plan->lefttree = subplan;
+    plan->righttree = NULL;
 
     return node;
 }
@@ -7612,9 +7561,9 @@ void adjust_all_pathkeys_by_agg_tlist(PlannerInfo* root, List* tlist, WindowList
 }
 
 Agg* make_agg(PlannerInfo* root, List* tlist, List* qual, AggStrategy aggstrategy, const AggClauseCosts* aggcosts,
-    int numGroupCols, AttrNumber* grpColIdx, Oid* grpOperators, long numGroups, Plan* lefttree, WindowLists* wflists,
-    bool need_stream, bool trans_agg, List* groupingSets, Size hash_entry_size, bool add_width,
-    AggOrientation agg_orientation, bool unique_check)
+    int numGroupCols, AttrNumber* grpColIdx, Oid* grpOperators, Oid* grpCollations, long numGroups,
+    Plan* lefttree, WindowLists* wflists, bool need_stream, bool trans_agg, List* groupingSets,
+    Size hash_entry_size, bool add_width, AggOrientation agg_orientation, bool unique_check)
 {
     Agg* node = makeNode(Agg);
     Plan* plan = &node->plan;
@@ -7680,6 +7629,7 @@ Agg* make_agg(PlannerInfo* root, List* tlist, List* qual, AggStrategy aggstrateg
     node->numGroups = numGroups;
     node->skew_optimize = SKEW_RES_NONE;
     node->unique_check = unique_check && root->parse->unique_check;
+    node->grp_collations = grpCollations;
 
 #ifdef STREAMPLAN
     inherit_plan_locator_info((Plan*)node, lefttree);
@@ -7762,14 +7712,22 @@ Agg* make_agg(PlannerInfo* root, List* tlist, List* qual, AggStrategy aggstrateg
     plan->righttree = NULL;
 
     /* check if sonic hashagg is enabled or not */
-    node->is_sonichash = isSonicHashAggEnable(node);
+    if (root->parse->is_flt_frame) {
+        if (!root->parse->hasTargetSRFs) {
+            node->is_sonichash = isSonicHashAggEnable(node);
+        } else {
+            node->is_sonichash = false;
+        }
+    } else {
+        node->is_sonichash = isSonicHashAggEnable(node);
+    }
 
     return node;
 }
 
 WindowAgg* make_windowagg(PlannerInfo* root, List* tlist, List* windowFuncs, Index winref, int partNumCols,
     AttrNumber* partColIdx, Oid* partOperators, int ordNumCols, AttrNumber* ordColIdx, Oid* ordOperators,
-    int frameOptions, Node* startOffset, Node* endOffset, Plan* lefttree)
+    int frameOptions, Node* startOffset, Node* endOffset, Plan* lefttree, Oid *partCollations, Oid *ordCollations)
 {
     WindowAgg* node = makeNode(WindowAgg);
     Plan* plan = &node->plan;
@@ -7785,6 +7743,8 @@ WindowAgg* make_windowagg(PlannerInfo* root, List* tlist, List* windowFuncs, Ind
     node->frameOptions = frameOptions;
     node->startOffset = startOffset;
     node->endOffset = endOffset;
+    node->part_collations = partCollations;
+    node->ord_collations = ordCollations;
 
 #ifdef STREAMPLAN
     inherit_plan_locator_info((Plan*)node, lefttree);
@@ -7821,7 +7781,7 @@ WindowAgg* make_windowagg(PlannerInfo* root, List* tlist, List* windowFuncs, Ind
 }
 
 Group* make_group(PlannerInfo* root, List* tlist, List* qual, int numGroupCols, AttrNumber* grpColIdx,
-    Oid* grpOperators, double numGroups, Plan* lefttree)
+    Oid* grpOperators, double numGroups, Plan* lefttree, Oid* grpCollations)
 {
     Group* node = makeNode(Group);
     Plan* plan = &node->plan;
@@ -7835,6 +7795,7 @@ Group* make_group(PlannerInfo* root, List* tlist, List* qual, int numGroupCols, 
     node->numCols = numGroupCols;
     node->grpColIdx = grpColIdx;
     node->grpOperators = grpOperators;
+    node->grp_collations = grpCollations;
 
 #ifdef STREAMPLAN
     inherit_plan_locator_info((Plan*)node, lefttree);
@@ -7898,6 +7859,7 @@ Unique* make_unique(Plan* lefttree, List* distinctList)
     int keyno = 0;
     AttrNumber* uniqColIdx = NULL;
     Oid* uniqOperators = NULL;
+    Oid* uniqCollations = NULL;
     ListCell* slitem = NULL;
 
 #ifdef STREAMPLAN
@@ -7931,6 +7893,7 @@ Unique* make_unique(Plan* lefttree, List* distinctList)
     Assert(numCols > 0);
     uniqColIdx = (AttrNumber*)palloc(sizeof(AttrNumber) * numCols);
     uniqOperators = (Oid*)palloc(sizeof(Oid) * numCols);
+    uniqCollations = (Oid*)palloc(sizeof(Oid) * numCols);
 
     foreach (slitem, distinctList) {
         SortGroupClause* sortcl = (SortGroupClause*)lfirst(slitem);
@@ -7938,6 +7901,7 @@ Unique* make_unique(Plan* lefttree, List* distinctList)
 
         uniqColIdx[keyno] = tle->resno;
         uniqOperators[keyno] = sortcl->eqop;
+        uniqCollations[keyno] = exprCollation((Node *) tle->expr);
         Assert(OidIsValid(uniqOperators[keyno]));
         keyno++;
     }
@@ -7945,6 +7909,7 @@ Unique* make_unique(Plan* lefttree, List* distinctList)
     node->numCols = numCols;
     node->uniqColIdx = uniqColIdx;
     node->uniqOperators = uniqOperators;
+    node->uniq_collations = uniqCollations;
 
     return node;
 }
@@ -7963,6 +7928,7 @@ SetOp* make_setop(SetOpCmd cmd, SetOpStrategy strategy, Plan* lefttree, List* di
     int keyno = 0;
     AttrNumber* dupColIdx = NULL;
     Oid* dupOperators = NULL;
+    Oid* dupCollations = NULL;
     ListCell* slitem = NULL;
 
 #ifdef STREAMPLAN
@@ -7992,6 +7958,7 @@ SetOp* make_setop(SetOpCmd cmd, SetOpStrategy strategy, Plan* lefttree, List* di
     Assert(numCols > 0);
     dupColIdx = (AttrNumber*)palloc(sizeof(AttrNumber) * numCols);
     dupOperators = (Oid*)palloc(sizeof(Oid) * numCols);
+    dupCollations = (Oid*)palloc(sizeof(Oid) * numCols);
 
     foreach (slitem, distinctList) {
         SortGroupClause* sortcl = (SortGroupClause*)lfirst(slitem);
@@ -7999,6 +7966,7 @@ SetOp* make_setop(SetOpCmd cmd, SetOpStrategy strategy, Plan* lefttree, List* di
 
         dupColIdx[keyno] = tle->resno;
         dupOperators[keyno] = sortcl->eqop;
+        dupCollations[keyno] = exprCollation((Node*) tle->expr);
         Assert(OidIsValid(dupOperators[keyno]));
         keyno++;
     }
@@ -8008,6 +7976,7 @@ SetOp* make_setop(SetOpCmd cmd, SetOpStrategy strategy, Plan* lefttree, List* di
     node->numCols = numCols;
     node->dupColIdx = dupColIdx;
     node->dupOperators = dupOperators;
+    node->dup_collations = dupCollations;
     node->flagColIdx = flagColIdx;
     node->firstFlag = firstFlag;
     node->numGroups = numGroups;
@@ -8179,6 +8148,13 @@ Limit* make_limit(PlannerInfo* root, Plan* lefttree, Node* limitOffset, Node* li
 #endif
 
     copy_plan_costsize(plan, lefttree);
+    if (ENABLE_CACHEDPLAN_MGR && root->glob->boundParams != NULL && root->glob->boundParams->uParamInfo != DEFUALT_INFO) {
+        if (limitOffset != NULL && IsA(limitOffset, Param)) {
+            Param *offset = (Param *)limitOffset;
+            Assert(root->glob->boundParams->params[offset->paramid - 1].ptype == INT8OID);
+            offset_est = DatumGetInt64(root->glob->boundParams->params[offset->paramid - 1].value);
+        }
+    }
     cost_limit(plan, lefttree, offset_est, count_est);
 
     plan->targetlist = lefttree->targetlist;
@@ -8220,7 +8196,12 @@ static Plan* parallel_limit_sort(
         plan = create_local_gather(plan);
         plan = (Plan*)make_sort_from_pathkeys(root, plan, root->sort_pathkeys, -1.0);
     } else {
+#ifdef ENABLE_MULTIPLE_NODES
         plan = create_local_gather(lefttree);
+#else
+        plan = (Plan*)make_limit(root, lefttree, limitOffset, limitCount, offset_est, count_est, false);
+        plan = create_local_gather(plan);
+#endif
     }
 
     return plan;
@@ -8474,6 +8455,7 @@ Plan* make_stream_limit(PlannerInfo* root, Plan* lefttree, Node* limitOffset, No
             list_make1(makeString((char*)"+")),
             (Node*)copyObject(limitCount),
             (Node*)copyObject(limitOffset),
+            NULL,
             -1);
 
     /*
@@ -8643,8 +8625,10 @@ static Plan* FindForeignScan(Plan* plan)
     switch (nodeTag(plan)) {
         case T_ForeignScan: {
             ForeignScan* fscan = (ForeignScan*)plan;
-            if (isObsOrHdfsTableFormTblOid(fscan->scan_relid) || IS_LOGFDW_FOREIGN_TABLE(fscan->scan_relid) ||
-                IS_POSTGRESFDW_FOREIGN_TABLE(fscan->scan_relid)) {
+            if (fscan->scan_relid > 0 &&
+                (isObsOrHdfsTableFormTblOid(fscan->scan_relid) ||
+                 IS_LOGFDW_FOREIGN_TABLE(fscan->scan_relid) ||
+                 IS_POSTGRESFDW_FOREIGN_TABLE(fscan->scan_relid))) {
                 return NULL;
             }
             return plan;
@@ -8720,25 +8704,25 @@ static Plan* FindForeignScan(Plan* plan)
 #ifdef STREAMPLAN
 uint32 getDistSessionKey(List* fdw_private)
 {
-    Assert(fdw_private && list_length(fdw_private) > 0);
+    if (fdw_private == NULL) {
+        ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE), errmsg("Un-support feature"),
+                        errdetail("update statement is an UPDATE FROM...")));
+    }
+
     ListCell* lc = NULL;
     uint32 distSessionKey = 0;
 
     foreach (lc, fdw_private) {
-#ifdef ENABLE_MOT
         /*
-         * MOT FDW may put a node of any type into the list, so if we are looking for
+         * FDW may put a node of any type into the list, so if we are looking for
          * some specific type, we need to first make sure that it's the correct type.
          */
         Node* node = (Node*)lfirst(lc);
         if (IsA(node, DefElem)) {
-#endif
             DefElem* defElem = (DefElem*)lfirst(lc);
             if (strcmp("session_key", defElem->defname) == 0)
                 distSessionKey = intVal(defElem->arg);
-#ifdef ENABLE_MOT
         }
-#endif
     }
 
     return distSessionKey;
@@ -8824,19 +8808,19 @@ static void deparallelize_modifytable(List* subplans)
  *	  Build a ModifyTable plan node
  *
  * Currently, we don't charge anything extra for the actual table modification
- * work, nor for the RETURNING expressions if any.	It would only be window
- * dressing, since these are always top-level nodes and there is no way for
- * the costs to change any higher-level planning choices.  But we might want
- * to make it look better sometime.
+ * work, nor for the WITH CHECK OPTIONS OR RETURNING expressions if any.	It
+ * would only be window dressing, since these are always top-level nodes and
+ * there is no way for the costs to change any higher-level planning choices.
+ * But we might want to make it look better sometime.
  */
 #ifdef STREAMPLAN
 Plan* make_modifytable(PlannerInfo* root, CmdType operation, bool canSetTag, List* resultRelations, List* subplans,
-    List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, Index mergeTargetRelation,
-    List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause, bool isDfsStore)
+    List *withCheckOptionLists, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated,
+    Index mergeTargetRelation, List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause)
 #else
 ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRelations, List* subplans,
-    List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, Index mergeTargetRelation,
-    List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause, bool isDfsStore)
+    List *withCheckOptionLists, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated,
+    Index mergeTargetRelation, List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause)
 #endif
 {
     ModifyTable* node = makeNode(ModifyTable);
@@ -8852,6 +8836,7 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
 #endif
 
     Assert(list_length(resultRelations) == list_length(subplans));
+    Assert(withCheckOptionLists == NIL || list_length(resultRelations) == list_length(withCheckOptionLists));
     Assert(returningLists == NIL || list_length(resultRelations) == list_length(returningLists));
 
     if (operation == CMD_MERGE) {
@@ -8911,6 +8896,7 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
     node->resultRelations = resultRelations;
     node->resultRelIndex = -1; /* will be set correctly in setrefs.c */
     node->plans = subplans;
+    node->withCheckOptionLists = withCheckOptionLists;
     node->returningLists = returningLists;
     node->rowMarks = rowMarks;
     node->epqParam = epqParam;
@@ -8934,6 +8920,7 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
 #ifdef STREAMPLAN
     node->plan.exec_nodes = exec_nodes;
 
+    resultRelations = (List*)linitial(resultRelations);
     Index resultidx;
     if (resultRelations != NIL && root->simple_rte_array != NULL) {
         resultidx = (Index)linitial_int(resultRelations);
@@ -8967,6 +8954,11 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
 
             /* Set cache entry if it has */
             if ((fscan = (ForeignScan*)FindForeignScan(*subplan))) {
+                if (fscan->fdw_private == NULL) {
+                    ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE),
+                                    errmsg("Un-support feature"), errdetail("update statement is an UPDATE SET...")));
+                }
+
                 uint32 distSessionKey = getDistSessionKey(fscan->fdw_private);
                 fscan->errCache = GetForeignErrCacheEntry(fscan->scan_relid, distSessionKey);
                 fscan->needSaveError = true;
@@ -9008,7 +9000,6 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
                         u_sess->opt_cxt.op_work_mem,
                         SET_DOP(node->plan.dop),
                         resultRelOid,
-                        isDfsStore,
                         &node->mem_info);
                 }
                 if (operation == CMD_DELETE) {
@@ -9021,7 +9012,6 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
                         u_sess->opt_cxt.op_work_mem,
                         SET_DOP(node->plan.dop),
                         resultRelOid,
-                        isDfsStore,
                         &node->mem_info);
                 }
                 if (operation == CMD_UPDATE) {
@@ -9034,7 +9024,6 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
                         u_sess->opt_cxt.op_work_mem,
                         SET_DOP(node->plan.dop),
                         resultRelOid,
-                        isDfsStore,
                         &node->mem_info);
                 }
             }
@@ -9045,7 +9034,7 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
             Plan* subplan = (Plan*)(linitial(subplans));
             ForeignScan* fscan = NULL;
             if ((fscan = (ForeignScan*)FindForeignScan(subplan)) != NULL) {
-                if (!CheckSupportedFDWType(fscan->scan_relid))
+                if (!CheckSupportedFDWType(fscan->fs_server, true))
                     ereport(ERROR,
                         (errmodule(MOD_OPT),
                             errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -9068,167 +9057,66 @@ ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRel
  *                when the subplans list length > 1.
  */
 Plan* make_modifytables(PlannerInfo* root, CmdType operation, bool canSetTag, List* resultRelations, List* subplans,
-    List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, bool isDfsStore, Index mergeTargetRelation,
+    List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, Index mergeTargetRelation,
     List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause)
 #else
 ModifyTable* make_modifytables(CmdType operation, bool canSetTag, List* resultRelations, List* subplans,
-    List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, bool isDfsStore, Index mergeTargetRelation,
+    List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, Index mergeTargetRelation,
     List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause)
 #endif
 {
-    if (isDfsStore) {
-        Plan* subPlan = NULL;
-        List* appendSubPlans = NIL;
-        int subResultRelation;
-        ListCell* cell1 = NULL;
-        ListCell* cell2 = NULL;
-        Plan* appendPlan = NULL;
-        Plan* topGatherNode = NULL;
-
-        forboth(cell1, subplans, cell2, resultRelations)
-        {
-            subPlan = (Plan*)lfirst(cell1);
-            subResultRelation = (int)lfirst_int(cell2);
-
-            /* And last, tack on a ModifyTable node to do the UPDATE/DELETE work */
-#ifdef STREAMPLAN
-            Plan* mt_stream_plan = make_modifytable(root,
-                operation,
-                canSetTag,
-                list_make1_int(subResultRelation),
-                list_make1(subPlan),
-                returningLists,
-                rowMarks,
-                epqParam,
-                partKeyUpdated,
-                0,
-                NULL,
-                NULL,
-                upsertClause,
-                isDfsStore);
-            /*
-             * We must adjust the plan tree. Because the make_modifytable function would make a
-             * RemoteQuery(Gather) node which node will not be accpted.
-             *
-             * The following plan tree will not be accepted.
-             *                             QUERY PLAN
-             *	-------------------------------------------------------------------------------------------------
-             *	 Append  (cost=0.00..20.20 rows=20 width=14)
-             *	   ->  Streaming (type: GATHER)  (cost=0.00..0.00 rows=0 width=0)
-             *	         Node/s: All datanodes
-             *	         ->  Delete on hdfs_table005  (cost=0.00..0.00 rows=0 width=0)
-             *	               ->  Row Adapter  (cost=0.00..0.00 rows=0 width=14)
-             *	                     ->  Dfs Scan on hdfs_table005  (cost=0.00..0.00 rows=0 width=14)
-             *	   ->  Streaming (type: GATHER)  (cost=0.00..20.20 rows=20 width=14)
-             *	         Node/s: All datanodes
-             *	         ->  Delete on pg_delta_50207 hdfs_table005  (cost=0.00..10.10 rows=10 width=14)
-             *	               ->  Seq Scan on pg_delta_50207 hdfs_table005  (cost=0.00..10.10 rows=10 width=14)
-             *
-             * we need the following plan tree.
-             *								QUERY PLAN
-             *	-------------------------------------------------------------------------------------------------
-             *	 Streaming (type: GATHER)  (cost=0.00..20.20 rows=20 width=14)
-             *	   Node/s: All datanodes
-             *	   ->  Append  (cost=0.00..20.11 rows=20 width=14)
-             *	         ->  Delete on hdfs_table005  (cost=0.00..10.01 rows=10 width=14)
-             *	               ->  Row Adapter  (cost=10.01..10.01 rows=10 width=14)
-             *	                     ->  CStore Scan on hdfs_table005  (cost=0.00..10.01 rows=10 width=14)
-             *	         ->  Delete on pg_delta_58399 hdfs_table005  (cost=0.00..10.10 rows=10 width=14)
-             *	               ->  Seq Scan on pg_delta_58399 hdfs_table005  (cost=0.00..10.10 rows=10 width=14)
-             */
-            if (IsA(mt_stream_plan, RemoteQuery)) {
-                topGatherNode = mt_stream_plan;
-                mt_stream_plan = mt_stream_plan->lefttree;
-            }
-            if (!IS_STREAM) {
-                mt_stream_plan = pgxc_make_modifytable(root, mt_stream_plan);
-            }
-            appendSubPlans = lappend(appendSubPlans, (void*)mt_stream_plan);
-#else
-            ModifyTable* mtplan = make_modifytable(operation,
-                canSetTag,
-                list_make1_int(subResultRelation),
-                list_make1(subPlan),
-                returningLists,
-                rowMarks,
-                epqParam,
-                partKeyUpdated,
-                0,
-                NULL,
-                NULL,
-                upsertClause,
-                isDfsStore);
-            appendSubPlans = lappend(appendSubPlans, (void*)mtplan);
-#endif
-        }
-
-        appendPlan = (Plan*)make_append(appendSubPlans, NIL);
-        if (IS_STREAM_PLAN) {
-            mark_distribute_setop(root, (Node*)appendPlan, true, false);
-        }
-
-#ifdef PGXC
-        if (IS_STREAM_PLAN && topGatherNode) {
-            topGatherNode->lefttree = appendPlan;
-            topGatherNode->righttree = NULL;
-            return topGatherNode;
-        } else
-#endif
-            return appendPlan;
-    } else {
-        /* And last, tack on a ModifyTable node to do the UPDATE/DELETE work */
+    /* And last, tack on a ModifyTable node to do the UPDATE/DELETE work */
 #ifdef PGXC
 #ifdef STREAMPLAN
-        Plan* mt_stream_plan = make_modifytable(root,
-            operation,
-            canSetTag,
-            resultRelations,
-            subplans,
-            returningLists,
-            rowMarks,
-            epqParam,
-            partKeyUpdated,
-            mergeTargetRelation,
-            mergeSourceTargetList,
-            mergeActionList,
-            upsertClause,
-            isDfsStore);
-        if (IS_STREAM_PLAN)
-            return mt_stream_plan;
-        else
-            return pgxc_make_modifytable(root, mt_stream_plan);
+    Plan* mt_stream_plan = make_modifytable(root,
+        operation,
+        canSetTag,
+        resultRelations,
+        subplans,
+        NIL,
+        returningLists,
+        rowMarks,
+        epqParam,
+        partKeyUpdated,
+        mergeTargetRelation,
+        mergeSourceTargetList,
+        mergeActionList,
+        upsertClause);
+    if (IS_STREAM_PLAN)
+        return mt_stream_plan;
+    else
+        return pgxc_make_modifytable(root, mt_stream_plan);
 #else
-        ModifyTable* mtplan = make_modifytable(operation,
-            canSetTag,
-            resultRelations,
-            subplans,
-            returningLists,
-            rowMarks,
-            epqParam,
-            partKeyUpdated,
-            mergeTargetRelation,
-            mergeSourceTargetList,
-            mergeActionList,
-            upsertClause
-            isDfsStore);
-        return pgxc_make_modifytable(root, (Plan*)mtplan);
+    ModifyTable* mtplan = make_modifytable(operation,
+        canSetTag,
+        resultRelations,
+        subplans,
+        NIL,
+        returningLists,
+        rowMarks,
+        epqParam,
+        partKeyUpdated,
+        mergeTargetRelation,
+        mergeSourceTargetList,
+        mergeActionList,
+        upsertClause);
+    return pgxc_make_modifytable(root, (Plan*)mtplan);
 #endif
 #else
-        return (Plan*)make_modifytable(operation,
-            canSetTag,
-            resultRelations,
-            subplans,
-            returningLists,
-            rowMarks,
-            epqParam,
-            partKeyUpdated,
-            mergeTargetRelation,
-            mergeSourceTargetList,
-            mergeActionList,
-            upsertClause,
-            isDfsStore);
+    return (Plan*)make_modifytable(operation,
+        canSetTag,
+        resultRelations,
+        subplans,
+        NIL,
+        returningLists,
+        rowMarks,
+        epqParam,
+        partKeyUpdated,
+        mergeTargetRelation,
+        mergeSourceTargetList,
+        mergeActionList,
+        upsertClause);
 #endif
-    }
 }
 
 /*
@@ -9262,11 +9150,9 @@ bool is_projection_capable_plan(Plan* plan)
             switch (nodeTag(plan->lefttree)) {
                 case T_SeqScan:
                 case T_CStoreScan:
-                case T_DfsScan:
 #ifdef ENABLE_MULTIPLE_NODES
                 case T_TsStoreScan:
 #endif   /* ENABLE_MULTIPLE_NODES */
-                case T_DfsIndexScan:
                 case T_IndexScan:
                 case T_IndexOnlyScan:
                 case T_BitmapHeapScan:
@@ -9279,10 +9165,55 @@ bool is_projection_capable_plan(Plan* plan)
             }
         case T_ExtensiblePlan:
             return ((ExtensiblePlan *)plan)->flags & EXTENSIBLEPATH_SUPPORT_PROJECTION;
+        case T_ProjectSet:
+            /*
+             * Although ProjectSet certainly projects, say "no" because we
+             * don't want the planner to randomly replace its tlist with
+             * something else; the SRFs have to stay at top level.  This might
+             * get relaxed later.
+             */
+            return false;
         default:
             break;
     }
     return true;
+}
+
+bool IsPlanForPartitionScan(Plan* plan)
+{
+    if (plan == NULL) {
+        return false;
+    }
+    if (IsA(plan, SeqScan) || IsA(plan, IndexScan) || IsA(plan, IndexOnlyScan) || IsA(plan, BitmapHeapScan) ||
+        IsA(plan, BitmapIndexScan) || IsA(plan, TidScan) || IsA(plan, VecToRow)) {
+        return true;
+    }
+    if (IsA(plan, CStoreScan) || IsA(plan, CStoreIndexScan) || IsA(plan, CStoreIndexCtidScan) ||
+        IsA(plan, CStoreIndexHeapScan) || IsA(plan, RowToVec)) {
+        return true;
+    }
+    return false;
+}
+
+static bool isPartiteratorElimination(PlannerInfo *root, RelOptInfo *relopt, Plan* plan)
+{
+    if (!u_sess->attr.attr_sql.partition_iterator_elimination) {
+        return false;
+    }
+    if (!IsPlanForPartitionScan(plan->lefttree)) {
+        return false;
+    }
+
+    bool result = false;
+    Index varno = relopt->relid;
+    RangeTblEntry *rte = planner_rt_fetch(varno, root);
+    Relation rel = relation_open(rte->relid, NoLock);
+    if (RelationIsCommonPartitioned(rel) && relopt->partItrs == 1) {
+        result = true;
+    }
+    relation_close(rel, NoLock);
+
+    return result;
 }
 
 /*
@@ -9877,6 +9808,14 @@ Plan* make_redistribute_for_agg(PlannerInfo* root, Plan* lefttree, List* redistr
 {
     Stream* stream = NULL;
     Plan* plan = NULL;
+
+    if (root->parse->is_flt_frame && root->planner_targets->grouping_contains_srfs) {
+        errno_t sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                            NOTPLANSHIPPING_LENGTH,
+                            "set-valued function + groupingsets");
+        securec_check_ss_c(sprintf_rc, "\0", "\0");
+        mark_stream_unsupport();
+    }
 
     /* For some agg operations (such as grouping sets), we do computing in their original node group */
     if (distribution == NULL) {
@@ -10600,4 +10539,47 @@ static PlanRowMark* check_lockrows_permission(PlannerInfo* root, Plan* lefttree)
             ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Unsupported FOR UPDATE/SHARE of non-row table.")));
 
     return rowmark;
+}
+
+/*
+ * is_projection_capable_path
+ *		Check whether a given Path node is able to do projection.
+ */
+bool is_projection_capable_path(Path *path)
+{
+    /* Most plan types can project, so just list the ones that can't */
+    switch (path->pathtype) {
+        case T_Hash:
+        case T_Material:
+        case T_Sort:
+        case T_Unique:
+        case T_SetOp:
+        case T_LockRows:
+        case T_Limit:
+        case T_ModifyTable:
+        case T_MergeAppend:
+        case T_RecursiveUnion:
+            return false;
+        case T_Append:
+
+            /*
+             * Append can't project, but if it's being used to represent a
+             * dummy path, claim that it can project.  This prevents us from
+             * converting a rel from dummy to non-dummy status by applying a
+             * projection to its dummy path.
+             */
+            return IS_DUMMY_PATH(path);
+        case T_ProjectSet:
+
+            /*
+             * Although ProjectSet certainly projects, say "no" because we
+             * don't want the planner to randomly replace its tlist with
+             * something else; the SRFs have to stay at top level.  This might
+             * get relaxed later.
+             */
+            return false;
+        default:
+            break;
+    }
+    return true;
 }

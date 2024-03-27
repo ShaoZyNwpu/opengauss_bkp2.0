@@ -61,6 +61,7 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rewriteRlsPolicy.h"
+#include "rewrite/rewriteHandler.h"
 #ifdef PGXC
 #include "miscadmin.h"
 #include "pgxc/pgxc.h"
@@ -90,6 +91,10 @@
 #include "db4ai/create_model.h"
 #include "db4ai/hyperparameter_validation.h"
 
+#ifdef ENABLE_MOT
+#include "storage/mot/jit_exec.h"
+#endif
+
 #ifndef ENABLE_MULTIPLE_NODES
 #include "optimizer/clauses.h"
 #endif
@@ -100,8 +105,10 @@ static const int MILLISECONDS_PER_SECONDS = 1000;
 static Query* transformDeleteStmt(ParseState* pstate, DeleteStmt* stmt);
 static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt);
 static void checkUpsertTargetlist(Relation targetTable, List* updateTlist);
-static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upsertClause, RangeVar* relation);
+static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upsertClause, List* resultRelations);
 static int count_rowexpr_columns(ParseState* pstate, Node* expr);
+static void transformVariableSetStmt(ParseState* pstate, VariableSetStmt* stmt);
+static Query* transformVariableMutiSetStmt(ParseState* pstate, VariableMultiSetStmt* muti_stmt);
 static Query* transformSelectStmt(
     ParseState* pstate, SelectStmt* stmt, bool isFirstNode = true, bool isCreateView = false);
 static Query* transformValuesClause(ParseState* pstate, SelectStmt* stmt);
@@ -109,11 +116,14 @@ static Query* transformSetOperationStmt(ParseState* pstate, SelectStmt* stmt);
 static Node* transformSetOperationTree(ParseState* pstate, SelectStmt* stmt, bool isTopLevel, List** targetlist);
 static void determineRecursiveColTypes(ParseState* pstate, Node* larg, List* nrtargetlist);
 static Query* transformUpdateStmt(ParseState* pstate, UpdateStmt* stmt);
-static List* transformUpdateTargetList(ParseState* pstate, List* qryTlist, List* origTlist, RangeVar* stmtrel);
+static List* transformUpdateTargetList(ParseState* pstate, List* qryTlist, List* origTlist, List* resultRelations);
 static List* transformReturningList(ParseState* pstate, List* returningList);
 static Query* transformDeclareCursorStmt(ParseState* pstate, DeclareCursorStmt* stmt);
 static Query* transformExplainStmt(ParseState* pstate, ExplainStmt* stmt);
 static Query* transformCreateTableAsStmt(ParseState* pstate, CreateTableAsStmt* stmt);
+static void CheckDeleteRelation(Relation targetrel);
+static void CheckUpdateRelation(Relation targetrel);
+static void transformVariableSetValueStmt(ParseState* pstate, VariableSetStmt* stmt);
 #ifdef PGXC
 static Query* transformExecDirectStmt(ParseState* pstate, ExecDirectStmt* stmt);
 static bool IsExecDirectUtilityStmt(const Node* node);
@@ -121,6 +131,7 @@ static bool is_relation_child(RangeTblEntry* child_rte, List* rtable);
 static bool is_rel_child_of_rel(RangeTblEntry* child_rte, RangeTblEntry* parent_rte);
 #endif
 
+static List* remove_update_redundant_relation(List* resultRelations, List* target_rangetblentry);
 static void transformLockingClause(ParseState* pstate, Query* qry, LockingClause* lc, bool pushedDown);
 static bool IsFindHDFSForeignTbl(Query* qry);
 
@@ -177,6 +188,7 @@ Query* parse_analyze(
     }
 
     pfree_ext(pstate->p_ref_hook_state);
+    pstate->rightRefState = nullptr;
     free_parsestate(pstate);
 
     /* For plpy CTAS query. CTAS is a recursive call. CREATE query is the first rewrited.
@@ -222,6 +234,14 @@ Query* parse_analyze_varparams(Node* parseTree, const char* sourceText, Oid** pa
     pfree_ext(pstate->p_ref_hook_state);
     free_parsestate(pstate);
 
+    /* For plpy CTAS query. CTAS is a recursive call. CREATE query is the first rewrited.
+     * thd 2nd rewrited query is INSERT SELECT. Without this attribute, DB will have
+     * an error that has no idea about $x when INSERT SELECT query is analyzed.
+     */
+    Assert(PointerIsValid(query));
+    query->fixed_paramTypes = *paramTypes;
+    query->fixed_numParams = *numParams;
+
     return query;
 }
 
@@ -248,6 +268,56 @@ Query* parse_sub_analyze(Node* parseTree, ParseState* parentParseState, CommonTa
     return query;
 }
 
+Node* parse_into_claues(Node* parseTree, IntoClause* intoClause)
+{
+    if (intoClause->userVarList) {
+        UserSetElem* uset = makeNode(UserSetElem);
+        uset->name = intoClause->userVarList;
+
+        SubLink* sl = makeNode(SubLink);
+        sl->subLinkType = EXPR_SUBLINK;
+        sl->testexpr = NULL;
+        sl->operName = NIL;
+        sl->subselect = parseTree;
+        sl->location = -1;
+
+        SelectIntoVarList *sis = makeNode(SelectIntoVarList);
+        sis->sublink = sl;
+        sis->userVarList = uset->name;
+
+        uset->val = (Expr *)sis;
+
+        VariableSetStmt* vss = makeNode(VariableSetStmt);
+        vss->kind = VAR_SET_DEFINED;
+        vss->name = "SELECT INTO VARLIST";
+        vss->defined_args = list_make1((Node *)uset);
+        vss->is_local = false;
+        vss->is_multiset = true;
+
+        VariableMultiSetStmt* vmss = makeNode(VariableMultiSetStmt);
+        vmss->args = list_make1((Node *)vss);
+        return (Node *)vmss;
+    } else if (intoClause->filename) {
+        CopyStmt* cn = makeNode(CopyStmt);
+        cn->relation = NULL;
+        cn->attlist = NIL;
+        cn->is_from = false;
+        cn->options = intoClause->copyOption;
+        cn->filename = intoClause->filename;
+        cn->filetype = intoClause->is_outfile ? S_OUTFILE : S_DUMPFILE;
+        
+        cn->query = parseTree;
+        return (Node*)cn;
+    } else {
+        CreateTableAsStmt* ctas = makeNode(CreateTableAsStmt);
+        ctas->query = parseTree;
+        ctas->into = intoClause;
+        ctas->relkind = OBJECT_TABLE;
+        ctas->is_select_into = true;
+        return (Node*)ctas;
+    }
+}
+
 /*
  * transformTopLevelStmt -
  *	  transform a Parse tree into a Query tree.
@@ -269,21 +339,13 @@ Query* transformTopLevelStmt(ParseState* pstate, Node* parseTree, bool isFirstNo
         AssertEreport(stmt && IsA(stmt, SelectStmt) && stmt->larg == NULL, MOD_OPT, "failure to check parseTree");
 
         if (stmt->intoClause) {
-            CreateTableAsStmt* ctas = makeNode(CreateTableAsStmt);
-
-            ctas->query = parseTree;
-            ctas->into = stmt->intoClause;
-            ctas->relkind = OBJECT_TABLE;
-            ctas->is_select_into = true;
-
+            parseTree = parse_into_claues(parseTree, stmt->intoClause);
             /*
-             * Remove the intoClause from the SelectStmt.  This makes it safe
-             * for transformSelectStmt to complain if it finds intoClause set
-             * (implying that the INTO appeared in a disallowed place).
-             */
+            * Remove the intoClause from the SelectStmt.  This makes it safe
+            * for lexical_select_stmt to complain if it finds intoClause set
+            * (implying that the INTO appeared in a disallowed place).
+            */
             stmt->intoClause = NULL;
-
-            parseTree = (Node*)ctas;
         }
     }
 
@@ -365,6 +427,58 @@ Query* transformCreateModelStmt(ParseState* pstate, CreateModelStmt* stmt)
     return result;
 }
 
+Query* transformVariableCreateEventStmt(ParseState* pstate, CreateEventStmt* stmt)
+{
+    Query* result = makeNode(Query);
+    result->commandType = CMD_UTILITY;
+    Node* old_time_expr = NULL;
+    Node* new_time_expr = NULL;
+    if (stmt->start_time_expr) {
+        old_time_expr = stmt->start_time_expr;
+        new_time_expr = transformExprRecurse(pstate, old_time_expr);
+        stmt->start_time_expr = new_time_expr;
+    }
+    if (stmt->end_time_expr) {
+        old_time_expr = stmt->end_time_expr;
+        new_time_expr = transformExprRecurse(pstate, old_time_expr);
+        stmt->end_time_expr = new_time_expr;
+    }
+    result->utilityStmt = (Node*)stmt;
+    return result;
+}
+ 
+Query* transformVariableAlterEventStmt(ParseState* pstate, AlterEventStmt* stmt)
+{
+    Query* result = makeNode(Query);
+    result->commandType = CMD_UTILITY;
+    Node* old_time_expr = NULL;
+    Node* new_time_node = NULL;
+    DefElem* new_time_expr = NULL;
+    if (stmt->start_time_expr) {
+        old_time_expr = stmt->start_time_expr->arg;
+        new_time_node = transformExprRecurse(pstate, old_time_expr);
+        if (new_time_node) {
+            new_time_expr = makeDefElem("start_date", new_time_node);
+        } else {
+            new_time_expr = NULL;
+        }
+        stmt->start_time_expr = new_time_expr;
+    }
+    if (stmt->end_time_expr) {
+        old_time_expr = stmt->end_time_expr->arg;
+        new_time_node = transformExprRecurse(pstate, old_time_expr);
+        if (new_time_node) {
+            new_time_expr = makeDefElem("start_date", new_time_node);
+        } else {
+            new_time_expr = NULL;
+        }
+        stmt->end_time_expr = new_time_expr;
+    }
+    result->utilityStmt = (Node*)stmt;
+    return result;
+}
+
+
 /*
  * transformStmt -
  *	  recursively transform a Parse tree into a Query tree.
@@ -373,6 +487,10 @@ Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNode, bool
 {
     Query* result = NULL;
     AnalyzerRoutine *analyzerRoutineHook = (AnalyzerRoutine*)u_sess->hook_cxt.analyzerRoutineHook;
+
+    if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+        pstate->p_is_flt_frame = true;
+    }
 
     switch (nodeTag(parseTree)) {
             /*
@@ -434,6 +552,40 @@ Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNode, bool
             result = transformCreateModelStmt(pstate, (CreateModelStmt*) parseTree);
             break;
 
+        case T_PrepareStmt: {
+            PrepareStmt* n = (PrepareStmt *)parseTree;
+            if (IsA(n->query, UserVar)) {
+                Node *uvar = transformExpr(pstate, n->query, EXPR_KIND_OTHER);
+                n->query = (Node *)copyObject((UserVar *)uvar);
+            }
+            result = makeNode(Query);
+            result->commandType = CMD_UTILITY;
+            result->utilityStmt = (Node*)parseTree;
+        } break;
+
+        case T_VariableSetStmt: {
+                VariableSetStmt* stmt = (VariableSetStmt*)parseTree;
+
+                if (DB_IS_CMPT(B_FORMAT) && stmt->kind == VAR_SET_VALUE &&
+                    (u_sess->attr.attr_common.enable_set_variable_b_format || ENABLE_SET_VARIABLES)) {
+                    transformVariableSetValueStmt(pstate, stmt);
+                }
+                result = makeNode(Query);
+                result->commandType = CMD_UTILITY;
+                result->utilityStmt = (Node*)parseTree;
+            } break;
+
+        case T_VariableMultiSetStmt: 
+            result = transformVariableMutiSetStmt(pstate, (VariableMultiSetStmt*)parseTree);
+            break;
+
+        case T_CreateEventStmt:
+            result = transformVariableCreateEventStmt(pstate, (CreateEventStmt*) parseTree);
+            break;
+
+        case T_AlterEventStmt:
+            result = transformVariableAlterEventStmt(pstate, (AlterEventStmt*) parseTree);
+            break;
 
         default:
 
@@ -447,6 +599,8 @@ Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNode, bool
             break;
     }
 
+    /* To be compatible before multi-relation modification supported. */
+    result->resultRelation = linitial2_int(result->resultRelations);
     /* Mark as original query until we learn differently */
     result->querySource = QSRC_ORIGINAL;
     result->canSetTag = true;
@@ -454,6 +608,13 @@ Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNode, bool
     /* Mark whether synonym object is in rtables or not. */
     result->hasSynonyms = pstate->p_hasSynonyms;
 
+    result->is_flt_frame = pstate->p_is_flt_frame;
+
+    if (nodeTag(parseTree) != T_InsertStmt) {
+        result->rightRefState = nullptr;
+    }
+
+    PreventCommandDuringSSOndemandRedo(parseTree);
     return result;
 }
 
@@ -515,6 +676,11 @@ bool analyze_requires_snapshot(Node* parseTree)
             }
             break;
 
+        case T_VariableMultiSetStmt:
+            /* user-defined variables support sublink */
+                result = true;
+            break;
+
         default:
             /* other utility statements don't have any real parse analysis */
             result = false;
@@ -525,19 +691,29 @@ bool analyze_requires_snapshot(Node* parseTree)
 }
 
 /*
- * Description: check if the delete stmt is for 'plan_table'.
+ * Description: check if the delete stmt is for 'plan_table'. If delete mutil relations, report err.
  * Parameters:
- * @in relname: the object name that delete from.
+ * @in relations: the delete tables list.
  * Return: ture if the object name is plan_table
  */
-static bool checkDeleteStmtForPlanTable(const char* relname)
+static bool checkDeleteStmtForPlanTable(List* relations)
 {
     OnlyDeleteFromPlanTable = false;
     const char* target_rel = V_PLAN_TABLE;
+    ListCell *lc = NULL;
     Oid plan_table_data_oid = RelnameGetRelid(T_PLAN_TABLE_DATA);
-    if (strcasecmp(relname, target_rel) == 0 && plan_table_data_oid != InvalidOid)
-        return true;
-
+    foreach (lc, relations) {
+        RangeVar* rv = (RangeVar*)lfirst(lc);
+        if (strcasecmp(rv->relname, target_rel) == 0 && plan_table_data_oid != InvalidOid) {
+            if (list_length(relations) > 1) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("plan_table cannot be deleted in mutiple tables delete")));
+            } else {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -647,7 +823,7 @@ static DeleteStmt* addWhereClauseForPlanTable(ParseState* pstate, DeleteStmt* st
     int current_location = -1;
 
     DeleteStmt* new_stmt = (DeleteStmt*)copyObject(stmt);
-    new_stmt->relation->relname = T_PLAN_TABLE_DATA;
+    ((RangeVar*)linitial(new_stmt->relations))->relname = T_PLAN_TABLE_DATA;
 
     current_location = strlen("delete from plan_table_data where ");
 
@@ -751,16 +927,21 @@ static bool check_del_timerange(const Node* qual)
 
 static void CheckTsDelete(const ParseState* pstate, const Query* qry)
 {
+    ListCell* l;
     if (pstate == NULL || qry == NULL) {
         ereport(ERROR, (errmodule(MOD_TIMESERIES), errmsg("Parsing null pointer to CheckTsDelete!")));
     }
-    if (g_instance.attr.attr_common.enable_tsdb && RelationIsTsStore(pstate->p_target_relation)) {
-        if (qry->jointree == NULL) {
-            ereport(ERROR, (errmodule(MOD_TIMESERIES), errmsg("Timeseries only supports deletion by time range!")));
-        } else {
-            Node* quals = qry->jointree->quals;
-            if (!check_del_timerange(quals)) {
+    foreach (l, pstate->p_target_relation) {
+        Relation targetrel = (Relation)lfirst(l);
+        if (g_instance.attr.attr_common.enable_tsdb && RelationIsTsStore(targetrel)) {
+            if (qry->jointree == NULL) {
                 ereport(ERROR, (errmodule(MOD_TIMESERIES), errmsg("Timeseries only supports deletion by time range!")));
+            } else {
+                Node* quals = qry->jointree->quals;
+                if (!check_del_timerange(quals)) {
+                    ereport(ERROR, (errmodule(MOD_TIMESERIES),
+                                    errmsg("Timeseries only supports deletion by time range!")));
+                }
             }
         }
     }
@@ -786,18 +967,235 @@ static bool IsSupportDeleteLimit(Relation rel, bool hasLimit)
 }
 
 /*
+ * transformUpdateSortClause -
+ *	  transforms an update statement sort clause
+ */
+static List* transformUpdateSortClause(ParseState* pstate, UpdateStmt* stmt, Query* qry)
+{
+    ListCell* lc = NULL;
+    TargetEntry* tle = NULL;
+
+    if (stmt->sortClause == NULL) {
+        return NULL;
+    }
+
+    int len = list_length(qry->targetList);
+    foreach(lc, qry->targetList) {
+        tle = (TargetEntry*)lfirst(lc);
+        tle->resjunk = true;
+    }
+
+    List* rlst = transformSortClause(pstate, stmt->sortClause, &qry->targetList, EXPR_KIND_ORDER_BY, true, false);
+    int i = 0;
+    foreach(lc, qry->targetList) {
+        tle = (TargetEntry*)lfirst(lc);
+        tle->resjunk = false;
+        if (++i >= len) {
+            break;
+        }
+    }
+    return rlst;
+}
+
+/*
+ * transformLimitSortClause -
+ *	  transforms an delete|update statement limit and sort clause
+ */
+static void transformLimitSortClause(ParseState* pstate, void* stmt, Query* qry, bool forDel)
+{
+    List *rlist = NULL;
+    qry->limitCount = forDel ? transformLimitClause(pstate, ((DeleteStmt*)stmt)->limitClause, EXPR_KIND_LIMIT, "LIMIT") :
+                            transformLimitClause(pstate, ((UpdateStmt*)stmt)->limitClause, EXPR_KIND_LIMIT, "LIMIT");
+
+    if (!IsSupportDeleteLimit((Relation)linitial(pstate->p_target_relation), (qry->limitCount != NULL))) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                forDel ? errdetail("replication table doesn't allow DELETE LIMIT") :
+                errdetail("replication table doesn't allow UPDATE LIMIT")));
+    }
+
+    rlist =  forDel ? transformSortClause(pstate, ((DeleteStmt*)stmt)->sortClause, &qry->targetList, EXPR_KIND_ORDER_BY, true, false) :
+                transformUpdateSortClause(pstate, (UpdateStmt*)stmt, qry);
+
+    /*
+     * For update statement, the effective range of sort clause is not optimized. For delete statement,
+     * sorting is performed only when limit or returning clause takes effect.
+     */
+    if (qry->limitCount != NULL) {
+        /* flag for discriminating rownum */
+        Const *flag = makeNode(Const);
+        flag->ismaxvalue = true;
+        flag->location = -1;
+        flag->consttype = INT8OID;
+        flag->consttypmod = -1;
+        qry->limitOffset = (Node*)flag;
+        qry->sortClause = rlist;
+    } else if (!forDel || qry->returningList != NULL) {
+        qry->sortClause = rlist;
+    }
+}
+
+static void CheckRelationSupportMultiModify(Relation targetrel, bool forDel)
+{
+    const char* type = NULL;
+    if (forDel) {
+        CheckDeleteRelation(targetrel);
+        type = "DELETE";
+    } else {
+        CheckUpdateRelation(targetrel);
+        type = "UPDATE";
+    }
+
+    if (RelationIsColStore(targetrel)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("column stored relation in mutilple-relations modifying doesn't support %s", type)));
+    }
+    if (RelationIsForeignTable(targetrel) || RelationIsStream(targetrel)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("FDW relation in mutilple-relations modifying doesn't support %s", type)));
+    }
+    if (targetrel->rd_rel->relhasrules) {
+        if (RelationIsView(targetrel) && (targetrel->rd_rules->numLocks > 1 ||
+            view_has_instead_trigger(targetrel, forDel ? CMD_DELETE : CMD_UPDATE))) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Un-support feature"),
+                    errdetail("view has rules or tiggers in mutilple-relations modifying doesn't support %s",
+                                type)));
+        } else if (!RelationIsView(targetrel)) {
+                ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Un-support feature"),
+                    errdetail("relation has rules in mutilple-relations modifying doesn't support %s", type)));
+        } else {
+            /* recursive check for view */
+            Query* viewquery = get_view_query(targetrel);
+            RangeTblRef* rtr = NULL;
+            RangeTblEntry* base_rte = NULL;
+            Relation base_rel;
+
+            /* Ignore here, and it would throw an error during query rewrite. */
+            if (list_length(viewquery->jointree->fromlist) != 1) {
+                return;
+            }
+
+            rtr = (RangeTblRef*)linitial(viewquery->jointree->fromlist);
+
+            /* Ignore here, it would throw an error during query rewrite. */
+            if (!IsA(rtr, RangeTblRef)) {
+                return;
+            }
+
+            base_rte = rt_fetch(rtr->rtindex, viewquery->rtable);
+            base_rel = try_relation_open(base_rte->relid, AccessShareLock);
+
+            if (base_rel != NULL) {
+                CheckRelationSupportMultiModify(base_rel, forDel);
+
+                relation_close(base_rel, AccessShareLock);
+            }
+        }
+    }
+}
+
+static void CheckUDRelations(ParseState* pstate, List* sortClause, Node* limitClause, List* returningList,
+                             bool forDel)
+{
+    if (list_length(pstate->p_target_relation) == 1) {
+        if (forDel) {
+            CheckDeleteRelation((Relation)linitial(pstate->p_target_relation));
+        } else {
+            CheckUpdateRelation((Relation)linitial(pstate->p_target_relation));
+        }
+        return;
+    }
+
+    const char* type = forDel ? "DELETE" : "UPDATE";
+    if (sortClause != NIL) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("mutilple-relations modifying doesn't support %s ORDER BY", type)));
+    }
+    if (limitClause != NULL) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("mutilple-relations modifying doesn't support %s LIMIT", type)));
+    }
+    if (returningList != NIL) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("mutilple-relations modifying doesn't support %s returning", type)));
+    }
+
+    foreach_cell (l, pstate->p_target_relation) {
+        Relation targetrel = (Relation)lfirst(l);
+        CheckRelationSupportMultiModify(targetrel, forDel);
+    }
+}
+
+static void CheckDeleteRelation(Relation targetrel)
+{
+    // check hdfs relation distributed by replication
+    if (targetrel->rd_locator_info &&
+        IsLocatorReplicated(targetrel->rd_locator_info->locatorType) &&
+        RelationIsPAXFormat(targetrel)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("hdfs replication table doesn't allow DELETE")));
+    }
+
+#ifdef ENABLE_MULTIPLE_NODES
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
+#endif
+        if (RelationIsMatview(targetrel)) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Unsupported feature"),
+                errdetail("Materialized view doesn't allow DELETE")));
+        }
+#ifdef ENABLE_MULTIPLE_NODES
+    }
+#endif
+
+    /* check delete permission */
+    if (((unsigned int)RelationGetInternalMask(targetrel) & INTERNAL_MASK_DDELETE)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("internal relation doesn't allow DELETE")));
+    }
+
+    // @Online expansion: check if the target relation is being redistributed in read only mode
+    if (!u_sess->attr.attr_sql.enable_cluster_resize && targetrel &&
+        RelationInClusterResizingWriteErrorMode(targetrel)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+                errmsg("%s is redistributing, please retry later.", targetrel->rd_rel->relname.data)));
+    }
+}
+/*
  * transformDeleteStmt -
  *	  transforms a Delete Statement
  */
 static Query* transformDeleteStmt(ParseState* pstate, DeleteStmt* stmt)
 {
     Query* qry = makeNode(Query);
+    ParseNamespaceItem *nsitem = NULL;
     Node* qual = NULL;
     /*
-     * Check the delete object name whether is 'paln_table'
+     * Check the delete object name whether is 'plan_table'
      * If it is, we will make a new where clause that include session_id and user_id filter condition.
      */
-    if (checkDeleteStmtForPlanTable(stmt->relation->relname)) {
+    if (checkDeleteStmtForPlanTable(stmt->relations)) {
         stmt = addWhereClauseForPlanTable(pstate, stmt);
         OnlyDeleteFromPlanTable = true;
     }
@@ -815,69 +1213,49 @@ static Query* transformDeleteStmt(ParseState* pstate, DeleteStmt* stmt)
         qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
     }
 
+    /*
+     * for sql_compatibility B, using clause may have the same relation name with result relations, so
+     * put transformFromClause here in advance to avoid checkNameSpaceConflicts with result relations.
+     */
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        transformFromClause(pstate, stmt->usingClause);
+    }
     /* set up range table with just the result rel */
-    qry->resultRelation =
-        setTargetTable(pstate, stmt->relation, interpretInhOption(stmt->relation->inhOpt), true, ACL_DELETE);
+    qry->resultRelations =
+        setTargetTables(pstate, stmt->relations, true, true, ACL_DELETE);
 
-    // check hdfs relation distributed by replication
-    if (pstate->p_target_relation != NULL && pstate->p_target_relation->rd_locator_info &&
-        IsLocatorReplicated(pstate->p_target_relation->rd_locator_info->locatorType) &&
-        RelationIsPAXFormat(pstate->p_target_relation)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Un-support feature"),
-                errdetail("hdfs replication table doesn't allow DELETE")));
-    }
-
-#ifdef ENABLE_MULTIPLE_NODES
-    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
-#endif
-        if (pstate->p_target_relation != NULL && RelationIsMatview(pstate->p_target_relation)) {
-            ereport(ERROR,
-                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("Unsupported feature"),
-                 errdetail("Materialized view doesn't allow DELETE")));
-        }
-#ifdef ENABLE_MULTIPLE_NODES
-    }
-#endif
-
-    /* check delete permission */
-    if (pstate->p_target_relation &&
-        ((unsigned int)RelationGetInternalMask(pstate->p_target_relation) & INTERNAL_MASK_DDELETE)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Un-support feature"),
-                errdetail("internal relation doesn't allow DELETE")));
-    }
-
-    // @Online expansion: check if the target relation is being redistributed in read only mode
-    if (!u_sess->attr.attr_sql.enable_cluster_resize && pstate->p_target_relation &&
-        RelationInClusterResizingWriteErrorMode(pstate->p_target_relation)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-                errmsg("%s is redistributing, please retry later.", pstate->p_target_relation->rd_rel->relname.data)));
-    }
-
+    CheckUDRelations(pstate, stmt->sortClause, stmt->limitClause, stmt->returningList, true);
+    /* there's no DISTINCT in DELETE */
     qry->distinctClause = NIL;
-
     /*
      * The USING clause is non-standard SQL syntax, and is equivalent in
      * functionality to the FROM list that can be specified for UPDATE. The
      * USING keyword is used rather than FROM because FROM is already a
      * keyword in the DELETE syntax.
      */
-    transformFromClause(pstate, stmt->usingClause);
+    if (u_sess->attr.attr_sql.sql_compatibility != B_FORMAT) {
+        /* grab the namespace item made by setTargetTable */
+        nsitem = (ParseNamespaceItem *)llast(pstate->p_relnamespace);
+        /* subqueries in USING can see the result relation only via LATERAL */
+        nsitem->p_lateral_only = true;
 
-    qual = transformWhereClause(pstate, stmt->whereClause, "WHERE");
+        transformFromClause(pstate, stmt->usingClause);
+        /* remaining clauses can see the result relation normally */
+        nsitem->p_lateral_only = false;
+    }
 
+
+
+    qual = transformWhereClause(pstate, stmt->whereClause, EXPR_KIND_WHERE, "WHERE");
+
+    Relation targetrel = (Relation)linitial(pstate->p_target_relation);
     qry->returningList = transformReturningList(pstate, stmt->returningList);
-    if (pstate->p_target_relation && qry->returningList != NIL && RelationIsColStore(pstate->p_target_relation)) {
+    if (pstate->p_target_relation && qry->returningList != NIL && RelationIsColStore(targetrel)) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("Un-support feature"),
                 errdetail("column stored relation doesn't support DELETE returning")));
-    } else if (pstate->p_target_relation && qry->returningList != NIL && RelationIsTsStore(pstate->p_target_relation)) {
+    } else if (pstate->p_target_relation && qry->returningList != NIL && RelationIsTsStore(targetrel)) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("Un-support feature"),
@@ -894,7 +1272,9 @@ static Query* transformDeleteStmt(ParseState* pstate, DeleteStmt* stmt)
     /* done building the range table and jointree */
     qry->rtable = pstate->p_rtable;
     qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
+    transformLimitSortClause(pstate, stmt, qry, true);
 
+    qry->hasTargetSRFs = pstate->p_hasTargetSRFs;
     qry->hasSubLinks = pstate->p_hasSubLinks;
     qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
     if (pstate->p_hasWindowFuncs)
@@ -908,25 +1288,7 @@ static Query* transformDeleteStmt(ParseState* pstate, DeleteStmt* stmt)
         parseCheckAggregates(pstate, qry);
 
     qry->hintState = stmt->hintState;
-    
-    qry->limitCount = transformLimitClause(pstate, stmt->limitClause, "LIMIT");
-    if (!IsSupportDeleteLimit(pstate->p_target_relation, (qry->limitCount != NULL))) {
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Un-support feature"),
-                errdetail("replication table doesn't allow DELETE LIMIT")));
-    }
 
-    if (qry->limitCount != NULL) {
-        /* flag for discriminating rownum */
-        Const *flag = makeNode(Const);
-        flag->ismaxvalue = true;
-        flag->location = -1;
-        flag->consttype = INT8OID;
-        flag->consttypmod = -1;
-        qry->limitOffset = (Node*)flag;
-    }
-    
 #ifdef ENABLE_MULTIPLE_NODES
     CheckTsDelete(pstate, qry);
 #endif   /* ENABLE_MULTIPLE_NODES */
@@ -1074,6 +1436,11 @@ void CheckTablesStorageEngine(Query* qry, StorageEngineType* type)
         }
     }
 
+    /* MOT JIT: check if this is an invoke MOT JITted SP */
+    if (JitExec::IsInvokeReadyFunction(qry)) {
+        context.isMotTable = true;
+    }
+
     /* add root query to query stack list */
     context.queryNodes = lappend(context.queryNodes, qry);
 
@@ -1088,110 +1455,6 @@ void CheckTablesStorageEngine(Query* qry, StorageEngineType* type)
         *type = SE_TYPE_MOT;
     }
 }
-
-/*
- * @brief: Expression_tree_walker callback function.
- * Checks the query and all sub queries to identify if there is update on indexed column.
- */
-static bool MotIndexedColumnUpdateWalker(Node* node, UpdateDetectorContext* context)
-{
-    if (node == NULL) {
-        return false;
-    }
-
-    if (IsA(node, RangeTblRef)) {
-        RangeTblRef* rtr = (RangeTblRef*)node;
-        Query* qry = (Query*)llast(context->queryNodes);
-        RangeTblEntry* rte = rt_fetch(rtr->rtindex, qry->rtable);
-        if (qry->commandType == CMD_UPDATE && rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_FOREIGN_TABLE &&
-            isMOTFromTblOid(rte->relid)) {
-            Relation rel = relation_open(rte->relid, AccessShareLock);
-            Bitmapset* idx_bmps = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_ALL);
-            relation_close(rel, NoLock);
-            if (idx_bmps == NULL) {
-                return false;
-            }
-            ListCell* target = NULL;
-            foreach (target, qry->targetList) {
-                TargetEntry* entry = (TargetEntry*)lfirst(target);
-                if (entry->resjunk) {
-                    continue;
-                }
-                if (bms_is_member(entry->resno - FirstLowInvalidHeapAttributeNumber, idx_bmps)) {
-                    context->isIndexedColumnUpdate = true;
-                }
-            }
-            bms_free(idx_bmps);
-        }
-        return false;
-    }
-
-    if (IsA(node, Query)) {
-        /* Recurse into subselects */
-        bool result = false;
-        context->queryNodes = lappend(context->queryNodes, (Query*)node);
-        context->sublevelsUp++;
-        result = query_tree_walker((Query*)node, (bool (*)())MotIndexedColumnUpdateWalker, (void*)context, 0);
-        context->sublevelsUp--;
-        context->queryNodes = list_delete(context->queryNodes, llast(context->queryNodes));
-        return result;
-    }
-
-    return expression_tree_walker(node, (bool (*)())MotIndexedColumnUpdateWalker, (void*)context);
-}
-
-/*
- * @brief: Analyze a query to check if there is update on indexed column of MOT table.
- * @input: Query to be analyzed.
- * @output: True/false.
- */
-bool CheckMotIndexedColumnUpdate(Query* qry)
-{
-    UpdateDetectorContext context;
-    context.queryNodes = NIL;
-    context.sublevelsUp = 0;
-    context.isIndexedColumnUpdate = false;
-
-    /* check root node RTEs in case of non RangeTblRef nodes */
-    List* rtable = qry->rtable;
-    ListCell* lc = NULL;
-    foreach (lc, rtable) {
-        RangeTblEntry* rte = (RangeTblEntry*)lfirst(lc);
-        if (qry->commandType == CMD_UPDATE && rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_FOREIGN_TABLE &&
-            isMOTFromTblOid(rte->relid)) {
-            Relation rel = relation_open(rte->relid, AccessShareLock);
-            Bitmapset* idx_bmps = RelationGetIndexAttrBitmap(rel, INDEX_ATTR_BITMAP_ALL);
-            relation_close(rel, NoLock);
-            if (idx_bmps == NULL) {
-                return false;
-            }
-            ListCell* target = NULL;
-            foreach (target, qry->targetList) {
-                TargetEntry* entry = (TargetEntry*)lfirst(target);
-                /* Junk entry is temporary and won't affect the db. in addition, entry->resno might be wrong.
-                 * We should ignore it.
-                 * More info in src/backend/executor/execJunk.cpp
-                 */
-                if (entry->resjunk) {
-                    continue;
-                }
-                if (bms_is_member(entry->resno - FirstLowInvalidHeapAttributeNumber, idx_bmps)) {
-                    bms_free(idx_bmps);
-                    return true;
-                }
-            }
-            bms_free(idx_bmps);
-        }
-    }
-
-    /* add root query to query stack list */
-    context.queryNodes = lappend(context.queryNodes, qry);
-
-    /* recursive walk on the query */
-    (void)query_or_expression_tree_walker((Node*)qry, (bool (*)())MotIndexedColumnUpdateWalker, (void*)&context, 0);
-
-    return context.isIndexedColumnUpdate;
-}
 #endif
 
 static void CheckUnsupportInsertSelectClause(Query* query)
@@ -1201,7 +1464,7 @@ static void CheckUnsupportInsertSelectClause(Query* query)
 
     if (query == NULL)
         return;
-    result = rt_fetch(query->resultRelation, query->rtable);
+    result = rt_fetch(linitial_int(query->resultRelations), query->rtable);
 
     AssertEreport(query->commandType == CMD_INSERT, MOD_OPT, "Only deal with CMD_INSERT commondType here");
     if (result->relkind == RELKIND_FOREIGN_TABLE || result->relkind == RELKIND_STREAM) {
@@ -1232,7 +1495,7 @@ static void CheckUnsupportInsertSelectClause(Query* query)
                     errmsg("Un-support feature"),
                     errdetail("too complex subquery")));
 
-        RangeTblEntry* subrte = rt_fetch(query->resultRelation == 1 ? 2 : 1, query->rtable);
+        RangeTblEntry* subrte = rt_fetch(linitial_int(query->resultRelations) == 1 ? 2 : 1, query->rtable);
         /* non-subquery is unsupported */
         if (subrte->rtekind != RTE_SUBQUERY)
             ereport(ERROR,
@@ -1308,7 +1571,7 @@ static void CheckUnsupportInsertSelectClause(Query* query)
                         errdetail("JOIN contains foreign table")));
             }
 
-            RangeTblEntry* rte = rt_fetch(query->resultRelation == 1 ? 2 : 1, query->rtable);
+            RangeTblEntry* rte = rt_fetch(linitial_int(query->resultRelations) == 1 ? 2 : 1, query->rtable);
             AssertEreport(rte->rtekind == RTE_SUBQUERY, MOD_OPT, "Only deal with subquery in FROM clause here");
 
             if (rte->subquery != subquery) {
@@ -1327,6 +1590,72 @@ static void CheckUnsupportInsertSelectClause(Query* query)
             }
         }
     }
+}
+
+
+static void SetInsertAttrnoState(ParseState* pstate, List* attrnos) 
+{
+    RightRefState* rstate = pstate->rightRefState;
+    Relation relation = (Relation)linitial(pstate->p_target_relation);
+    rstate->colCnt = RelationGetNumberOfAttributes(relation);
+    int len = list_length(attrnos);
+    rstate->explicitAttrLen = len;
+    rstate->explicitAttrNos = (int*)palloc0(sizeof(int) * len);
+    
+    ListCell* attr = list_head(attrnos);
+    for (int i = 0; i < len; ++i) {
+        rstate->explicitAttrNos[i] = lfirst_int(attr);
+        attr = lnext(attr);
+    }
+}
+
+static void SetUpsertAttrnoState(ParseState* pstate, List *targetList) 
+{
+    if (!targetList) {
+        return;
+    }
+    RightRefState* rstate = pstate->rightRefState;
+    const int len = list_length(targetList);
+    rstate->usExplicitAttrLen = len;
+    rstate->usExplicitAttrNos = (int*)palloc0(sizeof(int) * len);
+
+    Relation relation = (Relation)linitial(pstate->p_target_relation);
+    FormData_pg_attribute* attr = relation->rd_att->attrs;
+    const int colNum = RelationGetNumberOfAttributes(relation);
+    ListCell* target = list_head(targetList);
+    for (int ni = 0; ni < len; ++ni) {
+        ResTarget* res = (ResTarget*)lfirst(target);
+        char* name = nullptr;
+        if (list_length(res->indirection) > 0) {
+            name = ((Value*)llast(res->indirection))->val.str;
+        } else {
+            name = res->name;
+        }
+
+        for (int ci = 0; ci < colNum; ++ci) {
+            if (attr[ci].attisdropped) {
+                continue;
+            }
+            if (strcmp(name, attr[ci].attname.data) == 0) {
+                rstate->usExplicitAttrNos[ni] = ci + 1;
+                break;
+            }
+        }
+
+        if (rstate->usExplicitAttrNos[ni] == InvalidOid) {
+            ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_COLUMN),
+                 errmsg("Column \"%s\" not found in upsert attrno state initialization", name)));
+        }
+        target = lnext(target);
+    }
+}
+
+static RightRefState* MakeRightRefState() 
+{
+    RightRefState* refState = (RightRefState*)palloc0(sizeof(RightRefState));
+    refState->isSupported = !IsInitdb && DB_IS_CMPT(B_FORMAT);
+    return refState;
 }
 
 /*
@@ -1350,14 +1679,46 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
     ListCell* attnos = NULL;
     ListCell* lc = NULL;
     AclMode    targetPerms = ACL_INSERT;
+    Relation targetrel = NULL;
 
     /* There can't be any outer WITH to worry about */
     AssertEreport(pstate->p_ctenamespace == NIL, MOD_OPT, "para should be NIL");
 
+    RightRefState* rightRefState = MakeRightRefState();
+    
     qry->commandType = CMD_INSERT;
     pstate->p_is_insert = true;
+    pstate->p_has_ignore = stmt->hasIgnore;
+    pstate->rightRefState = rightRefState;
+    
     /* set io state for backend status for the thread, we will use it to check user space */
     pgstat_set_io_state(IOSTATE_WRITE);
+
+    qry->isReplace = stmt->isReplace;
+    if (stmt->isReplace) {
+        targetPerms |= ACL_DELETE;
+        /* transform set clause in REPLACE INTO stmt */
+        if (selectStmt == NULL && stmt->cols == NULL && stmt->targetList != NULL) {
+            stmt->selectStmt = (Node *)makeNode(SelectStmt);
+            selectStmt = (SelectStmt *)stmt->selectStmt;
+            ListCell* o_target = NULL;
+            List *ctext_expr_list = NULL;
+            
+            foreach (o_target, stmt->targetList) {
+                ResTarget* res = (ResTarget*)lfirst(o_target);
+
+                ctext_expr_list = lappend(ctext_expr_list, res->val);
+            }
+            selectStmt->valuesLists = list_make1(ctext_expr_list);
+
+            stmt->cols = (List *)copyObject(stmt->targetList);
+            foreach (o_target, stmt->cols) {
+                ResTarget* res = (ResTarget*)lfirst(o_target);
+                res->val = NULL;
+            }
+
+        }
+    }
 
     /*
      * Insert into relation pg_auth_history is not allowed.
@@ -1420,9 +1781,10 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
         targetPerms |= ACL_UPDATE;
     }
 
-    qry->resultRelation = setTargetTable(pstate, stmt->relation, false, false, targetPerms);
-    if (pstate->p_target_relation != NULL &&
-        ((unsigned int)RelationGetInternalMask(pstate->p_target_relation) & INTERNAL_MASK_DINSERT)) {
+    qry->resultRelations = setTargetTables(pstate, list_make1(stmt->relation), false, false, targetPerms);
+    targetrel = (Relation)linitial(pstate->p_target_relation);
+    if (targetrel != NULL &&
+        ((unsigned int)RelationGetInternalMask(targetrel) & INTERNAL_MASK_DINSERT)) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("Un-support feature"),
@@ -1431,8 +1793,8 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
 #ifdef ENABLE_MULTIPLE_NODES
     if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
 #endif
-        if (pstate->p_target_relation != NULL
-                && RelationIsMatview(pstate->p_target_relation) && !stmt->isRewritten) {
+        if (targetrel != NULL
+                && RelationIsMatview(targetrel) && !stmt->isRewritten) {
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("Unsupported feature"),
@@ -1442,26 +1804,34 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
     }
 #endif
 
-    if (pstate->p_target_relation != NULL && stmt->upsertClause != NULL) {
+    if (targetrel != NULL && stmt->upsertClause != NULL) {
         /* non-supported upsert cases */
-        if (!u_sess->attr.attr_sql.enable_upsert_to_merge && RelationIsColumnFormat(pstate->p_target_relation)) {
+        if (!u_sess->attr.attr_sql.enable_upsert_to_merge && RelationIsColumnFormat(targetrel)) {
             ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                              errmsg("INSERT ON DUPLICATE KEY UPDATE is not supported on column orientated table."))));
         }
 
-        if (RelationIsForeignTable(pstate->p_target_relation) || RelationIsStream(pstate->p_target_relation)) {
+        if (RelationIsForeignTable(targetrel) || RelationIsStream(targetrel)) {
             ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                              errmsg("INSERT ON DUPLICATE KEY UPDATE is not supported on foreign table."))));
         }
 
-        if (RelationIsView(pstate->p_target_relation)) {
+        if (RelationIsView(targetrel)) {
             ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("INSERT ON DUPLICATE KEY UPDATE is not supported on VIEW."))));
         }
 
-        if (RelationIsContquery(pstate->p_target_relation)) {
+        if (RelationIsContquery(targetrel)) {
             ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("INSERT ON DUPLICATE KEY UPDATE is not supported on CONTQUERY."))));
+        }
+    }
+
+    /* non-supported IGNORE cases */
+    if (pstate->p_has_ignore && targetrel != NULL) {
+        if (RelationIsColumnFormat(targetrel)) {
+            ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                             errmsg("IGNORE is not supported on INSERT column orientated table."))));
         }
     }
 
@@ -1474,15 +1844,18 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
      * We reply on gs_redis to ganurantee DFS table to be read only during online expansion
      * so we don't need to double check if target table is DFS table here anymore.
      */
-    if (!u_sess->attr.attr_sql.enable_cluster_resize && pstate->p_target_relation != NULL &&
-        RelationInClusterResizingWriteErrorMode(pstate->p_target_relation)) {
+    if (!u_sess->attr.attr_sql.enable_cluster_resize && targetrel != NULL &&
+        RelationInClusterResizingWriteErrorMode(targetrel)) {
         ereport(ERROR,
             (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-                errmsg("%s is redistributing, please retry later.", pstate->p_target_relation->rd_rel->relname.data)));
+                errmsg("%s is redistributing, please retry later.", targetrel->rd_rel->relname.data)));
     }
 
     /* Validate stmt->cols list, or build default list if no list given */
     icolumns = checkInsertTargets(pstate, stmt->cols, &attrnos);
+
+    SetInsertAttrnoState(pstate, attrnos);
+    
     AssertEreport(list_length(icolumns) == list_length(attrnos), MOD_OPT, "list length inconsistent");
 
     /*
@@ -1548,7 +1921,7 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
          * nodes in order to maintain global data visibility.
          */
         if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
-            target_rte = rt_fetch(qry->resultRelation, pstate->p_rtable);
+            target_rte = rt_fetch(linitial_int(qry->resultRelations), pstate->p_rtable);
             if (is_relation_child(target_rte, selectQuery->rtable)) {
                 qry->has_to_save_cmd_id = true;
                 SetSendCommandId(true);
@@ -1610,9 +1983,9 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
          * If td_compatible_truncation equal true and no foreign table found,
          * the auto truncation funciton should be enabled.
          */
-        if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && pstate->p_target_relation != NULL &&
-            !RelationIsForeignTable(pstate->p_target_relation) &&
-            !RelationIsStream(pstate->p_target_relation)) {
+        if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && targetrel != NULL &&
+            !RelationIsForeignTable(targetrel) &&
+            !RelationIsStream(targetrel)) {
             if (u_sess->attr.attr_sql.td_compatible_truncation) {
                 pstate->p_is_td_compatible_truncation = true;
             } else {
@@ -1679,7 +2052,7 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
             List* sublist = (List*)lfirst(lc);
 
             /* Do basic expression transformation (same as a ROW() expr) */
-            sublist = transformExpressionList(pstate, sublist);
+            sublist = transformExpressionList(pstate, sublist, EXPR_KIND_VALUES);
 
             /*
              * All the sublists must be the same length, *after*
@@ -1700,9 +2073,9 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
              * If td_compatible_truncation equal true and no foreign table found,
              * the auto truncation funciton should be enabled.
              */
-            if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && pstate->p_target_relation != NULL &&
-                !RelationIsForeignTable(pstate->p_target_relation) &&
-                !RelationIsStream(pstate->p_target_relation)) {
+            if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && targetrel != NULL &&
+                !RelationIsForeignTable(targetrel) &&
+                !RelationIsStream(targetrel)) {
                 if (u_sess->attr.attr_sql.td_compatible_truncation) {
                     pstate->p_is_td_compatible_truncation = true;
                 } else {
@@ -1785,15 +2158,15 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
         AssertEreport(selectStmt->intoClause == NULL, MOD_OPT, "intoClause should not happen here");
 
         /* Do basic expression transformation (same as a ROW() expr) */
-        exprList = transformExpressionList(pstate, (List*)linitial(valuesLists));
+        exprList = transformExpressionList(pstate, (List*)linitial(valuesLists), EXPR_KIND_VALUES_SINGLE);
 
         /*
          * If td_compatible_truncation equal true and no foreign table found,
          * the auto truncation funciton should be enabled.
          */
-        if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && pstate->p_target_relation != NULL &&
-            !RelationIsForeignTable(pstate->p_target_relation) &&
-            !RelationIsStream(pstate->p_target_relation)) {
+        if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && targetrel != NULL &&
+            !RelationIsForeignTable(targetrel) &&
+            !RelationIsStream(targetrel)) {
             if (u_sess->attr.attr_sql.td_compatible_truncation) {
                 pstate->p_is_td_compatible_truncation = true;
             } else {
@@ -1809,7 +2182,7 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
      * Generate query's target list using the computed list of expressions.
      * Also, mark all the target columns as needing insert permissions.
      */
-    rte = pstate->p_target_rangetblentry;
+    rte = (RangeTblEntry*)linitial(pstate->p_target_rangetblentry);
     qry->targetList = NIL;
     icols = list_head(icolumns);
     attnos = list_head(attrnos);
@@ -1834,7 +2207,15 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
 
     /* Process DUPLICATE KEY UPDATE, if any. */
     if (stmt->upsertClause) {
-        qry->upsertClause = transformUpsertClause(pstate, stmt->upsertClause, stmt->relation);
+        if (IS_SUPPORT_RIGHT_REF(rightRefState)) {
+            pstate->p_varnamespace = NIL;
+            rightRefState->isUpsert = true;
+            SetUpsertAttrnoState(pstate, stmt->upsertClause->targetList);
+            qry->upsertClause = transformUpsertClause(pstate, stmt->upsertClause, qry->resultRelations);
+            rightRefState->isUpsert = false;
+        } else {
+            qry->upsertClause = transformUpsertClause(pstate, stmt->upsertClause, qry->resultRelations);
+        }
     }
     /*
      * If we have a RETURNING clause, we need to add the target relation to
@@ -1845,14 +2226,22 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
     if (stmt->returningList) {
         pstate->p_relnamespace = NIL;
         pstate->p_varnamespace = NIL;
-        addRTEtoQuery(pstate, pstate->p_target_rangetblentry, false, true, true);
+        pstate->rightRefState = nullptr;
+        addRTEtoQuery(pstate, rte, false, true, true);
         qry->returningList = transformReturningList(pstate, stmt->returningList);
+        if (qry->returningList != NIL && RelationIsColStore(targetrel)) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Un-support feature"),
+                    errdetail("column stored relation doesn't support INSERT returning")));
+        }
     }
 
     /* done building the range table and jointree */
     qry->rtable = pstate->p_rtable;
     qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
 
+    qry->hasTargetSRFs = pstate->p_hasTargetSRFs;
     qry->hasSubLinks = pstate->p_hasSubLinks;
     /* aggregates not allowed (but subselects are okay) */
     if (pstate->p_hasAggs) {
@@ -1875,6 +2264,15 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt)
     /* Set query tdTruncCastStatus to recored if auto truncation enabled or not. */
     qry->tdTruncCastStatus = pstate->tdTruncCastStatus;
     qry->hintState = stmt->hintState;
+    qry->hasIgnore = stmt->hasIgnore;
+
+    if (IS_ENABLE_RIGHT_REF(rightRefState)) {
+        qry->rightRefState = rightRefState;
+    } else {
+        qry->rightRefState = nullptr;
+        pstate->rightRefState = nullptr;
+        pfree(rightRefState);
+    }
 
     return qry;
 }
@@ -1905,7 +2303,8 @@ static void checkUpsertTargetlist(Relation targetTable, List* updateTlist)
             }
         }
 
-        if (bms_overlap(index_attrs, target_attrs)) {
+        /* Allow in B_FORMAT */
+        if (bms_overlap(index_attrs, target_attrs) && u_sess->attr.attr_sql.sql_compatibility != B_FORMAT) {
             ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                          errmsg("INSERT ON DUPLICATE KEY UPDATE don't allow update on primary key or unique key."))));
         }
@@ -1924,7 +2323,7 @@ List* BuildExcludedTargetlist(Relation targetrel, Index exclRelIndex)
      * underlying relation, hence we need entries for dropped columns too.
      */
     for (attno = 0; attno < RelationGetNumberOfAttributes(targetrel); attno++) {
-        Form_pg_attribute attr = targetrel->rd_att->attrs[attno];
+        Form_pg_attribute attr = &targetrel->rd_att->attrs[attno];
         char* name = NULL;
 
         if (attr->attisdropped) {
@@ -1997,7 +2396,7 @@ static bool ContainSubLink(Node* clause)
 }
 #endif /* ENABLE_MULTIPLE_NODES */
 
-static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upsertClause, RangeVar* relation)
+static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upsertClause, List* resultRelations)
 {
     UpsertExpr* result = NULL;
     List* updateTlist = NIL;
@@ -2006,8 +2405,7 @@ static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upser
     List* exclRelTlist = NIL;
     Node* updateWhere = NULL;
     UpsertAction action = UPSERT_NOTHING;
-    Relation targetrel = pstate->p_target_relation;
-
+    Relation targetrel = (Relation)linitial(pstate->p_target_relation);
 #ifdef ENABLE_MULTIPLE_NODES
     if (targetrel->rd_rel->relhastriggers) {
         ereport(WARNING,
@@ -2055,12 +2453,12 @@ static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upser
          * be used in the UPDATE statement.
          */
         addRTEtoQuery(pstate, exclRte, false, true, true);
-        addRTEtoQuery(pstate, pstate->p_target_rangetblentry, false, true, true);
+        addRTEtoQuery(pstate, (RangeTblEntry*)linitial(pstate->p_target_rangetblentry), false, true, true);
 
-        updateTlist = transformTargetList(pstate, upsertClause->targetList);
+        updateTlist = transformTargetList(pstate, upsertClause->targetList, EXPR_KIND_UPDATE_TARGET);
         /* Done with select-like processing, move on transforming to match update set target column */
-        updateTlist = transformUpdateTargetList(pstate, updateTlist, upsertClause->targetList, relation);
-        updateWhere = transformWhereClause(pstate, upsertClause->whereClause, "WHERE");
+        updateTlist = transformUpdateTargetList(pstate, updateTlist, upsertClause->targetList, resultRelations);
+        updateWhere = transformWhereClause(pstate, upsertClause->whereClause, EXPR_KIND_WHERE, "WHERE");
 #ifdef ENABLE_MULTIPLE_NODES
         /* Do not support sublinks in update where clause for now */
         if (ContainSubLink(updateWhere)) {
@@ -2076,10 +2474,10 @@ static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upser
         /* We can't update primary or unique key in upsert, check it here */
 #ifdef ENABLE_MULTIPLE_NODES
         if (IS_PGXC_COORDINATOR && !u_sess->attr.attr_sql.enable_upsert_to_merge) {
-            checkUpsertTargetlist(pstate->p_target_relation, updateTlist);
+            checkUpsertTargetlist(targetrel, updateTlist);
         }
 #else
-        checkUpsertTargetlist(pstate->p_target_relation, updateTlist);
+        checkUpsertTargetlist(targetrel, updateTlist);
 #endif
     }
 
@@ -2158,7 +2556,8 @@ List* transformInsertRow(ParseState* pstate, List* exprlist, List* stmtcols, Lis
         col = (ResTarget*)lfirst(icols);
         AssertEreport(IsA(col, ResTarget), MOD_OPT, "nodeType inconsistant");
 
-        expr = transformAssignedExpr(pstate, expr, col->name, lfirst_int(attnos), col->indirection, col->location);
+        expr = transformAssignedExpr(pstate, expr, EXPR_KIND_INSERT_TARGET, col->name, lfirst_int(attnos), col->indirection, col->location,
+            (Relation)linitial(pstate->p_target_relation), (RangeTblEntry*)linitial(pstate->p_target_rangetblentry));
 
         result = lappend(result, expr);
 
@@ -2236,6 +2635,127 @@ static bool shouldTransformStartWithStmt(ParseState* pstate, SelectStmt* stmt, Q
 }
 
 /*
+ * transformVariableSetValueStmt - 
+ *    transforms a VariableSetStmt
+ */
+static Query* transformVariableMutiSetStmt(ParseState* pstate, VariableMultiSetStmt* muti_stmt)
+{
+    Query *query = makeNode(Query);
+    List *resultList = NIL;
+
+    List* stmts = muti_stmt->args;
+    ListCell* cell = NULL;
+    VariableSetStmt* set_stmt;
+    List *usersetlist = NIL;
+
+    foreach(cell, stmts) {
+        Node* stmt = (Node*)lfirst(cell);
+
+        if (nodeTag(stmt) == T_AlterSystemStmt) {
+            AlterSystemStmt *alter_sys_stmt = (AlterSystemStmt *)stmt;
+            set_stmt = alter_sys_stmt->setstmt;
+        } else {
+            set_stmt = (VariableSetStmt*)stmt;
+        }
+
+        if (set_stmt->kind == VAR_SET_DEFINED) {
+            transformVariableSetStmt(pstate, set_stmt);
+            if (strcmp(set_stmt->name, "USER DEFINED VARIABLE") == 0) {
+                usersetlist = list_concat(usersetlist, set_stmt->defined_args);
+            }
+        }
+
+        if (set_stmt->kind == VAR_SET_VALUE)
+            transformVariableSetValueStmt(pstate, set_stmt);
+
+        if (nodeTag(stmt) == T_AlterSystemStmt) {
+            AlterSystemStmt *newnode = makeNode(AlterSystemStmt);
+            newnode->setstmt = set_stmt;
+            resultList = lappend(resultList, newnode);
+        } else if (set_stmt->kind == VAR_SET_DEFINED) {
+            if (strcmp(set_stmt->name, "USER DEFINED VARIABLE") != 0) {
+                resultList = lappend(resultList, set_stmt);
+            }
+        } else {
+            resultList = lappend(resultList, set_stmt);
+        }
+    }
+
+    if (list_length(usersetlist) != 0) {
+        VariableSetStmt* new_set_stmt = makeNode(VariableSetStmt);
+        new_set_stmt->kind = VAR_SET_DEFINED;
+        new_set_stmt->name = "USER DEFINED VARIABLE";
+        new_set_stmt->is_local = false;
+        new_set_stmt->defined_args = usersetlist;
+        resultList = lappend(resultList, new_set_stmt);
+    }
+
+    list_free(muti_stmt->args);
+    muti_stmt->args = resultList;
+
+    query->commandType = CMD_UTILITY;
+    query->utilityStmt = (Node*)muti_stmt;
+    return query;
+}
+
+/*
+ * transformVariableSetStmt - transforms a user-defined variable
+ */
+static void transformVariableSetStmt(ParseState* pstate, VariableSetStmt* stmt)
+{
+    List *resultList = NIL;
+    ListCell *temp = NULL;
+
+    foreach (temp, stmt->defined_args) {
+        UserSetElem *userElem = (UserSetElem *)lfirst(temp);
+        UserSetElem *newUserElem = makeNode(UserSetElem);
+        newUserElem->name = userElem->name;
+        
+        Node *node = transformExprRecurse(pstate, (Node *)userElem->val);
+
+        if (IsA(node, UserSetElem)) {
+            newUserElem->name = list_concat(newUserElem->name, ((UserSetElem *)node)->name);
+            newUserElem->val = ((UserSetElem *)node)->val;
+        } else {
+            newUserElem->val = (Expr *)node;
+        }
+        
+        resultList = lappend(resultList, newUserElem);
+    }
+    stmt->defined_args = resultList;
+}
+
+/*
+ * transformVariableSetValueStmt - 
+ *    transforms a VariableSetStmt
+ */
+static void transformVariableSetValueStmt(ParseState* pstate, VariableSetStmt* stmt)
+{
+    List *resultlist = NIL;
+    ListCell* l = NULL;
+
+    foreach(l, stmt->args) {
+        Node* expr = (Node*)lfirst(l);
+
+        /* 
+         * The expression will eventually be converted to A_Const, 
+         * so the current A_Const expr does not need to be converted.
+         */
+        Node *node = NULL;
+        if (IsA(expr, A_Const)) {
+            node = expr;
+        } else {
+            node = transformExpr(pstate, expr, EXPR_KIND_OTHER);
+        }
+
+        resultlist = lappend(resultlist, (Expr*)node);
+    }
+
+    list_free(stmt->args);
+    stmt->args = resultlist;
+}
+
+/*
  * transformSelectStmt -
  *	  transforms a Select Statement
  *
@@ -2280,13 +2800,16 @@ static Query* transformSelectStmt(ParseState* pstate, SelectStmt* stmt, bool isF
     /* process the FROM clause */
     transformFromClause(pstate, stmt->fromClause, isFirstNode, isCreateView);
 
+    /* process index_hint in tables*/
+    qry->indexhintList = lappend3(qry->indexhintList, pstate->p_indexhintLists);
+
     /* transform START WITH...CONNECT BY clause */
     if (shouldTransformStartWithStmt(pstate, stmt, qry)) {
         transformStartWith(pstate, stmt, qry);
     }
 
     /* transform targetlist */
-    qry->targetList = transformTargetList(pstate, stmt->targetList);
+    qry->targetList = transformTargetList(pstate, stmt->targetList, EXPR_KIND_SELECT_TARGET);
 
     /* Transform operator "(+)" to outer join */
     if (stmt->hasPlus && stmt->whereClause != NULL) {
@@ -2305,13 +2828,17 @@ static Query* transformSelectStmt(ParseState* pstate, SelectStmt* stmt, bool isF
      * during transform Whereclause.
      */
     setIgnorePlusFlag(pstate, true);
-    qual = transformWhereClause(pstate, stmt->whereClause, "WHERE");
+    qual = transformWhereClause(pstate, stmt->whereClause, EXPR_KIND_WHERE, "WHERE");
     setIgnorePlusFlag(pstate, false);
 
     /*
      * Initial processing of HAVING clause is just like WHERE clause.
      */
-    qry->havingQual = transformWhereClause(pstate, stmt->havingClause, "HAVING");
+    qry->havingQual = transformWhereClause(pstate, stmt->havingClause, EXPR_KIND_HAVING, "HAVING");
+
+    pstate->shouldCheckOrderbyCol = (!ALLOW_ORDERBY_UNDISTINCT_COLUMN &&
+                                    stmt->distinctClause && linitial(stmt->distinctClause) == NULL &&
+                                    !IsInitdb && DB_IS_CMPT(B_FORMAT));
 
     /*
      * Transform sorting/grouping stuff.  Do ORDER BY first because both
@@ -2320,7 +2847,9 @@ static Query* transformSelectStmt(ParseState* pstate, SelectStmt* stmt, bool isF
      * them by reference.
      */
     qry->sortClause = transformSortClause(
-        pstate, stmt->sortClause, &qry->targetList, true /* fix unknowns */, false /* allow SQL92 rules */);
+        pstate, stmt->sortClause, &qry->targetList, EXPR_KIND_ORDER_BY, true /* fix unknowns */, false /* allow SQL92 rules */);
+
+    pstate->shouldCheckOrderbyCol = false;
 
     /*
      * Transform A_const to columnref type in group by clause, So that repeated group column
@@ -2343,6 +2872,7 @@ static Query* transformSelectStmt(ParseState* pstate, SelectStmt* stmt, bool isF
         &qry->groupingSets,
         &qry->targetList,
         qry->sortClause,
+        EXPR_KIND_GROUP_BY,
         false /* allow SQL92 rules */);
 
     if (stmt->distinctClause == NIL) {
@@ -2360,8 +2890,8 @@ static Query* transformSelectStmt(ParseState* pstate, SelectStmt* stmt, bool isF
     }
 
     /* transform LIMIT */
-    qry->limitOffset = transformLimitClause(pstate, stmt->limitOffset, "OFFSET");
-    qry->limitCount = transformLimitClause(pstate, stmt->limitCount, "LIMIT");
+    qry->limitOffset = transformLimitClause(pstate, stmt->limitOffset, EXPR_KIND_OFFSET, "OFFSET");
+    qry->limitCount = transformLimitClause(pstate, stmt->limitCount, EXPR_KIND_LIMIT, "LIMIT");
 
     /* transform window clauses after we have seen all window functions */
     qry->windowClause = transformWindowDefinitions(pstate, pstate->p_windowdefs, &qry->targetList);
@@ -2379,6 +2909,7 @@ static Query* transformSelectStmt(ParseState* pstate, SelectStmt* stmt, bool isF
     if (pstate->p_hasWindowFuncs) {
         parseCheckWindowFuncs(pstate, qry);
     }
+    qry->hasTargetSRFs = pstate->p_hasTargetSRFs;
     qry->hasAggs = pstate->p_hasAggs;
 
     foreach (l, stmt->lockingClause) {
@@ -2474,7 +3005,7 @@ static Query* transformValuesClause(ParseState* pstate, SelectStmt* stmt)
         List* sublist = (List*)lfirst(lc);
 
         /* Do basic expression transformation (same as a ROW() expr) */
-        sublist = transformExpressionList(pstate, sublist);
+        sublist = transformExpressionList(pstate, sublist, EXPR_KIND_VALUES);
 
         /*
          * All the sublists must be the same length, *after* transformation
@@ -2597,10 +3128,10 @@ static Query* transformValuesClause(ParseState* pstate, SelectStmt* stmt)
      * VALUES, so cope.
      */
     qry->sortClause = transformSortClause(
-        pstate, stmt->sortClause, &qry->targetList, true /* fix unknowns */, false /* allow SQL92 rules */);
+        pstate, stmt->sortClause, &qry->targetList, EXPR_KIND_ORDER_BY, true /* fix unknowns */, false /* allow SQL92 rules */);
 
-    qry->limitOffset = transformLimitClause(pstate, stmt->limitOffset, "OFFSET");
-    qry->limitCount = transformLimitClause(pstate, stmt->limitCount, "LIMIT");
+    qry->limitOffset = transformLimitClause(pstate, stmt->limitOffset, EXPR_KIND_OFFSET, "OFFSET");
+    qry->limitCount = transformLimitClause(pstate, stmt->limitCount, EXPR_KIND_LIMIT, "LIMIT");
 
     if (stmt->lockingClause) {
         ereport(ERROR,
@@ -2631,6 +3162,7 @@ static Query* transformValuesClause(ParseState* pstate, SelectStmt* stmt)
     qry->rtable = pstate->p_rtable;
     qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
 
+    qry->hasTargetSRFs = pstate->p_hasTargetSRFs;
     qry->hasSubLinks = pstate->p_hasSubLinks;
     /* aggregates not allowed (but subselects are okay) */
     if (pstate->p_hasAggs) {
@@ -2827,7 +3359,7 @@ static Query* transformSetOperationStmt(ParseState* pstate, SelectStmt* stmt)
     tllen = list_length(qry->targetList);
 
     qry->sortClause = transformSortClause(
-        pstate, sortClause, &qry->targetList, false /* no unknowns expected */, false /* allow SQL92 rules */);
+        pstate, sortClause, &qry->targetList, EXPR_KIND_ORDER_BY, false /* no unknowns expected */, false /* allow SQL92 rules */);
 
     pstate->p_rtable = list_truncate(pstate->p_rtable, sv_rtable_length);
     pstate->p_relnamespace = sv_relnamespace;
@@ -2842,8 +3374,8 @@ static Query* transformSetOperationStmt(ParseState* pstate, SelectStmt* stmt)
                 parser_errposition(pstate, exprLocation((const Node*)list_nth(qry->targetList, tllen)))));
     }
 
-    qry->limitOffset = transformLimitClause(pstate, limitOffset, "OFFSET");
-    qry->limitCount = transformLimitClause(pstate, limitCount, "LIMIT");
+    qry->limitOffset = transformLimitClause(pstate, limitOffset, EXPR_KIND_OFFSET, "OFFSET");
+    qry->limitCount = transformLimitClause(pstate, limitCount, EXPR_KIND_LIMIT, "LIMIT");
 
     qry->rtable = pstate->p_rtable;
     qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
@@ -2853,6 +3385,7 @@ static Query* transformSetOperationStmt(ParseState* pstate, SelectStmt* stmt)
     if (pstate->p_hasWindowFuncs) {
         parseCheckWindowFuncs(pstate, qry);
     }
+    qry->hasTargetSRFs = pstate->p_hasTargetSRFs;
     qry->hasAggs = pstate->p_hasAggs;
 
     foreach (l, lockingClause) {
@@ -3059,8 +3592,17 @@ static Node* transformSetOperationTree(ParseState* pstate, SelectStmt* stmt, boo
             int32 rescoltypmod;
             Oid rescolcoll;
 
-            /* select common type, same as CASE et al */
-            rescoltype = select_common_type(pstate, list_make2(lcolnode, rcolnode), context, &bestexpr);
+            if (IsA(lcolnode, SetToDefault) && ((SetToDefault*)lcolnode)->lrchild_unknown && rcoltype != UNKNOWNOID) {
+                /* the type of lcolnode's l&r child must be unknown or NULL, and lcoltype must be text. so allow text cover to other type */
+                rescoltype = rcoltype;
+                bestexpr = rcolnode;
+            } else if (IsA(rcolnode, SetToDefault) && ((SetToDefault*)rcolnode)->lrchild_unknown && lcoltype != UNKNOWNOID) {
+                rescoltype = lcoltype;
+                bestexpr = lcolnode;
+            } else {
+                /* select common type, same as CASE et al */
+                rescoltype = select_common_type(pstate, list_make2(lcolnode, rcolnode), context, &bestexpr);
+            }
             bestlocation = exprLocation(bestexpr);
             /* if same type and same typmod, use typmod; else default */
             if (lcoltype == rcoltype && lcoltypmod == rcoltypmod) {
@@ -3169,6 +3711,11 @@ static Node* transformSetOperationTree(ParseState* pstate, SelectStmt* stmt, boo
                 rescolnode->typeMod = rescoltypmod;
                 rescolnode->collation = rescolcoll;
                 rescolnode->location = bestlocation;
+                rescolnode->lrchild_unknown = false;
+                if ((lcoltype == UNKNOWNOID || (IsA(ltle->expr, SetToDefault) && ((SetToDefault*)ltle->expr)->lrchild_unknown))
+                    && (rcoltype == UNKNOWNOID || (IsA(rtle->expr, SetToDefault) && ((SetToDefault*)rtle->expr)->lrchild_unknown))) {
+                    rescolnode->lrchild_unknown = true;
+                }
                 restle = makeTargetEntry((Expr*)rescolnode,
                     0, /* no need to set resno */
                     NULL,
@@ -3273,7 +3820,7 @@ void fixResTargetNameWithTableNameRef(Relation rd, RangeVar* rel, ResTarget* res
 
     /*
      * Here only meet set_clause which has two elements like a.b or test.b.
-     * So first keep forward-ompatibility behavior of old version, that results
+     * So first keep forward-compatibility behavior of old version, that results
      * if a is a composite type and also relname/alisename then we first handle it as
      * composite type.
      * Otherwise we handle it like a.b like relname/alisename, then a is a relname just
@@ -3313,6 +3860,138 @@ void fixResTargetListWithTableNameRef(Relation rd, RangeVar* rel, List* clause_l
     }
 }
 
+/* Merge the targetlists of multiple identical result relations into the one and change their rtindex. */
+static void MergeTargetList(List** targetLists, RangeTblEntry* rte1, int rtindex1,
+                            RangeTblEntry* rte2, int rtindex2)
+{
+    ListCell* l = NULL;
+
+    foreach (l, targetLists[rtindex2 - 1]) {
+        TargetEntry* tle = (TargetEntry*)lfirst(l);
+        tle->rtindex = (Index)rtindex1;
+        rte1->updatedCols = bms_add_member(rte1->updatedCols, tle->resno - FirstLowInvalidHeapAttributeNumber);
+        rte2->updatedCols = bms_del_member(rte2->updatedCols, tle->resno - FirstLowInvalidHeapAttributeNumber);
+    }
+    targetLists[rtindex1 - 1] = list_concat(targetLists[rtindex1 - 1], targetLists[rtindex2 - 1]);
+    targetLists[rtindex2 - 1] = NULL;
+}
+
+static void transformMultiTargetList(List* target_rangetblentry, List** targetLists)
+{
+    int rtindex1 = 1, rtindex2 = 1;
+    ListCell* l1;
+    ListCell* l2;
+
+    if (list_length(target_rangetblentry) <= 1) {
+        return;
+    }
+    foreach (l1, target_rangetblentry) {
+        RangeTblEntry* rte1 = (RangeTblEntry*)lfirst(l1);
+        rtindex2 = 0;
+
+        l2 = lnext(l1);
+        rtindex2 = rtindex1 + 1;
+        while (l2 != NULL) {
+            RangeTblEntry* rte2 = (RangeTblEntry*)lfirst(l2);
+            if (rte2->relid == rte1->relid) {
+                MergeTargetList(targetLists, rte1, rtindex1, rte2, rtindex2);
+            }
+            rtindex2++;
+            l2 = lnext(l2);
+        }
+        rtindex1++;
+    }
+}
+
+/*
+ * If a relation has no column updated in the resultRelations, it is redundant
+ * and remove it from the resultRelations.
+ */
+static List* remove_update_redundant_relation(List* resultRelations, List* target_rangetblentry)
+{
+    if (list_length(resultRelations) == 1) {
+        return resultRelations;
+    }
+    RangeTblEntry* target_rte;
+    ListCell* rte = list_head(target_rangetblentry);
+    ListCell* res = list_head(resultRelations);
+    ListCell* res_pre = NULL;
+    ListCell* res_next = NULL;
+
+    while (res != NULL) {
+        res_next = lnext(res);
+        target_rte = (RangeTblEntry*)lfirst(rte);
+        if (bms_is_empty(target_rte->updatedCols)) {
+            resultRelations = list_delete_cell(resultRelations, res, res_pre);
+        } else {
+            res_pre = res;
+        }
+
+        res = res_next;
+        rte = lnext(rte);
+    }
+    return resultRelations;
+}
+
+static void CheckUpdateRelation(Relation targetrel)
+{
+	// check column store relation distributed by replication
+    if (RelationIsColStore(targetrel) &&
+        targetrel->rd_locator_info &&
+        IsLocatorReplicated(targetrel->rd_locator_info->locatorType)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("replicated columnar table doesn't allow UPDATE")));
+    }
+
+#ifdef ENABLE_MULTIPLE_NODES
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
+#endif
+        if (RelationIsMatview(targetrel)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("Unsupported feature"),
+                            errdetail("Materialized view doesn't allow UPDATE")));
+        }
+#ifdef ENABLE_MULTIPLE_NODES
+    }
+#endif
+
+    // check update permission
+    if (((unsigned int)RelationGetInternalMask(targetrel) & INTERNAL_MASK_DUPDATE)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("internal relation doesn't allow UPDATE")));
+    }
+
+    // check if the target relation is being redistributed in read only mode
+    if (!u_sess->attr.attr_sql.enable_cluster_resize && targetrel != NULL &&
+        RelationInClusterResizingWriteErrorMode(targetrel)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+                errmsg("%s is redistributing, please retry later.", targetrel->rd_rel->relname.data)));
+    }
+}
+
+void UpdateParseCheck(ParseState *pstate, Node *qry)
+{
+    /*
+     * Top-level aggregates are simply disallowed in UPDATE, per spec. (From
+     * an implementation point of view, this is forced because the implicit
+     * ctid reference would otherwise be an ungrouped variable.)
+     */
+    if (pstate->p_hasAggs) {
+        ereport(ERROR, (errcode(ERRCODE_GROUPING_ERROR), errmsg("cannot use aggregate function in UPDATE"),
+                        parser_errposition(pstate, locate_agg_of_level(qry, 0))));
+    }
+    if (pstate->p_hasWindowFuncs) {
+        ereport(ERROR, (errcode(ERRCODE_WINDOWING_ERROR), errmsg("cannot use window function in UPDATE"),
+                        parser_errposition(pstate, locate_windowfunc(qry))));
+    }
+}
+
 /*
  * transformUpdateStmt -
  *	  transforms an update statement
@@ -3321,9 +4000,11 @@ static Query* transformUpdateStmt(ParseState* pstate, UpdateStmt* stmt)
 {
     Query* qry = makeNode(Query);
     Node* qual = NULL;
-
+    ParseNamespaceItem *nsitem = NULL;
     qry->commandType = CMD_UPDATE;
     pstate->p_is_insert = false;
+    ListCell* l;
+    pstate->p_has_ignore = stmt->hasIgnore;
 
     /* set io state for backend status for the thread, we will use it to check user space */
     pgstat_set_io_state(IOSTATE_READ);
@@ -3338,60 +4019,61 @@ static Query* transformUpdateStmt(ParseState* pstate, UpdateStmt* stmt)
         qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
     }
 
-    qry->resultRelation =
-        setTargetTable(pstate, stmt->relation, interpretInhOption(stmt->relation->inhOpt), true, ACL_UPDATE);
-
-    // check column store relation distributed by replication
-    if (pstate->p_target_relation != NULL && RelationIsColStore(pstate->p_target_relation) &&
-        pstate->p_target_relation->rd_locator_info &&
-        IsLocatorReplicated(pstate->p_target_relation->rd_locator_info->locatorType)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Un-support feature"),
-                errdetail("replicated columnar table doesn't allow UPDATE")));
+    if (list_length(stmt->relationClause) > 1 || !IsA(linitial(stmt->relationClause), RangeVar)) {
+        /* add all relations from relationClause to resultRelations. */
+        transformFromClause(pstate, stmt->relationClause, true, false, true);
+        qry->resultRelations = pstate->p_updateRelations;
+    } else {
+        qry->resultRelations = setTargetTables(pstate, stmt->relationClause, true, true, ACL_UPDATE);
     }
 
-#ifdef ENABLE_MULTIPLE_NODES
-    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
-#endif
-        if (pstate->p_target_relation != NULL && RelationIsMatview(pstate->p_target_relation)) {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("Unsupported feature"),
-                            errdetail("Materialized view doesn't allow UPDATE")));
+    /* non-supported IGNORE cases */
+    Relation rel = ((Relation)linitial2(pstate->p_target_relation));
+    if (pstate->p_has_ignore && rel != NULL) {
+        if (RelationIsColumnFormat(rel)) {
+            ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                             errmsg("IGNORE is not supported on UPDATE column orientated table."))));
         }
-#ifdef ENABLE_MULTIPLE_NODES
-    }
-#endif
-
-    // check update permission
-    if (pstate->p_target_relation != NULL &&
-        ((unsigned int)RelationGetInternalMask(pstate->p_target_relation) & INTERNAL_MASK_DUPDATE)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Un-support feature"),
-                errdetail("internal relation doesn't allow UPDATE")));
     }
 
-    // check if the target relation is being redistributed in read only mode
-    if (!u_sess->attr.attr_sql.enable_cluster_resize && pstate->p_target_relation != NULL &&
-        RelationInClusterResizingWriteErrorMode(pstate->p_target_relation)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-                errmsg("%s is redistributing, please retry later.", pstate->p_target_relation->rd_rel->relname.data)));
+    /* subqueries in FROM cannot access the result relation */
+    int nsitem_count = list_length(pstate->p_varnamespace);
+    foreach(l, pstate->p_varnamespace) {
+        nsitem = (ParseNamespaceItem *)lfirst(l);
+        nsitem->p_lateral_only = true;
     }
 
+    CheckUDRelations(pstate, stmt->sortClause, stmt->limitClause, stmt->returningList, false);
     /*
      * the FROM clause is non-standard SQL syntax. We used to be able to do
      * this with REPLACE in POSTQUEL so we keep the feature.
      */
     transformFromClause(pstate, stmt->fromClause);
 
-    qry->targetList = transformTargetList(pstate, stmt->targetList);
-    qual = transformWhereClause(pstate, stmt->whereClause, "WHERE");
+    qry->targetList = transformTargetList(pstate, stmt->targetList, EXPR_KIND_UPDATE_TARGET);
+    qual = transformWhereClause(pstate, stmt->whereClause, EXPR_KIND_WHERE, "WHERE");
+
+    /* remaining clauses can reference the result relation normally */
+    foreach (l, pstate->p_varnamespace) {
+        if (nsitem_count == 0) {
+            break;
+        }
+        nsitem = (ParseNamespaceItem *)lfirst(l);
+        nsitem->p_lateral_only = false;
+        nsitem_count--;
+    }
+
+    /*
+     * Now we are done with SELECT-like processing, and can get on with
+     * transforming the target list to match the UPDATE target columns.
+     */
+    qry->targetList = transformUpdateTargetList(pstate, qry->targetList, stmt->targetList, qry->resultRelations);
+    transformLimitSortClause(pstate, stmt, qry, false);
+
+    qry->resultRelations = remove_update_redundant_relation(qry->resultRelations, pstate->p_target_rangetblentry);
 
     qry->returningList = transformReturningList(pstate, stmt->returningList);
-    if (qry->returningList != NIL && RelationIsColStore(pstate->p_target_relation)) {
+    if (qry->returningList != NIL && RelationIsColStore(((Relation)linitial(pstate->p_target_relation)))) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("Un-support feature"),
@@ -3401,63 +4083,220 @@ static Query* transformUpdateStmt(ParseState* pstate, UpdateStmt* stmt)
     qry->rtable = pstate->p_rtable;
     qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
 
+    qry->hasTargetSRFs = pstate->p_hasTargetSRFs;
     qry->hasSubLinks = pstate->p_hasSubLinks;
 
-    /*
-     * Top-level aggregates are simply disallowed in UPDATE, per spec. (From
-     * an implementation point of view, this is forced because the implicit
-     * ctid reference would otherwise be an ungrouped variable.)
-     */
-    if (pstate->p_hasAggs) {
-        ereport(ERROR,
-            (errcode(ERRCODE_GROUPING_ERROR),
-                errmsg("cannot use aggregate function in UPDATE"),
-                parser_errposition(pstate, locate_agg_of_level((Node*)qry, 0))));
-    }
-    if (pstate->p_hasWindowFuncs) {
-        ereport(ERROR,
-            (errcode(ERRCODE_WINDOWING_ERROR),
-                errmsg("cannot use window function in UPDATE"),
-                parser_errposition(pstate, locate_windowfunc((Node*)qry))));
-    }
-
-    /*
-     * Now we are done with SELECT-like processing, and can get on with
-     * transforming the target list to match the UPDATE target columns.
-     */
-    qry->targetList = transformUpdateTargetList(pstate, qry->targetList, stmt->targetList, stmt->relation);
+    UpdateParseCheck(pstate, (Node *)qry);
 
     assign_query_collations(pstate, qry);
     qry->hintState = stmt->hintState;
+    qry->hasIgnore = stmt->hasIgnore;
 
     return qry;
+}
+
+char* checkUpdateResTargetName(Relation rd, RangeVar* rel, ResTarget* res, bool* matchRelname)
+{
+    char* resname = NULL;
+    AttrNumber attrnoIndName = InvalidAttrNumber;
+    AttrNumber attrnoResName = InvalidAttrNumber;
+    Oid attrtypeid = InvalidOid;
+    Oid typrelid = InvalidOid;
+
+    /* the length of indireciton can't less than 1 and the first item type must not be A_Indices */
+    if ((list_length(res->indirection) < 1) || IsA(linitial(res->indirection), A_Indices)) {
+        return res->name;
+    }
+
+    /* name must relname or aliasname */
+    if ((strcmp(rel->relname, res->name) != 0) &&
+        ((rel->alias == NULL) || (strcmp((rel->alias)->aliasname, res->name) != 0))) {
+        return res->name;
+    }
+
+    /*
+    * if meet set_clause like a.b.c = 1 then the indirection will exceed one,
+    * so treat first indirection as tablename/alisename like a in this ex.
+    */
+    resname = pstrdup(strVal(linitial(res->indirection)));
+    if (list_length(res->indirection) > 1) {
+        *matchRelname = true;
+        return resname;
+    }
+
+    /*
+    * Here only meet set_clause which has two elements like a.b or test.b.
+    * So first keep forward-compatibility behavior of old version, that results
+    * if a is a composite type and also relname/alisename then we first handle it as
+    * composite type.
+    * Otherwise we handle it like a.b like relname/alisename, then a is a relname just
+    * update set_clause over.
+    */
+    attrnoResName = attnameAttNum(rd, res->name, true);
+    attrnoIndName = attnameAttNum(rd, resname, true);
+
+    if (attrnoResName > 0) {
+        attrtypeid = attnumTypeId(rd, attrnoResName);
+        if (attrtypeid) {
+            typrelid = typeidTypeRelid(attrtypeid);
+            if (typrelid && ((get_attnum(typrelid, resname) != InvalidAttrNumber) || (attrnoIndName <= 0))) {
+                ereport(
+                    NOTICE, (errmsg("update field '%s' of column '%s', though it's ambiguous.", resname, res->name)));
+                return res->name;
+            }
+        }
+    }
+
+    *matchRelname = true;
+    return resname;
+}
+
+/* Find the attrno corresponding to ResTarget from target tables. */
+static int fixUpdateResTargetName(ParseState* pstate, List* resultRelations, ResTarget* res, int* rti,
+    Relation* rd, RangeTblEntry** rte)
+{
+    ListCell* l1;
+    ListCell* l2;
+    ListCell* l3;
+    ListCell* l4;
+    bool removeRelname = false, matchRelname = false;
+    char* resname = NULL;
+    char* resultResName = NULL;
+    int attrno, resultAttrno = InvalidAttrNumber;
+    bool isMatched = false;
+
+    forfour (l1, pstate->p_target_rangetblentry, l2, pstate->p_target_relation, l3, pstate->p_updateRangeVars,
+        l4, resultRelations) {
+        RangeTblEntry* target_rte = (RangeTblEntry*)lfirst(l1);
+        Relation targetrel = (Relation)lfirst(l2);
+        RangeVar* rangeVar = (RangeVar*)lfirst(l3);
+        int rtindex = lfirst_int(l4);
+        
+        resname = checkUpdateResTargetName(targetrel, rangeVar, res, &matchRelname);
+        attrno = attnameAttNum(targetrel, resname, true);
+        if (attrno != InvalidAttrNumber) {
+            /*
+             * If the targetlist matches more than once and when target contains a relname(matchRelname)
+             * is the same as before(removeRelname), report error.
+             */
+            if (isMatched == true && (matchRelname == removeRelname)) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_AMBIGUOUS_COLUMN),
+                        errmsg("column reference \"%s\" is ambiguous", res->name),
+                        parser_errposition(pstate, res->location)));
+            }
+            resultAttrno = attrno;
+            resultResName = resname;
+            *rti = rtindex;
+            *rd = targetrel;
+            *rte = target_rte;
+
+            isMatched = true;
+            /* Mark the target column as requiring update permissions */
+            target_rte->updatedCols = bms_add_member(target_rte->updatedCols,
+                                                     attrno - FirstLowInvalidHeapAttributeNumber);
+        }
+        if (matchRelname == true) {
+            removeRelname = true;
+        }
+    }
+
+    if (!isMatched) {
+        res->name = resname;
+        if (matchRelname) {
+            res->indirection = RemoveListCell(res->indirection, 1);
+        }
+        return InvalidAttrNumber;
+    }
+
+    if (removeRelname) {
+        res->name = resultResName;
+        res->indirection = RemoveListCell(res->indirection, 1);
+    }
+    return resultAttrno;
+}
+
+static void UndefinedColumnError(ParseState* pstate, ResTarget* origTarget, int targetRelationNum)
+{
+    if (!origTarget->indirection) {
+        if (targetRelationNum == 1) {
+            ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_COLUMN),
+                    errmsg("column \"%s\" of relation \"%s\" does not exist",
+                        origTarget->name,
+                        RelationGetRelationName((Relation)linitial(pstate->p_target_relation))),
+                    parser_errposition(pstate, origTarget->location)));
+        }
+        ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_COLUMN),
+                errmsg("column \"%s\" does not exist",
+                    origTarget->name),
+                parser_errposition(pstate, origTarget->location)));
+    } else {
+        char* resname = pstrdup((char*)(((Value*)lfirst(list_head(origTarget->indirection)))->val.str));
+        if (targetRelationNum == 1) {
+            ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_COLUMN),
+                    errmsg("column \"%s.%s\" of relation \"%s\" does not exist",
+                        origTarget->name,
+                        resname,
+                        RelationGetRelationName((Relation)linitial(pstate->p_target_relation))),
+                    parser_errposition(pstate, origTarget->location)));
+        }
+        ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_COLUMN),
+                errmsg("column \"%s.%s\" does not exist",
+                    origTarget->name,
+                    resname),
+                parser_errposition(pstate, origTarget->location)));
+    }
+}
+
+/*
+ * checkSRFInMultiUpdate
+ * Verify that a set-returning function is called in multiple-update and throw a error.
+ */
+static inline void checkSRFInMultiUpdate(Expr* expr, int targetRelationNum)
+{
+    if (targetRelationNum == 1)
+        return;
+  
+    if ((expr->type == T_FuncExpr) && ((FuncExpr*)expr)->funcretset == true) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-support feature"),
+                errdetail("set-returning functions are not allowed in multiple UPDATE")));
+    }
 }
 
 /*
  * transformUpdateTargetList -
  * handle SET clause in UPDATE/INSERT ... DUPLICATE KEY UPDATE
  */
-static List* transformUpdateTargetList(ParseState* pstate, List* qryTlist, List* origTlist, RangeVar* stmtrel)
+static List* transformUpdateTargetList(ParseState* pstate, List* qryTlist, List* origTlist, List* resultRelations)
 {
     List* tlist = NIL;
     RangeTblEntry* target_rte = NULL;
-    ListCell* orig_tl = NULL;
-    ListCell* tl = NULL;
+    ListCell* tl;
+    ListCell* orig_tl;
+    Relation targetrel = NULL;
+    int rtindex = 0;
+    int targetRelationNum = list_length(pstate->p_target_relation);
+    int rangeTableNum = list_length(pstate->p_rtable);
 
-    tlist = qryTlist;
+    List** new_tle = (List**)palloc0(rangeTableNum * sizeof(List*));
 
     /* Prepare to assign non-conflicting resnos to resjunk attributes */
-    if (pstate->p_next_resno <= pstate->p_target_relation->rd_rel->relnatts) {
-        pstate->p_next_resno = pstate->p_target_relation->rd_rel->relnatts + 1;
+    pstate->p_next_resno = 1;
+    foreach_cell (cell, pstate->p_target_relation) {
+        targetrel = (Relation)lfirst(cell);
+        pstate->p_next_resno += targetrel->rd_rel->relnatts;
     }
 
     /* Prepare non-junk columns for assignment to target table */
-    target_rte = pstate->p_target_rangetblentry;
-    orig_tl = list_head(origTlist);
-
-    foreach (tl, tlist) {
+    forboth (tl, qryTlist, orig_tl, origTlist) {
         TargetEntry* tle = (TargetEntry*)lfirst(tl);
-        ResTarget* origTarget = NULL;
+        ResTarget* origTarget = (ResTarget*)lfirst(orig_tl);
         int attrno;
 
         if (tle->resjunk) {
@@ -3472,51 +4311,33 @@ static List* transformUpdateTargetList(ParseState* pstate, List* qryTlist, List*
             continue;
         }
 
-        if (orig_tl == NULL) {
-            ereport(ERROR,
-                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmsg("UPDATE target count mismatch --- internal error")));
-        }
-
-        origTarget = (ResTarget*)lfirst(orig_tl);
-        Assert(IsA(origTarget, ResTarget));
-        if (stmtrel != NULL) {
-            fixResTargetNameWithTableNameRef(pstate->p_target_relation, stmtrel, origTarget);
-        }
-
-        attrno = attnameAttNum(pstate->p_target_relation, origTarget->name, true);
+        attrno = fixUpdateResTargetName(pstate, resultRelations, origTarget, &rtindex, &targetrel, &target_rte);
         if (attrno == InvalidAttrNumber) {
-            if (!origTarget->indirection) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_COLUMN),
-                        errmsg("column \"%s\" of relation \"%s\" does not exist",
-                            origTarget->name,
-                            RelationGetRelationName(pstate->p_target_relation)),
-                        parser_errposition(pstate, origTarget->location)));
-            } else {
-                char* resname = pstrdup((char*)(((Value*)lfirst(list_head(origTarget->indirection)))->val.str));
-                ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_COLUMN),
-                        errmsg("column \"%s.%s\" of relation \"%s\" does not exist",
-                            origTarget->name,
-                            resname,
-                            RelationGetRelationName(pstate->p_target_relation)),
-                        parser_errposition(pstate, origTarget->location)));
+            UndefinedColumnError(pstate, origTarget, targetRelationNum);
+        }
+        updateTargetListEntry(pstate, tle, origTarget->name, attrno, origTarget->indirection, origTarget->location,
+            targetrel, target_rte);
+        checkSRFInMultiUpdate(tle->expr, targetRelationNum);
+        tle->rtindex = rtindex;
+        new_tle[rtindex - 1] = lappend(new_tle[rtindex - 1], tle);
+    }
+    /*
+     * If there are actually the same result relations by different alias
+     * or synonym in multiple update, merge their targetLists.
+     */
+    transformMultiTargetList(pstate->p_target_rangetblentry, new_tle);
+
+    if (targetRelationNum == 1) {
+        int i = linitial_int(resultRelations);
+        tlist = new_tle[i - 1];
+    } else {
+        for (int i = 0; i < rangeTableNum; i++) {
+            if (new_tle[i]) {
+                tlist = list_concat(tlist, new_tle[i]);
             }
         }
-        updateTargetListEntry(pstate, tle, origTarget->name, attrno, origTarget->indirection, origTarget->location);
-
-        /* Mark the target column as requiring update permissions */
-        target_rte->updatedCols = bms_add_member(target_rte->updatedCols, attrno - FirstLowInvalidHeapAttributeNumber);
-
-        orig_tl = lnext(orig_tl);
     }
-    if (orig_tl != NULL) {
-        ereport(
-            ERROR, (errcode(ERRCODE_NOT_NULL_VIOLATION), errmsg("UPDATE target count mismatch --- internal error")));
-    }
-
-    setExtraUpdatedCols(pstate->p_target_rangetblentry, pstate->p_target_relation->rd_att);
-
+    pfree(new_tle);
     return tlist;
 }
 
@@ -3550,7 +4371,7 @@ static List* transformReturningList(ParseState* pstate, List* returningList)
     pstate->p_hasWindowFuncs = false;
 
     /* transform RETURNING identically to a SELECT targetlist */
-    rlist = transformTargetList(pstate, returningList);
+    rlist = transformTargetList(pstate, returningList, EXPR_KIND_RETURNING);
 
     /* check for disallowed stuff */
 
@@ -3671,6 +4492,7 @@ static Query* transformExplainStmt(ParseState* pstate, ExplainStmt* stmt)
 {
     Query* result = NULL;
 
+    t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(stmt->query);
     /* transform contained query, allowing SELECT INTO */
     stmt->query = (Node*)transformTopLevelStmt(pstate, stmt->query);
 
@@ -3713,6 +4535,38 @@ static Query* transformCreateTableAsStmt(ParseState* pstate, CreateTableAsStmt* 
 
     /* transform contained query */
     stmt->query = (Node*)transformStmt(pstate, stmt->query);
+
+    if (u_sess->attr.attr_sql.sql_compatibility == B_FORMAT) {
+        /* CREATE TABLE AS SELECT is not allowed with Foreign Key and Tablelike Clause*/
+        foreach (lc, stmt->into->tableElts) {
+            Node* node = (Node*)lfirst(lc);
+            if (IsA(node, ColumnDef)) {
+                ColumnDef* col = (ColumnDef*) node;
+                ListCell* cell = NULL;
+                foreach(cell, col->constraints){
+                    if (IsA(lfirst(cell), Constraint)) {
+                        Constraint* constraint = (Constraint*) lfirst(cell);
+                        if (constraint->contype == CONSTR_FOREIGN) {
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("CREATE TABLE AS SELECT is not allowed with Foreign Key")));
+                        }
+                    }
+                }
+            } else if (IsA(node, Constraint)) {
+                Constraint* constraint = (Constraint*) node;
+                if (constraint->contype == CONSTR_FOREIGN) {
+                    ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("CREATE TABLE AS SELECT is not allowed with Foreign Key")));
+                }
+            } else if (IsA(node, TableLikeClause)) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("CREATE TABLE AS SELECT is not allowed with Tablelike Clause")));
+            }
+        }
+    }
 
     /* if result type of new relation is unknown-type, then resolve as type TEXT */
     foreach (lc, ((Query*)stmt->query)->targetList) {
@@ -4018,7 +4872,7 @@ static void init_execdirect_utility_stmt(RemoteQuery* step, const char* statemen
 }
 
 /*
- * find agg functions which need add finalize funcion on sql statement in deparse_query
+ * find agg functions which need add finalize function on sql statement in deparse_query
  */
 static bool check_agg_in_execute_direct_query(Node* node, void* context)
 {
@@ -4271,6 +5125,29 @@ void CheckSelectLocking(Query* qry)
     }
 }
 
+static bool CheckViewBasedOnCstore(Relation targetrel)
+{
+    Assert(RelationIsView(targetrel));
+
+    Query* viewquery = get_view_query(targetrel);
+    ListCell* l = NULL;
+
+    foreach (l, viewquery->jointree->fromlist) {
+        RangeTblRef* rtr = (RangeTblRef*)lfirst(l);
+        RangeTblEntry* base_rte = rt_fetch(rtr->rtindex, viewquery->rtable);
+        Relation base_rel = try_relation_open(base_rte->relid, AccessShareLock);
+
+        if (RelationIsColStore(base_rel) || (RelationIsView(base_rel) && CheckViewBasedOnCstore(base_rel))) {
+            heap_close(base_rel, AccessShareLock);
+            return true;
+        }
+
+        heap_close(base_rel, AccessShareLock);
+    }
+
+    return false;
+}
+
 /*
  * Transform a FOR [KEY] UPDATE/SHARE clause
  *
@@ -4302,7 +5179,6 @@ static void transformLockingClause(ParseState* pstate, Query* qry, LockingClause
         lc->strength = lc->forUpdate ? LCS_FORUPDATE : LCS_FORSHARE;
     }
     allrels->strength = lc->strength;
-    allrels->noWait = lc->noWait;
     allrels->waitSec = lc->waitSec;
 
     /* The processing delay of the ProcSleep function is in milliseconds. Set the delay to int_max/1000. */
@@ -4316,6 +5192,7 @@ static void transformLockingClause(ParseState* pstate, Query* qry, LockingClause
                 erraction("Modify SQL statement according to the manual.")));
     }
 
+    allrels->waitPolicy = lc->waitPolicy;
 
     if (lockedRels == NIL) {
         /* all regular tables used in query */
@@ -4331,17 +5208,30 @@ static void transformLockingClause(ParseState* pstate, Query* qry, LockingClause
                         heap_close(rel, AccessShareLock);
                         ereport(ERROR,
                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                errmsg("SELECT FOR UPDATE/SHARE%s cannot be used with "
-                                       "column table \"%s\"", NOKEYUPDATE_KEYSHARE_ERRMSG, rte->eref->aliasname)));
+                                errmsg("SELECT FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE cannot be used with "
+                                       "column table \"%s\"", rte->eref->aliasname)));
+                    } else if (RelationIsView(rel) && CheckViewBasedOnCstore(rel)) {
+                        heap_close(rel, AccessShareLock);
+                        ereport(ERROR,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("SELECT FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE cannot be used with "
+                                       "view \"%s\" based on column table", rte->eref->aliasname)));
+                    } else {
+                        if (!RelationIsAstoreFormat(rel) && lc->waitPolicy == LockWaitSkip) {
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmsg("SELECT FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE with skip locked "
+                                        "only be used with AStore table \"%s\"", rte->eref->aliasname)));
+                        }
                     }
 
                     heap_close(rel, AccessShareLock);
 
-                    applyLockingClause(qry, i, lc->strength, lc->noWait, pushedDown, lc->waitSec);
+                    applyLockingClause(qry, i, lc->strength, lc->waitPolicy, pushedDown, lc->waitSec);
                     rte->requiredPerms |= ACL_SELECT_FOR_UPDATE;
                     break;
                 case RTE_SUBQUERY:
-                    applyLockingClause(qry, i, lc->strength, lc->noWait, pushedDown, lc->waitSec);
+                    applyLockingClause(qry, i, lc->strength, lc->waitPolicy, pushedDown, lc->waitSec);
 
                     /*
                      * FOR [KEY] UPDATE/SHARE of subquery is propagated to all of
@@ -4392,15 +5282,30 @@ static void transformLockingClause(ParseState* pstate, Query* qry, LockingClause
                                         errmsg("SELECT FOR UPDATE/SHARE%s cannot be used with column table \"%s\"",
                                                NOKEYUPDATE_KEYSHARE_ERRMSG, rte->eref->aliasname),
                                         parser_errposition(pstate, thisrel->location)));
+                            } else if (RelationIsView(rel) && CheckViewBasedOnCstore(rel)) {
+                                heap_close(rel, AccessShareLock);
+                                ereport(ERROR,
+                                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                        errmsg("SELECT FOR UPDATE/SHARE%s cannot be used with view \"%s\" based on"
+                                               " column table", NOKEYUPDATE_KEYSHARE_ERRMSG, rte->eref->aliasname),
+                                        parser_errposition(pstate, thisrel->location)));
+                            } else {
+                                if (!RelationIsAstoreFormat(rel) && lc->waitPolicy == LockWaitSkip) {
+                                    ereport(ERROR,
+                                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                            errmsg("SELECT FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE with skip locked "
+                                                "only be used with row table \"%s\"", rte->eref->aliasname),
+                                            parser_errposition(pstate, thisrel->location)));
+                                }
                             }
 
                             heap_close(rel, AccessShareLock);
-                            applyLockingClause(qry, i, lc->strength, lc->noWait, pushedDown,
+                            applyLockingClause(qry, i, lc->strength, lc->waitPolicy, pushedDown,
                                                lc->waitSec);
                             rte->requiredPerms |= ACL_SELECT_FOR_UPDATE;
                             break;
                         case RTE_SUBQUERY:
-                            applyLockingClause(qry, i, lc->strength, lc->noWait, pushedDown,
+                            applyLockingClause(qry, i, lc->strength, lc->waitPolicy, pushedDown,
                                                lc->waitSec);
                             /* see comment above */
                             transformLockingClause(pstate, rte->subquery, allrels, true);
@@ -4456,7 +5361,7 @@ static void transformLockingClause(ParseState* pstate, Query* qry, LockingClause
 /*
  * Record locking info for a single rangetable item
  */
-void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, bool noWait, bool pushedDown,
+void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, LockWaitPolicy waitPolicy, bool pushedDown,
                         int waitSec)
 {
     RowMarkClause* rc = NULL;
@@ -4474,16 +5379,21 @@ void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, 
          * shared and exclusive lock at the same time; it'll end up being
          * exclusive anyway.)
          *
-         * We also consider that NOWAIT wins if it's specified both ways. This
-         * is a bit more debatable but raising an error doesn't seem helpful.
-         * (Consider for instance SELECT FOR UPDATE NOWAIT from a view that
-         * internally contains a plain FOR UPDATE spec.)
+         * Similarly, if the same RTE is specified with more than one lock wait
+         * policy, consider that NOWAIT wins over SKIP LOCKED, which in turn
+         * wins over waiting for the lock (the default).  This is a bit more
+         * debatable but raising an error doesn't seem helpful.  (Consider for
+         * instance SELECT FOR UPDATE NOWAIT from a view that internally
+         * contains a plain FOR UPDATE spec.)  Having NOWAIT win over SKIP
+         * LOCKED is reasonable since the former throws an error in case of
+         * coming across a locked tuple, which may be undesirable in some cases
+         * but it seems better than silently returning inconsistent results.
          *
          * And of course pushedDown becomes false if any clause is explicit.
          */
         rc->strength = Max(rc->strength, strength);
         rc->forUpdate = rc->strength == LCS_FORUPDATE;
-        rc->noWait = rc->noWait || noWait;
+        rc->waitPolicy = Max(rc->waitPolicy, waitPolicy);
         rc->waitSec = Max(rc->waitSec, waitSec);
         rc->pushedDown = rc->pushedDown && pushedDown;
         return;
@@ -4494,7 +5404,7 @@ void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, 
     rc->rti = rtindex;
     rc->forUpdate = strength == LCS_FORUPDATE;
     rc->strength = strength;
-    rc->noWait = noWait;
+    rc->waitPolicy = waitPolicy;
     rc->waitSec = waitSec;
     rc->pushedDown = pushedDown;
     qry->rowMarks = lappend(qry->rowMarks, rc);
@@ -4677,7 +5587,7 @@ static void transformGroupConstToColumn(ParseState* pstate, Node* groupClause, L
                 }
 
                 long target_pos = intVal(val);
-                if (target_pos <= list_length(targetList)) {
+                if (target_pos > 0 && target_pos <= list_length(targetList)) {
                     TargetEntry* tle = (TargetEntry*)list_nth(targetList, target_pos - 1);
                     lfirst(lc) = copyObject(tle->expr);
 
@@ -4720,12 +5630,14 @@ static bool checkAllowedTableCombination(ParseState* pstate)
     }
 
     // Check target table for the type of storage
-    rte = pstate->p_target_rangetblentry;
-    if (rte && rte->rtekind == RTE_RELATION) {
-        if (rte->is_ustore) {
-            has_ustore = true;
-        } else {
-            has_else = true;
+    foreach(lc, pstate->p_target_rangetblentry) {
+        rte = (RangeTblEntry*)lfirst(lc);
+        if (rte && rte->rtekind == RTE_RELATION) {
+            if (rte->is_ustore) {
+                has_ustore = true;
+            } else {
+                has_else = true;
+            }
         }
     }
 

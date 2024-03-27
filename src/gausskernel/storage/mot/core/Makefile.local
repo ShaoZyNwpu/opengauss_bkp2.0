@@ -17,14 +17,13 @@
 #     Makefile for the MOT storage engine core components
 #
 # IDENTIFICATION
-#        src/gausskernel/storage/mot/core/Makefile.local
+#     src/gausskernel/storage/mot/core/Makefile.local
 #
 # ---------------------------------------------------------------------------------------
 
-UNDERPG ?= yes
+UNDER_ENVELOPE ?= yes
 SECURE ?= yes
 DEBUG ?= no
-MODE ?= PG
 REPLICA ?= no
 ISOLATION ?= no
 CC=g++
@@ -33,7 +32,7 @@ CFLAGS ?=
 subdir=src/gausskernel/storage/mot/core
 top_builddir ?= ../../../../../
 
-ifeq ($(UNDERPG),yes)
+ifeq ($(UNDER_ENVELOPE),yes)
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/src/gausskernel/common.mk
 endif
@@ -89,7 +88,7 @@ ifeq ($(HUGE_PAGES_ON), yes)
         CFLAGS += -DHUGE_PAGES_ON=1
 endif
 #Debug and release flag definition
-ifeq ($(UNDERPG), no)
+ifeq ($(UNDER_ENVELOPE), no)
 ifeq ($(BUILD),Release)
     ifeq ($(PLATFORM_ARCH),aarch64)
 	CFLAGS += -O2 -DNDEBUG -D_FORTIFY_SOURCE=2
@@ -98,6 +97,10 @@ ifeq ($(BUILD),Release)
     endif
 else
 #	CFLAGS += -O0 -DDEBUG
+	CFLAGS += -DDEBUG
+endif
+else
+ifeq ($(enable_cassert), yes)
 	CFLAGS += -DDEBUG
 endif
 endif
@@ -115,12 +118,10 @@ CFLAGS += -L$(MASSTREE_HOME)/lib -lmasstree
 # For Masstree index tests
 CFLAGS += -DMASSTREE
 
-CFLAGS += -D$(MODE)
 # disable exceptions
 CFLAGS += -fno-exceptions
 # disable RTTI usage
 CFLAGS += -fno-rtti
-# TODO: enable
 #CFLAGS += -Woverloaded-virtual
 CFLAGS += -Wnon-virtual-dtor
 ifeq ($(ISOLATION), yes)
@@ -155,7 +156,7 @@ OBJS := $(CPPS)
 OBJS := $(patsubst %.cpp, $(OBJ_DIR)/%.o, $(OBJS))
 DEPS := $(OBJS:.o=.d)
 
-ifeq ($(UNDERPG), yes)
+ifeq ($(UNDER_ENVELOPE), yes)
 	ifeq ($(SECURE), yes)	
 		CFLAGS += -DMOT_SECURE
 		LDFLAGS += -L$(LIBOBS_LIB_PATH) -l$(SECURE_C_CHECK)
@@ -181,7 +182,7 @@ objfiles.txt: Makefile $(OBJS)
 	@touch $@
 
 $(OBJ_DIR)/%.o: %.cpp
-	@$(CC) -c $(CFLAGS) $(CPPFLAGS) -MMD -MP -MF"$(patsubst %.o,%.d,$@)" -MT"$@" -o $@ $<
+	@$(CC) -c $(CFLAGS) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF"$(patsubst %.o,%.d,$@)" -MT"$@" -o $@ $<
 
 .PHONY: clean
 
@@ -193,6 +194,8 @@ buildrepo:
 
 .PHONY: show
 show:
+	@echo "UNDER_ENVELOPE=${UNDER_ENVELOPE}"
+	@echo "enable_cassert=${enable_cassert}"
 	@echo "CC_VERSION=${CC_VERSION}"
 	@echo "CC=${CC}"
 	@echo
@@ -203,6 +206,8 @@ show:
 	@echo "SRC_DIRS=${SRC_DIRS}"
 	@echo
 	@echo "CPPFLAGS=${CPPFLAGS}"
+	@echo
+	@echo "CXXFLAGS=${CXXFLAGS}"
 	@echo
 	@echo "CFLAGS=${CFLAGS}"
 	@echo

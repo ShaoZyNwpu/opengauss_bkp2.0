@@ -15,19 +15,16 @@
  *
  * -------------------------------------------------------------------------
  */
-#include "access/dfs/dfs_query.h" /* stay here, otherwise compile errors */
 #include "postgres.h"
 #include <math.h>
 #include "access/clog.h"
 #include "access/cstore_rewrite.h"
-#include "access/dfs/dfs_insert.h"
 #include "access/genam.h"
 #include "access/tableam.h"
 #include "access/heapam.h"
 #include "access/reloptions.h"
 #include "access/transam.h"
 #include "access/xact.h"
-#include "catalog/dfsstore_ctlg.h"
 #include "catalog/index.h"
 #include "catalog/pgxc_class.h"
 #include "catalog/storage.h"
@@ -36,6 +33,7 @@
 #include "commands/cluster.h"
 #include "commands/tablespace.h"
 #include "commands/verify.h"
+#include "vecexecutor/vecnodes.h"
 #include "utils/acl.h"
 #include "utils/fmgroids.h"
 #include "utils/snapmgr.h"
@@ -377,7 +375,7 @@ void DoGlobalVerifyDatabase(VacuumStmt* stmt, const char* queryString, bool sent
         PushActiveSnapshot(GetTransactionSnapshot());
 
         Relation rel = relation_open(relid, AccessShareLock);
-        if (RelationIsForeignTable(rel) || RelationIsStream(rel) || RelationIsDfsStore(rel)) {
+        if (RelationIsForeignTable(rel) || RelationIsStream(rel)) {
             ereport(LOG, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("The hdfs table does not support verify.")));
             canVerify = false;
         }
@@ -626,7 +624,7 @@ static void CheckVerifyRelation(Relation rel)
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Non-table objects do not support verify.")));
     }
 
-    if (RelationIsForeignTable(rel) || RelationIsStream(rel) || RelationIsDfsStore(rel)) {
+    if (RelationIsForeignTable(rel) || RelationIsStream(rel)) {
         relation_close(rel, AccessShareLock);
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("The hdfs table does not support verify.")));
     }
@@ -765,7 +763,7 @@ static void DoGlobalVerifyRowRel(VacuumStmt* stmt, Oid relid, bool isDatabase)
     if (!isDatabase) {
         if (stmt->relation->partitionname != NULL) {
             /* check the partition relation */
-            Oid partOid = partitionNameGetPartitionOid(relid,
+            Oid partOid = PartitionNameGetPartitionOid(relid,
                 stmt->relation->partitionname,
                 PART_OBJ_TYPE_TABLE_PARTITION,
                 AccessShareLock,
@@ -847,7 +845,7 @@ static void DoGlobalVerifyColRel(VacuumStmt* stmt, Oid relid, bool isDatabase)
     if (!isDatabase) {
         if (stmt->relation->partitionname != NULL) {
             /* check the partition relation */
-            Oid partOid = partitionNameGetPartitionOid(relid,
+            Oid partOid = PartitionNameGetPartitionOid(relid,
                 stmt->relation->partitionname,
                 PART_OBJ_TYPE_TABLE_PARTITION,
                 AccessShareLock,
@@ -1279,6 +1277,15 @@ static bool VerifyRowRelFast(Relation rel, VerifyDesc* checkCudesc)
         /* If we got a cancel signal during the copy of the data, quit */
         CHECK_FOR_INTERRUPTS();
         SMGR_READ_STATUS rdStatus = smgrread(src, forkNum, blkno, buf);
+        /* For DMS , try to read from buffer in case the data is not flused to disk */
+        if (rdStatus == SMGR_RD_CRC_ERROR && ENABLE_DMS) {
+            Buffer buffer = ReadBufferWithoutRelcache(src->smgr_rnode.node, forkNum, blkno, RBM_NORMAL, NULL, NULL);
+            if (buffer != InvalidBuffer) {
+                ReleaseBuffer(buffer);
+                continue;
+            }
+        }
+
         /* check the page & crc */
         if (rdStatus == SMGR_RD_CRC_ERROR) {
             // Retry 5 times to increase program reliability.
@@ -1288,6 +1295,16 @@ static bool VerifyRowRelFast(Relation rel, VerifyDesc* checkCudesc)
                 rdStatus = smgrread(src, forkNum, blkno, buf);
             }
             if (rdStatus != SMGR_RD_CRC_ERROR) {
+                /* Ustrore white-box verification adapt to analyze verify. */
+                if (rdStatus == SMGR_RD_OK) {
+                    UPageVerifyParams verifyParam;
+                    Page page = (char *) buf;
+                    if (unlikely(ConstructUstoreVerifyParam(USTORE_VERIFY_MOD_UPAGE, USTORE_VERIFY_FAST,
+                        (char *) &verifyParam, rel, page, InvalidBlockNumber, NULL, NULL, InvalidXLogRecPtr, NULL,
+                        NULL, true))) {
+                        ExecuteUstoreVerify(USTORE_VERIFY_MOD_UPAGE, (char *) &verifyParam);
+                    }
+                }
                 continue;
             }
 
@@ -1312,6 +1329,15 @@ static bool VerifyRowRelFast(Relation rel, VerifyDesc* checkCudesc)
                         handle_in_client(true)));
             /* Add the wye page to the global variable and try to fix it. */
             addGlobalRepairBadBlockStat(src->smgr_rnode, forkNum, blkno);
+        } else if (rdStatus == SMGR_RD_OK) {
+            /* Ustrore white-box verification adapt to analyze verify. */
+            UPageVerifyParams verifyParam;
+            Page page = (char *) buf;
+            if (unlikely(ConstructUstoreVerifyParam(USTORE_VERIFY_MOD_UPAGE, USTORE_VERIFY_FAST,
+                (char *) &verifyParam, rel, page, InvalidBlockNumber, NULL, NULL, InvalidXLogRecPtr, NULL,
+                NULL, true))) {
+                ExecuteUstoreVerify(USTORE_VERIFY_MOD_UPAGE, (char *) &verifyParam);
+            }
         }
     }
 
@@ -1343,6 +1369,9 @@ static bool VerifyRowRelComplete(Relation rel, VerifyDesc* checkCudesc)
     ForkNumber forkNum = MAIN_FORKNUM;
     bool isValidRelationPageFast = true;
     bool isValidRelationPageComplete = true;
+    SMgrRelation smgrRel = NULL;
+    BlockNumber nblocks = 0;
+    char *buf = NULL;
 
     /* create column table verify memory context */
     MemoryContext verifyRowMemContext = AllocSetContextCreate(CurrentMemoryContext,
@@ -1355,6 +1384,26 @@ static bool VerifyRowRelComplete(Relation rel, VerifyDesc* checkCudesc)
 
     /* check page header and crc first */
     isValidRelationPageFast = VerifyRowRelFast(rel, checkCudesc);
+
+    /* check all tuples of ustore relation. */
+    buf = (char*)palloc(BLCKSZ);
+    RelationOpenSmgr(rel);
+    smgrRel = rel->rd_smgr;
+    nblocks = smgrnblocks(smgrRel, forkNum);
+    for (BlockNumber blkno = 0; blkno < nblocks; blkno++) {
+        CHECK_FOR_INTERRUPTS();
+        SMGR_READ_STATUS rdStatus = smgrread(smgrRel, forkNum, blkno, buf);
+        if (rdStatus == SMGR_RD_OK) {
+            UPageVerifyParams verifyParam;
+            Page page = (char *) buf;
+            if (unlikely(ConstructUstoreVerifyParam(USTORE_VERIFY_MOD_UPAGE, USTORE_VERIFY_COMPLETE,
+                (char *) &verifyParam, rel, page, InvalidBlockNumber, NULL, NULL, InvalidXLogRecPtr, NULL, NULL,
+                true))) {
+                ExecuteUstoreVerify(USTORE_VERIFY_MOD_UPAGE, (char *) &verifyParam);
+            }
+        }
+    }
+    pfree_ext(buf);
 
     if (rel->rd_rel->relkind == RELKIND_RELATION || rel->rd_rel->relkind == RELKIND_TOASTVALUE) {
         /* check the tuple */
@@ -1646,7 +1695,7 @@ static void VerifyColRelFast(Relation rel)
     TupleDesc tupleDesc;
     CStoreScanDesc scan = NULL;
     int16* colIdx = NULL;
-    Form_pg_attribute* attrs = NULL;
+    FormData_pg_attribute* attrs = NULL;
     int attno = rel->rd_rel->relnatts;
     int col = 0;
 
@@ -1668,7 +1717,7 @@ static void VerifyColRelFast(Relation rel)
     colIdx = (int16*)palloc0(sizeof(int16) * tupleDesc->natts);
     attrs = tupleDesc->attrs;
     for (int i = 0; i < tupleDesc->natts; i++) {
-        colIdx[i] = attrs[i]->attnum;
+        colIdx[i] = attrs[i].attnum;
     }
 
     scan = CStoreBeginScan(rel, tupleDesc->natts, colIdx, GetActiveSnapshot(), true);
@@ -1737,7 +1786,7 @@ static void VerifyColRelComplete(Relation rel)
     VerifyColRelFast(rel);
 
     int attrNum = rel->rd_att->natts;
-    Form_pg_attribute* attrs = rel->rd_att->attrs;
+    FormData_pg_attribute* attrs = rel->rd_att->attrs;
     CUDesc cuDesc;
     CU* cuPtr = NULL;
     BlockNumber cuId = FirstCUID + 1;
@@ -1756,7 +1805,7 @@ static void VerifyColRelComplete(Relation rel)
     int slotId = CACHE_BLOCK_INVALID_IDX;
 
     for (int i = 0; i < attrNum; i++) {
-        colIdx[i] = attrs[i]->attnum;
+        colIdx[i] = attrs[i].attnum;
     }
 
     CStoreScanDesc cstoreScanDesc = CStoreBeginScan(rel, attrNum, colIdx, GetActiveSnapshot(), false);
@@ -1767,7 +1816,7 @@ static void VerifyColRelComplete(Relation rel)
     for (cuId = FirstCUID + 1; cuId <= maxCuId; cuId++) {
         for (int col = 0; col < attrNum; col++) {
             /* skip dropped column */
-            if (attrs[col]->attisdropped) {
+            if (attrs[col].attisdropped) {
                 continue;
             }
 
@@ -1775,7 +1824,7 @@ static void VerifyColRelComplete(Relation rel)
             if (found && cuDesc.cu_size != 0) {
                 PG_TRY();
                 {
-                    cuPtr = cstore->GetCUData(&cuDesc, col, attrs[col]->attlen, slotId);
+                    cuPtr = cstore->GetCUData(&cuDesc, col, attrs[col].attlen, slotId);
                     if (IsValidCacheSlotID(slotId)) {
                         CUCache->UnPinDataBlock(slotId);
                     }

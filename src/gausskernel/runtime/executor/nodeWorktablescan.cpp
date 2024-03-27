@@ -20,6 +20,7 @@
 #include "executor/node/nodeRecursiveunion.h"
 #include "executor/node/nodeWorktablescan.h"
 
+static TupleTableSlot* ExecWorkTableScan(PlanState* node);
 static TupleTableSlot* WorkTableScanNext(WorkTableScanState* node);
 
 /* ----------------------------------------------------------------
@@ -127,8 +128,9 @@ static bool WorkTableScanRecheck(WorkTableScanState* node, TupleTableSlot* slot)
  * access method functions.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecWorkTableScan(WorkTableScanState* node)
+static TupleTableSlot* ExecWorkTableScan(PlanState* state)
 {
+    WorkTableScanState* node = castNode(WorkTableScanState, state);
     /*
      * On the first call, find the ancestor RecursiveUnion's state via the
      * Param slot reserved for it.	(We can't do this during node init because
@@ -234,6 +236,7 @@ WorkTableScanState* ExecInitWorkTableScan(WorkTableScan* node, EState* estate, i
     scan_state->ss.ps.plan = (Plan*)node;
     scan_state->ss.ps.state = estate;
     scan_state->rustate = NULL; /* we'll set this later */
+    scan_state->ss.ps.ExecProcNode = ExecWorkTableScan;
 
     /*
      * Miscellaneous initialization
@@ -257,7 +260,7 @@ WorkTableScanState* ExecInitWorkTableScan(WorkTableScan* node, EState* estate, i
     /*
      * Initialize result tuple type, but not yet projection info.
      */
-    ExecAssignResultTypeFromTL(&scan_state->ss.ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&scan_state->ss.ps);
 
     scan_state->ss.ps.ps_TupFromTlist = false;
 

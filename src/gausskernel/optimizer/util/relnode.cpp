@@ -27,6 +27,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
+#include "optimizer/tlist.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "optimizer/streamplan.h"
@@ -169,10 +170,13 @@ RelOptInfo* build_simple_rel(PlannerInfo* root, int relid, RelOptKind reloptkind
     rel->isPartitionedTable = rte->ispartrel;
     rel->partflag = PARTITION_NONE;
     rel->rows = 0;
-    rel->width = 0;
     rel->encodedwidth = 0;
     rel->encodednum = 0;
-    rel->reltargetlist = NIL;
+    rel->reltarget = create_empty_pathtarget();
+    rel->reltarget->exprs = NIL;
+    rel->reltarget->cost.startup = 0;
+    rel->reltarget->cost.per_tuple = 0;
+    rel->reltarget->width = 0;
     rel->alternatives = NIL;
     rel->base_rel = NULL;
     rel->pathlist = NIL;
@@ -201,8 +205,13 @@ RelOptInfo* build_simple_rel(PlannerInfo* root, int relid, RelOptKind reloptkind
     rel->subplan = NULL;
     rel->subroot = NULL;
     rel->subplan_params = NIL;
+    rel->serverid = InvalidOid;
+    rel->userid = rte->checkAsUser;
+    rel->useridiscurrent = false;
     rel->fdwroutine = NULL;
     rel->fdw_private = NULL;
+    rel->unique_for_rels = NIL;
+    rel->non_unique_for_rels = NIL;
     rel->baserestrictinfo = NIL;
     rel->baserestrictcost.startup = 0;
     rel->baserestrictcost.per_tuple = 0;
@@ -212,6 +221,15 @@ RelOptInfo* build_simple_rel(PlannerInfo* root, int relid, RelOptKind reloptkind
     rel->varratio = NIL;
 #ifdef STREAMPLAN
     if (rel->rtekind == RTE_RELATION) {
+#ifndef ENABLE_MULTIPLE_NODES
+        if (IS_STREAM_PLAN && get_rel_persistence(rte->relid) == RELPERSISTENCE_GLOBAL_TEMP) {
+            errno_t sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                NOTPLANSHIPPING_LENGTH,
+                "global template table not support stream operator.");
+            securec_check_ss_c(sprintf_rc, "\0", "\0");
+            mark_stream_unsupport();
+        }
+#endif
         rel->locator_type = GetLocatorType(rte->relid);
         rel->distribute_keys = build_baserel_distributekey(rte, relid);
         rel->rangelistOid = (IsLocatorDistributedBySlice(rel->locator_type)) ? rte->relid : InvalidOid;
@@ -338,6 +356,16 @@ RelOptInfo* build_simple_rel(PlannerInfo* root, int relid, RelOptKind reloptkind
     return rel;
 }
 
+bool contain_foreign_table(PlannerInfo *root)
+{
+    for (int i = 1; i < root->simple_rel_array_size; ++i) {
+        if (root->simple_rte_array[i]->relkind == 'f') {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * find_base_rel
  *	  Find a base or other relation entry, which must already exist.
@@ -346,6 +374,10 @@ RelOptInfo* find_base_rel(PlannerInfo* root, int relid)
 {
     RelOptInfo* rel = NULL;
 
+    if (relid <= 0 && contain_foreign_table(root)) {
+        ereport(ERROR,
+                (errmodule(MOD_OPT), errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE), errmsg("unavailable relid: 0")));
+    }
     AssertEreport(relid > 0, MOD_OPT, "Expected positive relid, run into exception.");
 
     if (relid < root->simple_rel_array_size) {
@@ -439,6 +471,45 @@ RelOptInfo* find_join_rel(PlannerInfo* root, Relids relids)
     }
 
     return NULL;
+}
+
+/*
+ * set_foreign_rel_properties
+ * 		Set up foreign-join fields if outer and inner relation are foreign
+ * 		tables (or joins) belonging to the same server and assigned to the same
+ * 		user to check access permissions as.
+ *
+ * In addition to an exact match of userid, we allow the case where one side
+ * has zero userid (implying current user) and the other side has explicit
+ * userid that happens to equal the current user; but in that case, pushdown of
+ * the join is only valid for the current user.  The useridiscurrent field
+ * records whether we had to make such an assumption for this join or any
+ * sub-join.
+ *
+ * Otherwise these fields are left invalid, so GetForeignJoinPaths will not be
+ * called for the join relation.
+ *
+ */
+static void set_foreign_rel_properties(RelOptInfo *joinrel, RelOptInfo *outer_rel, RelOptInfo *inner_rel)
+{
+    if (OidIsValid(outer_rel->serverid) && inner_rel->serverid == outer_rel->serverid) {
+        if (inner_rel->userid == outer_rel->userid) {
+            joinrel->serverid = outer_rel->serverid;
+            joinrel->userid = outer_rel->userid;
+            joinrel->useridiscurrent = outer_rel->useridiscurrent || inner_rel->useridiscurrent;
+            joinrel->fdwroutine = outer_rel->fdwroutine;
+        } else if (!OidIsValid(inner_rel->userid) && outer_rel->userid == GetUserId()) {
+            joinrel->serverid = outer_rel->serverid;
+            joinrel->userid = outer_rel->userid;
+            joinrel->useridiscurrent = true;
+            joinrel->fdwroutine = outer_rel->fdwroutine;
+        } else if (!OidIsValid(outer_rel->userid) && inner_rel->userid == GetUserId()) {
+            joinrel->serverid = outer_rel->serverid;
+            joinrel->userid = inner_rel->userid;
+            joinrel->useridiscurrent = true;
+            joinrel->fdwroutine = outer_rel->fdwroutine;
+        }
+    }
 }
 
 void remove_join_rel(PlannerInfo *root, RelOptInfo *rel)
@@ -575,10 +646,13 @@ RelOptInfo* build_join_rel(PlannerInfo* root, Relids joinrelids, RelOptInfo* out
     joinrel->isPartitionedTable = false;
     joinrel->partflag = PARTITION_NONE;
     joinrel->rows = 0;
-    joinrel->width = 0;
     joinrel->encodedwidth = 0;
     joinrel->encodednum = 0;
-    joinrel->reltargetlist = NIL;
+    joinrel->reltarget = create_empty_pathtarget();
+    joinrel->reltarget->exprs = NIL;
+    joinrel->reltarget->cost.startup = 0;
+    joinrel->reltarget->cost.per_tuple = 0;
+    joinrel->reltarget->width = 0;
     joinrel->pathlist = NIL;
     joinrel->ppilist = NIL;
     joinrel->cheapest_gather_path = NULL;
@@ -610,6 +684,8 @@ RelOptInfo* build_join_rel(PlannerInfo* root, Relids joinrelids, RelOptInfo* out
     joinrel->subplan_params = NIL;
     joinrel->fdwroutine = NULL;
     joinrel->fdw_private = NULL;
+    joinrel->unique_for_rels = NIL;
+    joinrel->non_unique_for_rels = NIL;
     joinrel->baserestrictinfo = NIL;
     joinrel->baserestrictcost.startup = 0;
     joinrel->baserestrictcost.per_tuple = 0;
@@ -617,10 +693,14 @@ RelOptInfo* build_join_rel(PlannerInfo* root, Relids joinrelids, RelOptInfo* out
     joinrel->joininfo = NIL;
     joinrel->has_eclass_joins = false;
     joinrel->varratio = NIL;
-    if (IsLocatorReplicated(inner_rel->locator_type) && IsLocatorReplicated(outer_rel->locator_type))
+    if (IsLocatorReplicated(inner_rel->locator_type) && IsLocatorReplicated(outer_rel->locator_type)) {
         joinrel->locator_type = LOCATOR_TYPE_REPLICATED;
-    else
+    } else {
         joinrel->locator_type = LOCATOR_TYPE_NONE;
+    }
+
+    /* Compute information relevant to the foreign relations. */
+    set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
 
     /*
      * Create a new tlist containing just the vars that need to be output from
@@ -632,7 +712,7 @@ RelOptInfo* build_join_rel(PlannerInfo* root, Relids joinrelids, RelOptInfo* out
      */
     build_joinrel_tlist(root, joinrel, outer_rel);
     build_joinrel_tlist(root, joinrel, inner_rel);
-    add_placeholders_to_joinrel(root, joinrel);
+    add_placeholders_to_joinrel(root, joinrel, outer_rel, inner_rel);
 
     /*
      * Construct restrict and join clause lists for the new joinrel. (The
@@ -711,7 +791,7 @@ static void build_joinrel_tlist(PlannerInfo* root, RelOptInfo* joinrel, const Re
     Relids relids = joinrel->relids;
     ListCell* vars = NULL;
 
-    foreach (vars, input_rel->reltargetlist) {
+    foreach (vars, input_rel->reltarget->exprs) {
         Var *var = (Var *) lfirst(vars);
         RelOptInfo* baserel = NULL;
         int ndx;
@@ -728,7 +808,7 @@ static void build_joinrel_tlist(PlannerInfo* root, RelOptInfo* joinrel, const Re
          * whole-row Var with a ConvertRowtypeExpr atop it.
          */
         if (!IsA(var, Var))
-            elog(ERROR, "unexpected node type in reltargetlist: %d",
+            elog(ERROR, "unexpected node type in rel targetlist: %d",
                  (int) nodeTag(var));
 
 
@@ -742,8 +822,8 @@ static void build_joinrel_tlist(PlannerInfo* root, RelOptInfo* joinrel, const Re
         ndx = var->varattno - baserel->min_attr;
         if (bms_nonempty_difference(baserel->attr_needed[ndx], relids)) {
             /* Yup, add it to the output */
-            joinrel->reltargetlist = lappend(joinrel->reltargetlist, var);
-            joinrel->width += baserel->attr_widths[ndx];
+            joinrel->reltarget->exprs = lappend(joinrel->reltarget->exprs, var);
+            joinrel->reltarget->width += baserel->attr_widths[ndx];
             if (root->glob->vectorized) {
                 joinrel->encodedwidth += columnar_get_col_width(exprType((Node *)var), baserel->attr_widths[ndx]);
                 joinrel->encodednum++;

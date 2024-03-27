@@ -341,7 +341,8 @@ CREATE VIEW pg_catalog.pg_gtt_attached_pids WITH (security_barrier) AS
  SELECT n.nspname AS schemaname,
     c.relname AS tablename,
     c.oid AS relid,
-    array(select pid from pg_catalog.pg_gtt_attached_pid(c.oid)) AS pids
+    array(select pid from pg_catalog.pg_gtt_attached_pid(c.oid)) AS pids,
+    array(select sessionid from pg_catalog.pg_gtt_attached_pid(c.oid)) AS sessionids
  FROM
      pg_class c
      LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -687,6 +688,19 @@ FROM
 	JOIN pg_namespace nsp ON l.classoid = nsp.tableoid AND l.objoid = nsp.oid
 WHERE
 	l.objsubid = 0
+UNION ALL
+SELECT
+    l.objoid, l.classoid, l.objsubid,
+    'event trigger'::text AS objtype,
+    NULL::oid AS objnamespace,
+    quote_ident(evt.evtname) AS objname,
+    l.provider, l.label
+FROM
+    pg_seclabel l
+    JOIN pg_event_trigger evt ON l.classoid = evt.tableoid
+        AND l.objoid = evt.oid
+WHERE
+    l.objsubid = 0
 UNION ALL
 SELECT
 	l.objoid, l.classoid, 0::int4 AS objsubid,
@@ -1672,11 +1686,11 @@ BEGIN
                       ON T.tid = S.threadid
                    )
                    SELECT * from SM
-                   UNION
+                   UNION ALL
                    SELECT 
                      Ssessid AS sessid, sesstype, contextname, level, parent, totalsize, freesize, usedsize
                    FROM TM WHERE Ssessid IS NOT NULL
-                   UNION
+                   UNION ALL
                    SELECT
                      Tsessid AS sessid, sesstype, contextname, level, parent, totalsize, freesize, usedsize
                    FROM TM WHERE Ssessid IS NULL;';
@@ -1753,7 +1767,8 @@ CREATE VIEW pg_replication_slots AS
             L.xmin,
             L.catalog_xmin,
             L.restart_lsn,
-            L.dummy_standby
+            L.dummy_standby,
+            L.confirmed_flush
     FROM pg_catalog.pg_get_replication_slots() AS L
             LEFT JOIN pg_database D ON (L.datoid = D.oid);
 
@@ -2184,18 +2199,18 @@ LANGUAGE SQL IMMUTABLE STRICT NOT FENCED;
 CREATE CAST (INTERVAL AS VARCHAR2) WITH FUNCTION pg_catalog.TO_VARCHAR2(INTERVAL) AS IMPLICIT;
 
 /* char,varchar2 to interval */
-CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(BPCHAR)
+CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(BPCHAR, int)
 RETURNS INTERVAL
-AS $$  select pg_catalog.interval_in(pg_catalog.bpcharout($1), 0::Oid, -1) $$
+AS $$  select pg_catalog.interval_in(pg_catalog.bpcharout($1), 0::Oid, $2) $$
 LANGUAGE SQL IMMUTABLE STRICT NOT FENCED;
 
-CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2)
+CREATE OR REPLACE FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2, int)
 RETURNS INTERVAL
-AS $$  select pg_catalog.interval_in(pg_catalog.varcharout($1), 0::Oid, -1) $$
+AS $$  select pg_catalog.interval_in(pg_catalog.varcharout($1), 0::Oid, $2) $$
 LANGUAGE SQL IMMUTABLE STRICT NOT FENCED;
 
-CREATE CAST (BPCHAR AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(BPCHAR) AS IMPLICIT;
-CREATE CAST (VARCHAR2 AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2) AS IMPLICIT;
+CREATE CAST (BPCHAR AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(BPCHAR, int) AS IMPLICIT;
+CREATE CAST (VARCHAR2 AS INTERVAL) WITH FUNCTION pg_catalog.TO_INTERVAL(VARCHAR2, int) AS IMPLICIT;
 
 /* raw to varchar2 */
 CREATE CAST (RAW AS VARCHAR2) WITH FUNCTION pg_catalog.rawtohex(RAW) AS IMPLICIT;
@@ -3471,7 +3486,8 @@ CREATE unlogged table statement_history(
     lwlock_wait_time bigint,
     details bytea,
     is_slow_sql bool,
-    trace_id text
+    trace_id text,
+    advise text
 );
 REVOKE ALL on table pg_catalog.statement_history FROM public;
 create index statement_history_time_idx on pg_catalog.statement_history USING btree (start_time, is_slow_sql);
@@ -3552,6 +3568,7 @@ CREATE VIEW pg_stat_subscription AS
             su.oid AS subid,
             su.subname,
             st.pid,
+            st.relid,
             st.received_lsn,
             st.last_msg_send_time,
             st.last_msg_receipt_time,

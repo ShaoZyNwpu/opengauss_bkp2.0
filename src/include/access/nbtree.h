@@ -113,6 +113,7 @@ typedef UBTPageOpaqueData* UBTPageOpaque;
 #define BTP_SPLIT_END (1 << 5)   /* rightmost page of split group */
 #define BTP_HAS_GARBAGE (1 << 6) /* page has LP_DEAD tuples */
 #define BTP_INCOMPLETE_SPLIT (1 << 7)	/* right sibling's downlink is missing */
+#define BTP_VACUUM_DELETING (1 << 8)    /* vacuum worker is deleting this page */
 
 /*
  * The max allowed value of a cycle ID is a bit less than 64K.	This is
@@ -219,7 +220,8 @@ typedef struct BTMetaPageData {
 #define P_ISHALFDEAD(opaque) ((opaque)->btpo_flags & BTP_HALF_DEAD)
 #define P_IGNORE(opaque) ((opaque)->btpo_flags & (BTP_DELETED | BTP_HALF_DEAD))
 #define P_HAS_GARBAGE(opaque) ((opaque)->btpo_flags & BTP_HAS_GARBAGE)
-#define P_INCOMPLETE_SPLIT(opaque)	((opaque)->btpo_flags & BTP_INCOMPLETE_SPLIT)
+#define P_INCOMPLETE_SPLIT(opaque) ((opaque)->btpo_flags & BTP_INCOMPLETE_SPLIT)
+#define P_VACUUM_DELETING(opaque) ((opaque)->btpo_flags & BTP_VACUUM_DELETING)
 
 /*
  *	Lehman and Yao's algorithm requires a ``high key'' on every non-rightmost
@@ -767,6 +769,8 @@ typedef struct BTScanOpaqueData {
     IndexInfo* indexInfo;
     EState* fakeEstate;
 
+    bool isPageInfoLogged;
+
     /*
      * If the marked position is on the same page as current position, we
      * don't use markPos, but just keep the marked itemIndex in markItemIndex
@@ -900,6 +904,8 @@ typedef struct BTCheckElement {
     ScanKey itupScanKey;
     OffsetNumber offset;
     int indnkeyatts;
+    bool useFastPath;
+    BlockNumber targetBlock;
 } BTCheckElement;
 
 /*
@@ -1061,6 +1067,33 @@ extern Datum btbulkdelete(PG_FUNCTION_ARGS);
 extern Datum btvacuumcleanup(PG_FUNCTION_ARGS);
 extern Datum btcanreturn(PG_FUNCTION_ARGS);
 extern Datum btoptions(PG_FUNCTION_ARGS);
+
+extern inline IndexBuildResult *btbuild_internal(Relation heap, Relation index, IndexInfo *index_info);
+
+extern inline void btbuildempty_internal(Relation index);
+
+extern inline bool btinsert_internal(Relation rel, Datum *values, const bool *isnull, ItemPointer ht_ctid, Relation heapRel, IndexUniqueCheck checkUnique);
+
+extern inline IndexBulkDeleteResult *btbulkdelete_internal(IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, const void *callback_state);
+
+extern inline IndexBulkDeleteResult *btvacuumcleanup_internal(IndexVacuumInfo *info, IndexBulkDeleteResult *stats);
+
+extern inline bool btcanreturn_internal();
+
+extern inline IndexScanDesc btbeginscan_internal(Relation rel, int nkeys, int norderbys);
+
+extern inline void btrescan_internal(IndexScanDesc scan, ScanKey scankey);
+
+extern inline int64 btgetbitmap_internal(IndexScanDesc scan, TIDBitmap *tbm);
+
+extern inline void btendscan_internal(IndexScanDesc scan);
+
+extern inline void btmarkpos_internal(IndexScanDesc scan);
+
+extern inline void btrestrpos_internal(IndexScanDesc scan);
+
+extern inline IndexBuildResult *btmerge_internal(Relation dstIdxRel, List *srcIdxRelScans, List *srcPartMergeOffsets);
+
 /*
  * this is the interface of merge 2 or more index for btree index
  * we also have similar interfaces for other kind of indexes, like hash/gist/gin
@@ -1154,7 +1187,7 @@ extern void _bt_leafbuild(BTSpool* btspool, BTSpool* spool2);
 extern void _bt_buildadd(BTWriteState* wstate, BTPageState* state, IndexTuple itup);
 extern void _bt_uppershutdown(BTWriteState* wstate, BTPageState* state);
 BTPageState* _bt_pagestate(BTWriteState* wstate, uint32 level);
-extern bool _index_tuple_compare(TupleDesc tupdes, ScanKey indexScanKey, int keysz, IndexTuple itup, IndexTuple itup2);
+extern bool _bt_index_tuple_compare(TupleDesc tupdes, ScanKey indexScanKey, int keysz, IndexTuple itup, IndexTuple itup2);
 extern List* insert_ordered_index(List* list, TupleDesc tupdes, ScanKey indexScanKey, int keysz, IndexTuple itup,
     BlockNumber heapModifiedOffset, IndexScanDesc srcIdxRelScan);
 extern uint64 uniter_next(pg_atomic_uint64 *curiter, uint32 cycle0, uint32 cycle1);

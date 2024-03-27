@@ -216,8 +216,12 @@ extern void set_disable_conn_mode(void);
     ((port)->cmdline_options != NULL && strstr((port)->cmdline_options, "remotetype=coordinator") != NULL)
 #else
 #define IsConnPortFromCoord(port) false
+extern bool get_addr_from_socket(int sock, struct sockaddr *saddr);
+extern int get_ip_port_from_addr(char* sock_ip, int* port, struct sockaddr saddr);
 #endif
 
+const char *GetSSServerMode(ServerMode mode);
+bool SSIsServerModeReadOnly();
 bool IsFromLocalAddr(Port* port);
 extern bool IsMatchSocketAddr(const struct sockaddr* sock_addr, int compare_port);
 extern bool IsHAPort(Port* port);
@@ -228,7 +232,7 @@ extern void startup_die(SIGNAL_ARGS);
 extern void PortInitialize(Port* port, knl_thread_arg* arg);
 extern void PreClientAuthorize();
 extern int ClientConnInitilize(Port* port);
-extern void CheckClientIp(Port* port);
+extern bool CheckClientIp(Port* port);
 extern Backend* GetBackend(int slot);
 extern Backend* AssignFreeBackEnd(int slot);
 extern long PostmasterRandom(void);
@@ -244,4 +248,10 @@ extern bool PMstateIsRun(void);
 extern ServerMode GetHaShmemMode(void);
 extern void InitProcessAndShareMemory();
 extern void InitShmemForDcfCallBack();
+extern void ShutdownForDRSwitchover(void);
+extern void InitMemoryLogDirectory();
+extern void InitShmemForDmsCallBack();
+extern void SignalTermAllBackEnd();
+extern void SSRestartFailoverPromote();
+extern void SIGBUS_handler(SIGNAL_ARGS);
 #endif /* _POSTMASTER_H */

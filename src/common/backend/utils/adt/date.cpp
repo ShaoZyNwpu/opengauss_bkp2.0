@@ -18,6 +18,7 @@
 
 #include <limits.h>
 #include <float.h>
+#include <ctype.h>
 
 #include "access/hash.h"
 #include "commands/copy.h"
@@ -50,6 +51,7 @@ static int timetz2tm(TimeTzADT* time, struct pg_tm* tm, fsec_t* fsec, int* tzp);
 static int tm2time(struct pg_tm* tm, fsec_t fsec, TimeADT* result);
 static int tm2timetz(struct pg_tm* tm, fsec_t fsec, int tz, TimeTzADT* result);
 static void AdjustTimeForTypmod(TimeADT* time, int32 typmod);
+static int getStartingDigits(char* str);
 
 /* common code for timetypmodin and timetztypmodin */
 static int32 anytime_typmodin(bool istz, ArrayType* ta)
@@ -102,6 +104,26 @@ static char* anytime_typmodout(bool istz, int32 typmod)
     return res;
 }
 
+/*
+ * Get starting digits of input string and return as int
+ *
+ * If the first character is not digit, return -1. NOTICE that if the first character is '+' or '-',
+ * it will consider it as invalid digit. So handle starting '+' nad '-' before using this function.
+ */
+static int getStartingDigits(char* str)
+{
+    int digitnum = 0;
+    long trunc_val = 0;
+    while (isdigit((unsigned char)*str)) {
+        trunc_val = trunc_val * 10 + (*str++ - '0');
+        digitnum++;
+        if (trunc_val > PG_INT32_MAX) {
+            return PG_INT32_MAX;
+        }
+    }
+    return digitnum == 0 ? -1 : trunc_val;
+}
+
 /*****************************************************************************
  *	 Date ADT
  *****************************************************************************/
@@ -142,8 +164,13 @@ Datum date_in(PG_FUNCTION_ARGS)
         dterr = ParseDateTime(str, workbuf, sizeof(workbuf), field, ftype, MAXDATEFIELDS, &nf);
         if (dterr == 0)
             dterr = DecodeDateTime(field, ftype, nf, &dtype, tm, &fsec, &tzp);
-        if (dterr != 0)
-            DateTimeParseError(dterr, str, "date");
+        if (dterr != 0) {
+            DateTimeParseError(dterr, str, "date", fcinfo->can_ignore);
+            /*
+             * if reporting warning in DateTimeParseError, return 1970-01-01
+             */
+            PG_RETURN_DATEADT(UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE);
+        }
 
         switch (dtype) {
             case DTK_DATE:
@@ -1078,7 +1105,7 @@ Datum time_in(PG_FUNCTION_ARGS)
     int nf;
     int dterr;
     char workbuf[MAXDATELEN + 1];
-    char* field[MAXDATEFIELDS];
+    char* field[MAXDATEFIELDS] = {0};
     int dtype;
     int ftype[MAXDATEFIELDS];
     char* time_fmt = NULL;
@@ -1101,8 +1128,25 @@ Datum time_in(PG_FUNCTION_ARGS)
         dterr = ParseDateTime(str, workbuf, sizeof(workbuf), field, ftype, MAXDATEFIELDS, &nf);
         if (dterr == 0)
             dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, &fsec, &tz);
-        if (dterr != 0)
-            DateTimeParseError(dterr, str, "time");
+        if (dterr != 0) {
+            DateTimeParseError(dterr, str, "time", fcinfo->can_ignore);
+            /*
+             * can_ignore == true means hint string "ignore_error" used. warning report instead of error.
+             * then we will return 00:00:xx if the first 1 or 2 character is lower than 60, otherwise return 00:00:00
+             */
+            char* field_str = field[0];
+            if (field_str == NULL) {
+                PG_RETURN_TIMEADT(0);
+            }
+            if (*field_str == '+') {
+                field_str++;
+            }
+            int trunc_val = getStartingDigits(field_str);
+            if (trunc_val < 0 || trunc_val >= 60) {
+                PG_RETURN_TIMEADT(0);
+            }
+            PG_RETURN_TIMEADT(trunc_val * 1000 * 1000);
+        }
     }
 
     /*
@@ -1829,15 +1873,33 @@ Datum timetz_in(PG_FUNCTION_ARGS)
     int nf;
     int dterr;
     char workbuf[MAXDATELEN + 1];
-    char* field[MAXDATEFIELDS];
+    char* field[MAXDATEFIELDS] = {0};
     int dtype;
     int ftype[MAXDATEFIELDS];
 
     dterr = ParseDateTime(str, workbuf, sizeof(workbuf), field, ftype, MAXDATEFIELDS, &nf);
     if (dterr == 0)
         dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, &fsec, &tz);
-    if (dterr != 0)
-        DateTimeParseError(dterr, str, "time with time zone");
+    if (dterr != 0) {
+        DateTimeParseError(dterr, str, "time with time zone", fcinfo->can_ignore);
+        /*
+         * can_ignore == true means hint string "ignore_error" used. warning report instead of error.
+         * then we will return 00:00:xx if the first 1 or 2 character is lower than 60, otherwise return 00:00:00
+         */
+        char* field_str = field[0];
+        if (field_str == NULL) {
+            tm->tm_sec = 0;
+        } else {
+            if (*field_str == '+') {
+                field_str++;
+            }
+            int trunc_val = getStartingDigits(field_str);
+            tm->tm_sec = (trunc_val < 0 || trunc_val >= 60) ? 0 : trunc_val;
+        }
+        tm->tm_hour = 0;
+        tm->tm_min = 0;
+        fsec = 0;
+    }
 
     result = (TimeTzADT*)palloc(sizeof(TimeTzADT));
     tm2timetz(tm, fsec, tz, result);

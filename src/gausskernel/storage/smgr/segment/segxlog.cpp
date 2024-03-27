@@ -533,7 +533,7 @@ void move_extent_flush_buffer(XLogMoveExtent *xlog_data)
             BlockNumber new_seg_blockno = xlog_data->new_extent + i;
 
             BufferDesc *buf_desc = BufferGetBufferDescriptor(buffer);
-            if (buf_desc->seg_blockno == old_seg_blockno) {
+            if (buf_desc->extra->seg_blockno == old_seg_blockno) {
                 uint32 buf_state = LockBufHdr(buf_desc);
                 if (buf_state & BM_DIRTY) {
                     /* spin-lock should be released before IO */
@@ -558,7 +558,7 @@ void move_extent_flush_buffer(XLogMoveExtent *xlog_data)
                 }
             } else {
                 /* Get here only because standby read after we modifiy the segment head */
-                SegmentCheck(buf_desc->seg_blockno == new_seg_blockno);
+                SegmentCheck(buf_desc->extra->seg_blockno == new_seg_blockno);
                 UnpinBuffer(buf_desc, true);
             }
         }
@@ -768,7 +768,8 @@ static void redo_space_drop(XLogReaderState *record)
 
 void seg_redo_new_page_copy_and_flush(BufferTag *tag, char *data, XLogRecPtr lsn)
 {
-    char page[BLCKSZ];
+    char page[BLCKSZ] __attribute__((__aligned__(ALIGNOF_BUFFER))) = {0};
+
     errno_t er = memcpy_s(page, BLCKSZ, data, BLCKSZ);
     securec_check(er, "\0", "\0");
 
@@ -779,20 +780,25 @@ void seg_redo_new_page_copy_and_flush(BufferTag *tag, char *data, XLogRecPtr lsn
         update_max_page_flush_lsn(lsn, t_thrd.proc_cxt.MyProcPid, false);
     }
 
-    bool flush_old_file = false;
-    uint32 pos = seg_dw_single_flush_without_buffer(*tag, (Block)page, &flush_old_file);
-    t_thrd.proc->dw_pos = pos;
-    t_thrd.proc->flush_new_dw = !flush_old_file;
-
-    SegSpace *spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false);
-    SegmentCheck(spc != NULL);
-    seg_physical_write(spc, tag->rnode, tag->forkNum, tag->blockNum, page, true);
-    if (flush_old_file) {
-        g_instance.dw_single_cxt.recovery_buf.single_flush_state[pos] = true;
+    if (dw_enabled() && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 0) {
+        bool flush_old_file = false;
+        uint16 pos = seg_dw_single_flush_without_buffer(*tag, (Block)page, &flush_old_file);
+        t_thrd.proc->dw_pos = pos;
+        t_thrd.proc->flush_new_dw = !flush_old_file;
+        SegSpace *spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false);
+        SegmentCheck(spc != NULL);
+        seg_physical_write(spc, tag->rnode, tag->forkNum, tag->blockNum, page, true);
+        if (flush_old_file) {
+            g_instance.dw_single_cxt.recovery_buf.single_flush_state[pos] = true;
+        } else {
+            g_instance.dw_single_cxt.single_flush_state[pos] = true;
+        }
+        t_thrd.proc->dw_pos = -1;
     } else {
-        g_instance.dw_single_cxt.single_flush_state[pos] = true;
+        SegSpace *spc = spc_open(tag->rnode.spcNode, tag->rnode.dbNode, false);
+        SegmentCheck(spc != NULL);
+        seg_physical_write(spc, tag->rnode, tag->forkNum, tag->blockNum, page, true);
     }
-    t_thrd.proc->dw_pos = -1;
 }
 
 

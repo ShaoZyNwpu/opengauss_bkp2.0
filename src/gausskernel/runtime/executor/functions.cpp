@@ -389,7 +389,7 @@ static Node* sql_fn_post_column_ref(ParseState* p_state, ColumnRef* c_ref, Node*
          * ParseFuncOrColumn will return NULL, and we'll fail back at the
          * caller.
          */
-        param = ParseFuncOrColumn(p_state, list_make1(sub_field), list_make1(param), NULL, c_ref->location);
+        param = ParseFuncOrColumn(p_state, list_make1(sub_field), list_make1(param), p_state->p_last_srf, NULL, c_ref->location);
     }
 
     return param;
@@ -424,7 +424,7 @@ static Node* sql_fn_make_param(SQLFunctionParseInfoPtr p_info, int param_no, int
     param->paramtypmod = -1;
     param->paramcollid = get_typcollation(param->paramtype);
     param->location = location;
-    param->tableOfIndexType = InvalidOid;
+    param->tableOfIndexTypeList = NULL;
 
     /*
      * If we have a function input collation, allow it to override the
@@ -589,6 +589,7 @@ static void init_sql_fcache(FmgrInfo* finfo, Oid collation, bool lazy_eval_ok)
     ListCell* lc = NULL;
     Datum tmp;
     bool is_null = false;
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
 
     /*
      * Create memory context that holds all the SQLFunctionCache data.	It
@@ -704,6 +705,7 @@ static void init_sql_fcache(FmgrInfo* finfo, Oid collation, bool lazy_eval_ok)
     foreach (lc, raw_parsetree_list) {
         Node* parsetree = (Node*)lfirst(lc);
         List* queryTree_sublist = NIL;
+        t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(parsetree);
 
         queryTree_sublist =
             pg_analyze_and_rewrite_params(parsetree, fcache->src, (ParserSetupHook)sql_fn_parser_setup, fcache->pinfo);
@@ -751,6 +753,7 @@ static void init_sql_fcache(FmgrInfo* finfo, Oid collation, bool lazy_eval_ok)
     /* Mark fcache with time of creation to show it's valid */
     fcache->lxid = t_thrd.proc->lxid;
     fcache->subxid = GetCurrentSubTransactionId();
+    t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
 
     ReleaseSysCache(procedure_tuple);
 
@@ -828,15 +831,19 @@ static bool postquel_getnext(execution_state* es, SQLFunctionCachePtr fcache)
 
     if (es->qd->utilitystmt) {
         /* ProcessUtility needs the PlannedStmt for DECLARE CURSOR */
-        ProcessUtility((es->qd->plannedstmt ? (Node*)es->qd->plannedstmt : es->qd->utilitystmt),
-            fcache->src,
-            es->qd->params,
-            false, /* not top level */
+        processutility_context proutility_cxt;
+        proutility_cxt.parse_tree = (es->qd->plannedstmt ? (Node*)es->qd->plannedstmt : es->qd->utilitystmt);
+        proutility_cxt.query_string = fcache->src;
+        proutility_cxt.readOnlyTree = false;
+        proutility_cxt.params = es->qd->params;
+        proutility_cxt.is_top_level = false;  /* not top level */
+        ProcessUtility(&proutility_cxt,
             es->qd->dest,
 #ifdef PGXC
             false,
 #endif /* PGXC */
-            NULL);
+            NULL,
+            PROCESS_UTILITY_QUERY);
         result = true; /* never stops early */
     } else {
         /* Run regular commands to completion unless lazyEval */
@@ -948,6 +955,8 @@ static void postquel_sub_params(SQLFunctionCachePtr fcache, FunctionCallInfo fci
             param_li->parserSetup = NULL;
             param_li->parserSetupArg = NULL;
             param_li->params_need_process = false;
+            param_li->uParamInfo = DEFUALT_INFO;
+            param_li->params_lazy_bind = false;
             param_li->numParams = nargs;
             fcache->paramLI = param_li;
         } else {
@@ -1046,6 +1055,7 @@ Datum fmgr_sql(PG_FUNCTION_ARGS)
     bool old_running_in_fmgr = t_thrd.codegen_cxt.g_runningInFmgr;
     t_thrd.codegen_cxt.g_runningInFmgr = true;
     bool need_snapshot = !ActiveSnapshotSet();
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
 
 #ifdef ENABLE_MULTIPLE_NODES
     bool outer_is_stream = false;
@@ -1059,6 +1069,8 @@ Datum fmgr_sql(PG_FUNCTION_ARGS)
         u_sess->opt_cxt.is_stream_support = true;
     }
 #else
+    bool outer_is_stream = u_sess->opt_cxt.is_stream;
+    bool outer_is_stream_support = u_sess->opt_cxt.is_stream_support;
     int outerDop = u_sess->opt_cxt.query_dop;
     u_sess->opt_cxt.query_dop = 1;
 #endif
@@ -1203,6 +1215,7 @@ Datum fmgr_sql(PG_FUNCTION_ARGS)
             pushed_snapshot = true;
         }
 
+        t_thrd.postgres_cxt.cur_command_tag = es->qd->operation == CMD_SELECT ? T_SelectStmt : T_CreateStmt;
         completed = postquel_getnext(es, fcache);
         /*
          * If we ran the command to completion, we can shut it down now. Any
@@ -1263,8 +1276,8 @@ Datum fmgr_sql(PG_FUNCTION_ARGS)
 
         if (IsClientLogicType(fcache->rettype)) {
             for (int i = 0; i < rsi->expectedDesc->natts; i++) {
-                if (IsClientLogicType(rsi->expectedDesc->attrs[i]->atttypid)) {
-                    rsi->expectedDesc->attrs[i]->atttypmod = fcache->rettype_orig;
+                if (IsClientLogicType(rsi->expectedDesc->attrs[i].atttypid)) {
+                    rsi->expectedDesc->attrs[i].atttypmod = fcache->rettype_orig;
                 }
             }
         }
@@ -1398,9 +1411,12 @@ Datum fmgr_sql(PG_FUNCTION_ARGS)
         u_sess->opt_cxt.is_stream_support = outer_is_stream_support;
     }
 #else
+    u_sess->opt_cxt.is_stream = outer_is_stream;
+    u_sess->opt_cxt.is_stream_support = outer_is_stream_support;
     u_sess->opt_cxt.query_dop = outerDop;
 #endif
     t_thrd.codegen_cxt.g_runningInFmgr = old_running_in_fmgr;
+    t_thrd.postgres_cxt.cur_command_tag  = old_node_tag;
     return result;
 }
 
@@ -1522,6 +1538,28 @@ static void ShutdownSQLFunction(Datum arg)
 }
 
 /*
+ * check_if_exist_client_logic_type()
+ * check if return value of a list exist client encryption type. if exist, report error.
+ */
+void check_if_exist_client_logic_type(List *tlist, Oid ret_type)
+{
+    if (ret_type != RECORDOID) {
+        return;
+    }
+    ListCell* lc = NULL;
+    foreach (lc, tlist) {
+        TargetEntry* tle = (TargetEntry*)lfirst(lc);
+        Oid tle_type = exprType((Node*)tle->expr);
+        if (IsClientLogicType(tle_type)) {
+            ereport(ERROR, (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
+                errmsg("Un-support to RETURN RECORD or RETURN SETOF RECORD when return client encryption columns."),
+                errhint("You possibly can use RETURN table(column_name column_type[,...]) instead of RETURN RECORD.")));
+        }
+    }
+    return;
+}
+
+/*
  * check_sql_fn_retval() -- check return value of a list of sql parse trees.
  *
  * The return value of a sql function is the value returned by the last
@@ -1574,7 +1612,6 @@ bool check_sql_fn_retval(Oid func_id, Oid ret_type, List* query_tree_list, bool*
     Oid res_type;
     ListCell* lc = NULL;
     bool gs_encrypted_proc_was_created = false;
-    AssertArg(!IsPolymorphicType(ret_type));
     CommandCounterIncrement();
     if (modify_target_list != NULL)
         *modify_target_list = false; /* initialize for no change */
@@ -1684,7 +1721,7 @@ bool check_sql_fn_retval(Oid func_id, Oid ret_type, List* query_tree_list, bool*
 
         /* Set up junk filter if needed */
         if (junk_filter != NULL)
-            *junk_filter = ExecInitJunkFilter(tlist, false, NULL);
+            *junk_filter = ExecInitJunkFilter(tlist, false, NULL, TableAmHeap);
     } else if (fn_type == TYPTYPE_COMPOSITE || ret_type == RECORDOID) {
         /* Returns a rowtype */
         TupleDesc tup_desc;
@@ -1722,19 +1759,20 @@ bool check_sql_fn_retval(Oid func_id, Oid ret_type, List* query_tree_list, bool*
                 }
                 /* Set up junk filter if needed */
                 if (junk_filter != NULL)
-                    *junk_filter = ExecInitJunkFilter(tlist, false, NULL);
+                    *junk_filter = ExecInitJunkFilter(tlist, false, NULL, TableAmHeap);
                 return false; /* NOT returning whole tuple */
             }
         }
 
         /* Is the rowtype fixed, or determined only at runtime? */
         if (get_func_result_type(func_id, NULL, &tup_desc) != TYPEFUNC_COMPOSITE) {
+            check_if_exist_client_logic_type(tlist, ret_type);
             /*
              * Assume we are returning the whole tuple. Crosschecking against
              * what the caller expects will happen at runtime.
              */
             if (junk_filter != NULL)
-                *junk_filter = ExecInitJunkFilter(tlist, false, NULL);
+                *junk_filter = ExecInitJunkFilter(tlist, false, NULL, TableAmHeap);
             return true;
         }
         Assert(tup_desc);
@@ -1770,7 +1808,7 @@ bool check_sql_fn_retval(Oid func_id, Oid ret_type, List* query_tree_list, bool*
                         (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
                             errmsg("return type mismatch in function declared to return %s", format_type_be(ret_type)),
                             errdetail("Final statement returns too many columns.")));
-                attr = tup_desc->attrs[col_index - 1];
+                attr = &tup_desc->attrs[col_index - 1];
                 if (attr->attisdropped && modify_target_list) {
                     Expr* null_expr = NULL;
 
@@ -1823,7 +1861,7 @@ bool check_sql_fn_retval(Oid func_id, Oid ret_type, List* query_tree_list, bool*
 
                     for (int j = 0; j < col_index - 1; j++) {
                         all_types_orig[j] = -1;
-                        all_types[j] = ObjectIdGetDatum(tup_desc->attrs[j]->atttypid);
+                        all_types[j] = ObjectIdGetDatum(tup_desc->attrs[j].atttypid);
                     }
                 }
                 all_types_orig[col_index - 1] = ObjectIdGetDatum(att_type);
@@ -1861,7 +1899,7 @@ bool check_sql_fn_retval(Oid func_id, Oid ret_type, List* query_tree_list, bool*
 
         /* remaining columns in tupdesc had better all be dropped */
         for (col_index++; col_index <= tup_natts; col_index++) {
-            if (!tup_desc->attrs[col_index - 1]->attisdropped)
+            if (!tup_desc->attrs[col_index - 1].attisdropped)
                 ereport(ERROR,
                     (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
                         errmsg("return type mismatch in function declared to return %s", format_type_be(ret_type)),

@@ -107,6 +107,8 @@ static Node *pull_up_sublinks_targetlist(PlannerInfo *root, Node *node,
                               Node *jtnode, Relids *relids,
                               Node **newTargetList,
                               Node *whereQuals);
+static void pull_up_sublinks_having(PlannerInfo* root);
+static bool is_safe_pull_up_sublink_having(PlannerInfo* root);
 
 #ifndef ENABLE_MULTIPLE_NODES
 static bool find_rownum_in_quals(PlannerInfo *root);
@@ -229,6 +231,13 @@ void pull_up_sublinks(PlannerInfo* root)
     }
 #endif
 
+    /* Always pull up HAVING before generic pull ups */
+    if (ENABLE_SUBLINK_PULLUP_ENHANCED() &&
+        permit_from_rewrite_hint(root, SUBLINK_PULLUP_ENHANCED) &&
+        is_safe_pull_up_sublink_having(root)) {
+            pull_up_sublinks_having(root);
+    }
+
     /* Begin recursion through the jointree */
     jtnode = pull_up_sublinks_jointree_recurse(root, (Node*)root->parse->jointree, &relids);
 
@@ -236,6 +245,7 @@ void pull_up_sublinks(PlannerInfo* root)
      * root->parse->jointree must always be a FromExpr, so insert a dummy one
      * if we got a bare RangeTblRef or JoinExpr out of the recursion.
      */
+    FromExpr* old_jointree = root->parse->jointree;
     if (IsA(jtnode, FromExpr))
         root->parse->jointree = (FromExpr*)jtnode;
     else
@@ -265,6 +275,9 @@ void pull_up_sublinks(PlannerInfo* root)
             root->parse->jointree = makeFromExpr(list_make1(jtnode), NULL);
     }
 
+    if (!equal(root->parse->jointree, old_jointree)) {
+        root->parse->is_from_sublink_rewrite = true;
+    }
 }
 
 /*
@@ -702,6 +715,11 @@ static Node* pull_up_sublinks_qual_recurse(PlannerInfo* root, Node* node, Node**
             return (Node*)make_andclause(newclauses);
     }
 
+    /* stop if not support pull up expr sublinks */
+    if (DISABLE_SUBLINK_PULLUP_EXPR() && permit_from_rewrite_hint(root, SUBLINK_PULLUP_DISABLE_EXPR)) {
+        return node;
+    }
+    
     /* convert or_clause to left join. */
     if (or_clause(node)) {
         convert_ORCLAUSE_to_join(root, (BoolExpr*)node, jtlink1, available_rels1);
@@ -747,7 +765,6 @@ static Node* pull_up_sublinks_qual_recurse(PlannerInfo* root, Node* node, Node**
 
         return node;
     }
-
 
     /* Stop if not an AND */
     return node;
@@ -1025,6 +1042,7 @@ void pull_up_subquery_hint(PlannerInfo* root, Query* parse, HintState* hint_stat
     parse->hintState->skew_hint = list_concat(parse->hintState->skew_hint, hint_state->skew_hint);
     parse->hintState->nall_hints = parse->hintState->nall_hints + hint_state->nall_hints;
     parse->hintState->multi_node_hint = hint_state->multi_node_hint;
+    parse->hintState->sql_ignore_hint = hint_state->sql_ignore_hint;
     /* no_expand hint, set hint, no_gpc hint should not be pulled up */
 
     if (hint_state->block_name_hint) {
@@ -1077,6 +1095,7 @@ static Node* pull_up_simple_subquery(PlannerInfo* root, Node* jtnode, RangeTblEn
         return jtnode;
     }
 
+    root->parse->is_from_subquery_rewrite = true;
     /*
      * Need a modifiable copy of the subquery to hack on.  Even if we didn't
      * sometimes choose not to pull up below, we must do this to avoid
@@ -1180,6 +1199,18 @@ static Node* pull_up_simple_subquery(PlannerInfo* root, Node* jtnode, RangeTblEn
          */
         return jtnode;
     }
+
+    /*
+     * We must flatten any join alias Vars in the subquery's targetlist,
+     * because pulling up the subquery's subqueries might have changed their
+     * expansions into arbitrary expressions, which could affect
+     * pullup_replace_vars' decisions about whether PlaceHolderVar wrappers
+     * are needed for tlist entries.  (Likely it'd be better to do
+     * flatten_join_alias_vars on the whole query tree at some earlier stage,
+     * maybe even in the rewriter; but for now let's just fix this case here.)
+     */
+    subquery->targetList =
+        (List *)flatten_join_alias_vars(subroot, (Node *)subquery->targetList);
 
     /*
      * Adjust level-0 varnos in subquery so that we can append its rangetable
@@ -1402,8 +1433,8 @@ static Node* pull_up_simple_subquery(PlannerInfo* root, Node* jtnode, RangeTblEn
     parse->hasRowSecurity = parse->hasRowSecurity || subquery->hasRowSecurity;
 
     /*
-     * subquery won't be pulled up if it hasAggs or hasWindowFuncs, so no work
-     * needed on those flags
+     * subquery won't be pulled up if it hasAggs or hasWindowFuncs, or
+     * hasTargetSRFs, so no work needed on those flags
      *
      * Return the adjusted subquery jointree to replace the RangeTblRef entry
      * in parent's jointree; or, if the FromExpr is degenerate, just return
@@ -1469,6 +1500,13 @@ static Node* pull_up_simple_union_all(PlannerInfo* root, Node* jtnode, RangeTblE
     rtoffset = list_length(root->parse->rtable);
     rtable = (List*)copyObject(subquery->rtable);
     IncrementVarSublevelsUp_rtable(rtable, -1, 1);
+    ListCell *lc= NULL;
+    foreach (lc, rtable){
+        RangeTblEntry* rte = (RangeTblEntry*)lfirst(lc);
+        if (rte->rtekind == RTE_SUBQUERY) {
+            rte->pulled_from_subquery = true;
+        }
+    }
     root->parse->rtable = list_concat(root->parse->rtable, rtable);
 
     /* Subquery can be pull, so set flag to true. */
@@ -1714,6 +1752,10 @@ static bool is_simple_subquery(Query* subquery, RangeTblEntry *rte, JoinExpr *lo
         subquery->limitCount || subquery->hasForUpdate || subquery->cteList)
         return false;
 
+    if (subquery->is_flt_frame && subquery->hasTargetSRFs) {
+        return false;
+    }
+
     /*
      * If the subquery is LATERAL, check for pullup restrictions from that.
      */
@@ -1864,6 +1906,8 @@ static bool is_safe_append_member(Query* subquery)
         jtnode = (FromExpr*)linitial(jtnode->fromlist);
     }
     if (!IsA(jtnode, RangeTblRef))
+        return false;
+    if (subquery->hintState)
         return false;
 
     return true;
@@ -2023,6 +2067,19 @@ static void replace_vars_in_jointree(Node* jtnode, pullup_replace_vars_context* 
         }
         replace_vars_in_jointree(j->larg, context, lowest_nulling_outer_join);
         replace_vars_in_jointree(j->rarg, context, lowest_nulling_outer_join);
+
+        /*
+         * Use PHVs within the join quals of a full join, even when it's the
+         * lowest nulling outer join.  Otherwise, we cannot identify which
+         * side of the join a pulled-up var-free expression came from, which
+         * can lead to failure to make a plan at all because none of the quals
+         * appear to be mergeable or hashable conditions.  For this purpose we
+         * don't care about the state of wrap_non_vars, so leave it alone.
+         */
+        if (j->jointype == JOIN_FULL) {
+            context->need_phvs = true;
+        }
+
         j->quals = pullup_replace_vars(j->quals, context);
 
         /*
@@ -3357,8 +3414,9 @@ void reduce_inequality_fulljoins(PlannerInfo* root)
  */
 static Node* reduce_inequality_fulljoins_jointree_recurse(PlannerInfo* root, Node* jtnode)
 {
+#ifdef ENABLE_MULTIPLE_NODES
     Assert(IS_STREAM_PLAN);
-
+#endif
     if (jtnode == NULL || IsA(jtnode, RangeTblRef)) {
         return jtnode; /* jtnode is returned unmodified */
     } else if (IsA(jtnode, FromExpr)) {
@@ -3402,6 +3460,13 @@ static Node* reduce_inequality_fulljoins_jointree_recurse(PlannerInfo* root, Nod
              */
             IncrementVarSublevelsUp(j1->quals, 2, 1);
             IncrementVarSublevelsUp(j2->quals, 2, 1);
+
+            /*
+            * Upper-level vars in subquery are now two level far to their parent
+            * than before.
+            */
+            IncrementVarSublevelsUp((Node*)setop1, 2, 1);
+            IncrementVarSublevelsUp((Node*)setop2, 2, 1);
 
             /* No quals in FromExpr. Search 'QUALS SHOULD BE HERE.' in this
              * source code file.
@@ -3520,6 +3585,7 @@ static Node* reduce_inequality_fulljoins_jointree_recurse(PlannerInfo* root, Nod
                     } break;
                     default:
                         oldvar = (Node*)copyObject(node);
+                        oldvar = eval_const_expressions(root, oldvar);
                         break;
                 }
 
@@ -3539,6 +3605,7 @@ static Node* reduce_inequality_fulljoins_jointree_recurse(PlannerInfo* root, Nod
 
             /* Generate subquery rte and add it to the range tables */
             RangeTblEntry* rte = addRangeTableEntryForSubquery(NULL, partial_query, makeAlias("subquery", NIL), false, true);
+            rte->pulled_from_subquery = true;
             root->parse->rtable = lappend(root->parse->rtable, rte);
 
             root->parse->targetList = (List*)replace_node_clause(
@@ -3607,3 +3674,195 @@ bool ContainRownumQual(const Query *parse)
     return contain_rownum_walker(((FromExpr *)parse->jointree)->quals, NULL);
 }
 
+/*
+ * @brief pull_up_sublinks_having
+ *  Pull up sublinks from HAVING quals.
+ *
+ * For sublinks in HAVING clause, make the sublink a subquery(outer query) and join with the
+ * original query(inner query). What is left for that specific qual with sublink is
+ * transoformed into a operation between the result from the inner query and the outer query.
+ *
+ * For example:     (Original Query)
+ *      SELECT a, SUM(b) AS value FROM t1
+ *      GROUP BY a HAVING SUM(a) >= (SELECT AVG(b) FROM t1)
+ *      ORDER BY value DESC;
+ * Will turn into:  (Rewritten Query)
+ *      SELECT __inner_query__.a,
+ *          __inner_query__.value
+ *      FROM
+ *          (SELECT a, SUM(b) AS value, SUM(a) AS sum_a FROM t1 GROUP BY a) AS __inner_query__,
+ *          (SELECT avg(b) AS avg_b FROM t1) AS __outer_query__
+ *      WHERE __inner_query__.sum_a >= __outer_query__.avg_b
+ *      ORDER BY value DESC;
+ *
+ * There are some limitations for this:
+ *  (1) Correlated sublink is not handled.
+ *  (2) Sublink must work as a expression(An aggregation sublink rather than LIMIT).
+ *  (3) Only pullup once.
+ *
+ * @param root          Planner info
+ * @return Node*        Rewritten Query
+ */
+static void pull_up_sublinks_having(PlannerInfo* root)
+{
+    Query* inner_query = NULL;
+    List* old_expr_list = NIL;
+    List* new_expr_list = NIL;
+    List* old_var_list = NIL;
+    List* new_var_list = NIL;
+    ListCell* lc = NULL;
+ 
+    Assert(root->parse->havingQual != NULL);
+ 
+    /*
+     * Step 1: Make the original query an subquery(inner_query).
+     *  Notice that the root->parse has been updated in push_down_one_query.
+     *  Therefore, after push_down_one_query is invoked, root->parse
+     *  is no longer the inner query but the SELECT wrapper.
+     */
+    push_down_one_query(root, &inner_query);
+ 
+    /*
+     * Step 2: Pull up HAVING clause, turn it into a qual.
+     *  1. move all sortgroup clause in HAVING to targetist
+     *  2. add missing vars in HAVING to targetlist(basically unjunk the target entry)
+     *  3. pull up HAVING as quals, then replace vars with added vars in (2)
+     */
+    old_expr_list = pull_aggref(inner_query->havingQual);
+    foreach(lc, old_expr_list) {
+        Aggref* agg = lfirst_node(Aggref, lc);
+        RangeTblEntry* rte = linitial_node(RangeTblEntry, root->parse->rtable);
+        TargetEntry* tle = NULL;
+        Var* new_var = NULL;
+ 
+        tle = makeTargetEntry((Expr*)agg,
+                                     list_length(inner_query->targetList) + 1,
+                                     "?column?",
+                                     false);
+        inner_query->targetList = lappend(inner_query->targetList, tle);
+        new_var = makeVarFromTargetEntry((Index)1, tle);
+        new_expr_list = lappend(new_expr_list, new_var);
+ 
+        /* Update colnames */
+        if (rte->eref != NULL) {
+            rte->eref->colnames = lappend(rte->eref->colnames, makeString(tle->resname));
+        }
+    }
+ 
+    inner_query->havingQual = replace_node_clause((Node*)inner_query->havingQual,
+                                                          (Node*)old_expr_list,
+                                                          (Node*)new_expr_list,
+                                                          RNC_REPLACE_FIRST_ONLY);
+ 
+    /* Unjunk missing vars in group clause */
+    foreach(lc, inner_query->targetList) {
+        TargetEntry* tle = lfirst_node(TargetEntry, lc);
+        List* varlist = NIL;
+        Var* new_var = NULL;
+        Var* old_var = NULL;
+ 
+        /* Skip norm entries */
+        if (!tle->resjunk || tle->ressortgroupref == 0) {
+            continue;
+        }
+ 
+        tle->resjunk = false;
+ 
+        /* Get var replacements */
+        new_var = makeVarFromTargetEntry((Index)1, tle);
+        new_var_list = lappend(new_var_list, new_var);
+ 
+        varlist = pull_var_clause((Node*)(tle->expr),
+                                          PVC_REJECT_AGGREGATES,
+                                          PVC_REJECT_PLACEHOLDERS);
+ 
+        AssertEreport(list_length(varlist) == 1, MOD_OPT_REWRITE,
+            "Cannot pull up HAVING from inner query, because inner query is broken.");
+ 
+        old_var = linitial_node(Var, varlist);
+        old_var_list = lappend(old_var_list, old_var);
+    }
+ 
+    /* pull up HAVING */
+    root->parse->jointree->quals = \
+        replace_node_clause((Node*)inner_query->havingQual,
+                                    (Node*)old_var_list,
+                                    (Node*)new_var_list,
+                                    RNC_NONE);
+ 
+    inner_query->havingQual = NULL;
+ 
+    /* Free temp lists */
+    list_free_ext(old_expr_list);
+    list_free_ext(new_expr_list);
+    list_free_ext(old_var_list);
+    list_free_ext(new_var_list);
+ 
+    /*
+     * Step 3: Pull up sort and limit clauses.
+     */
+    pull_up_sort_limit_clause(root->parse, inner_query, true);
+ 
+    /*
+     * Final Step: Invoke generic sublink pullup out(pull up outer_query).
+     *  This method is invoked before generic sublink pullups.
+     *  The final step is proceed in pull_up_sublinks.
+     */
+}
+ 
+/*
+ * @brief is_safe_pull_up_having
+ *  Check if is safe for pull having clause.
+*/
+static bool is_safe_pull_up_sublink_having(PlannerInfo* root)
+{
+    ListCell *lc = NULL;
+    List *sublinkList = NULL;
+    OpExpr* expr = NULL;
+    SubLink *sublink = NULL;
+    Relids level_up_varnos = NULL;
+    Query* subQuery = NULL;
+    Node* node = NULL;
+    List* aggreflist = NIL;
+ 
+    if (root->parse->groupClause == NULL || root->parse->havingQual == NULL) {
+        return false;
+    }
+    
+    if (!IsA(root->parse->havingQual, OpExpr)) {
+        return false;
+    }
+    expr = (OpExpr*)(root->parse->havingQual);
+    if (!safe_pullup_op_expr_sublink(expr)) {
+        return false;
+    }
+
+    // expr args should be agg and sublink
+    foreach(lc, expr->args)
+    {
+        node = (Node*)lfirst(lc);
+        if (IsA(node, SubLink)) {
+            continue;
+        }
+        aggreflist = pull_aggref(node);
+        if (list_length(aggreflist) == 0) {
+            return false;
+        }
+
+        list_free(aggreflist);
+    }
+ 
+    // sublink should be uncorrelared
+    sublinkList = pull_sublink((Node*)root->parse->havingQual, 0, false, false);
+    foreach(lc, sublinkList)
+    {
+        sublink = (SubLink *)lfirst(lc);
+        subQuery = castNode(Query, sublink->subselect);
+        level_up_varnos = pull_varnos((Node*)subQuery->jointree, 1, true);
+        if (!bms_is_empty(level_up_varnos)) {
+            return false;
+        }
+    }
+ 
+    return true;
+}

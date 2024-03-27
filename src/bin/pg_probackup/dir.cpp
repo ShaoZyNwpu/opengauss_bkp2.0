@@ -25,6 +25,7 @@
 #include "configuration.h"
 #include "common/fe_memutils.h"
 #include "PageCompression.h"
+#include "storage/file/fio_device.h"
 
 /*
  * The contents of these directories are removed or recreated during server
@@ -41,13 +42,6 @@ const char *pgdata_exclude_dir[] =
     */
     (const char *)"pg_stat_tmp",
     (const char *)"pgsql_tmp",
-
-    /*
-    * It is generally not useful to backup the contents of this directory even
-    * if the intention is to restore to another master. See backup.sgml for a
-    * more detailed description.
-    */
-    (const char *)"pg_replslot",
 
     /* Contents removed on startup, see dsm_cleanup_for_mmap(). */
     (const char *)"pg_dynshmem",
@@ -68,7 +62,7 @@ const char *pgdata_exclude_dir[] =
     (const char *)"pg_subtrans",
 
     /* end of list */
-    NULL,   /* pg_log will be set later */
+    NULL,   /* pg_log and pg_replslot will be set later */
     NULL
 };
 
@@ -128,16 +122,20 @@ may be removed int the future */
 
 static int pgCompareString(const void *str1, const void *str2);
 
-static char dir_check_file(pgFile *file, bool backup_logs);
+static char dir_check_file(pgFile *file, bool backup_logs, bool backup_replslots);
 static char check_in_tablespace(pgFile *file, bool in_tablespace);
 static char check_db_dir(pgFile *file);
 static char check_digit_file(pgFile *file);
 static char check_nobackup_dir(pgFile *file);
+static char check_in_dss(pgFile *file, int include_id);
 static void dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
                                                     bool exclude, bool follow_symlink, bool backup_logs,
-                                                    bool skip_hidden, int external_dir_num, fio_location location);
+                                                    bool skip_hidden, int external_dir_num, fio_location location,
+                                                    bool backup_replslots);
 static void opt_path_map(ConfigOption *opt, const char *arg,
                                              TablespaceList *list, const char *type);
+
+char check_logical_replslot_dir(const char *rel_path);
 
 /* Tablespace mapping */
 static TablespaceList tablespace_dirs = {NULL, NULL};
@@ -164,7 +162,7 @@ dir_create_dir(const char *dir, mode_t mode)
     /* Create directory */
     if (mkdir(dir, mode) == -1)
     {
-        if (errno == EEXIST)    /* already exist */
+        if (is_file_exist(errno))    /* already exist */
             return 0;
         elog(ERROR, "cannot create directory \"%s\": %s", dir, strerror(errno));
     }
@@ -183,13 +181,14 @@ pgFileNew(const char *path, const char *rel_path, bool follow_symlink,
     if (fio_stat(path, &st, follow_symlink, location) < 0)
     {
         /* file not found is not an error case */
-        if (errno == ENOENT)
+        if (is_file_delete(errno))
             return NULL;
         elog(ERROR, "cannot stat file \"%s\": %s", path,
             strerror(errno));
     }
 
     file = pgFileInit(rel_path);
+    file->type = fio_device_type(path);
     file->size = st.st_size;
     file->mode = st.st_mode;
     file->mtime = st.st_mtime;
@@ -230,10 +229,10 @@ pgFileInit(const char *rel_path)
     file->n_headers = 0;
 
     /* set uncompressed file default */
-    file->compressedFile = false;
-    file->compressedAlgorithm = 0;
-    file->compressedChunkSize = 0;
-    
+    file->compressed_file = false;
+    file->compressed_algorithm = 0;
+    file->compressed_chunk_size = 0;
+
     return file;
 }
 
@@ -248,7 +247,7 @@ pgFileDelete(mode_t mode, const char *full_path)
     {
         if (rmdir(full_path) == -1)
         {
-            if (errno == ENOENT)
+            if (is_file_delete(errno))
                 return;
             else if (errno == ENOTDIR)    /* could be symbolic link */
                 goto delete_file;
@@ -262,7 +261,7 @@ pgFileDelete(mode_t mode, const char *full_path)
     delete_file:
     if (remove(full_path) == -1)
     {
-        if (errno == ENOENT)
+        if (is_file_delete(errno))
             return;
         elog(ERROR, "Cannot remove file \"%s\": %s", full_path,
             strerror(errno));
@@ -278,7 +277,7 @@ pgFileDelete(mode_t mode, const char *full_path)
 pg_crc32
 pgFileGetCRC(const char *file_path, bool use_crc32c, bool missing_ok)
 {
-    FILE    *fp;
+    FILE    *fp = NULL;
     pg_crc32    crc = 0;
     char    *buf;
     size_t  len = 0;
@@ -289,7 +288,7 @@ pgFileGetCRC(const char *file_path, bool use_crc32c, bool missing_ok)
     fp = fopen(file_path, PG_BINARY_R);
     if (fp == NULL)
     {
-        if (errno == ENOENT)
+        if (is_file_delete(errno))
         {
             if (missing_ok)
             {
@@ -298,8 +297,7 @@ pgFileGetCRC(const char *file_path, bool use_crc32c, bool missing_ok)
             }
         }
 
-        elog(ERROR, "Cannot open file \"%s\": %s",
-        file_path, strerror(errno));
+        elog(ERROR, "Cannot open file \"%s\": %s", file_path, strerror(errno));
     }
 
     /* disable stdio buffering */
@@ -538,7 +536,7 @@ db_map_entry_free(void *entry)
 void
 dir_list_file(parray *files, const char *root, bool exclude, bool follow_symlink,
                         bool add_root, bool backup_logs, bool skip_hidden, int external_dir_num,
-                        fio_location location)
+                        fio_location location, bool backup_replslots)
 {
     pgFile  *file;
 
@@ -565,7 +563,7 @@ dir_list_file(parray *files, const char *root, bool exclude, bool follow_symlink
         parray_append(files, file);
 
     dir_list_file_internal(files, file, root, exclude, follow_symlink,
-                                        backup_logs, skip_hidden, external_dir_num, location);
+                                        backup_logs, skip_hidden, external_dir_num, location, backup_replslots);
 
     if (!add_root)
         pgFileFree(file);
@@ -589,12 +587,13 @@ dir_list_file(parray *files, const char *root, bool exclude, bool follow_symlink
  * - datafiles
  */
 static char
-dir_check_file(pgFile *file, bool backup_logs)
+dir_check_file(pgFile *file, bool backup_logs, bool backup_replslots)
 {
     int     i;
     int     sscanf_res;
     char    ret;
     bool    in_tablespace = false;
+    char    check_res;
 
     in_tablespace = path_is_prefix_of_path(PG_TBLSPC_DIR, file->rel_path);
 
@@ -652,6 +651,29 @@ dir_check_file(pgFile *file, bool backup_logs)
             }
         }
 
+        /*
+         * Backup pg_replslot if it is specified.
+         * It is generally not useful to backup the contents of this directory even
+         * if the intention is to restore to another master. See backup.sgml for a
+         * more detailed description.
+         */
+        if (!backup_replslots) {
+            if (strcmp(file->rel_path, PG_REPLSLOT_DIR) == 0) {
+                /* Skip */
+                elog(VERBOSE, "Excluding directory content: %s", file->rel_path);
+                return CHECK_EXCLUDE_FALSE;
+            }
+        } else {
+            /* 
+             * Check file that under pg_replslot and judge whether it
+             * belonged to logical replication slots for subscriptions.
+             */
+            if (strcmp(file->rel_path, PG_REPLSLOT_DIR) != 0 &&
+                path_is_prefix_of_path(PG_REPLSLOT_DIR, file->rel_path)) {
+                return check_logical_replslot_dir(file->rel_path);
+            }
+        }
+
         ret = check_nobackup_dir(file);
         if (ret != -1) {  /* -1 means need backup */
             return ret;
@@ -681,12 +703,59 @@ dir_check_file(pgFile *file, bool backup_logs)
             return CHECK_FALSE;
     }
 
+    /* skip other instance files in dss mode */
+    check_res = check_in_dss(file, instance_config.dss.instance_id);
+    if (check_res != CHECK_TRUE) {
+        return check_res;
+    }
+
     ret = check_in_tablespace(file, in_tablespace);
     if (ret != -1) {
         return ret;
     }
 
     return check_db_dir(file);
+}
+
+static char check_in_dss(pgFile *file, int include_id)
+{
+    char instance_id[MAX_INSTANCEID_LEN];
+    char top_path[MAXPGPATH];
+    errno_t rc = EOK;
+    int move = 0;
+
+    if (!is_dss_type(file->type)) {
+        return CHECK_TRUE;
+    }
+
+    /* step1 : skip other instance owner file or dir */
+    strlcpy(top_path, file->rel_path, sizeof(top_path));
+    get_top_path(top_path);
+
+    rc = snprintf_s(instance_id, sizeof(instance_id), sizeof(instance_id) - 1, "%d", include_id);
+    securec_check_ss_c(rc, "\0", "\0");
+
+    move = (int)strlen(top_path) - (int)strlen(instance_id);
+    if (move > 0 && move < MAXPGPATH && strcmp(top_path + move, instance_id) != 0) {
+        char tail = top_path[strlen(top_path) - 1];
+        /* Is this file or dir belongs to other instance? */
+        if (tail >= '0' && tail <= '9') {
+            return CHECK_FALSE;
+        }
+    }
+
+    /* step2: recheck dir is in the exclude list, include id will be considered */
+    if (S_ISDIR(file->mode)) {
+        for (int i = 0; pgdata_exclude_dir[i]; i++) {
+            int len = (int)strlen(pgdata_exclude_dir[i]);
+            if (strncmp(top_path, pgdata_exclude_dir[i], len) == 0 &&
+                strcmp(top_path + len, instance_id) == 0) {
+                return CHECK_EXCLUDE_FALSE;
+            }
+        }
+    }
+
+    return CHECK_TRUE;
 }
 
 static char check_in_tablespace(pgFile *file, bool in_tablespace)
@@ -722,11 +791,15 @@ if (in_tablespace)
     {
         file->tblspcOid = DEFAULTTABLESPACE_OID;
 
-        int ret = sscanf_s(file->rel_path, "base/%u/", &(file->dbOid));
-        if (ret == -1)
-            elog(INFO, "Cannot parse path \"%s\"", file->rel_path);
-        if (S_ISDIR(file->mode) && strcmp(file->name, "base") != 0)
-            file->is_database = true;
+        /* skip "base" itself */
+        if (strcmp(file->name, "base") != 0)
+        {
+            int ret = sscanf_s(file->rel_path, "base/%u/", &(file->dbOid));
+            if (ret == -1)
+                elog(INFO, "Cannot parse path \"%s\"", file->rel_path);
+            if (S_ISDIR(file->mode))
+                file->is_database = true;
+        }
     }
 
     return -1;
@@ -746,6 +819,35 @@ static char check_nobackup_dir(pgFile *file)
             }
         }
     }
+    return ret;
+}
+
+char check_logical_replslot_dir(const char *rel_path)
+{
+    char ret = CHECK_FALSE;
+    int i = 0;
+    char *tmp = pg_strdup(rel_path);
+    char *p;
+#define DIRECTORY_DELIMITER "/"
+
+    if (logical_replslot) {
+        /* extract slot name from rel_path, such as sub1 from pg_replslot/sub1/snap */
+        p = strtok(tmp, DIRECTORY_DELIMITER);
+        if (p != NULL) {
+            p = strtok(NULL, DIRECTORY_DELIMITER);
+        }
+
+        for (i = 0; p != NULL && i < (int)parray_num(logical_replslot); i++) {
+            char *slotName = (char *)parray_get(logical_replslot, i);
+            if (strcmp(p, slotName) == 0) {
+                pfree(tmp);
+                return CHECK_TRUE;
+            }
+        }
+    } else {
+        ret = CHECK_TRUE;
+    }
+    pfree(tmp);
     return ret;
 }
 
@@ -792,8 +894,27 @@ static char check_db_dir(pgFile *file)
 static char check_digit_file(pgFile *file)
 {
     char    *fork_name;
-    int     len;
+    uint32     len;
     char    suffix[MAXPGPATH];
+    int sscanf_res;
+
+    if (PageCompression::SkipCompressedFile(file->name, MAXPGPATH)) {
+        /* change oid_compress or oid.x_compress to oid or oid.x */
+        uint32 offset = strlen(file->name) - strlen("_compress");
+        file->name[offset] = '\0';
+        sscanf_res = sscanf_s(file->name, "%u.%d.%s", &(file->relOid),
+                              &(file->segno), suffix, sizeof(suffix));
+        /* recover oid_compress or oid.x_compress from oid or oid.x */
+        file->name[offset] = '_';
+        if (sscanf_res == 0) {
+            elog(ERROR, "Cannot parse compressed file name \"%s\"", file->name);
+        } else if (sscanf_res == 1 || sscanf_res == 2) {
+            file->is_datafile = true;
+            file->segno = (sscanf_res == 1) ? 0 : file->segno;
+        }
+
+        return CHECK_TRUE;
+    }
 
     fork_name = strstr(file->name, "_");
     if (fork_name)
@@ -820,7 +941,6 @@ static char check_digit_file(pgFile *file)
     }
     else
     {
-        int  sscanf_res;
         /*
         * snapfs files:
         * RELFILENODE.BLOCKNO.snapmap.SNAPID
@@ -829,8 +949,8 @@ static char check_digit_file(pgFile *file)
         if (strstr(file->name, "snap") != NULL)
                 return CHECK_TRUE;
 
-        len = strlen(file->name);
         /* reloid.cfm */
+        len = strlen(file->name);
         if (len > 3 && strcmp(file->name + len - 3, "cfm") == 0)
             return CHECK_TRUE;
 
@@ -845,25 +965,48 @@ static char check_digit_file(pgFile *file)
     return -1;
 }
 
-static inline void SetFileCompressOption(pgFile *file, char *child, size_t childLen)
+static inline void SetFileCompressOption(pgFile *file, char *child)
 {
-    if (file->is_datafile && PageCompression::IsCompressedTableFile(child, childLen)) {
-        std::unique_ptr<PageCompression> pageCompression = std::make_unique<PageCompression>();
-        COMPRESS_ERROR_STATE state = pageCompression->Init(child, childLen, InvalidBlockNumber);
-        if (state != SUCCESS) {
-            elog(ERROR, "can not read block of '%s_pca': ", child);
-        }
-        file->compressedFile = true;
-        file->size = pageCompression->GetMaxBlockNumber() * BLCKSZ;
-        file->compressedChunkSize = pageCompression->GetChunkSize();
-        file->compressedAlgorithm = pageCompression->GetAlgorithm();
+    if (!file->is_datafile ||
+        !PageCompression::SkipCompressedFile(child, strlen(child))) {
+        return;
     }
+
+    file->compressed_file = true;
+    file->size = 0;
+    file->compressed_chunk_size = 0;
+    file->compressed_algorithm = 0;
+
+    PageCompression *pageCompression = new(std::nothrow) PageCompression();
+    if (pageCompression == NULL) {
+        elog(ERROR, "compression page init failed");
+        return;
+    }
+    if (pageCompression->Init(child, file->segno) != SUCCESS) {
+        delete pageCompression;
+        elog(ERROR, "Cannot parse compressed file name \"%s\"", file->name);
+        return;
+    }
+
+    BlockNumber blknum = pageCompression->GetMaxBlockNumber();
+    file->size = blknum * BLCKSZ;
+    file->compressed_chunk_size = pageCompression->chunkSize;
+    file->compressed_algorithm = pageCompression->algorithm;
+
+    delete pageCompression;
+    return;
 }
 
 bool SkipSomeDirFile(pgFile *file, struct dirent *dent, bool skipHidden)
 {
     /* Skip entries point current dir or parent dir */
     if (S_ISDIR(file->mode) && (strcmp(dent->d_name, ".") == 0 || strcmp(dent->d_name, "..") == 0)) {
+        return false;
+    }
+    /* Skip recycle in dss mode */
+    if (is_dss_type(file->type) && strcmp(dent->d_name, ".recycle") == 0)
+    {
+        elog(WARNING, "Skip .recycle");
         return false;
     }
     /* skip hidden files and directories */
@@ -875,12 +1018,13 @@ bool SkipSomeDirFile(pgFile *file, struct dirent *dent, bool skipHidden)
      * Add only files, directories and links. Skip sockets and other
      * unexpected file formats.
      */
-    if (!S_ISDIR(file->mode) && !S_ISREG(file->mode)) {
+    if (!S_ISDIR(file->mode) && !S_ISREG(file->mode) && !S_ISLNK(file->mode)) {
         elog(WARNING, "Skip '%s': unexpected file format", file->name);
         return false;
     }
     return true;
 }
+
 /*
  * List files in parent->path directory.  If "exclude" is true do not add into
  * "files" files from pgdata_exclude_files and directories from
@@ -889,7 +1033,8 @@ bool SkipSomeDirFile(pgFile *file, struct dirent *dent, bool skipHidden)
 static void
 dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
                                         bool exclude, bool follow_symlink, bool backup_logs,
-                                        bool skip_hidden, int external_dir_num, fio_location location)
+                                        bool skip_hidden, int external_dir_num, fio_location location,
+                                        bool backup_replslots)
 {
     DIR     *dir;
     struct dirent *dent;
@@ -901,7 +1046,7 @@ dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
     dir = fio_opendir(parent_dir, location);
     if (dir == NULL)
     {
-        if (errno == ENOENT)
+        if (is_file_delete(errno))
         {
             /* Maybe the directory was removed */
             return;
@@ -921,11 +1066,6 @@ dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
         join_path_components(child, parent_dir, dent->d_name);
         join_path_components(rel_child, parent->rel_path, dent->d_name);
 
-        /* skip real compressed file cause we mark compress flag at oid file */
-        if (PageCompression::SkipCompressedFile(child, MAXPGPATH)) {
-            continue;
-        }
-
         file = pgFileNew(child, rel_child, follow_symlink, external_dir_num, location);
         if (file == NULL)
             continue;
@@ -937,7 +1077,7 @@ dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
 
         if (exclude)
         {
-            check_res = dir_check_file(file, backup_logs);
+            check_res = dir_check_file(file, backup_logs, backup_replslots);
             if (check_res == CHECK_FALSE)
             {
                 /* Skip */
@@ -950,8 +1090,8 @@ dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
                 parray_append(files, file);
                 continue;
             } else if (check_res == CHECK_TRUE) {
-                /* persistence compress option */
-                SetFileCompressOption(file, child, MAXPGPATH);
+                /* just deal with compressed file, persist it's option */
+                SetFileCompressOption(file, child);
             }
         }
 
@@ -963,10 +1103,10 @@ dir_list_file_internal(parray *files, pgFile *parent, const char *parent_dir,
         */
         if (S_ISDIR(file->mode))
             dir_list_file_internal(files, file, child, exclude, follow_symlink,
-                backup_logs, skip_hidden, external_dir_num, location);
+                backup_logs, skip_hidden, external_dir_num, location, backup_replslots);
     }
 
-    if (errno && errno != ENOENT)
+    if (errno && !is_file_delete(errno))
     {
         int errno_tmp = errno;
         fio_closedir(dir);
@@ -1153,7 +1293,7 @@ create_data_directories(parray *dest_files, const char *data_dir, const char *ba
     * original directory created as symlink to it.
     */
 
-    elog(LOG, "Restore directories and symlinks...");
+    elog(LOG, "Restore directories and symlinks... in %s", data_dir);
 
     /* create directories */
     for (i = 0; i < parray_num(dest_files); i++)
@@ -1161,12 +1301,27 @@ create_data_directories(parray *dest_files, const char *data_dir, const char *ba
         char parent_dir[MAXPGPATH];
         pgFile       *dir = (pgFile *) parray_get(dest_files, i);
 
+        /* skip undesirable type */
+        if (is_dss_type(dir->type) != fio_is_dss(location))
+            continue;
+
         if (!S_ISDIR(dir->mode))
             continue;
 
         /* skip external directory content */
         if (dir->external_dir_num != 0)
             continue;
+
+        if (is_dss_type(dir->type)) {
+            if (is_ss_xlog(dir->rel_path)) {
+                ss_createdir(dir->rel_path, instance_config.dss.vgdata, instance_config.dss.vglog);
+                continue;
+            }
+
+            if (ss_create_if_doublewrite(dir, instance_config.dss.vgdata, instance_config.dss.instance_id)) {
+                continue;
+            }
+        }
 
         /* tablespace_map exists */
         if (links)
@@ -1622,7 +1777,8 @@ dir_read_file_list(const char *root, const char *external_prefix,
                 dbOid,  /* used for partial restore */
                 hdr_crc,
                 hdr_off,
-                hdr_size;
+                hdr_size,
+                file_type;
         pgFile  *file = nullptr;
 
         COMP_FILE_CRC32(true, content_crc, buf, strlen(buf));
@@ -1636,19 +1792,21 @@ dir_read_file_list(const char *root, const char *external_prefix,
         get_control_value(buf, "compress_alg", compress_alg_string, NULL, false);
         get_control_value(buf, "external_dir_num", NULL, &external_dir_num, false);
         get_control_value(buf, "dbOid", NULL, &dbOid, false);
+        get_control_value(buf, "file_type", NULL, &file_type, true);
 
         file = pgFileInit(path);
         file->write_size = (int64) write_size;
         file->mode = (mode_t) mode;
         file->is_datafile = is_datafile ? true : false;
-        file->compressedFile = false;
-        file->compressedChunkSize = 0;
-        file->compressedAlgorithm = 0;
+        file->compressed_file = false;
+        file->compressed_chunk_size = 0;
+        file->compressed_algorithm = 0;
         file->is_cfs = is_cfs ? true : false;
         file->crc = (pg_crc32) crc;
         file->compress_alg = parse_compress_alg(compress_alg_string);
         file->external_dir_num = external_dir_num;
         file->dbOid = dbOid ? dbOid : 0;
+        file->type = (device_type_t)file_type;
 
         /*
         * Optional fields
@@ -1663,13 +1821,13 @@ dir_read_file_list(const char *root, const char *external_prefix,
         /* read compress option from control file */
         int64 compressedFile = 0;
         if (get_control_value(buf, "compressedFile", NULL, &compressedFile, false)) {
-            file->compressedFile = true;
-            int64 compressedAlgorithm = 0;
-            int64 compressedChunkSize = 0;
-            get_control_value(buf, "compressedAlgorithm", NULL, &compressedAlgorithm, true);
-            get_control_value(buf, "compressedChunkSize", NULL, &compressedChunkSize, true);
-            file->compressedAlgorithm = (uint8)compressedAlgorithm;
-            file->compressedChunkSize = (int16)compressedChunkSize;
+            file->compressed_file = true;
+            int64 compressed_algorithm = 0;
+            int64 compressed_chunk_size = 0;
+            (void)get_control_value(buf, "compressedAlgorithm", NULL, &compressed_algorithm, true);
+            (void)get_control_value(buf, "compressedChunkSize", NULL, &compressed_chunk_size, true);
+            file->compressed_algorithm = (uint8)compressed_algorithm;
+            file->compressed_chunk_size = (uint16)compressed_chunk_size;
         }
 
         if (get_control_value(buf, "segno", NULL, &segno, false))
@@ -1725,7 +1883,7 @@ dir_is_empty(const char *path, fio_location location)
     if (dir == NULL)
     {
         /* Directory in path doesn't exist */
-        if (errno == ENOENT)
+        if (is_file_delete(errno))
             return true;
         elog(ERROR, "cannot open directory \"%s\": %s", path, strerror(errno));
     }
@@ -1736,6 +1894,10 @@ dir_is_empty(const char *path, fio_location location)
         /* Skip entries point current dir or parent dir */
         if (strcmp(dir_ent->d_name, ".") == 0 ||
             strcmp(dir_ent->d_name, "..") == 0)
+            continue;
+
+        /* Skip recycle in dss mode */
+        if (fio_is_dss(location) && strcmp(dir_ent->d_name, ".recycle") == 0)
             continue;
 
         /* Directory is not empty */
@@ -1758,7 +1920,7 @@ fileExists(const char *path, fio_location location)
 {
     struct stat buf;
 
-    if (fio_stat(path, &buf, true, location) == -1 && errno == ENOENT)
+    if (fio_stat(path, &buf, true, location) == -1 && is_file_delete(errno))
         return false;
     else if (!S_ISREG(buf.st_mode))
         return false;
@@ -1766,7 +1928,7 @@ fileExists(const char *path, fio_location location)
         return true;
 }
 
-size_t
+off_t
 pgFileSize(const char *path)
 {
     struct stat buf;

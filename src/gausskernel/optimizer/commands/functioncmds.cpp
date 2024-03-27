@@ -51,6 +51,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/gs_package.h"
 #include "catalog/pg_proc_fn.h"
+#include "catalog/pg_synonym.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_fn.h"
 #include "catalog/gs_db_privilege.h"
@@ -72,6 +73,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrtab.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -86,6 +88,11 @@
 #include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "tsearch/ts_type.h"
+#include "commands/comment.h"
+
+#ifdef ENABLE_MOT
+#include "storage/mot/jit_exec.h"
+#endif
 
 typedef struct PendingLibraryDelete {
     char* filename; /* library file name. */
@@ -95,6 +102,26 @@ typedef struct PendingLibraryDelete {
 static void AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId);
 static void checkAllowAlter(HeapTuple tup);
 static int2vector* GetDefaultArgPos(List* defargpos);
+static void CheckInternalParamsReturnType(Oid declaredRetOid, Oid languageOid,
+    List* asClause, oidvector* parameterTypes, bool* isStrict);
+static bool IsTypeMatch(Oid oid1, Oid oid2);
+
+static void CreateFunctionComment(Oid funcOid, List* options, bool lock = false)
+{
+    ListCell *cell = NULL;
+    foreach (cell, options) {
+        DefElem* defElem = (DefElem*)lfirst(cell);
+        if (strcmp(defElem->defname, "comment") == 0) {
+            /* lock until transaction commit or rollback */
+            if (lock) {
+                LockDatabaseObject(funcOid, ProcedureRelationId, 0, ShareUpdateExclusiveLock);
+            }
+            CreateComments(funcOid, ProcedureRelationId, 0, defGetString(defElem));
+            break;
+        }
+    }
+
+}
 
 /*
  *	 Examine the RETURNS clause of the CREATE FUNCTION statement
@@ -115,6 +142,8 @@ static void compute_return_type(
     Type typtup;
     AclResult aclresult;
     Oid typowner = InvalidOid;
+    ObjectAddress address;
+
     /*
      * isalter is true, change the owner of the objects as the owner of the
      * namespace, if the owner of the namespce has the same name as the namescpe
@@ -222,7 +251,8 @@ static void compute_return_type(
             if (aclresult != ACLCHECK_OK)
                 aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(namespaceId));
         }
-        rettype = TypeShellMake(typname, namespaceId, typowner);
+        address = TypeShellMake(typname, namespaceId, typowner);
+        rettype = address.objectId;
         Assert(OidIsValid(rettype));
     }
 
@@ -427,12 +457,12 @@ static void examine_parameter_list(List* parameters, Oid languageOid, const char
         if (fp->defexpr) {
 #ifndef ENABLE_MULTIPLE_NODES
             if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT 
-                && (fp->mode == FUNC_PARAM_OUT || fp->mode == FUNC_PARAM_INOUT)) {
+                && fp->mode == FUNC_PARAM_OUT && enable_out_param_override()) {
                 ereport(ERROR,
                     (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
                     errmsg("The out/inout Parameter can't have default value.")));
             }
-#endif		
+#endif
             Node* def = NULL;
 
             if (!isinput)
@@ -440,7 +470,7 @@ static void examine_parameter_list(List* parameters, Oid languageOid, const char
                     (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
                         errmsg("only input parameters can have default values")));
 
-            def = transformExpr(pstate, fp->defexpr);
+            def = transformExpr(pstate, fp->defexpr, EXPR_KIND_FUNCTION_DEFAULT);
             def = coerce_to_specific_type(pstate, def, toid, "DEFAULT");
             assign_expr_collations(pstate, def);
 
@@ -630,11 +660,19 @@ static ArrayType* update_proconfig_value(ArrayType* a, const List* set_items)
     return a;
 }
 
+static bool compute_b_attribute(DefElem* defel)
+{
+    if (strcmp(defel->defname, "comment") == 0) {
+        return true;
+    }
+    return false;
+}
+
 /*
  * Dissect the list of options assembled in gram.y into function
  * attributes.
  */
-static void compute_attributes_sql_style(const List* options, List** as, char** language, bool* windowfunc_p,
+static List* compute_attributes_sql_style(const List* options, List** as, char** language, bool* windowfunc_p,
     char* volatility_p, bool* strict_p, bool* security_definer, bool* leakproof_p, ArrayType** proconfig,
     float4* procost, float4* prorows, bool* fenced, bool* shippable, bool* package)
 {
@@ -652,7 +690,7 @@ static void compute_attributes_sql_style(const List* options, List** as, char** 
     DefElem* fencedItem = NULL;
     DefElem* shippable_item = NULL;
     DefElem* package_item = NULL;
-
+    List* bCompatibilities = NIL;
     foreach (option, options) {
         DefElem* defel = (DefElem*)lfirst(option);
 
@@ -681,6 +719,9 @@ static void compute_attributes_sql_style(const List* options, List** as, char** 
                        &package_item)) {
             /* recognized common option */
             continue;
+        } else if (compute_b_attribute(defel)) {
+            /* recognized b compatibility options */
+            bCompatibilities = lcons(defel, bCompatibilities);
         } else
             ereport(ERROR,
                 (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("option \"%s\" not recognized", defel->defname)));
@@ -747,6 +788,7 @@ static void compute_attributes_sql_style(const List* options, List** as, char** 
         *package = intVal(package_item->arg);
     }
     list_free(set_items);
+    return bCompatibilities;
 }
 
 /* -------------
@@ -873,11 +915,51 @@ static void CheckWindowFuncValid(Oid languageOid, const char* prosrc_str)
     }
 }
 
+static bool isForbiddenSchema (Oid namespaceId)
+{
+    return IsPackageSchemaOid(namespaceId) || namespaceId == PG_DB4AI_NAMESPACE;
+}
+
+void CheckCreateFunctionPrivilege(Oid namespaceId, const char* funcname)
+{
+    if (!IsInitdb && !u_sess->attr.attr_common.IsInplaceUpgrade && isForbiddenSchema(namespaceId)) {
+        ereport(ERROR,
+            (errmodule(MOD_PLSQL), errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Permission denied to create function \"%s\"", funcname),
+                errdetail("Object creation is not supported for %s schema.", get_namespace_name(namespaceId)),
+                errcause("The schema in the package does not support object creation.."),
+                erraction("Please create an object in another schema.")));
+    }
+
+    if (!isRelSuperuser() &&
+        (namespaceId == PG_CATALOG_NAMESPACE ||
+        namespaceId == PG_PUBLIC_NAMESPACE ||
+        namespaceId == PG_DB4AI_NAMESPACE)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied to create function \"%s\"", funcname),
+                errhint("must be %s to create a function in %s schema.",
+                    g_instance.attr.attr_security.enablePrivilegesSeparate ? "initial user" : "sysadmin",
+                    get_namespace_name(namespaceId))));
+    }
+
+    if (!IsInitdb && !u_sess->attr.attr_common.IsInplaceUpgrade &&
+        !g_instance.attr.attr_common.allow_create_sysobject &&
+        IsSysSchema(namespaceId)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied to create function \"%s\"", funcname),
+                errhint("not allowd to create a function in %s schema when allow_create_sysobject is off.",
+                    get_namespace_name(namespaceId))));
+    }
+}
+
+extern HeapTuple SearchUserHostName(const char* userName, Oid* oid);
 /*
  * CreateFunction
  *	 Execute a CREATE FUNCTION utility statement.
  */
-void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_oid)
+ObjectAddress CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_oid)
 {
     char* probin_str = NULL;
     char* prosrc_str = NULL;
@@ -964,22 +1046,8 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
         ReleaseSysCache(tuple);
     }
 
-    if (!IsInitdb && !u_sess->attr.attr_common.IsInplaceUpgrade && IsPackageSchemaOid(namespaceId)) {
-        ereport(ERROR,
-            (errmodule(MOD_PLSQL), errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Permission denied to create function \"%s\"", funcname),
-                errdetail("Object creation is not supported for %s schema.", get_namespace_name(namespaceId)),
-                errcause("The schema in the package does not support object creation.."),
-                erraction("Please create an object in another schema.")));
-    }
+    CheckCreateFunctionPrivilege(namespaceId, funcname);
     bool anyResult = CheckCreatePrivilegeInNamespace(namespaceId, GetUserId(), CREATE_ANY_FUNCTION);
-    if (namespaceId == PG_PUBLIC_NAMESPACE && !isRelSuperuser()) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                errmsg("permission denied to create function \"%s\"", funcname),
-                errhint("must be %s to create a function in public schema.",
-                    g_instance.attr.attr_security.enablePrivilegesSeparate  ? "initial user" : "sysadmin")));
-    }
 
     //@Temp Table. Lock Cluster after determine whether is a temp object,
     // so we can decide if locking other coordinator
@@ -999,6 +1067,19 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
     } else {
         proowner = GetUserId();
     }
+
+    if (u_sess->attr.attr_sql.sql_compatibility ==  B_FORMAT) {
+        if (stmt->definer) {
+            HeapTuple roletuple = SearchUserHostName(stmt->definer, NULL);
+            if (!HeapTupleIsValid(roletuple))
+                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" does not exist", stmt->definer)));
+            proowner = HeapTupleGetOid(roletuple);
+            ReleaseSysCache(roletuple);
+        }
+        else {
+            proowner = GetUserId();
+        }
+    }
     /* default attributes */
     volatility = PROVOLATILE_VOLATILE;
     procost = -1; /* indicates not set */
@@ -1006,8 +1087,9 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
     shippable = false;
 
     /* override attributes from explicit list */
-    compute_attributes_sql_style((const List*)stmt->options, &as_clause, &language, &isWindowFunc, &volatility,
-        &isStrict, &security, &isLeakProof, &proconfig, &procost, &prorows, &fenced, &shippable, &package);
+    List *functionOptions = compute_attributes_sql_style((const List *)stmt->options, &as_clause, &language,
+                                                         &isWindowFunc, &volatility, &isStrict, &security, &isLeakProof,
+                                                         &proconfig, &procost, &prorows, &fenced, &shippable, &package);
 
     /* Look up the language and validate permissions */
     languageTuple = SearchSysCache1(LANGNAME, PointerGetDatum(language));
@@ -1017,26 +1099,32 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
                                             : 0)));
 
     languageOid = HeapTupleGetOid(languageTuple);
+    if (strcasecmp(get_language_name(languageOid), "plpgsql") != 0) {
+        u_sess->plsql_cxt.isCreateFunction = false;
+    }
 
-#ifdef ENABLE_MULTIPLE_NODES
     if (languageOid == JavalanguageId) {
+#ifdef ENABLE_MULTIPLE_NODES
         /*
          * single node dose not support Java UDF or other fenced functions.
          * check it here because users may not know the Java UDF is fenced by default,
          * so it's better to report detailed error messages for different senarios.
          */
         if (IS_SINGLE_NODE) {
-            ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("JAVA UDF is not yet supported in current version.")));
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("JAVA UDF is not yet supported in current version.")));
         }
 
         /* only support fenced mode Java UDF */
         if (!fenced) {
-            ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Java UDF dose not support NOT FENCED functions.")));
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("Java UDF dose not support NOT FENCED functions.")));
         }
-    }
+#else
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("JAVA UDF is not yet supported in current version.")));
 #endif
+    }
 
     languageStruct = (Form_pg_language)GETSTRUCT(languageTuple);
 
@@ -1112,6 +1200,8 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
     compute_attributes_with_style((const List*)stmt->withClause, &isStrict, &volatility);
     interpret_AS_clause(languageOid, language, funcname, as_clause, &prosrc_str, &probin_str);
 
+    CheckInternalParamsReturnType(prorettype, languageOid, as_clause, parameterTypes, &isStrict);
+
     /*
      * Set default values for COST and ROWS depending on other parameters;
      * reject ROWS if it's not returnsSet.  NB: pg_dump knows these default
@@ -1141,8 +1231,16 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
      * And now that we have all the parameters, and know we're permitted to do
      * so, go ahead and create the function.
      */
-    ProcedureCreate(funcname, namespaceId, pkg_oid, stmt->isOraStyle, stmt->replace,
-                    returnsSet, prorettype, proowner, languageOid, languageValidator,
+    ObjectAddress address=ProcedureCreate(funcname,
+        namespaceId,
+        pkg_oid,
+        stmt->isOraStyle,
+        stmt->replace,
+        returnsSet,
+        prorettype,
+        proowner,
+        languageOid,
+        languageValidator,
         prosrc_str, /* converted to text later */
         probin_str, /* converted to text later */
         false,      /* not an aggregate */
@@ -1160,11 +1258,155 @@ void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_o
         proIsProcedure,
         stmt->inputHeaderSrc,
         stmt->isPrivate);
+
+    CreateFunctionComment(address.objectId, functionOptions);
+
     u_sess->plsql_cxt.procedure_start_line = 0;
     u_sess->plsql_cxt.procedure_first_line = 0;
+    u_sess->plsql_cxt.isCreateFunction = false;
     if (u_sess->plsql_cxt.debug_query_string != NULL && !OidIsValid(pkg_oid)) {
         pfree_ext(u_sess->plsql_cxt.debug_query_string);
     }
+    return address;
+}
+
+static void CheckInternalParamsReturnType(Oid declaredRetOid, Oid languageOid,
+    List* asClause, oidvector* parameterTypes, bool* isStrict)
+{
+    if (languageOid != INTERNALlanguageId || !asClause ||
+        u_sess->attr.attr_common.IsInplaceUpgrade || IsInitdb) {
+        return;
+    }
+
+    /* check return type */
+    HeapTuple declaredRetTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(declaredRetOid));
+    if (!HeapTupleIsValid(declaredRetTuple)) {
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for type %u", declaredRetOid)));
+    }
+    Form_pg_type declaredType = (Form_pg_type)GETSTRUCT(declaredRetTuple);
+    bool isDeclaredTypeDefined = declaredType->typisdefined;
+    declaredType = NULL; /* donot use anymore */
+    ReleaseSysCache(declaredRetTuple);
+
+    char* internalFuncName = strVal(linitial(asClause));
+    Assert(PointerIsValid(internalFuncName));
+
+    Oid builtinFuncOid = fmgr_internal_function(internalFuncName);
+    if (builtinFuncOid == InvalidOid) {
+        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                        errmsg("there is no built-in function named \"%s\"", internalFuncName)));
+    }
+
+    HeapTuple funcTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(builtinFuncOid));
+    if (!HeapTupleIsValid(funcTuple)) {
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for function %u", builtinFuncOid)));
+    }
+
+    Form_pg_proc builtin = (Form_pg_proc)GETSTRUCT(funcTuple);
+    Oid builtinRetType = builtin->prorettype;
+    if (builtin->proisstrict) {
+        *isStrict = true;
+    }
+
+    /* compare return types */
+    if (declaredRetOid != VOIDOID && isDeclaredTypeDefined &&
+        !IsBinaryCoercible(builtinRetType, declaredRetOid) &&
+        !IsTypeMatch(builtinRetType, declaredRetOid)) {
+        ReleaseSysCache(funcTuple);
+        ereport(ERROR, (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+            errmsg("return type mismatch in function declared to return %s", format_type_be(declaredRetOid)),
+                errdetail("actual return type is %s", format_type_be(builtinRetType))));
+    }
+
+    /* check parameters */
+    if (builtin->pronargs <= 0) {
+        ReleaseSysCache(funcTuple);
+        return;
+    }
+
+    int nonDefautCnt = builtin->pronargs - builtin->pronargdefaults;
+    int paramCnt = (parameterTypes == nullptr) ? 0 : parameterTypes->dim1;
+    if (paramCnt == 0) {
+        ReleaseSysCache(funcTuple);
+        if (nonDefautCnt > 0) {
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                    errmsg("the number of input parameters does not match the built-in function"),
+                    errdetail("the number of input parameters: %d, minimum number of mandatory parameters: %d",
+                              paramCnt, nonDefautCnt)));
+        }
+        return;
+    }
+
+    if (paramCnt < nonDefautCnt) {
+        ReleaseSysCache(funcTuple);
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                errmsg("the number of input parameters does not match the built-in function"),
+                errdetail("the number of input parameters: %d, minimum number of mandatory parameters: %d",
+                            paramCnt, nonDefautCnt)));
+    }
+
+    const int minCnt = (builtin->pronargs > paramCnt) ? paramCnt : builtin->proargtypes.dim1;
+    for (int i = 0; i < minCnt; i++) {
+        Oid realParamOid = parameterTypes->values[i];
+        Oid expectedOid = builtin->proargtypes.values[i];
+        if (realParamOid == expectedOid ||
+            !get_typisdefined(realParamOid) ||
+            IsBinaryCoercible(realParamOid, expectedOid) ||
+            IsTypeMatch(realParamOid, expectedOid)) {
+            continue; /* OK */
+        }
+
+        ReleaseSysCache(funcTuple);
+        if (i == 0) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                errmsg("The 1st input parameter of the function does not match the parameter type of the built-in function")));
+        } else if (i == 1) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                errmsg("The 2nd input parameter of the function does not match the parameter type of the built-in function")));
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+                errmsg("The %dth input parameter of the function does not match the parameter type of the built-in function",
+                        i + 1)));
+        }
+    }
+
+    ReleaseSysCache(funcTuple);
+}
+
+static bool IsTypeMatch(Oid oid1, Oid oid2)
+{
+    HeapTuple tuple1 = NULL;
+    Form_pg_type type1 = NULL;
+    HeapTuple tuple2 = NULL;
+    Form_pg_type type2 = NULL;
+
+    tuple1 = SearchSysCache1(TYPEOID, ObjectIdGetDatum(oid1));
+    if (!HeapTupleIsValid(tuple1)) {
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for type %u", oid1)));
+    }
+
+    tuple2 = SearchSysCache1(TYPEOID, ObjectIdGetDatum(oid2));
+    if (!HeapTupleIsValid(tuple2)) {
+        ReleaseSysCache(tuple1);
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for type %u", oid2)));
+    }
+
+    type1 = (Form_pg_type)GETSTRUCT(tuple1);
+    type2 = (Form_pg_type)GETSTRUCT(tuple2);
+
+    bool isMatch = type1->typlen == type2->typlen &&
+                   type1->typbyval == type2->typbyval;
+
+    ReleaseSysCache(tuple1);
+    ReleaseSysCache(tuple2);
+    
+    return isMatch;
 }
 
 /*
@@ -1307,6 +1549,15 @@ void RemoveFunctionById(Oid funcOid)
     Form_pg_proc procedureStruct = (Form_pg_proc)GETSTRUCT(tup);
     isagg = procedureStruct->proisagg;
 
+#ifdef ENABLE_MOT
+    char* funcName = pstrdup(NameStr(procedureStruct->proname));
+    bool isNull = false;
+    Datum prokindDatum = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prokind, &isNull);
+    bool proIsProcedure = isNull ? false : PROC_IS_PRO(CharGetDatum(prokindDatum));
+    Datum packageDatum = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_package, &isNull);
+    bool isPackage = isNull ? false : DatumGetBool(packageDatum);
+#endif
+
     if (procedureStruct->prolang == ClanguageId) {
         PrepareCFunctionLibrary(tup);
     }
@@ -1342,6 +1593,13 @@ void RemoveFunctionById(Oid funcOid)
     }
     DropErrorByOid(PLPGSQL_PROC, funcOid); 
         ce_cache_refresh_type |= 0x20; /* refresh proc cache */
+
+#ifdef ENABLE_MOT
+    if (proIsProcedure && !isPackage && JitExec::IsMotSPCodegenEnabled()) {
+        JitExec::PurgeJitSourceCache(funcOid, JitExec::JIT_PURGE_SCOPE_SP, JitExec::JIT_PURGE_EXPIRE, funcName);
+    }
+    pfree_ext(funcName);
+#endif
 }
 /*
  * Guts of function deletion.
@@ -1392,6 +1650,14 @@ void RemovePackageById(Oid pkgOid, bool isBody)
         DropErrorByOid(PLPGSQL_PACKAGE, pkgOid); 
         simple_heap_delete(relation, &pkgtup->t_self);
     } else {
+        bool isNull = false;
+        SysCacheGetAttr(PACKAGEOID, pkgtup, Anum_gs_package_pkgbodydeclsrc, &isNull);
+        if (isNull) {
+            DropErrorByOid(PLPGSQL_PACKAGE_BODY, pkgOid);
+            ReleaseSysCache(pkgtup);
+            heap_close(relation, RowExclusiveLock);
+            return;
+        }
         bool nulls[Natts_gs_package];
         Datum values[Natts_gs_package];
         bool replaces[Natts_gs_package];
@@ -1407,6 +1673,7 @@ void RemovePackageById(Oid pkgOid, bool isBody)
         HeapTuple newtup = heap_modify_tuple(pkgtup, RelationGetDescr(relation), values, nulls, replaces);
         DropErrorByOid(PLPGSQL_PACKAGE_BODY, pkgOid); 
         simple_heap_update(relation, &newtup->t_self, newtup);
+        CatalogUpdateIndexes(relation, newtup);
     }
     ReleaseSysCache(pkgtup);
 
@@ -1466,7 +1733,7 @@ void DeleteFunctionByPackageOid(Oid package_oid)
 /*
  * Rename function
  */
-void RenameFunction(List* name, List* argtypes, const char* newname)
+ObjectAddress RenameFunction(List* name, List* argtypes, const char* newname)
 {
     Oid procOid;
     Oid namespaceOid;
@@ -1474,6 +1741,8 @@ void RenameFunction(List* name, List* argtypes, const char* newname)
     Form_pg_proc procForm;
     Relation rel;
     AclResult aclresult;
+    ObjectAddress address;
+
     rel = heap_open(ProcedureRelationId, RowExclusiveLock);
     procOid = LookupFuncNameTypeNames(name, argtypes, false);
 
@@ -1491,6 +1760,8 @@ void RenameFunction(List* name, List* argtypes, const char* newname)
             (errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
                 errmsg("the masking function \"%s\" can not be renamed", get_func_name(procOid))));
     }
+
+    ObjectAddressSubSet(address, ProcedureRelationId, procOid, 0);
 
     tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(procOid));
     if (!HeapTupleIsValid(tup)) /* should not happen */
@@ -1519,6 +1790,14 @@ void RenameFunction(List* name, List* argtypes, const char* newname)
                     get_namespace_name(namespaceOid))));
     }
 #else
+    /* 
+     * Check function name to ensure that it doesn't conflict with existing synonym.
+     */
+    if (!IsInitdb && GetSynonymOid(newname, namespaceOid, true) != InvalidOid) {
+        ereport(ERROR,
+                (errmsg("function name is already used by an existing synonym in schema \"%s\"",
+                    get_namespace_name(namespaceOid))));
+    }
     if (t_thrd.proc->workingVersionNum < 92470) {
         if (SearchSysCacheExists3(PROCNAMEARGSNSP,
                 CStringGetDatum(newname),
@@ -1574,16 +1853,19 @@ void RenameFunction(List* name, List* argtypes, const char* newname)
 
     heap_close(rel, NoLock);
     tableam_tops_free_tuple(tup);
+    return address;
 }
 
 /*
  * Change function owner by name and args
  */
-void AlterFunctionOwner(List* name, List* argtypes, Oid newOwnerId)
+ObjectAddress AlterFunctionOwner(List* name, List* argtypes, Oid newOwnerId)
 {
     Relation rel;
     Oid procOid;
     HeapTuple tup;
+    ObjectAddress address;
+
     rel = heap_open(ProcedureRelationId, RowExclusiveLock);
 
     procOid = LookupFuncNameTypeNames(name, argtypes, false);
@@ -1623,6 +1905,8 @@ void AlterFunctionOwner(List* name, List* argtypes, Oid newOwnerId)
     UpdatePgObjectMtime(procOid, OBJECT_TYPE_PROC);
 
     heap_close(rel, NoLock);
+    ObjectAddressSet(address, ProcedureRelationId, procOid);
+    return address;
 }
 
 /*
@@ -1824,7 +2108,7 @@ bool IsFunctionTemp(AlterFunctionStmt* stmt)
  * RENAME and OWNER clauses, which are handled as part of the generic
  * ALTER framework).
  */
-void AlterFunction(AlterFunctionStmt* stmt)
+ObjectAddress AlterFunction(AlterFunctionStmt* stmt)
 {
     HeapTuple tup;
     Oid funcOid;
@@ -1841,10 +2125,24 @@ void AlterFunction(AlterFunctionStmt* stmt)
     DefElem* fencedItem = NULL;
     DefElem* shippable_item = NULL;
     DefElem* package_item = NULL;
+    ObjectAddress address;
     bool isNull = false;
-    rel = heap_open(ProcedureRelationId, RowExclusiveLock);
 
     funcOid = LookupFuncNameTypeNames(stmt->func->funcname, stmt->func->funcargs, false);
+#ifndef ENABLE_MULTIPLE_NODES
+    char* schemaName = NULL;
+    char* pkgname = NULL;
+    char* procedureName = NULL;
+    DeconstructQualifiedName(stmt->func->funcname, &schemaName, &procedureName, &pkgname);
+    if (schemaName == NULL) {
+        tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcOid));
+        procForm = (Form_pg_proc)GETSTRUCT(tup);
+        schemaName = get_namespace_name(procForm->pronamespace);
+        ReleaseSysCache(tup);
+    }
+    LockProcName(schemaName, pkgname, procedureName);
+#endif
+    rel = heap_open(ProcedureRelationId, RowExclusiveLock);
     /* if the function is a builtin function, its Oid is less than 10000.
      * we can't allow alter the builtin functions
      */
@@ -1892,7 +2190,8 @@ void AlterFunction(AlterFunctionStmt* stmt)
     if (procForm->pronamespace == u_sess->catalog_cxt.myTempNamespace)
         ExecSetTempObjectIncluded();
 
-    /* Examine requested actions. */
+    /* Examine requested actions and add b compatibility options to alterOptions. */
+    List* alterOptions = NIL;
     foreach (l, stmt->actions) {
         DefElem* defel = (DefElem*)lfirst(l);
 
@@ -1906,9 +2205,15 @@ void AlterFunction(AlterFunctionStmt* stmt)
                 &rows_item,
                 &fencedItem,
                 &shippable_item,
-                &package_item) == false)
+                &package_item)) {
+            continue;
+        } else if (compute_b_attribute(defel)) {
+            /* recognized b compatibility options */
+            alterOptions = lcons(defel, alterOptions);
+        } else {
             ereport(ERROR,
                 (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION), errmsg("option \"%s\" not recognized", defel->defname)));
+        }
     }
 
     if (volatility_item != NULL)
@@ -2004,6 +2309,8 @@ void AlterFunction(AlterFunctionStmt* stmt)
     simple_heap_update(rel, &tup->t_self, tup);
     CatalogUpdateIndexes(rel, tup);
 
+    CreateFunctionComment(funcOid, alterOptions, true);
+
     /* Recode time of alter funciton. */
     if (OidIsValid(funcOid)) {
         UpdatePgObjectMtime(funcOid, OBJECT_TYPE_PROC);
@@ -2017,8 +2324,10 @@ void AlterFunction(AlterFunctionStmt* stmt)
         InvalidRelcacheForTriggerFunction(funcOid, procForm->prorettype);
     }
 
+    ObjectAddressSet(address, ProcedureRelationId, funcOid);
     heap_close(rel, NoLock);
     tableam_tops_free_tuple(tup);
+    return address;
 }
 
 /*
@@ -2111,7 +2420,7 @@ void SetFunctionArgType(Oid funcOid, int argIndex, Oid newArgType)
 /*
  * CREATE CAST
  */
-void CreateCast(CreateCastStmt* stmt)
+ObjectAddress CreateCast(CreateCastStmt* stmt)
 {
     Oid sourcetypeid;
     Oid targettypeid;
@@ -2412,6 +2721,7 @@ void CreateCast(CreateCastStmt* stmt)
     tableam_tops_free_tuple(tuple);
 
     heap_close(relation, RowExclusiveLock);
+    return myself;
 }
 
 /*
@@ -2460,10 +2770,11 @@ void DropCastById(Oid castOid)
  *
  * These commands are identical except for the lookup procedure, so share code.
  */
-void AlterFunctionNamespace(List* name, List* argtypes, bool isagg, const char* newschema)
+ObjectAddress AlterFunctionNamespace(List* name, List* argtypes, bool isagg, const char* newschema)
 {
     Oid procOid;
     Oid nspOid;
+    ObjectAddress address;
 
     /* get function OID */
     if (isagg)
@@ -2477,6 +2788,8 @@ void AlterFunctionNamespace(List* name, List* argtypes, bool isagg, const char* 
     TrForbidAccessRbObject(ProcedureRelationId, nspOid);
 
     (void)AlterFunctionNamespace_oid(procOid, nspOid);
+    ObjectAddressSet(address, ProcedureRelationId, procOid);
+    return address;
 }
 
 Oid AlterFunctionNamespace_oid(Oid procOid, Oid nspOid)
@@ -2520,12 +2833,13 @@ Oid AlterFunctionNamespace_oid(Oid procOid, Oid nspOid)
     CheckSetNamespace(oldNspOid, nspOid, ProcedureRelationId, procOid);
 
     /* disallow move objects into public schemas for non-admin user */
-    if (nspOid == PG_PUBLIC_NAMESPACE && !isRelSuperuser()) {
+    if ((nspOid == PG_PUBLIC_NAMESPACE || nspOid == PG_DB4AI_NAMESPACE) && !isRelSuperuser()) {
         ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), 
                  errmsg("permission denied to move objects into public schema"),
-                 errhint("must be %s to move objects into public schema.",
-                         g_instance.attr.attr_security.enablePrivilegesSeparate ? "initial user" : "sysadmin")));
+                 errhint("must be %s to move objects into %s schema.",
+                         g_instance.attr.attr_security.enablePrivilegesSeparate ? "initial user" : "sysadmin",
+                         get_namespace_name(nspOid))));
     }
 
     /* check for duplicate name (more friendly than unique-index failure) */
@@ -2541,6 +2855,14 @@ Oid AlterFunctionNamespace_oid(Oid procOid, Oid nspOid)
                     get_namespace_name(nspOid))));
     }    
 #else
+    /* 
+     * Check function name to ensure that it doesn't conflict with existing synonym.
+     */
+    if (!IsInitdb && GetSynonymOid(NameStr(proc->proname), nspOid, true) != InvalidOid) {
+        ereport(ERROR,
+                (errmsg("function name is already used by an existing synonym in schema \"%s\"",
+                    get_namespace_name(nspOid))));
+    }
     if (t_thrd.proc->workingVersionNum < 92470) { 
         if (SearchSysCacheExists3(PROCNAMEARGSNSP,
                 CStringGetDatum(NameStr(proc->proname)),
@@ -2936,4 +3258,27 @@ static void checkAllowAlter(HeapTuple tup) {
                 errcause("package is one object,not allow alter function in package"),
                 erraction("rebuild package")));
     }
+}
+
+/*
+ * Subroutine for ALTER FUNCTION/AGGREGATE SET SCHEMA/RENAME
+ *
+ * Is there a function with the given name and signature already in the given
+ * namespace?  If so, raise an appropriate error message.
+ */
+void
+IsThereFunctionInNamespace(const char *proname, int pronargs,
+                            oidvector *proargtypes, Oid nspOid)
+{
+    /* check for duplicate name (more friendly than unique-index failure) */
+    if (SearchSysCacheExists3(PROCNAMEARGSNSP,
+                              CStringGetDatum(proname),
+                              PointerGetDatum(proargtypes),
+                              ObjectIdGetDatum(nspOid)))
+        ereport(ERROR,
+                (errcode(ERRCODE_DUPLICATE_FUNCTION),
+                    errmsg("function %s already exists in schema \"%s\"",
+                        funcname_signature_string(proname, pronargs,
+                                                    NIL, proargtypes->values),
+                        get_namespace_name(nspOid))));
 }

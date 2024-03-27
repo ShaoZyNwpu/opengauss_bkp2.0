@@ -18,6 +18,14 @@
 #include "pgxc/pgxcnode.h"
 #include "tcop/tcopprot.h"
 
+typedef enum
+{
+    PROCESS_UTILITY_TOPLEVEL,       /* toplevel interactive command */
+    PROCESS_UTILITY_QUERY,          /* a complete query, but not toplevel */
+    PROCESS_UTILITY_SUBCOMMAND,     /* a piece of a query */
+    PROCESS_UTILITY_GENERATED       /* internally generated node query node */
+} ProcessUtilityContext;
+
 #define CHOOSE_EXEC_NODES(is_temp) ((is_temp) ? EXEC_ON_DATANODES : EXEC_ON_ALL_NODES)
 
 #define TRANSFER_DISABLE_DDL(namespaceOid) \
@@ -32,29 +40,40 @@
         } \
     } while(0) \
 
+typedef struct processutility_context {
+    Node* parse_tree;             /* the parse tree for the utility statement */
+    const char* query_string;     /* original source text of command */
+    bool readOnlyTree;            /* if true, pstmt's node tree must not be modified */
+    ParamListInfo params;         /* parameters to use during execution */
+    bool is_top_level;            /* true if executing a "top level" (interactively issued) command */
+} processutility_context;
+
 /* Hook for plugins to get control in ProcessUtility() */
-typedef void (*ProcessUtility_hook_type)(Node* parsetree, const char* queryString, ParamListInfo params,
-    bool isTopLevel, DestReceiver* dest,
+typedef void (*ProcessUtility_hook_type)(processutility_context* processutility_cxt,
+    DestReceiver* dest,
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
     char* completionTag,
+    ProcessUtilityContext context,
     bool isCTAS);
 extern THR_LOCAL PGDLLIMPORT ProcessUtility_hook_type ProcessUtility_hook;
 
-extern void ProcessUtility(Node* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel,
+extern void ProcessUtility(processutility_context* processutility_cxt,
     DestReceiver* dest,
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
     char* completionTag,
+    ProcessUtilityContext context,
     bool isCTAS = false);
-extern void standard_ProcessUtility(Node* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel,
+extern void standard_ProcessUtility(processutility_context* processutility_cxt,
     DestReceiver* dest,
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
     char* completionTag,
+    ProcessUtilityContext context,
     bool isCTAS = false);
 
 extern char* find_first_exec_cn();

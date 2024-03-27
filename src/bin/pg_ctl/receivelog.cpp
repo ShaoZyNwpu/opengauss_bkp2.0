@@ -38,6 +38,7 @@
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include "storage/file/fio_device.h"
 
 /* Size of the streaming replication protocol headers */
 #define STREAMING_HEADER_SIZE (1 + sizeof(WalDataMessageHeader))
@@ -50,6 +51,10 @@ static bool reportFlushPosition = false;
 static XLogRecPtr lastFlushPosition = InvalidXLogRecPtr;
 extern char* basedir;
 
+#define HEART_BEAT_INIT 0
+#define HEART_BEAT_RUN 1
+#define HEART_BEAT_STOP 2
+
 /*
  * The max size for single data file. copy from custorage.cpp.
  */
@@ -61,7 +66,7 @@ const int HEART_BEAT = 5;
 PGconn* xlogconn = NULL;
 pthread_t hearbeatTimerId;
 volatile uint32 timerFlag = 0;
-volatile uint32 heartbeatRunning = 0;
+volatile uint32 heartbeatRunning = HEART_BEAT_INIT;
 pthread_mutex_t heartbeatMutex;
 
 typedef enum { DO_WAL_DATA_WRITE_DONE, DO_WAL_DATA_WRITE_STOP, DO_WAL_DATA_WRITE_ERROR } DoWalDataWriteResult;
@@ -92,18 +97,25 @@ static int open_walfile(XLogRecPtr startpoint, uint32 timeline, const char* base
         MAXFNAMELEN - 1,
         "%08X%08X%08X",
         timeline,
-        (uint32)((startpoint / XLOG_SEG_SIZE) / XLogSegmentsPerXLogId),
-        (uint32)((startpoint / XLOG_SEG_SIZE) % XLogSegmentsPerXLogId));
+        (uint32)((startpoint / XLogSegSize) / XLogSegmentsPerXLogId),
+        (uint32)((startpoint / XLogSegSize) % XLogSegmentsPerXLogId));
     securec_check_ss_c(nRet, "", "");
 
     nRet = snprintf_s(fn, sizeof(fn), sizeof(fn) - 1, "%s/%s.partial", basedir, namebuf);
     securec_check_ss_c(nRet, "", "");
-
-    retVal = realpath(fn, Lrealpath);
-    if (retVal == NULL && '\0' == Lrealpath[0]) {
-        pg_log(PG_PRINT, _("%s: realpath WAL segment path %s failed : %s\n"), progname, Lrealpath, strerror(errno));
-    }
-
+    
+    /* This basedir is real path when dss enabled,we need to not transform to realpath */
+    if (is_dss_file(fn)) {
+        nRet = snprintf_s(Lrealpath, sizeof(Lrealpath), sizeof(Lrealpath) - 1, "%s", fn);
+        securec_check_ss_c(nRet, "", "");
+        pg_log(PG_DEBUG, _("%s: WAL segment path that will open is %s \n"), progname, fn);
+    } else {
+        retVal = realpath(fn, Lrealpath); 
+        if (retVal == NULL && '\0' == Lrealpath[0]) {
+            pg_log(PG_PRINT, _("%s: realpath WAL segment path %s failed : %s\n"), progname, Lrealpath, strerror(errno));
+        } 
+    } 
+    
     int f = open(Lrealpath, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
     if (f == -1) {
         pg_log(PG_PRINT, _("%s: Could not open WAL segment %s: %s\n"), progname, Lrealpath, strerror(errno));
@@ -122,11 +134,11 @@ static int open_walfile(XLogRecPtr startpoint, uint32 timeline, const char* base
         f = -1;
         return -1;
     }
-    if (statbuf.st_size == XLogSegSize)
+    if (statbuf.st_size == (off_t)XLogSegSize)
         return f; /* File is open and ready to use */
     if (statbuf.st_size != 0) {
         pg_log(PG_PRINT,
-            _("%s: WAL segment %s is %d bytes, should be 0 or %d\n"),
+            _("%s: WAL segment %s is %d bytes, should be 0 or %lu\n"),
             progname,
             Lrealpath,
             (int)statbuf.st_size,
@@ -137,12 +149,16 @@ static int open_walfile(XLogRecPtr startpoint, uint32 timeline, const char* base
         f = -1;
         return -1;
     }
-
-    /* New, empty, file. So pad it to 16Mb with zeroes */
-    zerobuf = (char*)xmalloc0(XLOG_BLCKSZ);
-    for (bytes = 0; bytes < (int)XLogSegSize; bytes += XLOG_BLCKSZ) {
-        if (write(f, zerobuf, XLOG_BLCKSZ) != XLOG_BLCKSZ) {
-            pg_log(PG_PRINT, _("%s: could not pad WAL segment %s: %s\n"), progname, Lrealpath, strerror(errno));
+    
+    
+    if (is_dss_fd(f)) {
+        /* extend file and fill space at once to avoid performance issue */
+        errno = 0;
+        if (ftruncate(f, XLogSegSize) != 0) {
+            int save_errno = errno;
+            /* if write didn't set errno, assume problem is no disk space */
+            errno = save_errno ? save_errno : ENOSPC;
+            pg_log(PG_PRINT, _("%s: could not write to file %s: %s\n"), progname, Lrealpath, strerror(errno));
             if (close(f) != 0) {
                 pg_log(PG_PRINT, _("%s: close file failed %s: %s\n"), progname, Lrealpath, strerror(errno));
             }
@@ -150,13 +166,29 @@ static int open_walfile(XLogRecPtr startpoint, uint32 timeline, const char* base
             if (unlink(Lrealpath) != 0) {
                 pg_log(PG_PRINT, _("%s: unlink file failed %s: %s\n"), progname, Lrealpath, strerror(errno));
             }
-            free(zerobuf);
-            zerobuf = NULL;
             return -1;
         }
+    } else {
+        /* New, empty, file. So pad it to 16Mb with zeroes */
+        zerobuf = (char*)xmalloc0(XLOG_BLCKSZ);
+        for (bytes = 0; bytes < (int)XLogSegSize; bytes += XLOG_BLCKSZ) {
+            if (write(f, zerobuf, XLOG_BLCKSZ) != XLOG_BLCKSZ) {
+                pg_log(PG_PRINT, _("%s: could not pad WAL segment %s: %s\n"), progname, Lrealpath, strerror(errno));
+                if (close(f) != 0) {
+                    pg_log(PG_PRINT, _("%s: close file failed %s: %s\n"), progname, Lrealpath, strerror(errno));
+                }
+                f = -1;
+                if (unlink(Lrealpath) != 0) {
+                    pg_log(PG_PRINT, _("%s: unlink file failed %s: %s\n"), progname, Lrealpath, strerror(errno));
+                }
+                free(zerobuf);
+                zerobuf = NULL;
+                return -1;
+            }
+        }
+        free(zerobuf);
+        zerobuf = NULL;
     }
-    free(zerobuf);
-    zerobuf = NULL;
 
     if (lseek(f, SEEK_SET, 0) != 0) {
         pg_log(PG_PRINT,
@@ -183,8 +215,9 @@ void* heartbeatTimerHandler(void* data)
     if (xlogconn == NULL) {
         return NULL;
     }
-    heartbeatRunning = 1;
-    while (heartbeatRunning) {
+    uint32 expected = HEART_BEAT_INIT;
+    (void)pg_atomic_compare_exchange_u32(&heartbeatRunning, &expected, HEART_BEAT_RUN);
+    while (pg_atomic_read_u32(&heartbeatRunning) == HEART_BEAT_RUN) {
         pthread_mutex_lock(&heartbeatMutex);
         (void)checkForReceiveTimeout(xlogconn);
         ping_sent = false;
@@ -228,7 +261,7 @@ void suspendHeartBeatTimer(void)
 
 void closeHearBeatTimer(void)
 {
-    heartbeatRunning = 0;
+    pg_atomic_write_u32(&heartbeatRunning, HEART_BEAT_STOP);
     pthread_mutex_unlock(&heartbeatMutex);
     (void)pthread_join(hearbeatTimerId, NULL);
     return;
@@ -263,7 +296,7 @@ static bool close_walfile(int walfile, const char* basedir, char* walname, bool 
      * Rename the .partial file only if we've completed writing the
      * whole segment or segment_complete is true.
      */
-    if (currpos == XLOG_SEG_SIZE || segment_complete) {
+    if (currpos == (off_t)XLogSegSize || segment_complete) {
         char oldfn[MAXPGPATH];
         char newfn[MAXPGPATH];
         errno_t nRet;
@@ -398,7 +431,7 @@ static bool checkForReceiveTimeout(PGconn* conn)
 static int DoWALWrite(const char* wal_buf, int len, XLogRecPtr& block_pos, const char* basedir, char* cur_wal_file,
     uint32 wal_file_timeline, int& walfile, stream_stop_callback stream_stop, PGconn* conn)
 {
-    int xlogoff = block_pos % XLOG_SEG_SIZE;
+    int xlogoff = block_pos % XLogSegSize;
     int bytes_left = len;
     int bytes_to_write = 0;
 
@@ -430,8 +463,8 @@ static int DoWALWrite(const char* wal_buf, int len, XLogRecPtr& block_pos, const
     while (bytes_left) {
 
         /* If crossing a WAL boundary, only write up until we reach XLOG_SEG_SIZE. */
-        if (xlogoff + bytes_left > XLOG_SEG_SIZE)
-            bytes_to_write = XLOG_SEG_SIZE - xlogoff;
+        if (xlogoff + bytes_left > (int)XLogSegSize)
+            bytes_to_write = (int)XLogSegSize - xlogoff;
         else
             bytes_to_write = bytes_left;
 
@@ -462,7 +495,7 @@ static int DoWALWrite(const char* wal_buf, int len, XLogRecPtr& block_pos, const
         xlogoff += bytes_to_write;
 
         /* Did we reach the end of a WAL segment? */
-        if (block_pos % XLOG_SEG_SIZE == 0) {
+        if (block_pos % XLogSegSize == 0) {
             if (!close_walfile(walfile, basedir, cur_wal_file, false, block_pos)) {
                 suspendHeartBeatTimer();
                 /* Error message written in close_walfile() */
@@ -688,7 +721,7 @@ bool ReceiveXlogStream(PGconn* conn, XLogRecPtr startpos, uint32 timeline, const
                 ping_sent = false;
                 continue;
             } else if (r < 0) {
-                pg_log(PG_WARNING, _(" select() failed: %m\n"));
+                pg_log(PG_WARNING, _(" select() failed: %s\n"), strerror(errno));
                 goto error;
             }
             /* Else there is actually data on the socket */

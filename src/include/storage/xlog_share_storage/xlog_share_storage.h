@@ -32,13 +32,15 @@
 void SharedStorageXlogCopyBackendMain(void);
 void WakeUpXLogCopyerBackend();
 void CheckShareStorageCtlInfo(XLogRecPtr localEnd);
-bool XLogOverwriteFromLocal(bool force = false);
+bool XLogOverwriteFromLocal(bool force = false, XLogRecPtr setStart = InvalidXLogRecPtr);
 bool XLogOverwriteFromShare();
 Size CalShareStorageCtlSize();
 ShareStorageXLogCtl *AlignAllocShareStorageCtl();
 void AlignFreeShareStorageCtl(ShareStorageXLogCtl *ctlInfo);
 bool LockNasWriteFile(int fd);
 bool UnlockNasWriteFile(int fd);
+void SSDoXLogCopyFromLocal(XLogRecPtr copyEnd);
+XLogRecPtr GetMaxPosCanOverWrite();
 
 static inline void AddShareStorageXLopCopyBackendWakeupRequest()
 {

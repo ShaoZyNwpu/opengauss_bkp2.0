@@ -105,6 +105,11 @@ select rownum rn from distributors group by rn;
 select id from distributors group by rownum,id having rownum < 5;
 select rownum from distributors group by rownum having rownum < 5;
 select id from distributors group by id having rownum < 5;
+select id+id from distributors group by id+id having rownum < 5;
+select id, (select id from distributors where rownum <= 1) from distributors group by id;
+select id, (select id from distributors group by id having rownum <= 1) from distributors group by id;
+select id from (select id from distributors where rownum <= 1) group by id;
+select id from (select id from distributors group by id having rownum <= 1) group by id;
 --test alias name after where
 select rownum rn, name from distributors where rn<3;
 select rownum rowno2, * from (select rownum rowno1, * from distributors order by id desc) where rowno2 < 2;
@@ -522,6 +527,52 @@ select rownum, sc1.stuname, sc2.id from  student_cstore2 as sc1, student_cstore2
 -- test rownum for agg
 select * from (select rownum, max(id) as max_id from student_cstore1 group by rownum) as t order by max_id;
 
+-- test rownum with base result plan
+create table tab_1110306_1 (a1 int, b1 int, c1 int, d1 int,e1 text,f1 date) with (orientation=column) ;
+
+insert into tab_1110306_1 values
+(1, 1, 1, 1,'A10Z','2000-03-01')
+,(1, 1, 1, 2,'A1Z' ,'2000-03-02')
+,(1, 1, 2, 1,'A11Z','2000-03-05')
+,(1, 1, 2, 2,'A2Z' ,'2000-03-04')
+,(1, 2, 1, 1,'A13Z','2000-03-05')
+,(1, 2, 1, 2,'A3Z' ,'2000-03-19')
+,(1, 2, 2, 1,'A15Z','2000-03-05')
+,(1, 2, 2, 2,'A4Z' ,'2000-03-19')
+,(1, 3, 3, 3,'A10Z','2000-03-05')
+,(2, 5, 5, 5,'A5Z' ,'2000-03-10')
+,(2, NULL, 6, 6,null,'2000-04-01')
+,(2, 6, NULL, 6,'A15Z','2000-05-01')
+,(null, 6, 6, NULL,'A6Z','2000-03-11')
+,(2, NULL, NULL, 7,'A5Z','2000-03-02')
+,(2, NULL, 7, NULL,'A7Z','2000-03-03')
+,(2, 7, NULL, NULL,'A10Z','2000-03-10')
+,(3, NULL, NULL, NULL,'A9Z','2000-03-05')
+;
+
+explain (verbose, costs off)select 1
+from (select transaction_timestamp() as aa
+from tab_1110306_1
+where f1 <=to_date('2010-01-02')
+and c1 > 12
+or statement_timestamp() >=current_timestamp
+and rownum < 6
+group by c1) t1
+group by t1.aa
+having t1.aa <=transaction_timestamp();
+
+select 1
+from (select transaction_timestamp() as aa
+from tab_1110306_1
+where f1 <=to_date('2010-01-02')
+and c1 > 12
+or statement_timestamp() >=current_timestamp
+and rownum < 6
+group by c1) t1
+group by t1.aa
+having t1.aa <=transaction_timestamp();
+
+drop table tab_1110306_1;
 drop table student_cstore1;
 drop table student_cstore2;
 drop table student;
@@ -595,4 +646,59 @@ select * from partition_hash where rownum < 5;
 
 drop table partition_hash;
 
+create table test_rownum_subquery
+(
+  pk integer,
+  no varchar2
+);
 
+insert into test_rownum_subquery values (1,'1');
+insert into test_rownum_subquery values (2,'2');
+insert into test_rownum_subquery values (3,'3');
+insert into test_rownum_subquery values (4,'4');
+insert into test_rownum_subquery values (5,'5');
+select * from test_rownum_subquery;
+
+update  test_rownum_subquery t set t.no = to_char(100 - 1 + (
+    select vou_no from (
+        select rownum as vou_no, no from (
+            select distinct no from test_rownum_subquery b order by 1
+        )
+    ) where nvl(no, 0) = nvl(t.no, 0)
+));
+select * from test_rownum_subquery;
+drop table test_rownum_subquery;
+
+create table test_rownum_push_qual(id int);
+
+insert into test_rownum_push_qual values(generate_series(1, 20));
+
+-- having qual should not be pushed if accompanied by rownum reference
+explain (verbose on, costs off) select rownum, * from test_rownum_push_qual group by id,rownum having ROWNUM < 10 and id between 10 and 20 order by 1;
+
+select rownum, * from test_rownum_push_qual group by id,rownum having ROWNUM < 10 and id between 10 and 20 order by 1; -- expect 0 rows
+
+explain (verbose on, costs off) select rownum, * from test_rownum_push_qual group by id,rownum having ROWNUM < 10 or id between 10 and 20 order by 1;
+
+select rownum, * from test_rownum_push_qual group by id,rownum having ROWNUM < 10 or id between 10 and 20 order by 1; -- expect 20 rows
+
+explain (verbose on, costs off) select rownum, * from test_rownum_push_qual group by id,rownum having case when ROWNUM < 10 then 'true'::boolean else 'false'::boolean end and id between 10 and 20 order by 1;
+
+select rownum, * from test_rownum_push_qual group by id,rownum having case when ROWNUM < 10 then 'true'::boolean else 'false'::boolean end and id between 10 and 20 order by 1; -- expect 0 rows
+
+-- do not transform rownum op const to limit const -1, if limit clause is stated
+explain (verbose on, costs off) select rownum, * from test_rownum_push_qual where rownum < 10 limit 10 offset 10;
+
+select rownum, * from test_rownum_push_qual where rownum < 10 limit 10 offset 10; -- expected 0 rows
+
+explain (verbose on, costs off) select rownum, * from test_rownum_push_qual where rownum > 10 limit 10 offset 10;
+
+select rownum, * from test_rownum_push_qual where rownum > 10 limit 10 offset 10; -- expected 0 rows
+
+explain (verbose on, costs off) select rownum, * from test_rownum_push_qual where rownum < 15 limit 10 offset 10;
+
+select rownum, * from test_rownum_push_qual where rownum < 15 limit 10 offset 10; -- expected 4 rows
+
+explain (verbose on, costs off) select rownum, * from (select * from test_rownum_push_qual order by 1) where rownum < 10 limit 10 offset 10;
+
+select rownum, * from (select * from test_rownum_push_qual order by 1) where rownum < 10 limit 10 offset 10;  -- expected 0 rows

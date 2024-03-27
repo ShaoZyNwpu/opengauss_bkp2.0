@@ -26,6 +26,7 @@
 #include "catalog/pg_proc_fn.h"
 #include "catalog/indexing.h"
 #include "catalog/catalog.h"
+#include "commands/proclang.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "tcop/autonomoustransaction.h"
@@ -40,6 +41,8 @@
 #include "pgstat.h"
 #include "utils/timestamp.h"
 #include "executor/spi_priv.h"
+#include "distributelayer/streamMain.h"
+#include "commands/event_trigger.h"
 
 #ifdef STREAMPLAN
 #include "optimizer/streamplan.h"
@@ -129,12 +132,12 @@ static void processError(CreateFunctionStmt* stmt, enum FunctionErrorType ErrorT
     }
 }
 
-static void InsertGsSource(Oid objId, Oid nspid, const char* name, const char* type, bool status)
+void InsertGsSource(Oid objId, Oid nspid, const char* name, const char* type, bool status)
 {
     bool notInsert = u_sess->attr.attr_common.upgrade_mode != 0 || IsSystemNamespace(nspid) || 
         IsToastNamespace(nspid) || IsCStoreNamespace(nspid) || 
         IsPackageSchemaOid(nspid) || SKIP_GS_SOURCE;
-    if (notInsert) {
+    if (notInsert || t_thrd.log_cxt.errordata_stack_depth > ERRORDATA_STACK_SIZE - 2) {
         return;
     }
     if (g_instance.attr.attr_storage.max_concurrent_autonomous_transactions <= 0) {
@@ -207,6 +210,7 @@ static void InsertGsSource(Oid objId, Oid nspid, const char* name, const char* t
         "EXCEPTION WHEN OTHERS THEN NULL; \n");
     appendStringInfoString(&str, "end;");
     List* rawParseList = raw_parser(str.data);
+    pfree_ext(str.data);
     DoStmt* stmt = (DoStmt *)linitial(rawParseList);
     int save_compile_status = getCompileStatus();
     int save_compile_list_length = list_length(u_sess->plsql_cxt.compile_context_list);
@@ -240,7 +244,6 @@ static void InsertGsSource(Oid objId, Oid nspid, const char* name, const char* t
     if (temp != NULL) {
         MemoryContextSwitchTo(temp);
     }
-    pfree_ext(str.data);
 }
 static void PkgInsertGsSource(Oid pkgOid, bool isSpec, bool status)
 {
@@ -303,7 +306,10 @@ static void ProcInsertGsSource(Oid funcOid, bool status)
     char* name = NameStr(procStruct->proname);
     Oid nspid = procStruct->pronamespace;
     const char* type = (prokind == PROKIND_PROCEDURE) ? ("procedure") : ("function");
-
+    if (strcasecmp(get_language_name((Oid)procStruct->prolang), "plpgsql") != 0) {
+        ReleaseSysCache(procTup);
+        return;
+    }
     InsertGsSource(funcOid, nspid, name, type, status);
 
     ReleaseSysCache(procTup);
@@ -425,7 +431,7 @@ void processPackageProcList(PLpgSQL_package* pkg)
                 rc = sprintf_s(message, MAXSTRLEN,
                                 "Function definition not found: %s",
                                 NameListToString(stmtArray[i]->funcname));
-                securec_check_ss_c(rc, "\0", "\0");
+                securec_check_ss(rc, "\0", "\0");
                 InsertErrorMessage(message, stmtArray[i]->startLineNumber);
                 ereport(ERROR,
                     (errcode(ERRCODE_UNDEFINED_FUNCTION),
@@ -698,7 +704,6 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
     bool needRecord = false;
     PLpgSQL_package* pkg = NULL;
     MemoryContext oldContext = CurrentMemoryContext;
-    FormatCallStack* plcallstack = NULL;
     int pkgDatumsNumber = 0;
     bool savedisAllowCommitRollback = true;
     /*
@@ -712,9 +717,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
     /* get cast owner and make sure current user is cast owner when execute cast-func */
     GetUserIdAndSecContext(&old_user, &save_sec_context);
     cast_owner = u_sess->exec_cxt.cast_owner;
-    if (InvalidCastOwnerId == cast_owner || !OidIsValid(cast_owner)) {
-        ereport(LOG, (errmsg("old system table pg_cast does not have castowner column, use old default permission")));
-    } else {
+    if (cast_owner != InvalidCastOwnerId && OidIsValid(cast_owner)) {
         SetUserIdAndSecContext(cast_owner, save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
         has_switch = true;
     }
@@ -738,6 +741,17 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
     }
 
     int fun_arg = fcinfo->nargs;
+
+    _PG_init();
+    /*
+     * Connect to SPI manager
+     */
+    SPI_STACK_LOG("connect", NULL, NULL);
+    rc =  SPI_connect_ext(DestSPI, NULL, NULL, nonatomic ? SPI_OPT_NONATOMIC : 0, func_oid);
+    if (rc  != SPI_OK_CONNECT) {
+        ereport(ERROR, (errmodule(MOD_PLSQL), errcode(ERRCODE_UNDEFINED_OBJECT),
+            errmsg("SPI_connect failed: %s when execute PLSQL function.", SPI_result_code_string(rc))));
+    }
 #ifdef ENABLE_MULTIPLE_NODES
     bool outer_is_stream = false;
     bool outer_is_stream_support = false;
@@ -751,21 +765,9 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
     /* Saves the status of whether to send commandId. */
     bool saveSetSendCommandId = IsSendCommandId();
 #else
-    int outerDop = u_sess->opt_cxt.query_dop;
-    u_sess->opt_cxt.query_dop = 1;
+    AutoDopControl dopControl;
+    dopControl.CloseSmp();
 #endif
-
-    _PG_init();
-    /*
-     * Connect to SPI manager
-     */
-    SPI_STACK_LOG("connect", NULL, NULL);
-    rc =  SPI_connect_ext(DestSPI, NULL, NULL, nonatomic ? SPI_OPT_NONATOMIC : 0, func_oid);
-    if (rc  != SPI_OK_CONNECT) {
-        ereport(ERROR, (errmodule(MOD_PLSQL), errcode(ERRCODE_UNDEFINED_OBJECT),
-            errmsg("SPI_connect failed: %s when execute PLSQL function.", SPI_result_code_string(rc))));
-    }
-
     int connect = SPI_connectid();
     Oid firstLevelPkgOid = InvalidOid;
     PG_TRY();
@@ -807,6 +809,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         /* Must save and restore prior value of cur_estate and debug_info */
         save_cur_estate = func->cur_estate;
         save_debug_info = func->debug;
+        NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
 
         // set the procedure's search_path as the current search_path
         validate_search_path(func);
@@ -826,7 +829,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         PLpgSQL_compile_context* save_compile_context = u_sess->plsql_cxt.curr_compile_context;
         int save_compile_list_length = list_length(u_sess->plsql_cxt.compile_context_list);
         int save_compile_status = u_sess->plsql_cxt.compile_status;
-
+        FormatCallStack* saveplcallstack = t_thrd.log_cxt.call_stack;
         PG_TRY();
         {
             /*
@@ -835,6 +838,10 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
              */
             if (CALLED_AS_TRIGGER(fcinfo)) {
                 retval = PointerGetDatum(plpgsql_exec_trigger(func, (TriggerData*)fcinfo->context));
+	    } else if (CALLED_AS_EVENT_TRIGGER(fcinfo)) {
+                plpgsql_exec_event_trigger(func,
+                    (EventTriggerData *) fcinfo->context);
+
             } else {
                 if (func->is_private && !u_sess->is_autonomous_session) {
                     if (OidIsValid(secondLevelPkgOid)) {
@@ -872,16 +879,9 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         {
             /* reset cur_exception_cxt */
             u_sess->plsql_cxt.cur_exception_cxt = NULL;
-            /* Put the new code behind this code snippet. Otherwise, unexpected errors may occur. */
-            plcallstack = t_thrd.log_cxt.call_stack;
 
-#ifndef ENABLE_MULTIPLE_NODES
-            estate_cursor_set(plcallstack);
-
-#endif
-            if (plcallstack != NULL) {
-                t_thrd.log_cxt.call_stack = plcallstack->prev;
-            }
+            t_thrd.log_cxt.call_stack = saveplcallstack;
+            t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
 
 #ifndef ENABLE_MULTIPLE_NODES
             /* for restore parent session and automn session package var values */
@@ -959,6 +959,7 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         DecreasePackageUseCount(func);
         func->cur_estate = save_cur_estate;
         func->debug = save_debug_info;
+        t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
 
         // resume the search_path when the procedure has executed
         PopOverrideSearchPath();
@@ -977,6 +978,8 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         }
 #ifdef ENABLE_MULTIPLE_NODES
         SetSendCommandId(saveSetSendCommandId);
+#else
+        dopControl.ResetSmp();
 #endif
         /* ErrorData could be allocted in SPI's MemoryContext, copy it. */
         oldContext = MemoryContextSwitchTo(oldContext);
@@ -1001,6 +1004,8 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
     }
 #ifdef ENABLE_MULTIPLE_NODES
     SetSendCommandId(saveSetSendCommandId);
+#else
+    dopControl.ResetSmp();
 #endif
 
     /*
@@ -1017,8 +1022,6 @@ Datum plpgsql_call_handler(PG_FUNCTION_ARGS)
         u_sess->opt_cxt.is_stream = outer_is_stream;
         u_sess->opt_cxt.is_stream_support = outer_is_stream_support;
     }
-#else
-    u_sess->opt_cxt.query_dop = outerDop;
 #endif
     if (has_switch) {
         SetUserIdAndSecContext(old_user, save_sec_context);
@@ -1047,15 +1050,6 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
     int64 startTime = 0;
     bool needRecord = false;
 
-#ifndef ENABLE_MULTIPLE_NODES
-    int outerDop = u_sess->opt_cxt.query_dop;
-    u_sess->opt_cxt.query_dop = 1;
-#else
-    /* Saves the status of whether to send commandId. */
-    bool saveSetSendCommandId = IsSendCommandId();
-#endif
-
-
     _PG_init();
 
     AssertEreport(IsA(codeblock, InlineCodeBlock), MOD_PLSQL, "Inline code block is required.");
@@ -1064,13 +1058,32 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
      * Connect to SPI manager
      */
     SPI_STACK_LOG("connect", NULL, NULL);
+#ifdef ENABLE_MOT
+    bool needSPIFinish = true;
+#endif
     rc = SPI_connect_ext(DestSPI, NULL, NULL, codeblock->atomic ? 0 : SPI_OPT_NONATOMIC);
     if (rc != SPI_OK_CONNECT) {
-        ereport(ERROR, (errmodule(MOD_PLSQL),
-                errcode(ERRCODE_SPI_CONNECTION_FAILURE),
-                errmsg("SPI_connect failed: %s when execute anonymous block.", SPI_result_code_string(rc))));
+#ifdef ENABLE_MOT
+        if (rc != SPI_ERROR_CONNECT) {
+#endif
+            ereport(ERROR, (errmodule(MOD_PLSQL),
+                    errcode(ERRCODE_SPI_CONNECTION_FAILURE),
+                    errmsg("SPI_connect failed: %s when execute anonymous block.", SPI_result_code_string(rc))));
+#ifdef ENABLE_MOT
+        } else {
+            needSPIFinish = false;
+        }
+#endif
     }
     PGSTAT_START_PLSQL_TIME_RECORD();
+
+#ifndef ENABLE_MULTIPLE_NODES
+    AutoDopControl dopControl;
+    dopControl.CloseSmp();
+#else
+    /* Saves the status of whether to send commandId. */
+    bool saveSetSendCommandId = IsSendCommandId();
+#endif
 
     /* Compile the anonymous code block */
     PLpgSQL_compile_context* save_compile_context = u_sess->plsql_cxt.curr_compile_context;
@@ -1084,6 +1097,9 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
     }
     PG_CATCH();
     {
+#ifndef ENABLE_MULTIPLE_NODES
+        dopControl.ResetSmp();
+#endif
         popToOldCompileContext(save_compile_context);
         PG_RE_THROW();
     }
@@ -1114,6 +1130,8 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
     save_compile_context = u_sess->plsql_cxt.curr_compile_context;
     int save_compile_list_length = list_length(u_sess->plsql_cxt.compile_context_list);
     int save_compile_status = u_sess->plsql_cxt.compile_status;
+    NodeTag old_node_tag = t_thrd.postgres_cxt.cur_command_tag;
+    FormatCallStack* saveplcallstack = t_thrd.log_cxt.call_stack;
     PG_TRY();
     {
         if (IsAutonomousTransaction(func->action->isAutonomous)) {
@@ -1126,22 +1144,20 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
     }
     PG_CATCH();
     {
-        /* Put the new code behind this code snippet. Otherwise, unexpected errors may occur. */
-        FormatCallStack* plcallstack = t_thrd.log_cxt.call_stack;
-#ifndef ENABLE_MULTIPLE_NODES
-        estate_cursor_set(plcallstack);
-#endif
-
-        if (plcallstack != NULL) {
-            t_thrd.log_cxt.call_stack = plcallstack->prev;
+        if (u_sess->SPI_cxt._connected == 0) {
+            t_thrd.utils_cxt.STPSavedResourceOwner = NULL;
         }
+        t_thrd.log_cxt.call_stack = saveplcallstack;
         /* Decrement package use-count */
         DecreasePackageUseCount(func);
 
 #ifndef ENABLE_MULTIPLE_NODES
         /* for restore parent session and automn session package var values */
         (void)processAutonmSessionPkgsInException(func);
+
+        dopControl.ResetSmp();
 #endif
+        t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
         ereport(DEBUG3, (errmodule(MOD_NEST_COMPILE), errcode(ERRCODE_LOG),
             errmsg("%s clear curr_compile_context because of error.", __func__)));
         /* reset nest plpgsql compile */
@@ -1157,9 +1173,19 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
         PG_RE_THROW();
     }
     PG_END_TRY();
+    t_thrd.postgres_cxt.cur_command_tag = old_node_tag;
+    if (u_sess->SPI_cxt._connected == 0) {
+        t_thrd.utils_cxt.STPSavedResourceOwner = NULL;
+    }
 
 #ifdef ENABLE_MULTIPLE_NODES
     SetSendCommandId(saveSetSendCommandId);
+#endif
+
+#ifdef ENABLE_MULTIPLE_NODES
+    SetSendCommandId(saveSetSendCommandId);
+#else
+    dopControl.ResetSmp();
 #endif
 
     /* Disconnecting and releasing resources */
@@ -1192,14 +1218,16 @@ Datum plpgsql_inline_handler(PG_FUNCTION_ARGS)
      * Disconnect from SPI manager
      */
     SPI_STACK_LOG("finish", NULL, NULL);
-    if (((rc = SPI_finish()) != SPI_OK_FINISH)) {
-        ereport(ERROR, (errmodule(MOD_PLSQL),
-                errcode(ERRCODE_SPI_CONNECTION_FAILURE),
-                errmsg("SPI_finish failed: %s when execute anonymous block.", SPI_result_code_string(rc))));
+#ifdef ENABLE_MOT
+    if (needSPIFinish) {
+#endif
+        if (((rc = SPI_finish()) != SPI_OK_FINISH)) {
+            ereport(ERROR, (errmodule(MOD_PLSQL),
+                    errcode(ERRCODE_SPI_CONNECTION_FAILURE),
+                    errmsg("SPI_finish failed: %s when execute anonymous block.", SPI_result_code_string(rc))));
+        }
+#ifdef ENABLE_MOT
     }
-
-#ifndef ENABLE_MULTIPLE_NODES
-    u_sess->opt_cxt.query_dop = outerDop;
 #endif
 
     return retval;
@@ -1224,7 +1252,9 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
     Oid* argtypes = NULL;
     char** argnames;
     char* argmodes = NULL;
-    bool istrigger = false;
+    bool is_dml_trigger = false;
+    bool is_event_trigger = false;
+    
     int i;
     /*
      * 3 means the number of arguments of function plpgsql_validator, while 'is_place' is the third one,
@@ -1234,11 +1264,6 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
     if (PG_NARGS() >= 3) {
         replace = PG_GETARG_BOOL(2);
     }
-
-#ifndef ENABLE_MULTIPLE_NODES
-    int outerDop = u_sess->opt_cxt.query_dop;
-    u_sess->opt_cxt.query_dop = 1;
-#endif
 
     _PG_init();
 
@@ -1262,7 +1287,9 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
     if (functyptype == TYPTYPE_PSEUDO) {
         /* we assume OPAQUE with no arguments means a trigger */
         if (proc->prorettype == TRIGGEROID || (proc->prorettype == OPAQUEOID && proc->pronargs == 0)) {
-            istrigger = true;
+            is_dml_trigger = true;                
+        } else if (proc->prorettype == EVTTRIGGEROID) { 
+            is_event_trigger = true;    
         } else if (proc->prorettype != RECORDOID && proc->prorettype != VOIDOID && !IsPolymorphicType(proc->prorettype)) {
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1288,7 +1315,8 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
     if (u_sess->attr.attr_sql.check_function_bodies) {
         FunctionCallInfoData fake_fcinfo;
         FmgrInfo flinfo;
-        TriggerData trigdata;
+        TriggerData dml_trigdata;
+        EventTriggerData event_trigdata;
         PLpgSQL_function* func = NULL;
         /*
          * Set up a fake fcinfo with just enough info to satisfy
@@ -1303,11 +1331,15 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
         fake_fcinfo.arg[0] = fcinfo->arg[1];
         flinfo.fn_oid = funcoid;
         flinfo.fn_mcxt = CurrentMemoryContext;
-        if (istrigger) {
-            errorno = memset_s(&trigdata, sizeof(trigdata), 0, sizeof(trigdata));
+        if (is_dml_trigger) {
+            errorno = memset_s(&dml_trigdata, sizeof(dml_trigdata), 0, sizeof(dml_trigdata));
             securec_check(errorno, "", "");
-            trigdata.type = T_TriggerData;
-            fake_fcinfo.context = (Node*)&trigdata;
+            dml_trigdata.type = T_TriggerData;
+            fake_fcinfo.context = (Node*)&dml_trigdata;
+        } else if (is_event_trigger) {
+            MemSet(&event_trigdata, 0, sizeof(event_trigdata));
+            event_trigdata.type = T_EventTriggerData;
+            fake_fcinfo.context = (Node *) &event_trigdata;
         }
         /* save flag for nest plpgsql compile */
         PLpgSQL_compile_context* save_compile_context = u_sess->plsql_cxt.curr_compile_context;
@@ -1323,12 +1355,15 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
         PG_CATCH();
         {
 #ifndef ENABLE_MULTIPLE_NODES
+            u_sess->parser_cxt.isPerform = false;
             bool insertError = (u_sess->attr.attr_common.plsql_show_all_error ||
                                     !u_sess->attr.attr_sql.check_function_bodies) &&
                                     u_sess->plsql_cxt.isCreateFunction;
+            if (!SKIP_GS_SOURCE && !IsInitdb && u_sess->plsql_cxt.isCreateFunction) {
+                ProcInsertGsSource(funcoid, false);
+            }
             if (insertError) {
                 if (!IsInitdb) {
-                    ProcInsertGsSource(funcoid, false);
                     int rc = CompileWhich();
                     if (rc == PLPGSQL_COMPILE_PACKAGE || rc == PLPGSQL_COMPILE_PACKAGE_PROC) {
                         InsertError(u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid);
@@ -1359,16 +1394,8 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
             PG_RE_THROW();
         }
         PG_END_TRY();
-        /* Skip validation on Initdb */
-#ifndef ENABLE_MULTIPLE_NODES
-        if (!IsInitdb && u_sess->plsql_cxt.isCreateFunction) {
-            ProcInsertGsSource(funcoid, true);
-        }
-#endif
-
         bool isNotComipilePkg = u_sess->plsql_cxt.curr_compile_context == NULL ||
-            (u_sess->plsql_cxt.curr_compile_context != NULL &&
-            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package == NULL);
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package == NULL;
 
         if (!IsInitdb && (
 #ifdef ENABLE_MULTIPLE_NODES
@@ -1386,10 +1413,10 @@ Datum plpgsql_validator(PG_FUNCTION_ARGS)
                 u_sess->ClientAuthInProgress = saved_client_auth;
         }
     }
-
 #ifndef ENABLE_MULTIPLE_NODES
-    u_sess->plsql_cxt.isCreateFunction = false;
-    u_sess->opt_cxt.query_dop = outerDop;
+    if (!IsInitdb && u_sess->plsql_cxt.isCreateFunction) {
+        ProcInsertGsSource(funcoid, true);
+    }
 #endif
 
     PG_RETURN_VOID();
@@ -1424,10 +1451,7 @@ PLpgSQL_package* plpgsql_package_validator(Oid packageOid, bool isSpec, bool isC
     PG_CATCH();
     {
 #ifndef ENABLE_MULTIPLE_NODES
-        bool insertError = (u_sess->attr.attr_common.plsql_show_all_error ||
-                                !u_sess->attr.attr_sql.check_function_bodies) &&
-                                isCreate;
-        if (insertError) {
+        if (isCreate) {
             SPI_STACK_LOG("finish", NULL, NULL);
             SPI_finish();
             if (!IsInitdb) {
@@ -1536,6 +1560,7 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
     }
     int package_line = 0;
     package_line = u_sess->plsql_cxt.package_as_line;
+    Oid old_value = saveCallFromPkgOid(pkg->pkg_oid);
     PushOverrideSearchPath(pkg->pkg_searchpath);
     ListCell* cell = NULL;
     int oldCompileStatus = getCompileStatus();
@@ -1622,6 +1647,7 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
     PLpgSQL_compile_context* save_compile_context = u_sess->plsql_cxt.curr_compile_context;
     int save_compile_list_length = list_length(u_sess->plsql_cxt.compile_context_list);
     int save_compile_status = u_sess->plsql_cxt.compile_status;
+    List* temp_tableof_index = NULL;
     PG_TRY();
     {
         u_sess->plsql_cxt.is_package_instantiation = true;
@@ -1632,6 +1658,8 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
                 if (!isCreate) {
                     if (!doStmt->isExecuted) {
                         (void)CompileStatusSwtichTo(COMPILIE_PKG_ANON_BLOCK);
+                        temp_tableof_index = u_sess->plsql_cxt.func_tableof_index;
+                        u_sess->plsql_cxt.func_tableof_index = NULL;
                         if (u_sess->SPI_cxt._connected > -1 &&
                             u_sess->SPI_cxt._connected != u_sess->SPI_cxt._curid) {
                             SPI_STACK_LOG("begin", NULL, NULL);
@@ -1646,12 +1674,16 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
                             pkg->isInit = true;
                             
                         }
+                        free_func_tableof_index();
+                        u_sess->plsql_cxt.func_tableof_index = temp_tableof_index;
                         (void)CompileStatusSwtichTo(oldCompileStatus);
                         doStmt->isExecuted = true;
                     }
                 } else {
                     if (doStmt->isSpec && !doStmt->isExecuted) {
                         (void)CompileStatusSwtichTo(COMPILIE_PKG_ANON_BLOCK);
+                        temp_tableof_index = u_sess->plsql_cxt.func_tableof_index;
+                        u_sess->plsql_cxt.func_tableof_index = NULL;
                         if (u_sess->SPI_cxt._connected > -1 &&
                             u_sess->SPI_cxt._connected != u_sess->SPI_cxt._curid) {
                             SPI_STACK_LOG("begin", NULL, NULL);
@@ -1662,7 +1694,8 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
                         } else if (!doStmt->isExecuted) {
                             ExecuteDoStmt(doStmt, true);
                         }
-                        
+                        free_func_tableof_index();
+                        u_sess->plsql_cxt.func_tableof_index = temp_tableof_index;
                         (void)CompileStatusSwtichTo(oldCompileStatus);
                         doStmt->isExecuted = true;
                     }
@@ -1682,6 +1715,7 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
     {
         stp_reset_xact_state_and_err_msg(oldStatus, needResetErrMsg);
         u_sess->plsql_cxt.is_package_instantiation = false;
+        free_temp_func_tableof_index(temp_tableof_index);
         PopOverrideSearchPath();
         ereport(DEBUG3, (errmodule(MOD_NEST_COMPILE), errcode(ERRCODE_LOG),
             errmsg("%s clear curr_compile_context because of error.", __func__)));
@@ -1693,6 +1727,7 @@ void PackageInit(PLpgSQL_package* pkg, bool isCreate)
     }
     PG_END_TRY();
     PopOverrideSearchPath();
+    restoreCallFromPkgOid(old_value);
 }
 #endif
 void record_pkg_function_dependency(PLpgSQL_package* pkg, List** invalItems, Oid funcid, Oid pkgid)

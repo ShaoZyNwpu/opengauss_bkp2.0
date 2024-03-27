@@ -57,8 +57,6 @@ extern XLogRecPtr FindMaxLSN(char* workingpath, char* returnmsg, pg_crc32 *maxLs
     TimeLineID *returnTli = NULL);
 BuildErrorCode findCommonCheckpoint(const char* datadir, TimeLineID tli, XLogRecPtr startrec, XLogRecPtr* lastchkptrec,
     TimeLineID* lastchkpttli, XLogRecPtr *lastchkptredo, uint32 term);
-extern int find_gucoption(const char** optlines, const char* opt_name, int* name_offset, int* name_len, 
-    int* value_offset, int* value_len);
 
 extern bool TransLsn2XlogFileName(XLogRecPtr lsn, TimeLineID lastcommontli, char* xlogName);
 extern XLogRecPtr getValidCommonLSN(XLogRecPtr checkLsn, XLogRecPtr maxLsn);
@@ -68,6 +66,11 @@ extern BuildErrorCode waitEndTargetFileStatThread(void);
 extern BuildErrorCode targetFilemapProcess(void);
 void recordReadTest(const char* datadir, XLogRecPtr ptr, TimeLineID tli);
 void openDebugLog(void);
+bool FindConfirmedLSN(const char* dataDir, XLogRecPtr *confirmedLsn);
+BuildErrorCode do_build_check(const char* pgdata, const char* connstr, char* sysidentifier, uint32 timeline, uint32 term);
+BuildErrorCode CheckConfirmedLSNOnTarget(const char *datadir, TimeLineID tli, XLogRecPtr ckptRedo, XLogRecPtr confirmedLSN,
+    uint32 term);
+bool CheckIfEanbedSaveSlots();
 
 #define PG_CHECKBUILD_AND_RETURN()                  \
     do {                                            \

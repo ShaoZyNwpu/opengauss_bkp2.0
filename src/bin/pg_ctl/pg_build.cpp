@@ -22,6 +22,7 @@
 #include "pg_build.h"
 #include "streamutil.h"
 #include "logging.h"
+#include "tool_common.h"
 
 #include "bin/elog.h"
 #include "nodes/pg_list.h"
@@ -32,9 +33,10 @@
 #include "common/fe_memutils.h"
 #include "libpq/libpq-fe.h"
 #include "libpq/libpq-int.h"
+#include "storage/file/fio_device.h"
 
 /* global variables for con */
-char conninfo_global[MAX_REPLNODE_NUM][MAX_VALUE_LEN] = {{0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}};
+char conninfo_global[MAX_REPLNODE_NUM][MAX_VALUE_LEN] = {{0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}, {0}};
 static const char* config_para_build[MAX_REPLNODE_NUM] = {"",
     "replconninfo1",
     "replconninfo2",
@@ -42,7 +44,8 @@ static const char* config_para_build[MAX_REPLNODE_NUM] = {"",
     "replconninfo4",
     "replconninfo5",
     "replconninfo6",
-    "replconninfo7"};
+    "replconninfo7",
+    "replconninfo8"};
 static const char* config_para_cross_cluster_build[MAX_REPLNODE_NUM] = {
     "",
     "cross_cluster_replconninfo1",
@@ -51,7 +54,8 @@ static const char* config_para_cross_cluster_build[MAX_REPLNODE_NUM] = {
     "cross_cluster_replconninfo4",
     "cross_cluster_replconninfo5",
     "cross_cluster_replconninfo6",
-    "cross_cluster_replconninfo7"
+    "cross_cluster_replconninfo7",
+    "cross_cluster_replconninfo8"
 };
 
 /* Node name */
@@ -63,6 +67,8 @@ int conn_flag = 0;
 char g_buildapplication_name[MAX_VALUE_LEN] = {0};
 char g_buildprimary_slotname[MAX_VALUE_LEN] = {0};
 char g_str_replication_type[MAX_VALUE_LEN] = {0};
+char g_repl_auth_mode[MAX_VALUE_LEN] = {0};
+char g_repl_uuid[MAX_VALUE_LEN] = {0};
 int g_replconn_idx = -1;
 int g_replication_type = -1;
 bool is_cross_region_build = false;
@@ -70,6 +76,34 @@ bool is_cross_region_build = false;
 #define RT_WITH_MULTI_STANDBY 1
 
 static void walkdir(const char *path, int (*action) (const char *fname, bool isdir), bool process_symlinks);
+
+static void check_repl_uuid(char *repl_uuid)
+{
+#define IsAlNum(c) (((c) >= 'A' && (c) <= 'Z') || ((c) >= 'a' && (c) <= 'z') || ((c) >= '0' && (c) <= '9'))
+
+    if (repl_uuid == NULL) {
+        return;
+    }
+
+    int ptr = 0;
+
+    if (strlen(repl_uuid) >= NAMEDATALEN) {
+        pg_log(PG_PRINT, _("Max repl_uuid string length is 63.\n"));
+        exit(1);
+    }
+
+    while (repl_uuid[ptr] != '\0') {
+        if (!IsAlNum(repl_uuid[ptr])) {
+            pg_log(PG_PRINT, _("repl_uuid only accepts alphabetic or digital character, case insensitive.\n"));
+            exit(1);
+        }
+
+        repl_uuid[ptr] = tolower(repl_uuid[ptr]);
+        ptr++;
+    }
+
+    return;
+}
 
 int32 pg_atoi(const char* s, int size, int c)
 {
@@ -229,11 +263,11 @@ char** readfile(const char* path)
 
 /*
  * @@GaussDB@@
- * Brief            : CheckReplChannel
+ * Brief            : BuildCheckReplChannel
  * Description        :
  * Notes            :
  */
-static bool CheckReplChannel(const char* ChannelInfo)
+static bool BuildCheckReplChannel(const char* ChannelInfo)
 {
     char* iter = NULL;
     char* ReplStr = NULL;
@@ -245,7 +279,6 @@ static bool CheckReplChannel(const char* ChannelInfo)
         if (ReplStr == NULL) {
             return false;
         } else {
-            /* check localhost */
             iter = strstr(ReplStr, "localhost");
             if (iter == NULL) {
                 free(ReplStr);
@@ -263,7 +296,6 @@ static bool CheckReplChannel(const char* ChannelInfo)
                 return false;
             }
 
-            /* check localport */
             iter = strstr(ReplStr, "localport");
             if (iter == NULL) {
                 free(ReplStr);
@@ -280,7 +312,6 @@ static bool CheckReplChannel(const char* ChannelInfo)
                 return false;
             }
 
-            /* check remotehost */
             iter = strstr(ReplStr, "remotehost");
             if (NULL == iter) {
                 free(ReplStr);
@@ -298,7 +329,6 @@ static bool CheckReplChannel(const char* ChannelInfo)
                 return false;
             }
 
-            /* check remoteport */
             iter = strstr(ReplStr, "remoteport");
             if (iter == NULL) {
                 free(ReplStr);
@@ -343,7 +373,7 @@ int GetLengthAndCheckReplConn(const char* ConnInfoList)
         }
         token = strtok_r(ReplStr, ",", &p);
         while (token != NULL) {
-            if (CheckReplChannel(token)) {
+            if (BuildCheckReplChannel(token)) {
                 repl_len++;
             }
 
@@ -579,7 +609,7 @@ void get_conninfo(const char* filename)
     }
 
     if (build_mode == CROSS_CLUSTER_FULL_BUILD || build_mode == CROSS_CLUSTER_INC_BUILD ||
-        build_mode == CROSS_CLUSTER_STANDBY_FULL_BUILD) {
+        build_mode == CROSS_CLUSTER_STANDBY_FULL_BUILD || build_mode == BUILD_CHECK) {
         /* For shared storage cluster */
         conninfo_para = config_para_cross_cluster_build;
     } else {
@@ -698,6 +728,27 @@ void get_conninfo(const char* filename)
                 (size_t)Min(optvalue_len - 2, MAX_VALUE_LEN - 1));
             securec_check_c(rc, "", "");
         }
+
+        /* read repl_auth_mode */
+        lines_index = find_gucoption((const char**)optlines,
+            CONFIG_REPL_AUTH_MODE, NULL, NULL, &optvalue_off, &optvalue_len, '\'');
+        if (lines_index != INVALID_LINES_IDX) {
+            rc = strncpy_s(g_repl_auth_mode, MAX_VALUE_LEN, optlines[lines_index] + optvalue_off,
+                (size_t)Min(optvalue_len, MAX_VALUE_LEN - 1));
+            securec_check_c(rc, "", "");
+        }
+
+        /* read repl_uuid */
+        lines_index = find_gucoption((const char**)optlines,
+            CONFIG_REPL_UUID, NULL, NULL, &optvalue_off, &optvalue_len, '\'');
+        if (lines_index != INVALID_LINES_IDX) {
+            rc = strncpy_s(g_repl_uuid, MAX_VALUE_LEN, optlines[lines_index] + optvalue_off,
+                (size_t)Min(optvalue_len, MAX_VALUE_LEN - 1));
+            securec_check_c(rc, "", "");
+        }
+        check_repl_uuid(g_repl_uuid);
+
+        pg_log(PG_WARNING, "Get repl_auth_mode is %s and repl_uuid is %s\n", g_repl_auth_mode, g_repl_uuid);
 
         while (optlines[opt_index] != NULL) {
             free(optlines[opt_index]);
@@ -858,6 +909,13 @@ PGconn* check_and_conn(int conn_timeout, int recv_timeout, uint32 term)
     int i = 0;
     int parse_failed_num = 0;
     ReplConnInfo repl_conn_info;
+    bool is_uuid_auth = (strcmp(g_repl_auth_mode, REPL_AUTH_MODE_UUID) == 0 && strlen(g_repl_uuid) > 0);
+    char uuidOption[MAXPGPATH] = {0};
+
+    if (is_uuid_auth) {
+        tnRet = snprintf_s(uuidOption, sizeof(uuidOption), sizeof(uuidOption) - 1, "-c repl_uuid=%s", g_repl_uuid);
+        securec_check_ss_c(tnRet, "\0", "\0");
+    }
 
     for (i = 1; i < MAX_REPLNODE_NUM; i++) {
         bool parseOk = ParseReplConnInfo(conninfo_global[i - 1], &repl_arr_length, &repl_conn_info);
@@ -865,6 +923,7 @@ PGconn* check_and_conn(int conn_timeout, int recv_timeout, uint32 term)
             parse_failed_num++;
             continue;
         }
+        is_cross_region_build = repl_conn_info.isCrossRegion;
 
         tnRet = memset_s(repl_conninfo_str, MAXPGPATH, 0, MAXPGPATH);
         securec_check_ss_c(tnRet, "", "");
@@ -896,25 +955,39 @@ PGconn* check_and_conn(int conn_timeout, int recv_timeout, uint32 term)
                 "dbname=replication replication=true "
                 "fallback_application_name=gs_ctl "
                 "connect_timeout=%d rw_timeout=%d "
-                "options='-c remotetype=application'",
+                "options='-c remotetype=application %s'",
                 repl_conn_info.localhost,
                 repl_conn_info.localport,
                 repl_conn_info.remotehost,
                 repl_conn_info.remoteport,
                 conn_timeout,
-                recv_timeout);
+                recv_timeout,
+                uuidOption);
         }
         securec_check_ss_c(tnRet, "", "");
         con_get = check_and_get_primary_conn(repl_conninfo_str, term);
         tnRet = memset_s(repl_conninfo_str, MAXPGPATH, 0, MAXPGPATH);
         securec_check_ss_c(tnRet, "", "");
-        if (con_get != NULL) {
-            pg_log(PG_WARNING, "build try host(%s) port(%d) success\n", repl_conn_info.remotehost,
-                repl_conn_info.remoteport);
-            break;
+        if (is_cross_region_build) {
+            if (con_get != NULL && (g_replconn_idx == -1 || i == g_replconn_idx)) {
+                g_replconn_idx = i;
+                pg_log(PG_WARNING, "build try host(%s) port(%d) success\n", repl_conn_info.remotehost,
+                    repl_conn_info.remoteport);
+                break;
+            }
+        } else {
+            if (con_get != NULL) {
+                pg_log(PG_WARNING, "build try host(%s) port(%d) success\n", repl_conn_info.remotehost,
+                    repl_conn_info.remoteport);
+                break;
+            }
         }
         pg_log(PG_WARNING, "build try host(%s) port(%d) failed\n", repl_conn_info.remotehost,
             repl_conn_info.remoteport);
+        if (con_get != NULL) {
+            PQfinish(con_get);
+            con_get = NULL;
+        }
     }
 
     if (parse_failed_num == MAX_REPLNODE_NUM - 1) {
@@ -939,6 +1012,13 @@ PGconn* check_and_conn_for_standby(int conn_timeout, int recv_timeout, uint32 te
     int i = 0;
     int parse_failed_num = 0;
     ReplConnInfo repl_conn_info;
+    bool is_uuid_auth = (strcmp(g_repl_auth_mode, REPL_AUTH_MODE_UUID) == 0 && strlen(g_repl_uuid) > 0);
+    char uuidOption[MAXPGPATH] = {0};
+
+    if (is_uuid_auth) {
+        tnRet = snprintf_s(uuidOption, sizeof(uuidOption), sizeof(uuidOption) - 1, "-c repl_uuid=%s", g_repl_uuid);
+        securec_check_ss_c(tnRet, "\0", "\0");
+    }
 
     for (i = 1; i < MAX_REPLNODE_NUM; i++) {
         bool parseOk = ParseReplConnInfo(conninfo_global[i - 1], &repl_arr_length, &repl_conn_info);
@@ -957,13 +1037,14 @@ PGconn* check_and_conn_for_standby(int conn_timeout, int recv_timeout, uint32 te
             "dbname=replication replication=true "
             "fallback_application_name=gs_ctl "
             "connect_timeout=%d rw_timeout=%d "
-            "options='-c remotetype=application'",
+            "options='-c remotetype=application %s'",
             repl_conn_info.localhost,
             repl_conn_info.localport,
             repl_conn_info.remotehost,
             repl_conn_info.remoteport,
             conn_timeout,
-            recv_timeout);
+            recv_timeout,
+            uuidOption);
         securec_check_ss_c(tnRet, "", "");
 
 
@@ -976,6 +1057,9 @@ PGconn* check_and_conn_for_standby(int conn_timeout, int recv_timeout, uint32 te
                 pg_log(PG_WARNING, "standby build try host(%s) port(%d) success\n", repl_conn_info.remotehost,
                     repl_conn_info.remoteport);
                 break;
+            } else {
+                PQfinish(con_get);
+                con_get = NULL;
             }
         } else {
             if (con_get != NULL) {
@@ -1008,8 +1092,11 @@ PGconn* check_and_conn_for_standby(int conn_timeout, int recv_timeout, uint32 te
  * Notes            :
  */
 int find_gucoption(
-    const char** optlines, const char* opt_name, int* name_offset, int* name_len, int* value_offset, int* value_len)
+    const char** optlines, const char* opt_name, int* name_offset, int* name_len,
+    int* value_offset, int* value_len, unsigned char strip_char)
 {
+#define SKIP_CHAR(c, skip_c) (isspace((c)) || (c) == (skip_c))
+
     const char* p = NULL;
     const char* q = NULL;
     const char* tmp = NULL;
@@ -1042,12 +1129,12 @@ int find_gucoption(
             continue;
         }
         p++;
-        while (isspace((unsigned char)*p)) {
+        while (SKIP_CHAR(((unsigned char)*p), strip_char)) {
             p++;
         }
         q = p;
         while (*q && !(*q == '\n' || *q == '#')) {
-            if (!isspace((unsigned char)*q)) {
+            if (!(SKIP_CHAR(((unsigned char)*q), strip_char))) {
                 tmp = ++q;
             } else {
                 q++;
@@ -1125,6 +1212,74 @@ static bool GetDCFKeyValue(const char *filename, const char *key, char *value)
     return true;
 }
 
+int IsBeginWith(const char *str1, char *str2)
+{
+    if (str1 == NULL || str2 == NULL) {
+        return -1;
+    }
+    int len1 = strlen(str1);
+    int len2 = strlen(str2);
+    if ((len1 < len2) || (len1 == 0 || len2 == 0)) {
+        return -1;
+    }
+
+    char *p = str2;
+    int i = 0;
+    while (*p != '\0') {
+        if (*p != str1[i]) {
+            return 0;
+        }
+        p++;
+        i++;
+    }
+    return 1;
+}
+
+bool SsIsSkipPath(const char* dirname, bool needskipall)
+{   
+    if (!ss_instance_config.dss.enable_dss) {
+        return false;    
+    }
+
+    if (strcmp(dirname, ".recycle") == 0) {
+        return true;    
+    }
+
+    /* skip doublewrite of all instances*/
+    if (IsBeginWith(dirname, "pg_doublewrite") > 0) {
+        return true;
+    }
+
+    /* skip pg_control file when dss enable, only copy pg_control of main standby,
+     * we need to retain pg_control of other nodes, so pg_contol not be deleted directly.
+     */
+    if (strcmp(dirname, "pg_control") == 0) {
+        return true;
+    }
+
+    /* skip directory which not belong to primary in dss */
+    if (needskipall) {
+        /* skip pg_xlog and doublewrite of all instances*/
+        if (IsBeginWith(dirname, "pg_xlog") > 0) {
+            return true;
+        }
+    } else {
+        /* skip other node pg_xlog except primary */
+        if (IsBeginWith(dirname, "pg_xlog") > 0) { 
+            int dirNameLen = strlen("pg_xlog");
+            char instanceId[MAX_INSTANCEID_LEN] = {0};
+            errno_t rc = EOK;
+            rc = snprintf_s(instanceId, sizeof(instanceId), sizeof(instanceId) - 1, "%d",
+                                ss_instance_config.dss.instance_id);
+            securec_check_ss_c(rc, "\0", "\0");
+            /* not skip pg_xlog directory in file systerm */
+            if (strlen(dirname) > dirNameLen && strcmp(dirname + dirNameLen, instanceId) != 0) 
+                return true;
+        }
+    }
+    return false;
+}
+
 static void DeleteSubDataDir(const char* dirname)
 {
     DIR* dir = NULL;
@@ -1172,6 +1327,9 @@ static void DeleteSubDataDir(const char* dirname)
                 continue;
             if (g_is_obsmode && (strcmp(de->d_name, "pg_replslot") == 0))
                 continue;
+            if (is_dss_file(dirname) && SsIsSkipPath(de->d_name, true))
+                continue;
+            
             rc = memset_s(fullpath, MAXPGPATH, 0, MAXPGPATH);
             securec_check_c(rc, "", "");
             /* others */
@@ -1274,6 +1432,7 @@ static void DeleteSubDataDir(const char* dirname)
             } else if (S_ISREG(st.st_mode)) {
                 if (strcmp(de->d_name, "postgresql.conf") == 0 || strcmp(de->d_name, "pg_ctl.lock") == 0 ||
                     strcmp(de->d_name, "postgresql.conf.lock") == 0 || strcmp(de->d_name, "postgresql.conf.bak.old") == 0 ||
+                    strcmp(de->d_name, "postgresql.conf.bak") == 0 || strcmp(de->d_name, "postgresql.conf.guc.bak") == 0 ||
                     strcmp(de->d_name, "build_completed.start") == 0 || strcmp(de->d_name, "gs_build.pid") == 0 ||
                     strcmp(de->d_name, "postmaster.opts") == 0 || strcmp(de->d_name, "gaussdb.state") == 0 ||
                     strcmp(de->d_name, "disc_readonly_test") == 0 || strcmp(de->d_name, ssl_cert_file) == 0 ||
@@ -1287,6 +1446,7 @@ static void DeleteSubDataDir(const char* dirname)
                     (IS_CROSS_CLUSTER_BUILD && strcmp(de->d_name, "pg_hba.conf") == 0) ||
                     strcmp(de->d_name, "pg_hba.conf.old") == 0)
                     continue;
+                
                 /* Skip paxos index files for building process will write them */
                 if (enableDCF && ((strcmp(de->d_name, "paxosindex") == 0) ||
                     (strcmp(de->d_name, "paxosindex.backup") == 0)))
@@ -1328,6 +1488,7 @@ void delete_datadir(const char* dirname)
         pg_log(PG_WARNING, _("input parameter is NULL.\n"));
         exit(1);
     }
+    
     nRet = snprintf_s(fullpath, MAXPGPATH, sizeof(fullpath) - 1, "%s/pg_tblspc", dirname);
     securec_check_ss_c(nRet, "", "");
 
@@ -1411,7 +1572,12 @@ void delete_datadir(const char* dirname)
      * this is to keep the basedir/pg_xlog, and delete all files and
      * directories under it.
      */
-    nRet = snprintf_s(xlogpath, MAXPGPATH, sizeof(xlogpath) - 1, "%s/pg_xlog", dirname);
+    if (strncmp(dirname, "+", 1) == 0 ) {
+        nRet = snprintf_s(xlogpath, MAXPGPATH, sizeof(xlogpath) - 1, "%s/pg_xlog%d", dirname,
+        ss_instance_config.dss.instance_id);
+    } else {
+        nRet = snprintf_s(xlogpath, MAXPGPATH, sizeof(xlogpath) - 1, "%s/pg_xlog", dirname);
+    }
     securec_check_ss_c(nRet, "", "");
 
     if (lstat(xlogpath, &stbuf) == 0) {
@@ -1552,7 +1718,7 @@ bool libpqRotateCbmFile(PGconn* connObj, XLogRecPtr lsn)
     bool ec = true;
 
     errorno = snprintf_s(sql, MAX_QUERY_LEN, MAX_QUERY_LEN - 1,
-        "select * from pg_cbm_rotate_file('%08X/%08X'); ",
+        "select * from pg_catalog.pg_cbm_rotate_file('%08X/%08X'); ",
         (uint32)(lsn >> 32), (uint32)(lsn));
     securec_check_ss_c(errorno, "\0", "\0");
     res = PQexec(connObj, sql);
@@ -1619,7 +1785,12 @@ void fsync_pgdata(const char *pg_data)
     char pg_tblspc[MAXPGPATH] = {0};
     errno_t errorno = EOK;
 
-    errorno = snprintf_s(pg_xlog, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog", pg_data);
+    if (is_dss_file(pg_data)) {
+        errorno = snprintf_s(pg_xlog, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog%d", pg_data,
+                             ss_instance_config.dss.instance_id);
+    } else {
+        errorno = snprintf_s(pg_xlog, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog", pg_data);
+    }
     securec_check_ss_c(errorno, "\0", "\0");
     errorno = snprintf_s(pg_tblspc, MAXPGPATH, MAXPGPATH - 1, "%s/pg_tblspc", pg_data);
     securec_check_ss_c(errorno, "\0", "\0");
@@ -1629,7 +1800,7 @@ void fsync_pgdata(const char *pg_data)
         struct stat st;
 
         if (lstat(pg_xlog, &st) < 0) {
-            pg_log(PG_WARNING, _("could not stat file \"%s\": %m\n"), pg_xlog);
+            pg_log(PG_WARNING, _("could not stat file \"%s\": %s\n"), pg_xlog, strerror(errno));
             exit(1);
         }
         else if (S_ISLNK(st.st_mode))
@@ -1677,7 +1848,7 @@ static void walkdir(const char *path, int (*action) (const char *fname, bool isd
 
     dir = opendir(path);
     if (dir == NULL) {
-        pg_log(PG_WARNING, _("could not open directory \"%s\": %m\n"), path);
+        pg_log(PG_WARNING, _("could not open directory \"%s\": %s\n"), path, strerror(errno));
         return;
     }
 
@@ -1700,7 +1871,7 @@ static void walkdir(const char *path, int (*action) (const char *fname, bool isd
         else
             sret = lstat(subpath, &fst);
         if (sret < 0) {
-            pg_log(PG_WARNING, _("could not stat file \"%s\": %m\n"), subpath);
+            pg_log(PG_WARNING, _("could not stat file \"%s\": %s\n"), subpath, strerror(errno));
             continue;
         }
 
@@ -1711,7 +1882,7 @@ static void walkdir(const char *path, int (*action) (const char *fname, bool isd
     }
 
     if (errno)
-        pg_log(PG_WARNING, _("could not read directory \"%s\": %m\n"), path);
+        pg_log(PG_WARNING, _("could not read directory \"%s\": %s\n"), path, strerror(errno));
 
     (void)closedir(dir);
 
@@ -1758,7 +1929,7 @@ int fsync_fname(const char *fname, bool isdir)
     if (fd < 0) {
         if (errno == EACCES || (isdir && errno == EISDIR))
             return 0;
-        pg_log(PG_WARNING, _("could not open file \"%s\": %m\n"), fname);
+        pg_log(PG_WARNING, _("could not open file \"%s\": %s\n"), fname, strerror(errno));
         return -1;
     }
 
@@ -1769,7 +1940,7 @@ int fsync_fname(const char *fname, bool isdir)
      * those errors. Anything else needs to be reported.
      */
     if (returncode != 0 && !(isdir && (errno == EBADF || errno == EINVAL))) {
-        pg_log(PG_WARNING, _("could not fsync file \"%s\": %m\n"), fname);
+        pg_log(PG_WARNING, _("could not fsync file \"%s\": %s\n"), fname, strerror(errno));
         (void) close(fd);
         exit(EXIT_FAILURE);
     }

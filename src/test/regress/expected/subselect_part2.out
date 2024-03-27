@@ -137,6 +137,20 @@ with q as (select max(f1) from int4_tbl group by f1 order by f1)
 (6 rows)
 
 --
+-- check for over-optimization of whole-row Var referencing an Append plan
+--
+select (select q from (select 1,2,3 where f1 > 0 union all select 4,5,6.0 where f1 <= 0 ) q) from int4_tbl;
+     q     
+-----------
+ (4,5,6.0)
+ (1,2,3)
+ (4,5,6.0)
+ (1,2,3)
+ (4,5,6.0)
+ 
+(6 rows)
+
+--
 -- Test case for sublinks pushed down into subselects via join alias expansion
 --
 select
@@ -431,9 +445,122 @@ WHERE 1=0);
         1
 (6 rows)
 
+--
+-- Check EXISTS simplification with LIMIT
+--
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit null);
+                QUERY PLAN                
+------------------------------------------
+ Hash Join
+   Hash Cond: (o.f1 = i.f1)
+   ->  Seq Scan on int4_tbl o
+   ->  Hash
+         ->  HashAggregate
+               Group By Key: i.f1
+               ->  Seq Scan on int4_tbl i
+(7 rows)
+
+explain (costs off)
+select * from int4_tbl o where not exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 1);
+             QUERY PLAN             
+------------------------------------
+ Hash Anti Join
+   Hash Cond: (o.f1 = i.f1)
+   ->  Seq Scan on int4_tbl o
+   ->  Hash
+         ->  Seq Scan on int4_tbl i
+(5 rows)
+
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 0);
+              QUERY PLAN              
+--------------------------------------
+ Seq Scan on int4_tbl o
+   Filter: (SubPlan 1)
+   SubPlan 1
+     ->  Limit
+           ->  Seq Scan on int4_tbl i
+                 Filter: (f1 = o.f1)
+(6 rows)
+
 drop table if exists location_type cascade;
 drop table if exists item_inventory_plan cascade;
 NOTICE:  drop cascades to view usview03
 drop table if exists item_inventory cascade;
 drop  view usview03;
 ERROR:  view "usview03" does not exist
+set rewrite_rule = 'remove_redundant_distinct_group_by';
+create table subselect_t1 (a int);
+create table subselect_t2 (a int, b int);
+insert into subselect_t1 values (1);
+insert into subselect_t1 values (2);
+insert into subselect_t1 values (-1);
+insert into subselect_t2 values (1, 1);
+insert into subselect_t2 values (2, 2);
+insert into subselect_t2 values (-1, -1);
+explain (costs off) select * from subselect_t1 where a in (select distinct a from subselect_t2);
+                   QUERY PLAN                   
+------------------------------------------------
+ Hash Join
+   Hash Cond: (subselect_t1.a = subselect_t2.a)
+   ->  Seq Scan on subselect_t1
+   ->  Hash
+         ->  HashAggregate
+               Group By Key: subselect_t2.a
+               ->  Seq Scan on subselect_t2
+(7 rows)
+
+select * from subselect_t1 where a in (select distinct a from subselect_t2);
+ a  
+----
+  1
+  2
+ -1
+(3 rows)
+
+explain (costs off) select * from subselect_t1 where a in (select a from subselect_t2 group by a);
+                   QUERY PLAN                   
+------------------------------------------------
+ Hash Join
+   Hash Cond: (subselect_t1.a = subselect_t2.a)
+   ->  Seq Scan on subselect_t1
+   ->  Hash
+         ->  HashAggregate
+               Group By Key: subselect_t2.a
+               ->  Seq Scan on subselect_t2
+(7 rows)
+
+select * from subselect_t1 where a in (select a from subselect_t2 group by a);
+ a  
+----
+  1
+  2
+ -1
+(3 rows)
+
+explain (costs off) select * from subselect_t1 where a in (select distinct on (abs(a)) a from subselect_t2);
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Hash Semi Join
+   Hash Cond: (subselect_t1.a = "ANY_subquery".a)
+   ->  Seq Scan on subselect_t1
+   ->  Hash
+         ->  Subquery Scan on "ANY_subquery"
+               ->  Unique
+                     ->  Sort
+                           Sort Key: (abs(subselect_t2.a))
+                           ->  Seq Scan on subselect_t2
+(9 rows)
+
+select * from subselect_t1 where a in (select distinct on (abs(a)) a from subselect_t2);
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+reset rewrite_rule;

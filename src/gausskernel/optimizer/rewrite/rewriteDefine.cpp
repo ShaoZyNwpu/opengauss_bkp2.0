@@ -29,6 +29,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pgxc_class.h"
 #include "catalog/pgxc_slice.h"
 #include "catalog/storage.h"
@@ -57,6 +58,7 @@
 #include "utils/snapmgr.h"
 
 static void checkRuleResultList(List* targetList, TupleDesc resultDesc, bool isSelect);
+static bool checkWhetherForbiddenRule(Oid relId);
 static bool setRuleCheckAsUser_walker(Node* node, Oid* context);
 static void setRuleCheckAsUser_Query(Query* qry, Oid userid);
 
@@ -188,7 +190,7 @@ static Oid InsertRule(char* rulname, int evtype, Oid eventrel_oid, AttrNumber ev
  * DefineRule
  *		Execute a CREATE RULE command.
  */
-void DefineRule(RuleStmt* stmt, const char* queryString)
+ObjectAddress DefineRule(RuleStmt* stmt, const char* queryString)
 {
     List* actions = NIL;
     Node* whereClause = NULL;
@@ -202,9 +204,14 @@ void DefineRule(RuleStmt* stmt, const char* queryString)
      * DefineQueryRewrite.
      */
     relId = RangeVarGetRelid(stmt->relation, AccessExclusiveLock, false);
-
+    if (checkWhetherForbiddenRule(relId)) {
+        ereport(ERROR,
+            (errmodule(MOD_EXECUTOR),
+                errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("not supported to create a rule on this table.")));
+    }
     /* ... and execute */
-    DefineQueryRewrite(stmt->rulename, relId, whereClause, stmt->event, stmt->instead, stmt->replace, actions);
+    return DefineQueryRewrite(stmt->rulename, relId, whereClause, stmt->event, stmt->instead, stmt->replace, actions);
 }
 
 /*
@@ -214,7 +221,7 @@ void DefineRule(RuleStmt* stmt, const char* queryString)
  * This is essentially the same as DefineRule() except that the rule's
  * action and qual have already been passed through parse analysis.
  */
-void DefineQueryRewrite(
+ObjectAddress DefineQueryRewrite(
     char* rulename, Oid event_relid, Node* event_qual, CmdType event_type, bool is_instead, bool replace, List* action)
 {
     Relation event_relation;
@@ -226,6 +233,8 @@ void DefineQueryRewrite(
     bool nulls[Natts_pg_class];
     bool replaces[Natts_pg_class];
     errno_t rc;
+    Oid         ruleId = InvalidOid;
+    ObjectAddress address;
 
     /*
      * If we are installing an ON SELECT rule, we had better grab
@@ -267,17 +276,17 @@ void DefineQueryRewrite(
      */
     foreach (l, action) {
         query = (Query*)lfirst(l);
-        if (query->resultRelation == 0)
+        if (linitial2_int(query->resultRelations) == 0)
             continue;
         /* Don't be fooled by INSERT/SELECT */
         if (query != getInsertSelectQuery(query, NULL))
             continue;
-        if (query->resultRelation == PRS2_OLD_VARNO)
+        if (linitial2_int(query->resultRelations) == PRS2_OLD_VARNO)
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     errmsg("rule actions on OLD are not implemented"),
                     errhint("Use views or triggers instead.")));
-        if (query->resultRelation == PRS2_NEW_VARNO)
+        if (linitial2_int(query->resultRelations) == PRS2_NEW_VARNO)
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     errmsg("rule actions on NEW are not implemented"),
@@ -391,8 +400,6 @@ void DefineQueryRewrite(
             rulename = pstrdup(ViewSelectRuleName);
         }
 
-        event_relation->rd_rel->relkind = RELKIND_MATVIEW;
-
         /*
          * Are we converting a relation to a view?
          *
@@ -494,7 +501,7 @@ void DefineQueryRewrite(
 
     /* discard rule if it's null action and not INSTEAD; it's a no-op */
     if (action != NIL || is_instead) {
-        (void)InsertRule(rulename, event_type, event_relid, event_attno, is_instead, event_qual, action, replace);
+        ruleId = InsertRule(rulename, event_type, event_relid, event_attno, is_instead, event_qual, action, replace);
 
         /*
          * Set pg_class 'relhasrules' field TRUE for event relation. If
@@ -604,6 +611,9 @@ void DefineQueryRewrite(
         replaces[Anum_pg_class_relfrozenxid64 - 1] = true;
         values[Anum_pg_class_relfrozenxid64 - 1] = TransactionIdGetDatum(InvalidTransactionId);
 
+        replaces[Anum_pg_class_reloptions - 1] = true;
+        nulls[Anum_pg_class_reloptions - 1] = true;
+
         nctup = (HeapTuple) tableam_tops_modify_tuple(classTup, RelationGetDescr(relationRelation), values, nulls, replaces);
 
         simple_heap_update(relationRelation, &nctup->t_self, nctup);
@@ -613,7 +623,7 @@ void DefineQueryRewrite(
         tableam_tops_free_tuple(classTup);
         heap_close(relationRelation, RowExclusiveLock);
 
-#ifdef PGXC
+#ifdef ENABLE_MULTIPLE_NODES
         RemovePgxcClass(event_relid);
         RemovePgxcSlice(event_relid);
         deleteDependencyRecordsFor(PgxcClassRelationId, event_relid, false);
@@ -631,9 +641,30 @@ void DefineQueryRewrite(
 #endif
     }
 
+    ObjectAddressSet(address, RewriteRelationId, ruleId);
     /* Close rel, but keep lock till commit... */
     heap_close(event_relation, NoLock);
+    return address;
 }
+
+
+/* Check whether the rule creates on a forbidden table. */
+static bool checkWhetherForbiddenRule(Oid relId)
+{
+    Relation rel = heap_open(relId, NoLock);
+    Oid namespaceId = RelationGetNamespace(rel);
+    
+    /* Currently, there is only one schema in the blacklist. */
+    /* Therefore, we can make a simple judgment by using the following method. */
+    bool forbidden = false;
+    if (namespaceId == PG_DB4AI_NAMESPACE && !strcmp(RelationGetRelationName(rel), "snapshot")) {
+        forbidden = true;
+    }
+    
+    heap_close(rel, NoLock);
+    return forbidden;
+}
+
 
 /*
  * checkRuleResultList
@@ -665,7 +696,7 @@ static void checkRuleResultList(List* targetList, TupleDesc resultDesc, bool isS
                     isSelect ? errmsg("SELECT rule's target list has too many entries")
                              : errmsg("RETURNING list has too many entries")));
 
-        attr = resultDesc->attrs[i - 1];
+        attr = &resultDesc->attrs[i - 1];
         attname = NameStr(attr->attname);
 
         /*

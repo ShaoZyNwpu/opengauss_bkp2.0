@@ -269,7 +269,8 @@ MemoryContext AsanMemoryAllocator::AllocSetContextCreate(MemoryContext parent, c
      * Don't limit the memory allocation for ErrorContext.
      * And skip memory tracking memory allocation.
      */
-    if ((strcmp(name, "ErrorContext") != 0) && (strcmp(name, "MemoryTrackMemoryContext") != 0)) {
+    if ((strcmp(name, "ErrorContext") != 0) && (strcmp(name, "MemoryTrackMemoryContext") != 0)
+        && (strcmp(name, "DolphinErrorData") != 0)) {
         value |= IS_PROTECT;
     }
 
@@ -825,11 +826,11 @@ void dumpAsanBlock(AsanSet set, StringInfoData* memoryBuf)
     return;
 }
 
-void GetAsanBlockInfo(AsanSet set, StringInfoData* memoryBuf)
+void GetAsanBlockInfo(AsanSet set, StringInfoDataHuge* memoryBuf)
 {
     for (AsanBlock blk = set->blocks; blk != NULL; blk = blk->next) {
         uint32 realSize = ASAN_BLOCKRELSZ(blk->requestSize);
-        appendStringInfo(memoryBuf, "%s:%d, %u\n", blk->file, blk->line, realSize);
+        appendStringInfoHuge(memoryBuf, "%s:%d, %u\n", blk->file, blk->line, realSize);
     }
 
     return;

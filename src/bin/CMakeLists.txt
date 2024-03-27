@@ -4,7 +4,7 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_RULE_MESSAGES OFF)
 set(CMAKE_SKIP_RPATH TRUE)
 
-INCLUDE_DIRECTORIES(${LIBTHRIFT_INCLUDE_PATH} ${SNAPPY_INCLUDE_PATH} ${CJSON_INCLUDE_PATH} ${BOOST_INCLUDE_PATH})
+INCLUDE_DIRECTORIES(${CJSON_INCLUDE_PATH} ${BOOST_INCLUDE_PATH})
 
 set(CMAKE_MODULE_PATH 
     ${CMAKE_CURRENT_SOURCE_DIR}/gs_cgroup
@@ -26,9 +26,9 @@ set(CMAKE_MODULE_PATH
     ${CMAKE_CURRENT_SOURCE_DIR}/pg_rewind
     ${CMAKE_CURRENT_SOURCE_DIR}/gs_plan_simulator
     ${CMAKE_CURRENT_SOURCE_DIR}/gs_loader
+    ${CMAKE_CURRENT_SOURCE_DIR}/gs_persist
 )
 if("${ENABLE_MULTIPLE_NODES}" STREQUAL "ON")
-    add_subdirectory(gs_cgroup)
     add_subdirectory(gs_log)
     add_subdirectory(pg_upgrade)
     add_subdirectory(pgxc_clean)
@@ -37,6 +37,7 @@ if("${ENABLE_MULTIPLE_NODES}" STREQUAL "ON")
 endif()
 
 add_subdirectory(initdb)
+add_subdirectory(gs_cgroup)
 add_subdirectory(pg_ctl)
 add_subdirectory(pg_rewind)
 add_subdirectory(pg_dump)
@@ -49,3 +50,10 @@ add_subdirectory(gsqlerr)
 add_subdirectory(pg_basebackup)
 add_subdirectory(pg_probackup)
 add_subdirectory(gs_loader)
+if("${ENABLE_UT}" STREQUAL "ON")
+    add_subdirectory(gs_persist)
+else()
+    if("${ENABLE_MULTIPLE_NODES}_${ENABLE_PRIVATEGAUSS}" STREQUAL "OFF_ON")
+        add_subdirectory(gs_persist)
+    endif()
+endif()

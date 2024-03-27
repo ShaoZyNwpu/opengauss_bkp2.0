@@ -23,6 +23,7 @@
 
 #include "access/xact.h"
 #include "access/ustore/knl_uheap.h"
+#include "catalog/pg_partition_fn.h"
 #include "executor/executor.h"
 #include "executor/node/nodeLockRows.h"
 #ifdef PGXC
@@ -34,13 +35,16 @@
 #include "utils/snapmgr.h"
 #include "access/tableam.h"
 
+static TupleTableSlot* ExecLockRows(PlanState* state);
+
 /* ----------------------------------------------------------------
  * ExecLockRows
  * return: a tuple or NULL
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecLockRows(LockRowsState* node)
+static TupleTableSlot* ExecLockRows(PlanState* state)
 {
+    LockRowsState* node = castNode(LockRowsState, state);
     TupleTableSlot* slot = NULL;
     EState* estate = NULL;
     PlanState* outer_plan = NULL;
@@ -50,6 +54,10 @@ TupleTableSlot* ExecLockRows(LockRowsState* node)
     Relation target_rel = NULL;
     Partition target_part = NULL;
     Relation bucket_rel = NULL;
+    bool orig_early_free = false;
+    bool orig_early_deinit = false;
+
+    CHECK_FOR_INTERRUPTS();
 
     /*
      * get information from the node
@@ -58,19 +66,20 @@ TupleTableSlot* ExecLockRows(LockRowsState* node)
     outer_plan = outerPlanState(node);
 
     /*
+     * Get next tuple from subplan, if any.
+     */
+lnext:
+
+    /*
      * EvalPlanQual is called when concurrent lockrows or update or delete
      * we should skip early free.
      */
-    bool orig_early_free = outer_plan->state->es_skip_early_free;
-    bool orig_early_deinit = outer_plan->state->es_skip_early_deinit_consumer;
+    orig_early_free = outer_plan->state->es_skip_early_free;
+    orig_early_deinit = outer_plan->state->es_skip_early_deinit_consumer;
 
     outer_plan->state->es_skip_early_free = true;
     outer_plan->state->es_skip_early_deinit_consumer = true;
 
-    /*
-     * Get next tuple from subplan, if any.
-     */
-lnext:
     /*
      * We must reset the targetPart and targetRel to NULL for correct used
      * searchFakeReationForPartitionOid in goto condition.
@@ -153,7 +162,7 @@ lnext:
             /* if it is a partition */
             if (tblid != erm->relation->rd_id) {
                 searchFakeReationForPartitionOid(estate->esfRelations,
-                    estate->es_query_cxt, erm->relation, tblid, target_rel,
+                    estate->es_query_cxt, erm->relation, tblid, INVALID_PARTITION_NO, target_rel,
                     target_part, RowShareLock);
                 Assert(tblid == target_rel->rd_id);
             }
@@ -202,7 +211,7 @@ lnext:
 
         /* Need to merge the ustore logic with AM logic */
         test = tableam_tuple_lock(bucket_rel, &tuple, &buffer, 
-                                  estate->es_output_cid, lock_mode, erm->noWait, &tmfd,
+                                      estate->es_output_cid, lock_mode, erm->waitPolicy, &tmfd,
 #ifdef ENABLE_MULTIPLE_NODES
                                   false, false, false, estate->es_snapshot, NULL, true,
 #else
@@ -213,6 +222,10 @@ lnext:
         ReleaseBuffer(buffer);
 
         switch (test) {
+            case TM_WouldBlock:
+                /* couldn't lock tuple in SKIP LOCKED mode */
+                goto lnext;
+
             case TM_SelfCreated:
                 ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                     errmsg("attempted to lock invisible tuple")));
@@ -292,7 +305,6 @@ lnext:
                         errmsg("partition table update conflict"),
                         errdetail("disable row movement of table can avoid this conflict")));
                 }
-
                 goto lnext;
 
             default:
@@ -351,6 +363,7 @@ lnext:
                         estate->es_query_cxt,
                         erm->relation,
                         tblid,
+                        INVALID_PARTITION_NO,
                         target_rel,
                         target_part,
                         RowShareLock);
@@ -390,11 +403,19 @@ lnext:
          */
         EvalPlanQualSetSlot(&node->lr_epqstate, slot);
         EvalPlanQualFetchRowMarks(&node->lr_epqstate);
+        orig_early_free = node->lr_epqstate.estate->es_skip_early_free;
+        orig_early_deinit = node->lr_epqstate.estate->es_skip_early_deinit_consumer;
 
+        node->lr_epqstate.estate->es_skip_early_free = true;
+        node->lr_epqstate.estate->es_skip_early_deinit_consumer = true;
         /*
          * And finally we can re-evaluate the tuple.
          */
         slot = EvalPlanQualNext(&node->lr_epqstate);
+
+        node->lr_epqstate.estate->es_skip_early_free = orig_early_free;
+        node->lr_epqstate.estate->es_skip_early_deinit_consumer = orig_early_deinit;
+
         if (TupIsNull(slot)) {
             /* Updated tuple fails qual, so ignore it and go on */
             goto lnext;
@@ -424,6 +445,7 @@ LockRowsState* ExecInitLockRows(LockRows* node, EState* estate, int eflags)
 
     lrstate->ps.plan = (Plan*)node;
     lrstate->ps.state = estate;
+    lrstate->ps.ExecProcNode = ExecLockRows;
 
     /*
      * Miscellaneous initialization
@@ -448,11 +470,11 @@ LockRowsState* ExecInitLockRows(LockRows* node, EState* estate, int eflags)
      * this node appropriately
      */
     TupleDesc resultDesc = ExecGetResultType(outerPlanState(lrstate));
-    ExecAssignResultTypeFromTL(&lrstate->ps, resultDesc->tdTableAmType);
+    ExecAssignResultTypeFromTL(&lrstate->ps, resultDesc->td_tam_ops);
 
     lrstate->ps.ps_ProjInfo = NULL;
 
-    Assert(lrstate->ps.ps_ResultTupleSlot->tts_tupleDescriptor->tdTableAmType != TAM_INVALID);
+    Assert(lrstate->ps.ps_ResultTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     /*
      * Locate the ExecRowMark(s) that this node is responsible for, and

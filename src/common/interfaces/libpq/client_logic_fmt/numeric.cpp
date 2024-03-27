@@ -37,25 +37,27 @@
 #define VEC_TO_CHOICE(res) ((NumericChoice *)(res))
 #define NUMERIC_FLAGBITS(n) ((n)->choice.n_header & NUMERIC_SIGN_MASK)
 
+#define NUMERIC_HEADER_IS_SHORT(n)	(((n)->choice.n_header & 0x8000) != 0)
+#define NUMERIC_HEADER_SIZE(n) (VARHDRSZ + sizeof(uint16) + (NUMERIC_HEADER_IS_SHORT(n) ? 0 : sizeof(int16)))
 #define NUMERIC_IS_SHORT(n) (NUMERIC_FLAGBITS(n) == NUMERIC_SHORT)
 #define NUMERIC_SHORT_SIGN_MASK 0x2000
 #define NUMERIC_DSCALE_MASK 0x3FFF
-#define NUMERIC_SIGN(n)                                                                                             \
-    (NUMERIC_IS_SHORT(n) ? (((n)->choice.n_short.n_header & NUMERIC_SHORT_SIGN_MASK) ? NUMERIC_NEG : NUMERIC_POS) : \
-                            NUMERIC_FLAGBITS(n))
-#define NUMERIC_DSCALE(n)                                                                          \
-    (NUMERIC_IS_SHORT((n)) ?                                                                       \
-        ((n)->choice.n_short.n_header & NUMERIC_SHORT_DSCALE_MASK) >> NUMERIC_SHORT_DSCALE_SHIFT : \
-        ((n)->choice.n_long.n_sign_dscale & NUMERIC_DSCALE_MASK))
+#define NUMERIC_SIGN(n)                                                                           \
+    (NUMERIC_IS_SHORT(n)                                                                   \
+         ? (((n)->choice.n_short.n_header & NUMERIC_SHORT_SIGN_MASK) ? NUMERIC_NEG : NUMERIC_POS) \
+         : NUMERIC_FLAGBITS(n))
+#define NUMERIC_DSCALE(n)                                                                           \
+    (NUMERIC_HEADER_IS_SHORT((n))                                                                   \
+         ? ((n)->choice.n_short.n_header & NUMERIC_SHORT_DSCALE_MASK) >> NUMERIC_SHORT_DSCALE_SHIFT \
+         : ((n)->choice.n_long.n_sign_dscale & NUMERIC_DSCALE_MASK))
 
+#define NUMERIC_WEIGHT(n)                                                                                      \
+    (NUMERIC_HEADER_IS_SHORT((n))                                                                              \
+         ? (((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_SIGN_MASK ? ~NUMERIC_SHORT_WEIGHT_MASK : 0) | \
+            ((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_MASK))                                        \
+         : ((n)->choice.n_long.n_weight))
 
-#define NUMERIC_WEIGHT(n)                                                                                   \
-    (NUMERIC_IS_SHORT((n)) ?                                                                                \
-        (((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_SIGN_MASK ? ~NUMERIC_SHORT_WEIGHT_MASK : 0) | \
-        ((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_MASK)) :                                       \
-        ((n)->choice.n_long.n_weight))
-
-#define NUMERIC_DIGITS(num) (NUMERIC_IS_SHORT(num) ? (num)->choice.n_short.n_data : (num)->choice.n_long.n_data)
+#define NUMERIC_DIGITS(num) (NUMERIC_HEADER_IS_SHORT(num) ? (num)->choice.n_short.n_data : (num)->choice.n_long.n_data)
 #define NUMERIC_64 0xD000
 #define NUMERIC_64VALUE(n) (*((int64 *)((n)->choice.n_bi.n_data)))
 #define NUMERIC_SHORT_DSCALE_MASK 0x1F80
@@ -81,7 +83,6 @@
 #define NUMERIC_NDIGITS(num) ((VARSIZE(num) - NUMERIC_HEADER_SIZE(num)) / sizeof(NumericDigit))
 
 #define VARSIZE(PTR) VARSIZE_4B(PTR)
-#define NUMERIC_HEADER_SIZE(n) (sizeof(uint16) + (((NUMERIC_FLAGBITS(n) & 0x8000) == 0) ? sizeof(int16) : 0))
 #define NUMERIC_NB_FLAGBITS(n) ((n)->choice.n_header & NUMERIC_BI_MASK)  // nan or biginteger
 #define NUMERIC_IS_BI(n) (NUMERIC_NB_FLAGBITS(n) > NUMERIC_NAN)
 
@@ -113,13 +114,47 @@ typedef union {
 } varattrib_4b_fe;
 
 
-#define init_var(v) MemSetAligned(v, 0, sizeof(NumericVar))
-#define digitbuf_alloc(ndigits) ((NumericDigit *)palloc((ndigits) * sizeof(NumericDigit)))
+#define quick_init_var(v)    \
+    do {                     \
+        (v)->buf = (v)->ndb; \
+        (v)->digits = NULL;  \
+    } while (0)
 
+#define init_var(v)          \
+    do {                     \
+        quick_init_var((v)); \
+        (v)->ndigits = 0;    \
+        (v)->weight = 0;     \
+        (v)->sign = 0;       \
+        (v)->dscale = 0;     \
+    } while (0)
 
-#define digitbuf_free(buf) do { \
-        if ((buf) != NULL)      \
-            FREE_POINTER(buf);  \
+#define digitbuf_alloc(ndigits) \
+    ((NumericDigit*) palloc((ndigits) * sizeof(NumericDigit)))
+
+#define digitbuf_free(v)            \
+    do {                            \
+        if ((v)->buf != (v)->ndb) { \
+            pfree((v)->buf);        \
+            (v)->buf = (v)->ndb;    \
+        }                           \
+    } while (0)
+
+#define free_var(v) digitbuf_free((v));
+
+/*
+ * Init a var and allocate digit buffer of ndigits digits (plus a spare digit for rounding).
+ * Called when first using a var.
+ */
+#define init_alloc_var(v, n)                    \
+    do  {                                       \
+        (v)->buf = (v)->ndb;                    \
+        (v)->ndigits = (n);                     \
+        if ((n) > NUMERIC_LOCAL_NMAX) {         \
+            (v)->buf = digitbuf_alloc((n) + 1); \
+        }                                       \
+        (v)->buf[0] = 0;                        \
+        (v)->digits = (v)->buf + 1;             \
     } while (0)
 
 
@@ -128,7 +163,6 @@ static void alloc_var(NumericVar *var, int ndigits);
 static void strip_var(NumericVar *var);
 
 static const char *set_var_from_str(const char *str, const char *cp, NumericVar *dest, char *err_msg);
-static void free_var(NumericVar *var);
 static void init_var_from_num(NumericData* num, NumericVar *dest);
 static bool get_str_from_var(const NumericVar *var, char *str, size_t max_size);
 static NumericVar const_nan = { 0, 0, NUMERIC_NAN, 0, NULL, NULL };
@@ -155,27 +189,8 @@ static void dump_numeric(const char *str, NumericData* num);
  */
 static void alloc_var(NumericVar *var, int ndigits)
 {
-    digitbuf_free(var->buf);
-    var->buf = digitbuf_alloc(ndigits + 1);
-    if (var->buf == NULL) {
-        return;
-    }
-    var->buf[0] = 0; /* spare digit for rounding */
-    var->digits = var->buf + 1;
-    var->ndigits = ndigits;
-}
-
-
-/*
- * free_var() -
- * Return the digit buffer of a variable to the free pool
- */
-static void free_var(NumericVar *var)
-{
-    digitbuf_free(var->buf);
-    var->buf = NULL;
-    var->digits = NULL;
-    var->sign = NUMERIC_NAN;
+    digitbuf_free(var);
+    init_alloc_var(var, ndigits);
 }
 
 
@@ -187,9 +202,8 @@ static void free_var(NumericVar *var)
  */
 static void zero_var(NumericVar *var)
 {
-    digitbuf_free(var->buf);
-    var->buf = NULL;
-    var->digits = NULL;
+    digitbuf_free(var);
+    quick_init_var(var);
     var->ndigits = 0;
     var->weight = 0;         /* by convention; doesn't really matter */
     var->sign = NUMERIC_POS; /* anything but NAN... */
@@ -758,7 +772,7 @@ static inline void init_var_from_num(NumericData* num, NumericVar* dest)
     dest->sign = NUMERIC_SIGN(num);
     dest->dscale = NUMERIC_DSCALE(num);
     dest->digits = NUMERIC_DIGITS(num);
-    dest->buf = NULL; /* digits array is not palloc'd */
+    dest->buf = dest->ndb;
 }
 
 /*

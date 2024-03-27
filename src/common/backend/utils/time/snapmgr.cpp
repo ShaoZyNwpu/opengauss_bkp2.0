@@ -59,9 +59,14 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "ddes/dms/ss_common_attr.h"
+#include "ddes/dms/ss_transaction.h"
+#include "storage/file/fio_device.h"
+
 #ifdef PGXC
 #include "pgxc/pgxc.h"
 #endif
+#include "storage/sinvaladt.h"
 SnapshotData CatalogSnapshotData = {SNAPSHOT_MVCC};
 
 /*
@@ -81,13 +86,21 @@ typedef struct ActiveSnapshotElt {
 static THR_LOCAL bool RegisterStreamSnapshot = false;
 
 /* Define pathname of exported-snapshot files */
-#define SNAPSHOT_EXPORT_DIR "pg_snapshots"
+#define SNAPSHOT_EXPORT_DIR (g_instance.datadir_cxt.snapshotsDir)
+
+/* Structure holding info about exported snapshot. */
+typedef struct ExportedSnapshot {
+    char *snapfile;
+    Snapshot snapshot;
+} ExportedSnapshot;
+
 #define XactExportFilePath(path, xid, num, suffix) \
     {                                              \
         int rc = snprintf_s(path,                  \
             sizeof(path),                          \
             sizeof(path) - 1,                      \
-            SNAPSHOT_EXPORT_DIR "/%08X%08X-%d%s",  \
+            "%s/%08X%08X-%d%s",                    \
+            (g_instance.datadir_cxt.snapshotsDir), \
             (uint32)((xid) >> 32),                 \
             (uint32)(xid),                         \
             (num),                                 \
@@ -168,7 +181,7 @@ bool IsXidVisibleInGtmLiteLocalSnapshot(TransactionId xid, Snapshot snapshot,
     return false;
 }
 
-static void RecheckXidFinish(TransactionId xid, CommitSeqNo csn)
+void RecheckXidFinish(TransactionId xid, CommitSeqNo csn)
 {
     if (TransactionIdIsInProgress(xid)) {
         ereport(defence_errlevel(), (errmsg("transaction id %lu is still running, "
@@ -201,7 +214,16 @@ bool XidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, TransactionIdSta
 #endif
 
 loop:
-    csn = TransactionIdGetCommitSeqNo(xid, false, true, false, snapshot);
+    if (ENABLE_DMS) {
+        /* fetch TXN info locally if either reformer, original primary, or normal primary */
+        if (SS_PRIMARY_MODE || SS_OFFICIAL_PRIMARY) {
+            csn = TransactionIdGetCommitSeqNo(xid, false, true, false, snapshot);
+        } else {
+            csn = SSTransactionIdGetCommitSeqNo(xid, false, true, false, snapshot, sync);
+        }
+    } else {
+        csn = TransactionIdGetCommitSeqNo(xid, false, true, false, snapshot);
+    }
 
 #ifdef XIDVIS_DEBUG
     ereport(DEBUG1,
@@ -221,6 +243,10 @@ loop:
         else
             return false;
     } else if (COMMITSEQNO_IS_COMMITTING(csn)) {
+        /* SS master node would've already sync-waited, so this should never happen */
+        if (SS_STANDBY_MODE) {
+            ereport(FATAL, (errmsg("SS xid %lu's csn %lu is still COMMITTING after Master txn waited.", xid, csn)));
+        }
         if (looped) {
             ereport(DEBUG1, (errmsg("transaction id %lu's csn %ld is changed to ABORT after lockwait.", xid, csn)));
             /* recheck if transaction id is finished */
@@ -339,9 +365,22 @@ bool CommittedXidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, Buffer 
     }
 
 loop:
-    csn = TransactionIdGetCommitSeqNo(xid, true, true, false, snapshot);
+    if (ENABLE_DMS) {
+        /* fetch TXN info locally if either reformer, original primary, or normal primary */
+        if (SS_PRIMARY_MODE || SS_OFFICIAL_PRIMARY) {
+            csn = TransactionIdGetCommitSeqNo(xid, true, true, false, snapshot);
+        } else {
+            csn = SSTransactionIdGetCommitSeqNo(xid, true, true, false, snapshot, NULL);
+        }
+    } else {
+        csn = TransactionIdGetCommitSeqNo(xid, true, true, false, snapshot);
+    }
 
     if (COMMITSEQNO_IS_COMMITTING(csn)) {
+        /* SS master node would've already sync-waited, so this should never happen */
+        if (SS_STANDBY_MODE) {
+            ereport(FATAL, (errmsg("SS xid %lu's csn %lu is still COMMITTING after Master txn waited.", xid, csn)));
+        }
         if (looped) {
             ereport(WARNING,
                 (errmsg("committed transaction id %lu's csn %lu"
@@ -617,7 +656,7 @@ void SnapshotSetCommandId(CommandId curcid)
  * must take care of all the same considerations as the first-snapshot case
  * in GetTransactionSnapshot.
  */
-static void SetTransactionSnapshot(Snapshot sourcesnap, TransactionId sourcexid)
+void SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid, ThreadId sourcepid)
 {
     /* Caller should have checked this already */
     Assert(!u_sess->utils_cxt.FirstSnapshotSet);
@@ -664,7 +703,7 @@ static void SetTransactionSnapshot(Snapshot sourcesnap, TransactionId sourcexid)
      */
     if (IsolationUsesXactSnapshot()) {
         if (IsolationIsSerializable())
-            SetSerializableTransactionSnapshot(u_sess->utils_cxt.CurrentSnapshot, sourcexid);
+            SetSerializableTransactionSnapshot(u_sess->utils_cxt.CurrentSnapshot, sourcevxid, sourcepid);
         /* Make a saved copy */
         Assert(!(u_sess->utils_cxt.CurrentSnapshot != NULL && u_sess->utils_cxt.CurrentSnapshot->user_data != NULL));
         u_sess->utils_cxt.CurrentSnapshot = CopySnapshot(u_sess->utils_cxt.CurrentSnapshot);
@@ -1015,6 +1054,8 @@ static void SnapshotResetXmin(void)
 {
     if (u_sess->utils_cxt.RegisteredSnapshots == 0 && u_sess->utils_cxt.ActiveSnapshot == NULL) {
         t_thrd.pgxact->xmin = InvalidTransactionId;
+        t_thrd.proc->snapXmax = InvalidTransactionId;
+        t_thrd.proc->snapCSN = InvalidCommitSeqNo;
         t_thrd.pgxact->csn_min = InvalidCommitSeqNo;
         t_thrd.pgxact->csn_dr = InvalidCommitSeqNo;
     }
@@ -1114,26 +1155,26 @@ void AtEOXact_Snapshot(bool isCommit)
      * If we exported any snapshots, clean them up.
      */
     if (u_sess->utils_cxt.exportedSnapshots != NIL) {
-        TransactionId myxid = GetTopTransactionId();
-        int i;
-        char buf[MAXPGPATH];
-
+        ListCell   *lc;
         /*
          * Get rid of the files.  Unlink failure is only a WARNING because (1)
          * it's too late to abort the transaction, and (2) leaving a leaked
          * file around has little real consequence anyway.
+         *
+         * We also also need to remove the snapshots from RegisteredSnapshots
+         * to prevent a warning below.
+         *
+         * As with the FirstXactSnapshot, we don't need to free resources of
+         * the snapshot iself as it will go away with the memory context.
          */
-        for (i = 1; i <= list_length(u_sess->utils_cxt.exportedSnapshots); i++) {
-            XactExportFilePath(buf, myxid, i, "");
-            if (unlink(buf))
-                ereport(WARNING, (errmsg("could not unlink file \"%s\": %m", buf)));
+        foreach(lc, u_sess->utils_cxt.exportedSnapshots) {
+            ExportedSnapshot *esnap = (ExportedSnapshot *)lfirst(lc);
+
+            if (unlink(esnap->snapfile))
+                ereport(WARNING, (errmsg("could not unlink file \"%s\": %m", esnap->snapfile)));
         }
 
         /*
-         * As with the FirstXactSnapshot, we needn't spend any effort on
-         * cleaning up the per-snapshot data structures, but we do need to
-         * adjust the RegisteredSnapshots count to prevent a warning below.
-         *
          * Note: you might be thinking "why do we have the exportedSnapshots
          * list at all?  All we need is a counter!".  You're right, but we do
          * it this way in case we ever feel like improving xmin management.
@@ -1189,6 +1230,7 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
 {
     TransactionId topXid;
     TransactionId* children = NULL;
+    ExportedSnapshot *esnap;
     int nchildren;
     int addTopXid;
     StringInfoData buf;
@@ -1197,6 +1239,7 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
     MemoryContext oldcxt;
     char path[MAXPGPATH];
     char pathtmp[MAXPGPATH];
+    int rc;
 
     /*
      * It's tempting to call RequireTransactionChain here, since it's not very
@@ -1213,9 +1256,9 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
      */
 
     /*
-     * This will assign a transaction ID if we do not yet have one.
+     * Get our transaction ID if there is one, to include in the snapshot.
      */
-    topXid = GetTopTransactionId();
+    topXid = GetTopTransactionIdIfAny();
 
     /*
      * We cannot export a snapshot from a subtransaction because there's no
@@ -1234,6 +1277,14 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
     nchildren = xactGetCommittedChildren(&children);
 
     /*
+     * Generate file path for the snapshot.  We start numbering of snapshots
+     * inside the transaction from 1.
+     */
+    rc = snprintf_s(path, sizeof(path), sizeof(path) - 1, "%s/%08X-%08X-%d", SNAPSHOT_EXPORT_DIR,
+        t_thrd.proc->backendId, t_thrd.proc->lxid, list_length(u_sess->utils_cxt.exportedSnapshots) + 1);
+    securec_check_ss(rc, "", "");
+
+    /*
      * Copy the snapshot into u_sess->top_transaction_mem_cxt, add it to the
      * exportedSnapshots list, and mark it pseudo-registered.  We do this to
      * ensure that the snapshot's xmin is honored for the rest of the
@@ -1243,7 +1294,10 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
     snapshot = CopySnapshot(snapshot);
 
     oldcxt = MemoryContextSwitchTo(u_sess->top_transaction_mem_cxt);
-    u_sess->utils_cxt.exportedSnapshots = lappend(u_sess->utils_cxt.exportedSnapshots, snapshot);
+    esnap = (ExportedSnapshot *) palloc(sizeof(ExportedSnapshot));
+    esnap->snapfile = pstrdup(path);
+    esnap->snapshot = snapshot;
+    u_sess->utils_cxt.exportedSnapshots = lappend(u_sess->utils_cxt.exportedSnapshots, esnap);
     (void)MemoryContextSwitchTo(oldcxt);
 
     snapshot->regd_count++;
@@ -1256,7 +1310,8 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
      */
     initStringInfo(&buf);
 
-    appendStringInfo(&buf, "xid:" XID_FMT "\n", topXid);
+    appendStringInfo(&buf, "vxid: %d/" XID_FMT "\n", t_thrd.proc->backendId, t_thrd.proc->lxid);
+    appendStringInfo(&buf, "pid:%lu\n", t_thrd.proc_cxt.MyProcPid);
     appendStringInfo(&buf, "dbid:%u\n", u_sess->proc_cxt.MyDatabaseId);
     appendStringInfo(&buf, "iso:%d\n", u_sess->utils_cxt.XactIsoLevel);
     appendStringInfo(&buf, "ro:%d\n", u_sess->attr.attr_common.XactReadOnly);
@@ -1277,7 +1332,7 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
      * xmax.  (We need not make the same check for subxip[] members, see
      * snapshot.h.)
      */
-    addTopXid = TransactionIdPrecedes(topXid, snapshot->xmax) ? 1 : 0;
+    addTopXid = (TransactionIdIsValid(topXid) && TransactionIdPrecedes(topXid, snapshot->xmax)) ? 1 : 0;
     if (addTopXid)
         appendStringInfo(&buf, "xip:" XID_FMT "\n", topXid);
 
@@ -1306,7 +1361,8 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
      * ensures that no other backend can read an incomplete file
      * (ImportSnapshot won't allow it because of its valid-characters check).
      */
-    XactExportFilePath(pathtmp, topXid, list_length(u_sess->utils_cxt.exportedSnapshots), ".tmp");
+    rc = snprintf_s(pathtmp, sizeof(pathtmp), sizeof(pathtmp) - 1, "%s.tmp", path);
+    securec_check_ss(rc, "", "");
     if (!(f = AllocateFile(pathtmp, PG_BINARY_W)))
         ereport(ERROR, (errcode_for_file_access(), errmsg("could not create file \"%s\": %m", pathtmp)));
 
@@ -1322,8 +1378,6 @@ char* ExportSnapshot(Snapshot snapshot, CommitSeqNo *snapshotCsn)
      * Now that we have written everything into a .tmp file, rename the file
      * to remove the .tmp suffix.
      */
-    XactExportFilePath(path, topXid, list_length(u_sess->utils_cxt.exportedSnapshots), "");
-
     if (rename(pathtmp, path) < 0)
         ereport(
             ERROR, (errcode_for_file_access(), errmsg("could not rename file \"%s\" to \"%s\": %m", pathtmp, path)));
@@ -1371,7 +1425,7 @@ Datum pg_export_snapshot_and_csn(PG_FUNCTION_ARGS)
      * Construct a tuple descriptor for the result row.  This must match this
      * function's pg_proc entry!
      */
-    tupdesc = CreateTemplateTupleDesc(2, false, TAM_HEAP);
+    tupdesc = CreateTemplateTupleDesc(2, false);
     TupleDescInitEntry(tupdesc, (AttrNumber) 1, "snapshot_name", TEXTOID, -1, 0);
     TupleDescInitEntry(tupdesc, (AttrNumber) 2, "CSN", TEXTOID, -1, 0);
     tupdesc = BlessTupleDesc(tupdesc);
@@ -1457,6 +1511,25 @@ static GTM_Timeline parseTimelineFromText(const char* prefix, char** s, const ch
     return val;
 }
 
+static void parseVxidFromText(const char *prefix, char **s, const char *filename, VirtualTransactionId *vxid)
+{
+    char *ptr = *s;
+    int prefixlen = strlen(prefix);
+
+    if (strncmp(ptr, prefix, prefixlen) != 0)
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid snapshot data in file \"%s\"", filename)));
+    ptr += prefixlen;
+    if (sscanf_s(ptr, "%d/%u", &vxid->backendId, &vxid->localTransactionId) != 2)
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid snapshot data in file \"%s\"", filename)));
+    ptr = strchr(ptr, '\n');
+    if (!ptr)
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid snapshot data in file \"%s\"", filename)));
+    *s = ptr + 1;
+}
+
 /*
  * ImportSnapshot
  *		Import a previously exported snapshot.	The argument should be a
@@ -1469,7 +1542,8 @@ void ImportSnapshot(const char* idstr)
     FILE* f = NULL;
     struct stat stat_buf;
     char* filebuf = NULL;
-    TransactionId src_xid;
+    VirtualTransactionId src_vxid;
+    ThreadId src_pid;
     Oid src_dbid;
     int src_isolevel;
     bool src_readonly = false;
@@ -1504,7 +1578,7 @@ void ImportSnapshot(const char* idstr)
             ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid snapshot identifier: \"%s\"", idstr)));
 
     /* OK, read the file */
-    int rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, SNAPSHOT_EXPORT_DIR "/%s", idstr);
+    int rc = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", SNAPSHOT_EXPORT_DIR, idstr);
     securec_check_ss(rc, "", "");
 
     f = AllocateFile(path, PG_BINARY_R);
@@ -1531,7 +1605,8 @@ void ImportSnapshot(const char* idstr)
     rc = memset_s(&snapshot, sizeof(SnapshotData), 0, sizeof(snapshot));
     securec_check(rc, "", "");
 
-    src_xid = parseXidFromText("xid:", &filebuf, path);
+    parseVxidFromText("vxid:", &filebuf, path, &src_vxid);
+    src_pid = parseIntFromText("pid:", &filebuf, path);
     /* we abuse parseXidFromText a bit here ... */
     src_dbid = parseXidFromText("dbid:", &filebuf, path);
     src_isolevel = parseIntFromText("iso:", &filebuf, path);
@@ -1550,7 +1625,7 @@ void ImportSnapshot(const char* idstr)
      * don't trouble to check the array elements, just the most critical
      * fields.
      */
-    if (!TransactionIdIsNormal(src_xid) || !OidIsValid(src_dbid) || !TransactionIdIsNormal(snapshot.xmin) ||
+    if (!VirtualTransactionIdIsValid(src_vxid) || !OidIsValid(src_dbid) || !TransactionIdIsNormal(snapshot.xmin) ||
         !TransactionIdIsNormal(snapshot.xmax))
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid snapshot data in file \"%s\"", path)));
@@ -1587,7 +1662,7 @@ void ImportSnapshot(const char* idstr)
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot import a snapshot from a different database")));
 
     /* OK, install the snapshot */
-    SetTransactionSnapshot(&snapshot, src_xid);
+    SetTransactionSnapshot(&snapshot, &src_vxid, src_pid);
 }
 
 /*
@@ -1627,7 +1702,7 @@ void DeleteAllExportedSnapshotFiles(void)
         if (strcmp(s_de->d_name, ".") == 0 || strcmp(s_de->d_name, "..") == 0)
             continue;
 
-        rc = snprintf_s(buf, MAXPGPATH, MAXPGPATH - 1, SNAPSHOT_EXPORT_DIR "/%s", s_de->d_name);
+        rc = snprintf_s(buf, MAXPGPATH, MAXPGPATH - 1, "%s/%s", SNAPSHOT_EXPORT_DIR, s_de->d_name);
         securec_check_ss(rc, "", "");
         /* Again, unlink failure is not worthy of FATAL */
         if (unlink(buf))

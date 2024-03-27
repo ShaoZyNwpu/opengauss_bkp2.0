@@ -52,7 +52,7 @@ void DeleteFusion::InitLocals(ParamListInfo params)
 
     m_local.m_reslot = MakeSingleTupleTableSlot(m_global->m_tupDesc);
     if (m_global->m_table_type == TAM_USTORE) {
-        m_local.m_reslot->tts_tupslotTableAm = TAM_USTORE;
+        m_local.m_reslot->tts_tam_ops = TableAmUstore;
     }
     m_local.m_values = (Datum*)palloc0(m_global->m_natts * sizeof(Datum));
     m_local.m_isnull = (bool*)palloc0(m_global->m_natts * sizeof(bool));
@@ -71,12 +71,14 @@ void DeleteFusion::InitLocals(ParamListInfo params)
 
 void DeleteFusion::InitGlobals()
 {
-    m_global->m_reloid = getrelid(linitial_int(m_global->m_planstmt->resultRelations), m_global->m_planstmt->rtable);
+    m_global->m_reloid = getrelid(linitial_int((List*)linitial(m_global->m_planstmt->resultRelations)),
+                                  m_global->m_planstmt->rtable);
     Relation rel = heap_open(m_global->m_reloid, AccessShareLock);
     m_global->m_natts = RelationGetDescr(rel)->natts;
     m_global->m_tupDesc = CreateTupleDescCopy(RelationGetDescr(rel));
     m_global->m_is_bucket_rel = RELATION_OWN_BUCKET(rel);
     m_global->m_table_type = RelationIsUstoreFormat(rel) ? TAM_USTORE : TAM_HEAP;
+    m_global->m_tupDesc->td_tam_ops = GetTableAmRoutine(m_global->m_table_type);
     m_global->m_exec_func_ptr = (OpFusionExecfuncType)&DeleteFusion::ExecDelete;
     heap_close(rel, AccessShareLock);
 
@@ -172,6 +174,7 @@ unsigned long DeleteFusion::ExecDelete(Relation rel, ResultRelInfo* resultRelInf
                 exec_index_tuples_state.targetPartRel = RELATION_IS_PARTITIONED(rel) ? partRel : NULL;
                 exec_index_tuples_state.p = RELATION_IS_PARTITIONED(rel) ? part : NULL;
                 exec_index_tuples_state.conflict = NULL;
+                exec_index_tuples_state.rollbackIndex = false;
                 tableam_tops_exec_delete_index_tuples(oldslot, bucket_rel == NULL ? destRel : bucket_rel, NULL,
                     &((HeapTuple)oldtup)->t_self, exec_index_tuples_state, modifiedIdxAttrs);
                 if (oldslot) {
@@ -293,6 +296,7 @@ bool DeleteFusion::execute(long max_rows, char *completionTag)
             snprintf_s(completionTag, COMPLETION_TAG_BUFSIZE, COMPLETION_TAG_BUFSIZE - 1, "DELETE %ld", nprocessed);
     }
     securec_check_ss(errorno, "\0", "\0");
-
+    u_sess->statement_cxt.current_row_count = nprocessed;
+    u_sess->statement_cxt.last_row_count = u_sess->statement_cxt.current_row_count;
     return success;
 }

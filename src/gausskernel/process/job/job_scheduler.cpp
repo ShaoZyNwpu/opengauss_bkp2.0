@@ -164,6 +164,7 @@ NON_EXEC_STATIC void JobScheduleMain()
      * tcop/postgres.c.
      */
     (void)gspqsignal(SIGHUP, jobschd_sighup_handler);
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGINT, StatementCancelHandler);
     (void)gspqsignal(SIGTERM, jobschd_sigterm_handler);
 
@@ -708,7 +709,7 @@ static void ScanExpireJobs()
     HeapTuple tuple = NULL;
     MemoryContext oldCtx = NULL;
     int jobStatus = JOB_WORKER_INACTIVE;
-    Datum curtime = DirectFunctionCall1(timestamptz_timestamp, GetCurrentTimestamp());
+    Datum curtime = TimestampGetDatum(GetCurrentTimestamp());
 
     StartTransactionCommand();
 
@@ -733,12 +734,15 @@ static void ScanExpireJobs()
             continue;
         }
 
+#ifdef ENABLE_MULTIPLE_NODES
         /* handle cases - ALL_NODE/ALL_CN/ALL_DN/CCN specific node */
         if (!IsExecuteOnCurrentNode(pg_job->node_name.data)) {
             continue;
         }
+#endif
 
-        if (false == DatumGetBool(DirectFunctionCall2(timestamp_gt, curtime, values[Anum_pg_job_next_run_date - 1]))) {
+        Datum cur_job_start_time = DirectFunctionCall1(timestamp_timestamptz, values[Anum_pg_job_next_run_date - 1]);
+        if (false == DatumGetBool(DirectFunctionCall2(timestamp_gt, curtime, cur_job_start_time))) {
             /* skip since it doesnot reach book time */
             continue;
         }

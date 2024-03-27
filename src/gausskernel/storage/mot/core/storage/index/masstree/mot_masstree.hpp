@@ -41,7 +41,6 @@ bool basic_table<P>::init(const uint16_t keyLength, const std::string& name, des
 template <typename P>
 int basic_table<P>::getMemtagMaxSize(enum memtag tag)
 {
-    int size = 0;
     switch (tag) {
         case memtag_masstree_leaf:
             return MAX_MEMTAG_MASSTREE_LEAF_ALLOCATION_SIZE;
@@ -56,8 +55,6 @@ int basic_table<P>::getMemtagMaxSize(enum memtag tag)
         default:
             return -1;
     }
-
-    return -1;
 }
 }  // namespace Masstree
 #endif  // MOT_MASSTREE_HPP

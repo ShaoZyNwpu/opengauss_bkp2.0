@@ -24,6 +24,7 @@
 #include "utils/resowner.h"
 #include "utils/partitionmap_gs.h"
 #include "utils/plpgsql.h"
+#include "utils/guc.h"
 
 /*
  * The "eflags" argument to ExecutorStart and the various ExecInitNode
@@ -152,6 +153,7 @@ extern THR_LOCAL PGDLLIMPORT ExecutorEnd_hook_type ExecutorEnd_hook;
 typedef bool (*ExecutorCheckPerms_hook_type)(List*, bool);
 extern THR_LOCAL PGDLLIMPORT ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook;
 
+typedef ExprState* (*execInitExprFunc)(Expr* node, PlanState* parent);
 /*
  * prototypes from functions in execAmi.c
  */
@@ -175,13 +177,14 @@ ScanState* search_plan_tree(PlanState* node, Oid table_oid);
  * prototypes from functions in execGrouping.c
  */
 extern bool execTuplesMatch(TupleTableSlot* slot1, TupleTableSlot* slot2, int numCols, AttrNumber* matchColIdx,
-    FmgrInfo* eqfunctions, MemoryContext evalContext);
+    FmgrInfo* eqfunctions, MemoryContext evalContext, Oid *collations);
 extern bool execTuplesUnequal(TupleTableSlot* slot1, TupleTableSlot* slot2, int numCols, AttrNumber* matchColIdx,
-    FmgrInfo* eqfunctions, MemoryContext evalContext);
+    FmgrInfo* eqfunctions, MemoryContext evalContext, Oid *collations);
 extern FmgrInfo* execTuplesMatchPrepare(int numCols, Oid* eqOperators);
 extern void execTuplesHashPrepare(int numCols, Oid* eqOperators, FmgrInfo** eqFunctions, FmgrInfo** hashFunctions);
 extern TupleHashTable BuildTupleHashTable(int numCols, AttrNumber* keyColIdx, FmgrInfo* eqfunctions,
-    FmgrInfo* hashfunctions, long nbuckets, Size entrysize, MemoryContext tablecxt, MemoryContext tempcxt, int workMem);
+    FmgrInfo* hashfunctions, long nbuckets, Size entrysize, MemoryContext tablecxt, MemoryContext tempcxt, int workMem,
+    Oid *collations = NULL);
 extern TupleHashEntry LookupTupleHashEntry(
     TupleHashTable hashtable, TupleTableSlot* slot, bool* isnew, bool isinserthashtbl = true);
 extern TupleHashEntry FindTupleHashEntry(
@@ -190,13 +193,15 @@ extern TupleHashEntry FindTupleHashEntry(
 /*
  * prototypes from functions in execJunk.c
  */
-extern JunkFilter* ExecInitJunkFilter(List* targetList, bool hasoid, TupleTableSlot* slot, TableAmType tam = TAM_HEAP);
-extern JunkFilter* ExecInitJunkFilterConversion(List* targetList, TupleDesc cleanTupType, TupleTableSlot* slot);
-extern AttrNumber ExecFindJunkAttribute(JunkFilter* junkfilter, const char* attrName);
-extern AttrNumber ExecFindJunkAttributeInTlist(List* targetlist, const char* attrName);
-extern Datum ExecGetJunkAttribute(TupleTableSlot* slot, AttrNumber attno, bool* isNull);
-extern TupleTableSlot* ExecFilterJunk(JunkFilter* junkfilter, TupleTableSlot* slot);
-extern void ExecSetjunkFilteDescriptor(JunkFilter* junkfilter, TupleDesc tupdesc);
+extern JunkFilter *ExecInitJunkFilter(List *targetList, bool hasoid, TupleTableSlot *slot,
+                                      const TableAmRoutine *tam_ops);
+extern void ExecInitJunkAttr(EState *estate, CmdType operation, List *targetlist, ResultRelInfo *result_rel_info);
+extern JunkFilter *ExecInitJunkFilterConversion(List *targetList, TupleDesc cleanTupType, TupleTableSlot *slot);
+extern AttrNumber ExecFindJunkAttribute(JunkFilter *junkfilter, const char *attrName);
+extern AttrNumber ExecFindJunkAttributeInTlist(List *targetlist, const char *attrName);
+extern Datum ExecGetJunkAttribute(TupleTableSlot *slot, AttrNumber attno, bool *isNull);
+extern TupleTableSlot *ExecFilterJunk(JunkFilter *junkfilter, TupleTableSlot *slot);
+extern void ExecSetjunkFilteDescriptor(JunkFilter *junkfilter, TupleDesc tupdesc);
 
 #ifdef PGXC
 extern List* ExecFindJunkPrimaryKeys(List* targetlist);
@@ -223,7 +228,8 @@ extern void InitResultRelInfo(
     ResultRelInfo* resultRelInfo, Relation resultRelationDesc, Index resultRelationIndex, int instrument_options);
 extern ResultRelInfo* ExecGetTriggerResultRel(EState* estate, Oid relid);
 extern bool ExecContextForcesOids(PlanState* planstate, bool* hasoids);
-extern void ExecConstraints(ResultRelInfo* resultRelInfo, TupleTableSlot* slot, EState* estate);
+extern bool ExecConstraints(ResultRelInfo* resultRelInfo, TupleTableSlot* slot, EState* estate, bool skipAutoInc = false);
+extern void ExecWithCheckOptions(ResultRelInfo *resultRelInfo, TupleTableSlot *slot, EState *estate);
 extern ExecRowMark* ExecFindRowMark(EState* estate, Index rti);
 extern ExecAuxRowMark* ExecBuildAuxRowMark(ExecRowMark* erm, List* targetlist);
 extern TupleTableSlot* EvalPlanQual(EState* estate, EPQState* epqstate, Relation relation, Index rti,
@@ -234,7 +240,8 @@ extern TupleTableSlot* EvalPlanQualUHeap(EState* estate, EPQState* epqstate, Rel
 extern TupleTableSlot *EvalPlanQualUSlot(EPQState *epqstate, Relation relation, Index rti);
 extern HeapTuple EvalPlanQualFetch(
     EState* estate, Relation relation, int lockmode, ItemPointer tid, TransactionId priorXmax);
-extern void EvalPlanQualInit(EPQState* epqstate, EState* estate, Plan* subplan, List* auxrowmarks, int epqParam);
+extern void EvalPlanQualInit(EPQState* epqstate, EState* estate, Plan* subplan, List* auxrowmarks, int epqParam,
+    ProjectionInfo** projInfos = NULL);
 extern void EvalPlanQualSetPlan(EPQState* epqstate, Plan* subplan, List* auxrowmarks);
 extern void EvalPlanQualSetTuple(EPQState* epqstate, Index rti, Tuple tuple);
 extern Tuple EvalPlanQualGetTuple(EPQState* epqstate, Index rti);
@@ -247,15 +254,54 @@ extern void EvalPlanQualBegin(EPQState* epqstate, EState* parentestate, bool isU
 extern void EvalPlanQualEnd(EPQState* epqstate);
 
 /*
- * prototypes from functions in execProcnode.c
+ * functions in execProcnode.c
  */
 extern PlanState* ExecInitNode(Plan* node, EState* estate, int eflags);
-extern TupleTableSlot* ExecProcNode(PlanState* node);
 extern Node* MultiExecProcNode(PlanState* node);
 extern void ExecEndNode(PlanState* node);
 extern bool NeedStubExecution(Plan* plan);
+extern TupleTableSlot* FetchPlanSlot(PlanState* subPlanState, ProjectionInfo** projInfos);
 
 extern long ExecGetPlanMemCost(Plan* node);
+
+/* ----------------------------------------------------------------
+ *		ExecProcNode
+ *
+ *		Execute the given node to return a(nother) tuple.
+ * ----------------------------------------------------------------
+ */
+#ifndef FRONTEND
+#ifndef ENABLE_MULTIPLE_NODES
+
+static inline TupleTableSlot *ExecProcNode(PlanState *node)
+{
+    TupleTableSlot* result;
+    Assert(node->ExecProcNode);
+    if (unlikely(node->nodeContext)) {
+        MemoryContext old_context = MemoryContextSwitchTo(node->nodeContext); /* Switch to Node Level Memory Context */
+        if (node->chgParam != NULL) /* something changed? */
+            ExecReScan(node);       /* let ReScan handle this */
+        result = node->ExecProcNode(node);
+        MemoryContextSwitchTo(old_context);
+    } else {
+        if (node->chgParam != NULL) /* something changed? */
+            ExecReScan(node);
+        result = node->ExecProcNode(node);
+    }
+    node->ps_rownum++;
+    return result;
+}
+#else  /* ENABLE_MULTIPLE_NODES */
+
+static inline TupleTableSlot *ExecProcNode(PlanState *node)
+{
+    return NULL;
+}
+
+#endif /* ENABLE_MULTIPLE_NODES */
+
+#endif /* FRONTEND */
+
 
 /*
  * prototypes from functions in execQual.c
@@ -267,11 +313,13 @@ extern Tuplestorestate* ExecMakeTableFunctionResult(
 extern Datum ExecEvalExprSwitchContext(
     ExprState* expression, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 extern ExprState* ExecInitExpr(Expr* node, PlanState* parent);
+extern List* ExecInitExprList(List* nodes, PlanState *parent);
 extern ExprState* ExecPrepareExpr(Expr* node, EState* estate);
 extern bool ExecQual(List* qual, ExprContext* econtext, bool resultForNull);
 extern int ExecTargetListLength(List* targetlist);
 extern int ExecCleanTargetListLength(List* targetlist);
 extern TupleTableSlot* ExecProject(ProjectionInfo* projInfo, ExprDoneCond* isDone);
+extern Datum ExecMakeFunctionResultSet(FuncExprState *fcache, ExprContext *econtext, bool *isNull, ExprDoneCond *isDone);
 
 extern TupleTableSlot* ExecScan(ScanState* node, ExecScanAccessMtd accessMtd, ExecScanRecheckMtd recheckMtd);
 extern void ExecAssignScanProjectionInfo(ScanState* node);
@@ -285,14 +333,18 @@ extern bool is_huge_clob(Oid type_oid, bool is_null, Datum value);
 /*
  * prototypes from functions in execTuples.c
  */
-extern void ExecInitResultTupleSlot(EState* estate, PlanState* planstate, TableAmType tam = TAM_HEAP);
-extern void ExecInitScanTupleSlot(EState* estate, ScanState* scanstate, TableAmType tam = TAM_HEAP);
-extern TupleTableSlot* ExecInitExtraTupleSlot(EState* estate, TableAmType tam = TAM_HEAP);
-extern TupleTableSlot* ExecInitNullTupleSlot(EState* estate, TupleDesc tupType);
-extern TupleDesc ExecTypeFromTL(List* targetList, bool hasoid, bool markdropped = false, TableAmType tam = TAM_HEAP);
-extern TupleDesc ExecCleanTypeFromTL(List* targetList, bool hasoid, TableAmType tam = TAM_HEAP);
-extern TupleDesc ExecTypeFromExprList(List* exprList, List* namesList, TableAmType tam = TAM_HEAP);
-extern void UpdateChangedParamSet(PlanState* node, Bitmapset* newchg);
+extern void ExecInitResultTupleSlot(EState *estate, PlanState *planstate, const TableAmRoutine *tam_ops = TableAmHeap);
+extern void ExecInitScanTupleSlot(EState *estate, ScanState *scanstate, const TableAmRoutine *tam_ops = TableAmHeap);
+extern TupleTableSlot *ExecInitExtraTupleSlot(EState *estate, const TableAmRoutine *tam_ops = TableAmHeap);
+extern TupleTableSlot *ExecInitNullTupleSlot(EState *estate, TupleDesc tupType);
+extern TupleDesc ExecTypeFromTL(List *targetList, bool hasoid, bool markdropped = false,
+                                const TableAmRoutine *tam_ops = TableAmHeap);
+extern TupleDesc ExecCleanTypeFromTL(List *targetList, bool hasoid, const TableAmRoutine *tam_ops = TableAmHeap);
+extern TupleDesc ExecTypeFromExprList(List *exprList, List *namesList, const TableAmRoutine *tam_ops = TableAmHeap);
+extern void UpdateChangedParamSet(PlanState *node, Bitmapset *newchg);
+extern void InitOutputValues(RightRefState *refState, GenericExprState *targetArr[], Datum *values, bool *isnull,
+                             int targetCount, bool *hasExecs);
+extern void SortTargetListAsArray(RightRefState *refState, List *targetList, GenericExprState *targetArr[]);
 
 typedef struct TupOutputState {
     TupleTableSlot* slot;
@@ -304,6 +356,7 @@ typedef struct ExecIndexTuplesState {
     Relation targetPartRel;
     Partition p;
     bool* conflict;
+    bool rollbackIndex;
 } ExecIndexTuplesState;
 
 typedef struct ConflictInfoData {
@@ -341,6 +394,7 @@ extern ExprContext* CreateExprContext(EState* estate);
 extern ExprContext* CreateStandaloneExprContext(void);
 extern void FreeExprContext(ExprContext* econtext, bool isCommit);
 extern void ReScanExprContext(ExprContext* econtext);
+extern void ShutdownExprContext(ExprContext* econtext, bool isCommit);
 
 #define ResetExprContext(econtext) MemoryContextReset((econtext)->ecxt_per_tuple_memory)
 
@@ -371,7 +425,7 @@ extern ExprContext* MakePerTupleExprContext(EState* estate);
 
 extern void ExecAssignExprContext(EState* estate, PlanState* planstate);
 extern void ExecAssignResultType(PlanState* planstate, TupleDesc tupDesc);
-extern void ExecAssignResultTypeFromTL(PlanState* planstate, TableAmType tam = TAM_HEAP);
+extern void ExecAssignResultTypeFromTL(PlanState* planstate, const TableAmRoutine* tam_ops = TableAmHeap);
 extern TupleDesc ExecGetResultType(PlanState* planstate);
 extern void ExecAssignVectorForExprEval(ExprContext* econtext);
 extern ProjectionInfo* ExecBuildProjectionInfo(
@@ -393,6 +447,22 @@ static inline RangeTblEntry *exec_rt_fetch(Index rti, EState *estate)
     return (RangeTblEntry *)list_nth(estate->es_range_table, rti - 1);
 }
 
+static inline int128 datum2autoinc(ConstrAutoInc *cons_autoinc, Datum datum)
+{
+    if (cons_autoinc->datum2autoinc_func != NULL) {
+        return DatumGetInt128(DirectFunctionCall1((PGFunction)(uintptr_t)cons_autoinc->datum2autoinc_func, datum));
+    }
+    return DatumGetInt128(datum);
+}
+
+static inline Datum autoinc2datum(ConstrAutoInc *cons_autoinc, int128 autoinc)
+{
+    if (cons_autoinc->autoinc2datum_func != NULL) {
+        return DirectFunctionCall1((PGFunction)(uintptr_t)cons_autoinc->autoinc2datum_func, Int128GetDatum(autoinc));
+    }
+    return Int128GetDatum(autoinc);
+}
+
 extern Partition ExecOpenScanParitition(
     EState* estate, Relation parent, PartitionIdentifier* partID, LOCKMODE lockmode);
 
@@ -406,7 +476,8 @@ extern bool ExecCheckIndexConstraints(TupleTableSlot *slot, EState *estate, Rela
                                       Oid *conflictPartOid = NULL, int2 *conflictBucketId = NULL);
 
 extern void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* estate,
-    Relation targetPartRel, Partition p, const Bitmapset *modifiedIdxAttrs, const bool inplaceUpdated);
+    Relation targetPartRel, Partition p, const Bitmapset *modifiedIdxAttrs,
+    const bool inplaceUpdated, const bool isRollbackIndex);
 
 extern void ExecUHeapDeleteIndexTuplesGuts(
     TupleTableSlot* oldslot, Relation rel, ModifyTableState* node, ItemPointer tupleid,
@@ -443,6 +514,8 @@ extern void ExplainNodeFinish(PlanState* result_plan, PlannedStmt* pstmt, Timest
 extern void ExecCopyDataFromDatum(PLpgSQL_datum** datums, int dno, Cursor_Data* target_cursor);
 extern void ExecCopyDataToDatum(PLpgSQL_datum** datums, int dno, Cursor_Data* target_cursor);
 
+extern Tuple ExecAutoIncrement(Relation rel, EState* estate, TupleTableSlot* slot, Tuple tuple);
+
 /*
  * prototypes from functions in execReplication.cpp
  */
@@ -465,6 +538,11 @@ extern void ExecSimpleRelationDelete(EState *estate, EPQState *epqstate, TupleTa
     FakeRelationPartition *relAndPart);
 extern void CheckCmdReplicaIdentity(Relation rel, CmdType cmd);
 extern void GetFakeRelAndPart(EState *estate, Relation rel, TupleTableSlot *slot, FakeRelationPartition *relAndPart);
+extern Datum GetTypeZeroValue(Form_pg_attribute att_tup);
+extern Tuple ReplaceTupleNullCol(TupleDesc tupleDesc, TupleTableSlot* slot);
+
+extern Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
+extern int ResourceOwnerForgetIfExistPthreadMutex(ResourceOwner owner, pthread_mutex_t* pMutex, bool trace);
 
 // AutoMutexLock
 //		Auto object for non-recursive pthread_mutex_t lock
@@ -473,7 +551,11 @@ class AutoMutexLock {
 public:
     AutoMutexLock(pthread_mutex_t* mutex, bool trace = true)
         : m_mutex(mutex), m_fLocked(false), m_trace(trace), m_owner(t_thrd.utils_cxt.CurrentResourceOwner)
-    {}
+    {
+        if (mutex == &file_list_lock) {
+            m_owner = t_thrd.lsc_cxt.local_sysdb_resowner;
+        }
+    }
 
     ~AutoMutexLock()
     {
@@ -520,10 +602,11 @@ public:
         if (m_fLocked) {
             int ret = 0;
 
-            if (t_thrd.utils_cxt.CurrentResourceOwner == NULL)
-                m_owner = NULL;
-
-            ret = PthreadMutexUnlock(m_owner, m_mutex, m_trace);
+            if (m_mutex == &file_list_lock) {
+                ret = ResourceOwnerForgetIfExistPthreadMutex(m_owner, m_mutex, m_trace);
+            } else {
+                ret = PthreadMutexUnlock(m_owner, m_mutex, m_trace);
+            }
             m_fLocked = (ret == 0 ? false : true);
             if (m_fLocked) {
                 /* this should never happen, system may be completely in a mess */
@@ -544,6 +627,42 @@ private:
     bool m_fLocked;
     bool m_trace;
     ResourceOwner m_owner;
+};
+
+class AutoDopControl {
+public:
+    AutoDopControl()
+    {
+        if (likely(u_sess != NULL)) {
+            m_smpEnabled = u_sess->opt_cxt.smp_enabled;
+        } else {
+            m_smpEnabled = true;
+        }
+    }
+
+    ~AutoDopControl()
+    {
+        if (u_sess != NULL) {
+            u_sess->opt_cxt.smp_enabled = m_smpEnabled;
+        }
+    }
+
+    void CloseSmp()
+    {
+        if (likely(u_sess != NULL)) {
+            u_sess->opt_cxt.smp_enabled = false;
+        }
+    }
+
+    void ResetSmp()
+    {
+        if (u_sess != NULL) {
+            u_sess->opt_cxt.smp_enabled = m_smpEnabled;
+        }
+    }
+
+private:
+    bool m_smpEnabled;
 };
 
 #endif /* EXECUTOR_H  */

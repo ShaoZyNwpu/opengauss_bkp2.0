@@ -43,8 +43,17 @@ static TupleTableSlot* ExecScanFetch(ScanState* node, ExecScanAccessMtd access_m
          */
         Index scan_rel_id = ((Scan*)node->ps.plan)->scanrelid;
 
-        Assert(scan_rel_id > 0);
-        if (estate->es_epqTupleSet[scan_rel_id - 1]) {
+        if (scan_rel_id == 0) {
+            /*
+             * This is a ForeignScan which has pushed down a
+             * join to the remote side.  The recheck method is responsible not
+             * only for rechecking the scan/join quals but also for storing
+             * the correct tuple in the slot.
+             * 
+             * currently not support.
+             */
+            Assert(false);
+        } else if (estate->es_epqTupleSet[scan_rel_id - 1]) {
             TupleTableSlot* slot = node->ss_ScanTupleSlot;
 
             /* Return empty slot if we already returned a tuple */
@@ -161,8 +170,6 @@ TupleTableSlot* ExecScan(ScanState* node, ExecScanAccessMtd access_mtd, /* funct
     for (;;) {
         TupleTableSlot* slot = NULL;
 
-        CHECK_FOR_INTERRUPTS();
-
         slot = ExecScanFetch(node, access_mtd, recheck_mtd);
         /* refresh qual every loop */
         qual = node->ps.qual;
@@ -173,10 +180,12 @@ TupleTableSlot* ExecScan(ScanState* node, ExecScanAccessMtd access_mtd, /* funct
          * tupleDesc.
          */
         if (TupIsNull(slot) || unlikely(executorEarlyStop())) {
-            if (proj_info != NULL)
+            if (proj_info != NULL) {
                 return ExecClearTuple(proj_info->pi_slot);
-            else
-                return slot;
+            } else {
+                /* slot is not used whild early free happen */
+                return NULL;
+            }
         }
 
         /*
@@ -196,6 +205,9 @@ TupleTableSlot* ExecScan(ScanState* node, ExecScanAccessMtd access_mtd, /* funct
              * Found a satisfactory scan tuple.
              */
             if (proj_info != NULL) {
+                if (node->ps.state && node->ps.state->es_plannedstmt) {
+                    econtext->can_ignore = node->ps.state->es_plannedstmt->hasIgnore;
+                }
                 /*
                  * Form a projection tuple, store it in the result tuple slot
                  * and return it --- unless we find we can project no tuples
@@ -312,7 +324,7 @@ bool tlist_matches_tupdesc(PlanState* ps, List* tlist, Index var_no, TupleDesc t
 
     /* Check the tlist attributes */
     for (attr_no = 1; attr_no <= num_attrs; attr_no++) {
-        Form_pg_attribute att_tup = tup_desc->attrs[attr_no - 1];
+        Form_pg_attribute att_tup = &tup_desc->attrs[attr_no - 1];
         Var* var = NULL;
 
         if (tlist_item == NULL)

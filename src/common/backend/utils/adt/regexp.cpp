@@ -423,6 +423,8 @@ Datum textregexeq(PG_FUNCTION_ARGS)
     text* s = PG_GETARG_TEXT_PP(0);
     text* p = PG_GETARG_TEXT_PP(1);
 
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexeq");
+
     PG_RETURN_BOOL(
         RE_compile_and_execute(p, VARDATA_ANY(s), VARSIZE_ANY_EXHDR(s), REG_ADVANCED, PG_GET_COLLATION(), 0, NULL));
 }
@@ -431,6 +433,8 @@ Datum textregexne(PG_FUNCTION_ARGS)
 {
     text* s = PG_GETARG_TEXT_PP(0);
     text* p = PG_GETARG_TEXT_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexeq");
 
     PG_RETURN_BOOL(
         !RE_compile_and_execute(p, VARDATA_ANY(s), VARSIZE_ANY_EXHDR(s), REG_ADVANCED, PG_GET_COLLATION(), 0, NULL));
@@ -463,6 +467,7 @@ Datum texticregexeq(PG_FUNCTION_ARGS)
 {
     text* s = PG_GETARG_TEXT_PP(0);
     text* p = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexsubstr");
 
     PG_RETURN_BOOL(RE_compile_and_execute(
         p, VARDATA_ANY(s), VARSIZE_ANY_EXHDR(s), REG_ADVANCED | REG_ICASE, PG_GET_COLLATION(), 0, NULL));
@@ -472,6 +477,8 @@ Datum texticregexne(PG_FUNCTION_ARGS)
 {
     text* s = PG_GETARG_TEXT_PP(0);
     text* p = PG_GETARG_TEXT_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexsubstr");
 
     PG_RETURN_BOOL(!RE_compile_and_execute(
         p, VARDATA_ANY(s), VARSIZE_ANY_EXHDR(s), REG_ADVANCED | REG_ICASE, PG_GET_COLLATION(), 0, NULL));
@@ -485,6 +492,8 @@ Datum textregexsubstr(PG_FUNCTION_ARGS)
 {
     text* s = PG_GETARG_TEXT_PP(0);
     text* p = PG_GETARG_TEXT_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexsubstr");
     regex_t* re = NULL;
     regmatch_t pmatch[2];
     int so, eo;
@@ -604,7 +613,7 @@ Datum regexp_replace(PG_FUNCTION_ARGS)
     re = RE_compile_and_cache(pattern, re_flags.cflags, PG_GET_COLLATION());
     result = replace_text_regexp(src, (void*)re, r, position, occurrence);
 
-    if (VARHDRSZ == VARSIZE(result) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT)
+    if (VARHDRSZ == VARSIZE(result) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !ACCEPT_EMPTY_STR)
         PG_RETURN_NULL();
     else
         PG_RETURN_TEXT_P(result);
@@ -653,6 +662,7 @@ Datum textregexreplace_noopt(PG_FUNCTION_ARGS)
     if (PG_ARGISNULL(0))
         PG_RETURN_NULL();
     s = PG_GETARG_TEXT_PP(0);
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexsubstr");
 
     if (PG_ARGISNULL(1))
         PG_RETURN_TEXT_P(s);
@@ -674,7 +684,7 @@ Datum textregexreplace_noopt(PG_FUNCTION_ARGS)
 
     result = replace_text_regexp(s, (void*)re, r, 1, occurrence);
 
-    if (VARHDRSZ == VARSIZE(result) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT)
+    if (VARHDRSZ == VARSIZE(result) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !ACCEPT_EMPTY_STR)
         PG_RETURN_NULL();
     else
         PG_RETURN_TEXT_P(result);
@@ -699,6 +709,7 @@ Datum textregexreplace(PG_FUNCTION_ARGS)
         PG_RETURN_NULL();
 
     s = PG_GETARG_TEXT_PP(ARG_0);
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregexsubstr");
 
     if (PG_ARGISNULL(ARG_1))
         PG_RETURN_TEXT_P(s);
@@ -728,7 +739,7 @@ Datum textregexreplace(PG_FUNCTION_ARGS)
 
     result = replace_text_regexp(s, (void*)re, r, 1, occurrence);
 
-    if (VARHDRSZ == VARSIZE(result) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT)
+    if (VARHDRSZ == VARSIZE(result) && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !ACCEPT_EMPTY_STR)
         PG_RETURN_NULL();
     else
         PG_RETURN_TEXT_P(result);
@@ -766,13 +777,17 @@ Datum similar_escape(PG_FUNCTION_ARGS)
         esc_text = PG_GETARG_TEXT_PP(1);
         e = VARDATA_ANY(esc_text);
         elen = VARSIZE_ANY_EXHDR(esc_text);
-        if (elen == 0)
+        if (elen == 0) {
             e = NULL; /* no escape character */
-        else if (elen != 1)
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
-                    errmsg("invalid escape string"),
-                    errhint("Escape string must be empty or one character.")));
+        } else if (elen > 1) {
+            int	escape_mblen = pg_mbstrlen_with_len(e, elen);
+            if (escape_mblen > 1) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
+                        errmsg("invalid escape string"),
+                        errhint("Escape string must be empty or one character.")));
+            }
+        }
     }
 
     /* ----------
@@ -792,8 +807,10 @@ Datum similar_escape(PG_FUNCTION_ARGS)
      * We need room for the prefix/postfix plus as many as 3 output bytes per
      * input byte; since the input is at most 1GB this can't overflow
      */
-    result = (text*)palloc(VARHDRSZ + 6 + 3 * plen);
+    const int dataBuffSize = 6 + 3 * plen;
+    result = (text*)palloc(VARHDRSZ + dataBuffSize);
     r = VARDATA(result);
+    const char* dataStartPtr = r;
 
     *r++ = '^';
     *r++ = '(';
@@ -803,6 +820,50 @@ Datum similar_escape(PG_FUNCTION_ARGS)
     while (plen > 0) {
         char pchar = *p;
 
+        /*
+         * If both the escape character and the current character from the
+         * pattern are multi-byte, we need to take the slow path.
+         *
+         * But if one of them is single-byte, we can process the pattern one
+         * byte at a time, ignoring multi-byte characters.  (This works
+         * because all server-encodings have the property that a valid
+         * multi-byte character representation cannot contain the
+         * representation of a valid single-byte character.)
+         */
+        if (elen > 1) {
+            int mblen = pg_mblen(p);
+            if (mblen > 1) {
+                /* slow, multi-byte path */
+                if (afterescape) {
+                    *r++ = '\\';
+                    int destMax = dataBuffSize - (r - dataStartPtr) / sizeof(char);
+                    errno_t rc = memcpy_s(r, destMax, p, mblen);
+                    securec_check(rc, "\0", "\0");
+                    r += mblen;
+                    afterescape = false;
+                } else if (e && elen == mblen && memcmp(e, p, mblen) == 0) {
+                    /* SQL99 escape character; do not send to output */
+                    afterescape = true;
+                } else {
+                    /*
+                     * We know it's a multi-byte character, so we don't need
+                     * to do all the comparisons to single-byte characters
+                     * that we do below.
+                     */
+                    int destMax = dataBuffSize - (r - dataStartPtr) / sizeof(char);
+                    errno_t rc = memcpy_s(r, destMax, p, mblen);
+                    securec_check(rc, "\0", "\0");
+                    r += mblen;
+                }
+
+                p += mblen;
+                plen -= mblen;
+
+                continue;
+            }
+        }
+
+        /* fast path */
         if (afterescape) {
             if (pchar == '"' && !incharclass) /* for SUBSTRING patterns */
                 *r++ = ((nquotes++ % 2) == 0) ? '(' : ')';
@@ -870,6 +931,8 @@ Datum regexp_count(PG_FUNCTION_ARGS)
     /* source string */
     if (!PG_ARGISNULL(ARG_0))
         src = PG_GETARG_TEXT_P_COPY(ARG_0);
+
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), src, "textpos()");
 
     /* pattern string */
     if (!PG_ARGISNULL(ARG_1))
@@ -991,6 +1054,8 @@ Datum regexp_instr(PG_FUNCTION_ARGS)
     if (!PG_ARGISNULL(ARG_0))
         src = PG_GETARG_TEXT_PP(ARG_0);
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(ARG_0), src, "textpos()");
+
     if (!PG_ARGISNULL(ARG_1))
         pattern = PG_GETARG_TEXT_PP(ARG_1);
 
@@ -1049,6 +1114,7 @@ Datum regexp_matches(PG_FUNCTION_ARGS)
     if (SRF_IS_FIRSTCALL()) {
         text* pattern = PG_GETARG_TEXT_PP(1);
         text* flags = PG_GETARG_TEXT_PP_IF_EXISTS(2);
+        FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), PG_GETARG_TEXT_PP(0), "regexp_matches()");
         pg_re_flags re_flags;
         MemoryContext oldcontext;
 
@@ -1260,13 +1326,13 @@ static ArrayType* build_regexp_matches_result(regexp_matches_ctx* matchctx)
 /* return value datatype must be text */
 #define RESET_NULL_FLAG(_result)                                                   \
     do {                                                                           \
-        if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !RETURN_NS) {   \
+        if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !RETURN_NS && !ACCEPT_EMPTY_STR) {   \
             if ((_result) == ((Datum)0)) {                                         \
                 fcinfo->isnull = true;                                             \
             } else {                                                               \
                 text *t = DatumGetTextP((_result));                                \
                 fcinfo->isnull = false;                                            \
-                if (VARSIZE_ANY_EXHDR(t) == 0) {                                   \
+                if (VARSIZE_ANY_EXHDR(t) == 0 && !ACCEPT_EMPTY_STR) {            \
                     fcinfo->isnull = true;                                         \
                     (_result) = (Datum)0;                                          \
                 }                                                                  \
@@ -1289,6 +1355,7 @@ Datum regexp_split_to_table(PG_FUNCTION_ARGS)
     if (SRF_IS_FIRSTCALL()) {
         text* pattern = PG_GETARG_TEXT_PP(1);
         text* flags = PG_GETARG_TEXT_PP_IF_EXISTS(2);
+        FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), PG_GETARG_TEXT_PP(0), "regexp_split_to_table()");
         pg_re_flags re_flags;
         MemoryContext oldcontext;
 
@@ -1539,7 +1606,7 @@ Datum textregexsubstr_enforce_a(PG_FUNCTION_ARGS)
     regmatch_t pmatch[2];
     int so = 0;
     int eo = 0;
-
+    FUNC_CHECK_HUGE_POINTER(false, s, "textregex()");
     /* Compile RE */
     if (REGEX_COMPAT_MODE) {
         cflags |= REG_NLSTOP;
@@ -1656,6 +1723,8 @@ Datum regexp_substr_core(PG_FUNCTION_ARGS)
     if (!PG_ARGISNULL(ARG_0))
         src = PG_GETARG_TEXT_PP(ARG_0);
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), src, "regexp()");
+
     if (!PG_ARGISNULL(ARG_1))
         pattern = PG_GETARG_TEXT_PP(ARG_1);
 
@@ -1670,7 +1739,7 @@ Datum regexp_substr_core(PG_FUNCTION_ARGS)
                                              PG_GET_COLLATION());
 
     if (ret == NULL || (VARHDRSZ == VARSIZE(ret) &&
-        u_sess->attr.attr_sql.sql_compatibility == A_FORMAT)) {
+        u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && !ACCEPT_EMPTY_STR)) {
         PG_RETURN_NULL();
     } else {
         PG_RETURN_TEXT_P(ret);

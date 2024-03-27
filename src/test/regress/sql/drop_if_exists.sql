@@ -145,9 +145,7 @@ DROP TEXT SEARCH CONFIGURATION test_tsconfig_exists;
 -- doesn't exists
 DROP EXTENSION test_extension_exists;
 DROP EXTENSION IF EXISTS test_extension_exists;
--- exists but doesn't support drop
-DROP EXTENSION plpgsql;
-DROP EXTENSION IF EXISTS plpgsql;
+\c regression
 
 -- functions
 DROP FUNCTION test_function_exists();
@@ -232,3 +230,7 @@ DROP TABLE test_exists;
 
 -- drop the database
 DROP DATABASE if exists abc123_123ABCxar;
+
+-- drop extension
+drop extension file_fdw;
+drop extension file_fdw cascade;

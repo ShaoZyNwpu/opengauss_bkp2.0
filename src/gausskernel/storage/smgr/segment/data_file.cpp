@@ -31,7 +31,9 @@
 #include "storage/smgr/fd.h"
 #include "storage/smgr/knl_usync.h"
 #include "storage/smgr/segment.h"
+#include "storage/file/fio_device.h"
 #include "postmaster/pagerepair.h"
+#include "ddes/dms/ss_common_attr.h"
 
 static const mode_t SEGMENT_FILE_MODE = S_IWUSR | S_IRUSR;
 
@@ -41,6 +43,7 @@ static void df_open_target_files(SegLogicFile *sf, int targetno);
 
 static char *slice_filename(const char *filename, int sliceno);
 void df_extend_internal(SegLogicFile *sf);
+void df_extend_file_vector(SegLogicFile *sf);
 
 /*
  * We can not use virtual fd because space data files are accessed by multi-thread.
@@ -58,19 +61,24 @@ static int dv_open_file(char *filename, uint32 flags, int mode)
 
 static void dv_close_file(int fd)
 {
-    close(fd);
+    if (fd > 0) {
+        close(fd);
+    }
     ereport(LOG, (errmsg("dv_close_file fd is %d", fd)));
 }
 
 /* Return a palloc string, and callers should free it */
 static char *slice_filename(const char *filename, int sliceno)
 {
-    char *res = (char *)palloc(MAXPGPATH);
+    char *res = NULL;
+    int len = strlen(filename);
     if (sliceno == 0) {
-        errno_t rc = snprintf_s(res, MAXPGPATH, MAXPGPATH - 1, "%s", filename);
+        res = (char *)palloc(len + 1);
+        errno_t rc = sprintf_s(res, len + 1, "%s", filename);
         securec_check_ss(rc, "\0", "\0");
     } else {
-        errno_t rc = snprintf_s(res, MAXPGPATH, MAXPGPATH - 1, "%s.%d", filename, sliceno);
+        res = (char *)palloc(len + MAX_LEN_OF_MAXINTRANGE);
+        errno_t rc = sprintf_s(res, len + MAX_LEN_OF_MAXINTRANGE, "%s.%d", filename, sliceno);
         securec_check_ss(rc, "\0", "\0");
     }
     return res;
@@ -137,7 +145,78 @@ void df_create_file(SegLogicFile *sf, bool redo)
     pfree(filename);
 }
 
-static SegPhysicalFile df_get_physical_file(SegLogicFile *sf, int sliceno, BlockNumber target_block)
+/*
+ * Refreshes segfile's total blocks and compare to target block. Returns true if total block num holds target.
+ */
+bool df_ss_update_segfile_size(SegLogicFile *sf, BlockNumber target_block)
+{
+    if (!ENABLE_DMS) {
+        return false;
+    }
+
+    uint32 flags = O_RDWR | PG_BINARY;
+    /* need palloc segfiles if file_num is 0 */
+    if (sf->vector_capacity == 0) {
+        df_extend_file_vector(sf);
+    }
+
+    if (sf->file_num == 0) {
+        char *filename = slice_filename(sf->filename, 0);
+        int fd = dv_open_file(filename, flags, (int)SEGMENT_FILE_MODE);
+        if (fd < 0) {
+            pfree(filename);
+            ereport(LOG,
+                (errmodule(MOD_SEGMENT_PAGE), errmsg("File \"%s\" does not exist, stop read here.", filename)));
+            return false;
+        }
+        
+        sf->file_num++;
+        sf->segfiles[0].fd = fd;
+        sf->segfiles[0].sliceno = 0;
+        pfree(filename);
+    }
+    int sliceno = sf->file_num - 1;
+    int fd = sf->segfiles[sliceno].fd;
+    if (fd <= 0) {
+        char *filename = slice_filename(sf->filename, sliceno);
+        sf->segfiles[sliceno].fd = dv_open_file(filename, flags, SEGMENT_FILE_MODE);
+        fd = sf->segfiles[sliceno].fd;
+        pfree(filename);
+    }
+    off_t size = lseek(fd, 0L, SEEK_END);
+    sf->total_blocks = (uint32)(sliceno * DF_FILE_SLICE_BLOCKS + size / BLCKSZ); /* size of full slices + last slice */
+
+    while (size == DF_FILE_SLICE_SIZE) {
+        sliceno = sf->file_num;
+        if (sliceno >= sf->vector_capacity) {
+            df_extend_file_vector(sf);
+        }
+        char *filename = slice_filename(sf->filename, sliceno);
+        fd = dv_open_file(filename, flags, (int)SEGMENT_FILE_MODE);
+        if (fd < 0) {
+            ereport(LOG,
+                (errmodule(MOD_SEGMENT_PAGE), errmsg("File \"%s\" does not exist, stop read here.", filename)));
+            pfree(filename);
+            break;
+        }
+
+        sf->segfiles[sliceno].fd = fd;
+        sf->segfiles[sliceno].sliceno = sliceno;
+
+        size = lseek(fd, 0L, SEEK_END);
+        sf->total_blocks += (uint32)(size / BLCKSZ);
+        sf->file_num++;
+        pfree(filename);
+    }
+
+    if (sf->total_blocks <= target_block) {
+        return false;
+    }
+
+    return true;
+}
+
+SegPhysicalFile df_get_physical_file(SegLogicFile *sf, int sliceno, BlockNumber target_block)
 {
     AutoMutexLock filelock(&sf->filelock);
     filelock.lock();
@@ -147,7 +226,7 @@ static SegPhysicalFile df_get_physical_file(SegLogicFile *sf, int sliceno, Block
             (errcode(ERRCODE_DATA_EXCEPTION), errmsg("df_get_physical_file target_block is InvalidBlockNumber!\n")));
     }
 
-    if (sf->total_blocks <= target_block) {
+    if (sf->total_blocks <= target_block && !df_ss_update_segfile_size(sf, target_block)) {
         ereport(LOG,
                 (errmodule(MOD_SEGMENT_PAGE), errmsg("Try to access file %s block %u, exceeds the file total blocks %u",
                                                      sf->filename, target_block, sf->total_blocks)));
@@ -158,6 +237,11 @@ static SegPhysicalFile df_get_physical_file(SegLogicFile *sf, int sliceno, Block
     }
 
     SegmentCheck(sliceno < sf->file_num);
+    if (ENABLE_DMS && sf->segfiles[sliceno].fd <= 0) {
+        char *filename = slice_filename(sf->filename, sliceno);
+        sf->segfiles[sliceno].fd = dv_open_file(filename, O_RDWR | PG_BINARY, SEGMENT_FILE_MODE);
+        pfree(filename);
+    }
 
     SegPhysicalFile spf = sf->segfiles[sliceno];
     return spf;
@@ -196,7 +280,7 @@ void df_extend_file_vector(SegLogicFile *sf)
 {
     int new_capacity = sf->vector_capacity + DF_ARRAY_EXTEND_STEP;
     MemoryContext oldcnxt = MemoryContextSwitchTo(INSTANCE_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
-    SegPhysicalFile *newfiles = (SegPhysicalFile *)palloc(sizeof(SegPhysicalFile) * new_capacity);
+    SegPhysicalFile *newfiles = (SegPhysicalFile *)palloc0(sizeof(SegPhysicalFile) * new_capacity);
     MemoryContextSwitchTo(oldcnxt);
 
     for (int i = 0; i < sf->file_num; i++) {
@@ -335,7 +419,7 @@ void df_open_all_file(RepairFileKey key, int32 max_sliceno)
     eg->segfile->file_num = max_sliceno + 1;
     off_t size = lseek(maxopenslicefd, 0L, SEEK_END);
     if (max_sliceno == 0) {
-        eg->segfile->total_blocks = size;
+        eg->segfile->total_blocks = size / BLCKSZ;
     } else {
         eg->segfile->total_blocks = max_sliceno * RELSEG_SIZE + size / BLCKSZ;
     }
@@ -365,7 +449,7 @@ static void df_open_target_files(SegLogicFile *sf, int targetno)
         }
         int fd = dv_open_file(filename, flags, SEGMENT_FILE_MODE);
         if (fd < 0) {
-            if (errno != ENOENT) {
+            if (!FILE_POSSIBLY_DELETED(errno)) {
                 ereport(PANIC, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", filename)));
             }
             // The file does not exist, break.
@@ -649,10 +733,10 @@ void df_unlink(SegLogicFile *sf)
 
         char *path = slice_filename(sf->filename, i);
         int ret = unlink(path);
-        pfree(path);
         if (ret < 0) {
-            ereport(ERROR, (errmsg("Could not remove file %s", path)));
+            ereport(ERROR, (errmsg("Could not remove file %s, errno : %d", path, errno)));
         }
+        pfree(path);
         sf->file_num--;
     }
     sf->file_num = 0;

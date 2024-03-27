@@ -79,11 +79,13 @@ max_connections = 200			# (change requires restart)
 #unix_socket_group = ''			# (change requires restart)
 #unix_socket_permissions = 0700		# begin with 0 to use octal notation
 					# (change requires restart)
+#light_comm = off			# whether use light commnucation with nonblock mode or latch
 
 # - Security and Authentication -
 
 #authentication_timeout = 1min		# 1s-600s
 session_timeout = 10min			# allowed duration of any unused session, 0s-86400s(1 day), 0 is disabled 
+#idle_in_transaction_session_timeout = 0    # Sets the maximum allowed idle time between queries, when in a transaction, 0 is disabled
 #ssl = off				# (change requires restart)
 #ssl_ciphers = 'ALL'			# allowed SSL ciphers
 					# (change requires restart)
@@ -137,6 +139,9 @@ session_timeout = 10min			# allowed duration of any unused session, 0s-86400s(1 
 #max_process_memory = 12GB
 #UDFWorkerMemHardLimit = 1GB
 
+#enable_huge_pages = off      # (change requires restart)
+#huge_page_size = 0     # make sure huge_page_size is valid for os. 0 as default.
+                    # (change requires restart)
 #shared_buffers = 32MB			# min 128kB
 					# (change requires restart)
 bulk_write_ring_size = 2GB		# for bulkload, max shared_buffers
@@ -257,9 +262,8 @@ max_wal_senders = 4		# max number of walsender processes
 wal_keep_segments = 16		# in logfile segments, 16MB each; 0 disables
 #wal_sender_timeout = 6s	# in milliseconds; 0 disables
 enable_slot_log = off
-max_replication_slots = 8	# max number of replication slots.i
-				# The value belongs to [1,7].
-				# (change requires restart)
+max_replication_slots = 8
+
 #max_changes_in_memory = 4096
 #max_cached_tuplebufs = 8192
 
@@ -336,6 +340,7 @@ hot_standby = on			# "on" allows queries during recovery
 #enable_xlog_prune = on # xlog keep for all standbys even through they are not connecting and donnot created replslot.
 #max_size_for_xlog_prune = 2147483647  # xlog keep for the wal size less than max_xlog_size when the enable_xlog_prune is on
 #max_logical_replication_workers = 4   # Maximum number of logical replication worker processes.
+#max_sync_workers_per_subscription = 2   # Maximum number of table synchronization workers per subscription.
 
 #------------------------------------------------------------------------------
 # QUERY TUNING
@@ -363,6 +368,7 @@ enable_kill_query = off			# optional: [on, off], default: off
 #cpu_index_tuple_cost = 0.005		# same scale as above
 #cpu_operator_cost = 0.0025		# same scale as above
 #effective_cache_size = 128MB
+#var_eq_const_selectivity = off
 
 # - Genetic Query Optimizer -
 
@@ -384,6 +390,10 @@ enable_kill_query = off			# optional: [on, off], default: off
 					# JOIN clauses
 #plan_mode_seed = 0         # range -1-0x7fffffff
 #check_implicit_conversions = off
+#enable_expr_fusion = off
+#enable_functional_dependency = off
+#enable_indexscan_optimization = off
+#enable_inner_unique_opt = off
 
 #------------------------------------------------------------------------------
 # ERROR REPORTING AND LOGGING
@@ -587,6 +597,10 @@ use_workload_manager = on		# Enables workload manager in the system.
 					# autovacuum, -1 means use
 					# vacuum_cost_limit
 
+#------------------------------------------------------------------------------
+# AI-based Optimizer
+#------------------------------------------------------------------------------
+# enable_ai_stats = on           # Enable AI Ext Statistics? default value is 'on'
 
 #------------------------------------------------------------------------------
 # CLIENT CONNECTION DEFAULTS
@@ -616,10 +630,27 @@ use_workload_manager = on		# Enables workload manager in the system.
 #vacuum_freeze_min_age = 50000000
 #vacuum_freeze_table_age = 150000000
 #bytea_output = 'hex'			# hex, escape
+#block_encryption_mode = 'aes-128-cbc'     #  values in order of decreasing detail:
+    #  aes-128-cbc
+    #  aes-192-cbc
+    #  aes-256-cbc
+    #  aes-128-cfb1
+    #  aes-192-cfb1
+    #  aes-256-cfb1
+    #  aes-128-cfb8
+    #  aes-192-cfb8
+    #  aes-256-cfb8
+    #  aes-128-cfb128
+    #  aes-192-cfb128
+    #  aes-256-cfb128
+    #  aes-128-ofb
+    #  aes-192-ofb
+    #  aes-256-ofb
 #xmlbinary = 'base64'
 #xmloption = 'content'
 #max_compile_functions = 1000
 #gin_pending_list_limit = 4MB
+#group_concat_max_len=1024
 # - Locale and Formatting -
 
 #datestyle = 'iso, mdy'
@@ -739,6 +770,9 @@ audit_enabled = on
 #audit_set_parameter = 1		# whether audit set parameter operation
 #audit_xid_info = 0 			# whether record xid info in audit log
 #audit_thread_num = 1
+#no_audit_client = ""
+#full_audit_users = ""
+#audit_system_function_exec = 0
 
 #Choose which style to print the explain info, normal,pretty,summary,run
 #explain_perf_mode = normal
@@ -783,3 +817,37 @@ job_queue_processes = 10        # Number of concurrent jobs, optional: [0..1000]
 # PLSQL COMPILE OPTIONS
 #------------------------------------------------------------------------------
 #plsql_show_all_error=off
+#enable_seqscan_fusion = off
+#enable_cachedplan_mgr=on
+
+#------------------------------------------------------------------------------
+# SHARED STORAGE OPTIONS
+#------------------------------------------------------------------------------
+#ss_enable_dms = off
+#ss_enable_dss = off
+#ss_enable_ssl = on
+#ss_enable_aio = on
+#ss_enable_catalog_centralized = on
+#ss_instance_id = 0
+#ss_dss_vg_name = ''
+#ss_dss_conn_path = ''
+#ss_interconnect_channel_count = 16
+#ss_work_thread_count = 32
+#ss_recv_msg_pool_size = 16MB
+#ss_interconnect_type = 'TCP'
+#ss_interconnect_url = '0:127.0.0.1:1611'
+#ss_rdma_work_config = ''
+#ss_ock_log_path = ''
+#ss_enable_scrlock = off
+#ss_enable_scrlock_sleep_mode = on
+#ss_scrlock_server_port = 8000
+#ss_scrlock_worker_count = 2
+#ss_scrlock_worker_bind_core = ''
+#ss_scrlock_server_bind_core = ''
+#ss_log_level = 7
+#ss_log_backup_file_count = 10
+#ss_log_max_file_size = 10MB
+#ss_parallel_thread_count = 16
+#ss_enable_ondemand_recovery = off
+#ss_ondemand_recovery_mem_size = 4GB     # min: 1GB, max: 100GB
+#enable_segment = off

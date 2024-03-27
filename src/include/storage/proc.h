@@ -27,6 +27,7 @@
 #include "gtm/gtm_c.h"
 #include "alarm/alarm.h"
 #include "utils/atomic.h"
+#include "utils/snapshot.h"
 #include "access/multi_redo_settings.h"
 
 
@@ -184,6 +185,7 @@ struct PGPROC {
     int syncRepState;       /* wait state for sync rep */
     bool syncRepInCompleteQueue; /* waiting in complete queue */
     SHM_QUEUE syncRepLinks; /* list link if process is in syncrep queue */
+    XLogRecPtr syncSetConfirmedLSN;     /* set confirmed LSN for SyncRepWaitForLSN */
 
     XLogRecPtr waitPaxosLSN;    /* waiting for this LSN or higher on paxos callback */
     int syncPaxosState;  /* wait state for sync paxos, reuse syncRepState defines */
@@ -197,17 +199,34 @@ struct PGPROC {
     char myProgName[64];
     pg_time_t myStartTime;
     syscalllock deleMemContextMutex;
+    int64* usedMemory;
 
     /* Support for group XID clearing. */
     /* true, if member of ProcArray group waiting for XID clear */
     bool procArrayGroupMember;
     /* next ProcArray group member waiting for XID clear */
     pg_atomic_uint32 procArrayGroupNext;
+
     /*
      * latest transaction id among the transaction's main XID and
      * subtransactions
      */
     TransactionId procArrayGroupMemberXid;
+
+    /* Support for group snapshot getting. */
+    bool snapshotGroupMember;
+    /* next ProcArray group member waiting for snapshot getting */
+    pg_atomic_uint32 snapshotGroupNext;
+    volatile Snapshot snapshotGroup;
+    TransactionId xminGroup;
+    TransactionId xmaxGroup;
+    TransactionId globalxminGroup;
+    volatile TransactionId replicationSlotXminGroup;
+    volatile TransactionId replicationSlotCatalogXminGroup;
+
+    TransactionId snapXmax;     /* maximal running XID as it was when we were
+                             * getting our snapshot. */
+    CommitSeqNo snapCSN;    /* csn as it was when we were getting our snapshot. */
 
     /* commit sequence number send down */
     CommitSeqNo commitCSN;
@@ -334,6 +353,9 @@ typedef struct PGXACT {
 /* the offset of the last padding if exists*/
 #define PROC_HDR_PAD_OFFSET 112
 
+/* max number of CMA's connections */
+#define NUM_CMAGENT_PROCS (10)
+
 /*
  * There is one ProcGlobal struct for the whole database cluster.
  */
@@ -354,12 +376,16 @@ typedef struct PROC_HDR {
     PGPROC* autovacFreeProcs;
     /* Head of list of cm agent's free PGPROC structures */
     PGPROC* cmAgentFreeProcs;
+    /* Head of list of cm agent's all PGPROC structures */
+    PGPROC* cmAgentAllProcs[NUM_CMAGENT_PROCS];
     /* Head of list of pg_job's free PGPROC structures */
     PGPROC* pgjobfreeProcs;
 	/* Head of list of bgworker free PGPROC structures */
     PGPROC* bgworkerFreeProcs;
     /* First pgproc waiting for group XID clear */
     pg_atomic_uint32 procArrayGroupFirst;
+    /* First pgproc waiting for group snapshot getting */
+    pg_atomic_uint32 snapshotGroupFirst;
     /* First pgproc waiting for group transaction status update */
     pg_atomic_uint32 clogGroupFirst;
     /* WALWriter process's latch */
@@ -396,7 +422,7 @@ typedef struct PROC_HDR {
  *
  * PGXC needs another slot for the pool manager process
  */
-const int MAX_PAGE_WRITER_THREAD_NUM = 16;
+const int MAX_PAGE_WRITER_THREAD_NUM = 17;
 
 #ifndef ENABLE_LITE_MODE
 const int MAX_COMPACTION_THREAD_NUM = 100;
@@ -414,8 +440,6 @@ const int MAX_COMPACTION_THREAD_NUM = 10;
 
 #define NUM_AUXILIARY_PROCS (NUM_SINGLE_AUX_PROC + NUM_MULTI_AUX_PROC) 
 
-/* max number of CMA's connections */
-#define NUM_CMAGENT_PROCS (10)
 /* buffer length of information when no free proc available for cm_agent */
 #define CONNINFOLEN (64)
 
@@ -424,9 +448,27 @@ const int MAX_COMPACTION_THREAD_NUM = 10;
         (g_instance.attr.attr_storage.dcf_attr.enable_dcf ? \
         g_instance.attr.attr_storage.dcf_attr.dcf_max_workers : 0)
 
+#define NUM_DMS_REFORM_CALLLBACK_PROCS (5)
+#define NUM_DMS_LSNR_CALLBACK_PROC (1)
+#define NUM_DMS_SMON_CALLBACK_PROC (2) // smon + smon_recycle
+#define NUM_DMS_PARALLEL_CALLBACK_PROC (g_instance.attr.attr_storage.dms_attr.parallel_thread_num <= 1 ? 0 : \
+                                        g_instance.attr.attr_storage.dms_attr.parallel_thread_num)
+#define NUM_DMS_RDMA_THREAD_CNT (g_instance.attr.attr_storage.dms_attr.work_thread_count * 2)
+#define NUM_DMS_CALLBACK_PROCS \
+        (g_instance.attr.attr_storage.dms_attr.enable_dms ? \
+        (g_instance.attr.attr_storage.dms_attr.channel_count * g_instance.attr.attr_storage.dms_attr.inst_count + \
+        ((!strcasecmp(g_instance.attr.attr_storage.dms_attr.interconnect_type, "TCP"))? \
+        g_instance.attr.attr_storage.dms_attr.work_thread_count :      \
+        NUM_DMS_RDMA_THREAD_CNT) + \
+        NUM_DMS_LSNR_CALLBACK_PROC + \
+        NUM_DMS_SMON_CALLBACK_PROC + \
+        NUM_DMS_PARALLEL_CALLBACK_PROC + \
+        NUM_DMS_REFORM_CALLLBACK_PROCS ) : 0)
+
 #define GLOBAL_ALL_PROCS \
     (g_instance.shmem_cxt.MaxBackends + \
      NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS + \
+     NUM_DMS_CALLBACK_PROCS + \
      (g_instance.attr.attr_storage.max_prepared_xacts * NUM_TWOPHASE_PARTITIONS))
 
 #define GLOBAL_MAX_SESSION_NUM (2 * g_instance.shmem_cxt.MaxBackends)
@@ -453,6 +495,9 @@ extern void InitProcess(void);
 extern void InitProcessPhase2(void);
 extern void InitAuxiliaryProcess(void);
 
+extern void ProcBaseLockAcquire(pthread_mutex_t *procBaseLock);
+extern void ProcBaseLockRelease(pthread_mutex_t *procBaseLock);
+
 extern int GetAuxProcEntryIndex(int baseIdx);
 extern void PublishStartupProcessInformation(void);
 
@@ -477,7 +522,9 @@ extern TimestampTz GetStatementFinTime();
 extern bool enable_sig_alarm(int delayms, bool is_statement_timeout);
 extern bool enable_lockwait_sig_alarm(int delayms);
 extern bool enable_session_sig_alarm(int delayms);
+extern bool enable_idle_in_transaction_session_sig_alarm(int delayms);
 extern bool disable_session_sig_alarm(void);
+extern bool disable_idle_in_transaction_session_sig_alarm(void);
 
 extern bool disable_sig_alarm(bool is_statement_timeout);
 extern bool pause_sig_alarm(bool is_statement_timeout);
@@ -501,12 +548,12 @@ extern void BecomeLockGroupMember(PGPROC *leader);
 
 static inline bool TransactionIdOlderThanAllUndo(TransactionId xid)
 {
-    uint64 cutoff = pg_atomic_read_u64(&g_instance.undo_cxt.oldestXidInUndo);
+    uint64 cutoff = pg_atomic_read_u64(&g_instance.undo_cxt.globalRecycleXid);
     return xid < cutoff;
 }
 static inline bool TransactionIdOlderThanFrozenXid(TransactionId xid)
 {
-    uint64 cutoff = pg_atomic_read_u64(&g_instance.undo_cxt.oldestFrozenXid);
+    uint64 cutoff = pg_atomic_read_u64(&g_instance.undo_cxt.globalFrozenXid);
     return xid < cutoff;
 }
 

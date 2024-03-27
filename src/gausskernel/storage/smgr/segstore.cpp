@@ -38,6 +38,8 @@
 #include "utils/resowner.h"
 #include "vectorsonic/vsonichash.h"
 #include "storage/procarray.h"
+#include "ddes/dms/ss_transaction.h"
+#include "ddes/dms/ss_dms_bufmgr.h"
 /*
  * This code manages relations that reside on segment-page storage. It implements functions used for smgr.cpp.
  *
@@ -97,6 +99,9 @@
 static void seg_update_timeline()
 {
     pg_atomic_add_fetch_u32(&g_instance.segment_cxt.segment_drop_timeline, 1);
+    if (ENABLE_DMS && SS_PRIMARY_MODE) {
+        SSUpdateSegDropTimeline(pg_atomic_read_u32(&g_instance.segment_cxt.segment_drop_timeline));
+    }
 }
 
 static uint32 seg_get_drop_timeline()
@@ -135,6 +140,12 @@ void UnlockSegmentHeadPartition(Oid spcNode, Oid dbNode, BlockNumber head)
 
 #define ReadLevel0Buffer(spc, blockno)                                                                                 \
     ReadBufferFast((spc), EXTENT_GROUP_RNODE((spc), LEVEL0_PAGE_EXTENT_SIZE), MAIN_FORKNUM, (blockno), RBM_NORMAL)
+
+#define ReadSegmentBuffer_RBM_ZERO(spc, blockno)                                                                       \
+        ReadBufferFast((spc), EXTENT_GROUP_RNODE((spc), SEGMENT_HEAD_EXTENT_SIZE), MAIN_FORKNUM, (blockno), RBM_ZERO)
+
+#define ReadLevel0Buffer_RBM_ZERO(spc, blockno)                                                                        \
+    ReadBufferFast((spc), EXTENT_GROUP_RNODE((spc), LEVEL0_PAGE_EXTENT_SIZE), MAIN_FORKNUM, (blockno), RBM_ZERO)
 
 /*
  * Calculate extent id & offset according to logic page id
@@ -227,7 +238,7 @@ void seg_init_new_level0_page(SegSpace *spc, uint32_t new_extent_id, Buffer seg_
 {
     SegmentHead *seg_head = (SegmentHead *)PageGetContents(BufferGetPage(seg_head_buffer));
 
-    Buffer new_level0_buffer = ReadLevel0Buffer(spc, new_level0_page);
+    Buffer new_level0_buffer = ReadLevel0Buffer_RBM_ZERO(spc, new_level0_page);
     LockBuffer(new_level0_buffer, BUFFER_LOCK_EXCLUSIVE);
     Page level0_page = BufferGetPage(new_level0_buffer);
 
@@ -358,9 +369,15 @@ SegPageLocation seg_logic_to_physic_mapping(SMgrRelation reln, SegmentHead *seg_
     BlockNumber blocknum;
 
     /* Recovery thread should use physical location to read data directly. */
-    if (RecoveryInProgress() && !CurrentThreadIsWorker()) {
-        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("recovery is in progress"),
-                        errhint("cannot do segment address translation during recovery")));
+    if (ENABLE_DMS && t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE &&
+        g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY &&
+        g_instance.attr.attr_storage.xlog_file_path != 0) {
+        ereport(DEBUG1, (errmsg("can segment address translation when role is SS_STANDBY_CLUSTER_MAIN_STANDBY")));
+    } else {
+        if (RecoveryInProgress() && !CurrentThreadIsWorker() && !SS_IN_FLUSHCOPY) {
+            ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("recovery is in progress"),
+                            errhint("cannot do segment address translation during recovery")));
+        }
     }
 
     SegLogicPageIdToExtentId(logic_id, &extent_id, &offset, &extent_size);
@@ -486,6 +503,9 @@ static bool normal_open_segment(SMgrRelation reln, int forknum, bool create)
             reln->seg_desc[MAIN_FORKNUM]->head_blocknum)));
     }
 
+    if (ENABLE_DMS) {
+        LockBuffer(main_buffer, BUFFER_LOCK_SHARE);
+    }
     /*
      * For non-main fork, the segment head is stored in the main fork segment head.
      * The block number being invalid means that the segment has not been created yet.
@@ -494,6 +514,9 @@ static bool normal_open_segment(SMgrRelation reln, int forknum, bool create)
 
     if (fork_head_blocknum == InvalidBlockNumber) {
         if (create) {
+            if (ENABLE_DMS) {
+                LockBuffer(main_buffer, BUFFER_LOCK_UNLOCK);
+            }
             LockBuffer(main_buffer, BUFFER_LOCK_EXCLUSIVE);
 
             /*
@@ -529,10 +552,16 @@ static bool normal_open_segment(SMgrRelation reln, int forknum, bool create)
             }
             SegUnlockReleaseBuffer(main_buffer);
         } else {
+            if (ENABLE_DMS) {
+                LockBuffer(main_buffer, BUFFER_LOCK_UNLOCK);
+            }
             SegReleaseBuffer(main_buffer);
             return false;
         }
     } else {
+        if (ENABLE_DMS) {
+            LockBuffer(main_buffer, BUFFER_LOCK_UNLOCK);
+        }
         SegReleaseBuffer(main_buffer);
     }
 
@@ -709,7 +738,7 @@ static void bucket_ensure_mapblock(SegSpace *spc, Buffer main_buffer, uint32 blo
             spc_alloc_extent(spc, SEGMENT_HEAD_EXTENT_SIZE, MAIN_FORKNUM, InvalidBlockNumber, iptr);
         main_head->bkt_map[blockid] = newmap_block;
 
-        Buffer map_buffer = ReadSegmentBuffer(spc, newmap_block);
+        Buffer map_buffer = ReadSegmentBuffer_RBM_ZERO(spc, newmap_block);
         LockBuffer(map_buffer, BUFFER_LOCK_EXCLUSIVE);
         bucket_init_map_page(map_buffer, lsn);
         XLogAtomicOpRegisterBuffer(map_buffer, REGBUF_WILL_INIT, SPCXLOG_BUCKET_INIT_MAPBLOCK,
@@ -771,7 +800,7 @@ static BlockNumber bucket_alloc_segment(Oid tablespace_id, Oid database_id, Bloc
     XLogAtomicOpStart();
     BlockNumber main_head_blocknum =
         spc_alloc_extent(spc, SEGMENT_HEAD_EXTENT_SIZE, MAIN_FORKNUM, InvalidBlockNumber, iptr);
-    Buffer main_head_buffer = ReadSegmentBuffer(spc, main_head_blocknum);
+    Buffer main_head_buffer = ReadSegmentBuffer_RBM_ZERO(spc, main_head_blocknum);
     LockBuffer(main_head_buffer, BUFFER_LOCK_EXCLUSIVE);
 
     Page main_head_page = BufferGetPage(main_head_buffer);
@@ -1079,11 +1108,12 @@ BlockNumber bucket_totalblocks(SMgrRelation reln, ForkNumber forknum, Buffer mai
     return result;
 }
 
-SegPageLocation seg_get_physical_location(RelFileNode rnode, ForkNumber forknum, BlockNumber blocknum)
+SegPageLocation seg_get_physical_location(RelFileNode rnode, ForkNumber forknum, BlockNumber blocknum,
+                                          bool check_standby)
 {
     SMgrRelation reln;
 
-    if (RecoveryInProgress()) {
+    if (check_standby && RecoveryInProgress()) {
         ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("recovery is in progress"),
                         errhint("cannot get segment address translation during recovery")));
     }
@@ -1091,9 +1121,17 @@ SegPageLocation seg_get_physical_location(RelFileNode rnode, ForkNumber forknum,
     reln = smgropen(rnode, InvalidBackendId);
     Buffer buffer = read_head_buffer(reln, forknum, false);
     SegmentCheck(BufferIsValid(buffer));
+    volatile BufferDesc *buf = GetBufferDescriptor(buffer - 1);
+    bool need_lock = !LWLockHeldByMe(buf->content_lock);
+    if (ENABLE_DMS && need_lock) {
+        LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    } 
     SegmentHead *head = (SegmentHead *)PageGetContents(BufferGetBlock(buffer));
 
     SegPageLocation loc = seg_logic_to_physic_mapping(reln, head, blocknum);
+    if (ENABLE_DMS && need_lock) {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    }
 
     SegReleaseBuffer(buffer);
     return loc;
@@ -1140,7 +1178,7 @@ static bool open_segment(SMgrRelation reln, ForkNumber forknum, bool create, XLo
     }
 
     if (reln->seg_desc[forknum]) {
-        if (forknum != MAIN_FORKNUM && !CurrentThreadIsWorker() &&
+        if (forknum != MAIN_FORKNUM && (!CurrentThreadIsWorker() || SS_STANDBY_MODE) &&
             reln->seg_desc[forknum]->timeline != seg_get_drop_timeline()) {
             /*
              * It's possible that the current smgr cache is invalid. We should close it and reopen.
@@ -1403,6 +1441,19 @@ void seg_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, cha
 
     SegPageLocation loc = seg_logic_to_physic_mapping(reln, seg_head, blocknum);
 
+#ifdef USE_ASSERT_CHECKING
+    if (ENABLE_DSS) {
+        RelFileNode relNode = {
+            .spcNode = rnode.spcNode,
+            .dbNode = rnode.dbNode,
+            .relNode = EXTENT_SIZE_TO_TYPE(loc.extent_size),
+            .bucketNode = rnode.bucketNode,
+            .opt = rnode.opt
+        };
+        seg_physical_write(reln->seg_space, relNode, forknum, loc.blocknum, buffer, false);
+    }
+#endif
+
     LockBuffer(seg_buffer, BUFFER_LOCK_EXCLUSIVE);
 
     ereport(DEBUG5,
@@ -1411,8 +1462,8 @@ void seg_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, cha
                     reln->seg_desc[forknum]->head_blocknum, seg_head->nblocks, seg_head->total_blocks, blocknum)));
 
     /* Add physical location for XLog */
-    buf_desc->seg_fileno = (uint8)EXTENT_SIZE_TO_TYPE(loc.extent_size);
-    buf_desc->seg_blockno = loc.blocknum;
+    buf_desc->extra->seg_fileno = (uint8)EXTENT_SIZE_TO_TYPE(loc.extent_size);
+    buf_desc->extra->seg_blockno = loc.blocknum;
 
     if (seg_head->nblocks <= blocknum) {
         XLogDataSegmentExtend xlog_data;
@@ -1459,18 +1510,32 @@ SMGR_READ_STATUS seg_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blo
 {
     LOG_SMGR_API(reln->smgr_rnode, forknum, blocknum, "seg_read");
 
+    if (ENABLE_DMS && SSSegRead(reln, forknum, buffer)) {
+        return SMGR_RD_OK;
+    }
+
     Buffer seg_buffer = read_head_buffer(reln, forknum, false);
+    if (ENABLE_DMS) {
+        LockBuffer(seg_buffer, BUFFER_LOCK_SHARE);
+    }
     SegmentCheck(BufferIsValid(seg_buffer));
     SegmentHead *seg_head = (SegmentHead *)PageGetContents(BufferGetBlock(seg_buffer));
     SegmentCheck(IsNormalSegmentHead(seg_head));
 
     if (seg_head->nblocks <= blocknum) {
+        if (ENABLE_DMS) {
+            LockBuffer(seg_buffer, BUFFER_LOCK_UNLOCK);
+        }
         SegReleaseBuffer(seg_buffer);
         ereport(ERROR, (errmodule(MOD_SEGMENT_PAGE), errcode(ERRCODE_DATA_CORRUPTED),
                         errmsg("seg_read blocknum exceeds segment size"),
                         errdetail("segment %s, head: %u, read block %u, but nblocks is %u",
                                   relpathperm(reln->smgr_rnode.node, forknum), reln->seg_desc[forknum]->head_blocknum,
                                   blocknum, seg_head->nblocks)));
+    }
+
+    if (ENABLE_DMS) {
+        LockBuffer(seg_buffer, BUFFER_LOCK_UNLOCK);
     }
 
     LockSegmentHeadPartition(reln->seg_space->spcNode, reln->seg_space->dbNode, reln->seg_desc[forknum]->head_blocknum,
@@ -1492,8 +1557,8 @@ SMGR_READ_STATUS seg_read(SMgrRelation reln, ForkNumber forknum, BlockNumber blo
     Buffer buf = BlockGetBuffer(buffer);
     if (BufferIsValid(buf)) {
         BufferDesc *buf_desc = BufferGetBufferDescriptor(buf);
-        buf_desc->seg_fileno = (uint8)EXTENT_SIZE_TO_TYPE(loc.extent_size);
-        buf_desc->seg_blockno = loc.blocknum;
+        buf_desc->extra->seg_fileno = (uint8)EXTENT_SIZE_TO_TYPE(loc.extent_size);
+        buf_desc->extra->seg_blockno = loc.blocknum;
     }
 
     SegReleaseBuffer(seg_buffer);
@@ -1856,3 +1921,48 @@ void seg_physical_write(SegSpace *spc, RelFileNode &rNode, ForkNumber forknum, B
 
     spc_write_block(spc, rNode, forknum, buffer, blocknum);
 }
+
+int32 seg_physical_aio_prep_pwrite(SegSpace *spc, RelFileNode &rNode, ForkNumber forknum, BlockNumber blocknum,
+    const char *buffer, void *iocb_ptr)
+{
+    SegmentCheck(IsSegmentPhysicalRelNode(rNode));
+    SegmentCheck(spc != NULL);
+
+    return spc_aio_prep_pwrite(spc, rNode, forknum, blocknum, buffer, iocb_ptr);
+}
+static bool check_meta_data(BlockNumber extent, uint32 extent_size, uint32* offset_block)
+{
+    if (extent < DF_MAP_HEAD_PAGE + 1 || extent_size == EXTENT_1) {
+        return true;
+    }
+    extent -= DF_MAP_HEAD_PAGE + 1;
+    BlockNumber group_total_blocks = DF_MAP_GROUP_SIZE + IPBLOCK_GROUP_SIZE + DF_MAP_GROUP_EXTENTS * extent_size;
+    BlockNumber group_offset = extent % group_total_blocks;
+
+    if (group_offset < DF_MAP_GROUP_SIZE + IPBLOCK_GROUP_SIZE) {
+        return true;
+    }
+    *offset_block = (group_offset - DF_MAP_GROUP_SIZE - IPBLOCK_GROUP_SIZE) % extent_size;
+    return false;
+}
+
+bool repair_check_physical_type(uint32 spcNode, uint32 dbNode, int32 forkNum, uint32 *relNode, uint32 *blockNum)
+{
+    uint32 offset_blocks;
+    if (!check_meta_data(*blockNum, EXTENT_TYPE_TO_SIZE(*relNode), &offset_blocks)) {
+        SegSpace *spc = spc_open(spcNode, dbNode, false);
+        SegExtentGroup *seg = &spc->extent_group[EXTENT_TYPE_TO_GROUPID(*relNode)][forkNum];
+        ExtentInversePointer iptr = RepairGetInversePointer(seg, *blockNum);
+        if (!InversePointerIsValid(iptr)) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            (errmsg("Blocknum %u is Invalid. \n", *blockNum))));
+        }
+        RelFileNode logic_node = get_segment_logic_rnode(spc, iptr.owner, seg->forknum);
+        uint32 extent_id = SPC_INVRSPTR_GET_SPECIAL_DATA(iptr);
+        *blockNum = ExtentIdToLogicBlockNum(extent_id) + offset_blocks;
+        *relNode = logic_node.relNode;
+        return true;
+    }
+    return false;
+}
+

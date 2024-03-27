@@ -71,7 +71,7 @@ extern void disuse_physical_tlist(Plan* plan, Path* path);
 extern void copy_plan_costsize(Plan* dest, Plan* src);
 extern SubqueryScan* make_subqueryscan(List* qptlist, List* qpqual, Index scanrelid, Plan* subplan);
 extern ForeignScan* make_foreignscan(List* qptlist, List* qpqual, Index scanrelid, List* fdw_exprs, List* fdw_private,
-    RemoteQueryExecType type = EXEC_ON_ALL_NODES);
+    List *fdw_scan_tlist, List *fdw_recheck_quals, Plan *outer_plan, RemoteQueryExecType type = EXEC_ON_ALL_NODES);
 extern Append* make_append(List* appendplans, List* tlist);
 extern RecursiveUnion* make_recursive_union(
     List* tlist, Plan* lefttree, Plan* righttree, int wtParam, List* distinctList, long numGroups);
@@ -83,16 +83,18 @@ extern Sort* make_sort_from_targetlist(PlannerInfo* root, Plan* lefttree, double
 extern Sort* make_sort(PlannerInfo* root, Plan* lefttree, int numCols, AttrNumber* sortColIdx, Oid* sortOperators,
     Oid* collations, bool* nullsFirst, double limit_tuples);
 extern Agg* make_agg(PlannerInfo* root, List* tlist, List* qual, AggStrategy aggstrategy,
-    const AggClauseCosts* aggcosts, int numGroupCols, AttrNumber* grpColIdx, Oid* grpOperators, long numGroups,
-    Plan* lefttree, WindowLists* wflists, bool need_stream, bool trans_agg, List* groupingSets = NIL,
+    const AggClauseCosts* aggcosts, int numGroupCols, AttrNumber* grpColIdx, Oid* grpOperators, Oid* grp_collations,
+    long numGroups, Plan* lefttree, WindowLists* wflists, bool need_stream, bool trans_agg, List* groupingSets = NIL,
     Size hash_entry_size = 0, bool add_width = false, AggOrientation agg_orientation = AGG_LEVEL_1_INTENT,
     bool unique_check = true);
 extern WindowAgg* make_windowagg(PlannerInfo* root, List* tlist, List* windowFuncs, Index winref, int partNumCols,
     AttrNumber* partColIdx, Oid* partOperators, int ordNumCols, AttrNumber* ordColIdx, Oid* ordOperators,
-    int frameOptions, Node* startOffset, Node* endOffset, Plan* lefttree);
+    int frameOptions, Node* startOffset, Node* endOffset, Plan* lefttree, Oid *part_collations, Oid *ord_collations);
 extern Group* make_group(PlannerInfo* root, List* tlist, List* qual, int numGroupCols, AttrNumber* grpColIdx,
-    Oid* grpOperators, double numGroups, Plan* lefttree);
+    Oid* grpOperators, double numGroups, Plan* lefttree, Oid* grp_collations);
+extern ProjectSet *make_project_set(List *tlist, Plan *subplan);
 extern Plan* materialize_finished_plan(Plan* subplan, bool materialize_above_stream = false, bool vectorized = false);
+extern bool is_projection_capable_path(Path *path);
 extern Unique* make_unique(Plan* lefttree, List* distinctList);
 extern LockRows* make_lockrows(PlannerInfo* root, Plan* lefttree);
 extern Limit* make_limit(PlannerInfo* root, Plan* lefttree, Node* limitOffset, Node* limitCount, int64 offset_est,
@@ -118,10 +120,11 @@ extern bool check_dsitribute_key_in_targetlist(PlannerInfo* root, List* distribu
 extern int get_plan_actual_total_width(Plan* plan, bool vectorized, OpType type, int newcol = 0);
 #ifdef STREAMPLAN
 extern Plan* make_modifytable(PlannerInfo* root, CmdType operation, bool canSetTag, List* resultRelations,
-    List* subplans, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, Index mergeTargetRelation,
-    List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause, bool isDfsStore = false);
+    List* subplans, List *withCheckOptionLists, List* returningLists, List* rowMarks, int epqParam,
+    bool partKeyUpdated, Index mergeTargetRelation, List* mergeSourceTargetList, List* mergeActionList,
+    UpsertExpr* upsertClause);
 extern Plan* make_modifytables(PlannerInfo* root, CmdType operation, bool canSetTag, List* resultRelations,
-    List* subplans, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, bool isDfsStore,
+    List* subplans, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated,
     Index mergeTargetRelation, List* mergeSourceTargetList, List *mergeActionList, UpsertExpr *upsertClause);
 extern Plan* make_redistribute_for_agg(PlannerInfo* root, Plan* lefttree, List* redistribute_keys, double multiple,
     Distribution* distribution = NULL, bool is_local_redistribute = false);
@@ -129,10 +132,11 @@ extern Plan* make_stream_plan(PlannerInfo* root, Plan* lefttree, List* redistrib
     Distribution* target_distribution = NULL);
 #else
 extern ModifyTable* make_modifytable(CmdType operation, bool canSetTag, List* resultRelations,
-    List* subplans, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, Index mergeTargetRelation,
-    List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause, bool isDfsStore = false);
+    List* subplans, List *withCheckOptionLists, List* returningLists, List* rowMarks, int epqParam,
+    bool partKeyUpdated, Index mergeTargetRelation, List* mergeSourceTargetList, List* mergeActionList,
+    UpsertExpr* upsertClause);
 extern ModifyTable* make_modifytables(CmdType operation, bool canSetTag, List* resultRelations,
-    List* subplans, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated, bool isDfsStore,
+    List* subplans, List* returningLists, List* rowMarks, int epqParam, bool partKeyUpdated,
     Index mergeTargetRelation, List* mergeSourceTargetList, List* mergeActionList, UpsertExpr* upsertClause);
 #endif
 
@@ -159,6 +163,7 @@ extern RestrictInfo* build_implied_join_equality(
     Oid opno, Oid collation, Expr* item1, Expr* item2, Relids qualscope, Relids nullable_relids, Index security_level);
 
 extern bool useInformationalConstraint(PlannerInfo* root, List* qualClause, Relids relids);
+extern List *build_plan_tlist(PlannerInfo *root, PathTarget *pathtarget);
 
 /*
  * prototypes for plan/analyzejoins.c
@@ -166,6 +171,8 @@ extern bool useInformationalConstraint(PlannerInfo* root, List* qualClause, Reli
 extern List* remove_useless_joins(PlannerInfo* root, List* joinlist);
 extern bool query_supports_distinctness(Query* query);
 extern bool query_is_distinct_for(Query* query, List* colnos, List* opids);
+extern bool innerrel_is_unique(PlannerInfo *root, RelOptInfo *outerrel, RelOptInfo *innerrel,
+    JoinType jointype, List *restrictlist);
 
 /*
  * prototypes for plan/setrefs.c

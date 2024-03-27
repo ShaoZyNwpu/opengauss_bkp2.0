@@ -813,7 +813,7 @@ void tuplestore_putvalues(Tuplestorestate* state, TupleDesc tdesc, Datum* values
     MinimalTuple tuple;
     MemoryContext oldcxt = MemoryContextSwitchTo(state->context);
 
-    tuple = tableam_tops_form_minimal_tuple(tdesc, values, isnull, NULL, HEAP_TUPLE);
+    tuple = tableam_tops_form_minimal_tuple(tdesc, values, isnull, NULL);
     if (tuplestore_in_memory(state))
         state->width += tuple->t_len;
     USEMEM(state, GetMemoryChunkSpace(tuple));
@@ -1508,4 +1508,9 @@ bool tuplestore_get_busy_status(Tuplestorestate* state)
 int tuplestore_get_spread_num(Tuplestorestate* state)
 {
     return state->spreadNum;
+}
+
+int tuplestore_get_memtupcount(Tuplestorestate* state)
+{
+    return state->memtupcount;
 }

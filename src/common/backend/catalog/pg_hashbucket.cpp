@@ -649,6 +649,7 @@ Relation bucketGetRelation(Relation rel, Partition part, int2 bucketId)
     oldcxt = MemoryContextSwitchTo(u_sess->cache_mem_cxt);
     bucket = (Relation)palloc0(sizeof(RelationData));
     *bucket = *rel;
+    bucket->rd_att->tdrefcount++;
     /*
      * Init bucket relation to avoid double free in releaseDummyRelation()
      * for bucket relation is copied from main relation.
@@ -1160,8 +1161,10 @@ HeapTuple HbktModifyRelationRelfilenode(HeapTuple reltup, DataTransferType trans
         newrelfilenode = GetNewRelFileNode(indexrel->rd_rel->reltablespace, NULL, indexrel->rd_rel->relpersistence);
         bucketNode = InvalidBktId;
     } else {
+        Oid database_id = (ConvertToRelfilenodeTblspcOid(indexrel->rd_rel->reltablespace) == GLOBALTABLESPACE_OID) ?
+            InvalidOid : u_sess->proc_cxt.MyDatabaseId;
         newrelfilenode = seg_alloc_segment(ConvertToRelfilenodeTblspcOid(indexrel->rd_rel->reltablespace),
-            u_sess->proc_cxt.MyDatabaseId, isBucket, InvalidBlockNumber);
+            database_id, isBucket, InvalidBlockNumber);
         bucketNode = SegmentBktId;
     }
     rnode = indexrel->rd_node;

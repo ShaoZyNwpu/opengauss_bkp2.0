@@ -104,7 +104,10 @@ bool get_stored_password(const char* role, password_info* pass_info)
     t_thrd.int_cxt.ImmediateInterruptOK = false;
 
     /* Get role info from pg_authid */
-    roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
+    if (strchr(role, '@') && !OidIsValid(u_sess->proc_cxt.MyDatabaseId))
+        ereport(ERROR,(errcode(ERRCODE_INVALID_NAME),errmsg("@ can't be allowed in username")));
+    roleTup = SearchUserHostName(role, NULL);
+
     if (!HeapTupleIsValid(roleTup)) {
         t_thrd.int_cxt.ImmediateInterruptOK = save_ImmediateInterruptOK;
         return false; /* no such user */
@@ -164,7 +167,9 @@ static bool GetValidPeriod(const char *role, password_info *passInfo)
     t_thrd.int_cxt.ImmediateInterruptOK = false;
     
     /* Get role info from pg_authid */
-    HeapTuple roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
+    if (strchr(role, '@') && !OidIsValid(u_sess->proc_cxt.MyDatabaseId))
+        ereport(ERROR,(errcode(ERRCODE_INVALID_NAME),errmsg("@ can't be allowed in username")));
+    HeapTuple roleTup = SearchUserHostName(role, NULL);
     if (!HeapTupleIsValid(roleTup)) {
         t_thrd.int_cxt.ImmediateInterruptOK = save_ImmediateInterruptOK;
         return false;	/* no such user */
@@ -728,18 +733,25 @@ int get_stored_iteration(const char* role)
         pfree_ext(pass_info.shadow_pass);
         return -1;
     }
+    iteration_count = get_iteration_by_password(pass_info.shadow_pass);
 
-    if (isCOMBINED(pass_info.shadow_pass)) {
-        iteration_count = decode_iteration(&pass_info.shadow_pass[SHA256_PASSWD_LEN + MD5_PASSWD_LEN]);
-    } else if (isSHA256(pass_info.shadow_pass)) {
-        iteration_count = decode_iteration(&pass_info.shadow_pass[SHA256_PASSWD_LEN]);
-    } else if (isSM3(pass_info.shadow_pass)) {
-        iteration_count = decode_iteration(&pass_info.shadow_pass[SM3_PASSWD_LEN]);
+    pfree_ext(pass_info.shadow_pass);
+    return iteration_count;
+}
+
+/* get iteration from the encrypted password */
+int get_iteration_by_password(char* encrypted_password)
+{
+    int iteration_count = 0;
+    if (isCOMBINED(encrypted_password)) {
+        iteration_count = decode_iteration(&encrypted_password[SHA256_PASSWD_LEN + MD5_PASSWD_LEN]);
+    } else if (isSHA256(encrypted_password)) {
+        iteration_count = decode_iteration(&encrypted_password[SHA256_PASSWD_LEN]);
+    } else if (isSM3(encrypted_password)) {
+        iteration_count = decode_iteration(&encrypted_password[SM3_PASSWD_LEN]);
     } else {
         iteration_count = ITERATION_COUNT;
     }
-
-    pfree_ext(pass_info.shadow_pass);
     return iteration_count;
 }
 

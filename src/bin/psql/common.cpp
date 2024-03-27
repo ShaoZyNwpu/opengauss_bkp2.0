@@ -740,8 +740,11 @@ static bool ProcessResult(PGresult** results, bool is_explain, bool print_error)
     bool success = true;
     bool first_cycle = true;
 
-    if (is_explain && (*results = PQgetResult(pset.db)) == NULL && ConnectionUp())
-        return success;
+    if (is_explain) {
+        *results = PQgetResult(pset.db);
+        if (*results == NULL && ConnectionUp())
+            return success;
+    }
 
     do {
         ExecStatusType result_status;
@@ -782,12 +785,27 @@ static bool ProcessResult(PGresult** results, bool is_explain, bool print_error)
              * Marshal the COPY data.  Either subroutine will get the
              * connection out of its COPY state, then call PQresultStatus()
              * once and report any error.
+             *
+             * For COPY OUT, direct the output to pset.copyStream if it's set,
+             * otherwise to queryFout.
+             * For COPY IN, use pset.copyStream as data source if it's set,
+             * otherwise cur_cmd_source.
              */
+            FILE *copystream;
+
             SetCancelConn();
-            if (result_status == PGRES_COPY_OUT)
-                success = handleCopyOut(pset.db, pset.queryFout) && success;
-            else
-                success = handleCopyIn(pset.db, pset.cur_cmd_source, PQbinaryTuples(*results)) && success;
+            if (result_status == PGRES_COPY_OUT) {
+                /*
+                 * pset.copyStream: invoked by \copy
+                 * pset.queryFout: fall back to the generic query output stream
+                 */
+                copystream = pset.copyStream ? pset.copyStream : pset.queryFout;
+                success = handleCopyOut(pset.db, copystream) && success;
+            } else {
+                /* COPY IN */
+                copystream = pset.copyStream ? pset.copyStream : pset.cur_cmd_source;
+                success = handleCopyIn(pset.db, copystream, PQbinaryTuples(*results)) && success;
+            }
             ResetCancelConn();
 
             /*
@@ -800,10 +818,13 @@ static bool ProcessResult(PGresult** results, bool is_explain, bool print_error)
         } else if (is_explain || first_cycle)
             /* fast path: no COPY commands; PQexec visited all results */
             break;
-        else if (!is_explain && ((next_result = PQgetResult(pset.db)) != NULL)) {
-            /* non-COPY command(s) after a COPY: keep the last one */
-            PQclear(*results);
-            *results = next_result;
+        else if (!is_explain) {
+            next_result = PQgetResult(pset.db);
+            if (next_result != NULL) {
+                /* non-COPY command(s) after a COPY: keep the last one */
+                PQclear(*results);
+                *results = next_result;
+            }
         }
 
         first_cycle = false;
@@ -1205,7 +1226,30 @@ bool SendQuery(const char* query, bool is_print, bool print_error)
         else if (!PQsendQuery(pset.db, query))
             results = NULL;
 
-        OK = GetPrintResult(&results, is_explain, is_print, query, print_error);
+        if (is_explain) {
+            OK = GetPrintResult(&results, is_explain, is_print, query, print_error);
+#ifdef HAVE_CE            
+            pset.db->client_logic->isInvalidOperationOnColumn = false;
+#endif
+            if (pset.timing && is_print) {
+                INSTR_TIME_SET_CURRENT(after);
+                INSTR_TIME_SUBTRACT(after, before);
+                elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
+            }
+        } else {
+            OK = ProcessResult(&results, is_explain, print_error);
+            if (pset.timing && is_print) {
+                INSTR_TIME_SET_CURRENT(after);
+                INSTR_TIME_SUBTRACT(after, before);
+                elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
+            }
+            /* but printing results isn't: */
+            if (OK && is_print && results) {
+                OK = PrintQueryResults(results);
+                /* record the set stmts when needed. */
+                RecordGucStmt(results, query);
+            }
+        }
 #ifndef WIN32
         /* Clear password related memory to avoid leaks when core. */
         if (pset.cur_cmd_interactive) {
@@ -1216,11 +1260,6 @@ bool SendQuery(const char* query, bool is_print, bool print_error)
         }
 #endif
 
-        if (pset.timing && is_print) {
-            INSTR_TIME_SET_CURRENT(after);
-            INSTR_TIME_SUBTRACT(after, before);
-            elapsed_msec = INSTR_TIME_GET_MILLISEC(after);
-        }
 
         // For EXPLAIN PERFORMANCE command, the query is sent by PQsendQuery.
         // But PQsendQuery doesn't wait for it to finish and then goes to the do-while
@@ -2014,6 +2053,20 @@ static bool command_no_begin(const char* query)
             return true;
         if (wordlen == 10 && pg_strncasecmp(query, "tablespace", 10) == 0)
             return true;
+        if (wordlen == 5 && (pg_strncasecmp(query, "index", 5) == 0 || pg_strncasecmp(query, "table", 5) == 0)) {
+            query += wordlen;
+            query = skip_white_space(query);
+            wordlen = 0;
+            while (isalpha((unsigned char) query[wordlen]))
+                wordlen += PQmblen(&query[wordlen], pset.encoding);
+
+            /*
+             * REINDEX [ TABLE | INDEX ] CONCURRENTLY are not allowed 
+             * in xacts.
+             */
+            if(wordlen == 12 && pg_strncasecmp(query, "concurrently", 12) == 0)
+                return true;
+        }
         return false;
     }
 

@@ -57,7 +57,23 @@ SUBDIRS = \
 	pg_probackup \
 	gs_plan_simulator
 
+ifeq ($(enable_ut), yes)
+	SUBDIRS += gs_persist
+else
+ifeq ($(enable_multiple_nodes)_$(enable_privategauss), no_yes)
+	SUBDIRS += gs_persist
 endif
+endif
+endif
+
 
 $(recurse)
 $(recurse_always)
+
+# psql and pg_dump need to make subtarget: libpq-ce, if these two targets make parallel, it
+# may cause frontend_parser/gram.o: file not recognized: file truncated. 
+# I'm not sure why this happen, and since we use $(recurse) to make install and make all.
+# I have no idea how to forbide psql and pg_dump to make parallel.
+# So try to use NOTPARALLEL to avoid make parallel in this makefile. This will forbide all
+# SUBDIRS make in parallel, which will decrease the compile speed...
+.NOTPARALLEL:

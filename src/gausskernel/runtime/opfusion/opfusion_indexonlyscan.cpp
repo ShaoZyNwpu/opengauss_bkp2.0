@@ -28,6 +28,7 @@
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "opfusion/opfusion_util.h"
+#include "utils/knl_partcache.h"
 
 
 IndexOnlyScanFusion::IndexOnlyScanFusion(IndexOnlyScan* node, PlannedStmt* planstmt, ParamListInfo params)
@@ -154,7 +155,7 @@ void IndexOnlyScanFusion::Init(long max_rows)
         *m_direction = NoMovementScanDirection;
     }
 
-    m_reslot = MakeSingleTupleTableSlot(m_tupDesc, false, m_tupDesc->tdTableAmType);
+    m_reslot = MakeSingleTupleTableSlot(m_tupDesc, false, m_tupDesc->td_tam_ops);
     ScanState* scanstate = makeNode(ScanState); // need release
     scanstate->ps.plan =  (Plan *)m_node;
 
@@ -222,7 +223,7 @@ TupleTableSlot *IndexOnlyScanFusion::getTupleSlotInternal()
     bool bucket_changed = false;
     TupleTableSlot* tmpreslot = NULL;
     tmpreslot = MakeSingleTupleTableSlot(RelationGetDescr(m_scandesc->heapRelation),
-        false, m_scandesc->heapRelation->rd_tam_type);
+        false, m_scandesc->heapRelation->rd_tam_ops);
 
     while ((tid = scan_handler_idx_getnext_tid(m_scandesc, *m_direction, &bucket_changed)) != NULL) {
         HeapTuple tuple = NULL;

@@ -32,6 +32,8 @@
 #include "funcapi.h"
 #include "storage/lmgr.h"
 #include "workload/statctl.h"
+#include "instruments/instr_statement.h"
+#include "ddes/dms/ss_dms.h"
 #include "instruments/instr_waitevent.h"
 
 const int MASK_CLASS_ID = 0xFF000000;
@@ -109,6 +111,13 @@ static uint32 get_event_id(uint32 wait_event_info)
                 eventId = UINT32_MAX;
             }
             break;
+        case PG_WAIT_DMS:
+            eventId = (WaitEventDMS)wait_event_info - (WaitEventDMS)WAIT_EVENT_IDLE_WAIT;
+            if (eventId >= DMS_EVENT_NUM) {
+                ereport(LOG, (errmsg("dms eventId %u", wait_event_info)));
+                eventId = UINT32_MAX;
+            }
+            break;
         default:
             eventId = UINT32_MAX;
             break;
@@ -158,6 +167,11 @@ void InstrWaitEventInitLastUpdated(PgBackendStatus* current_entry, TimestampTz c
         current_entry->waitInfo.event_info.io_info[i].last_updated = current_time;
     }
 
+    /* dms event */
+    for (i = 0; i < DMS_EVENT_NUM; i++) {
+        current_entry->waitInfo.event_info.dms_info[i].last_updated = current_time;
+    }
+
     /* lock info */
     for (i = 0; i < LOCK_EVENT_NUM; i++) {
         current_entry->waitInfo.event_info.lock_info[i].last_updated = current_time;
@@ -187,6 +201,7 @@ void UpdateWaitStatusStat(volatile WaitInfo* InstrWaitInfo, uint32 waitstatus, i
      * When the duration is 0, we set the duration to 1
      */
     duration = (duration == 0) ? 1 : duration;
+    instr_stmt_set_wait_events_bitmap(PG_WAIT_STATE, waitstatus);
     updateMinValueForAtomicType(duration,
         &(InstrWaitInfo->status_info.statistics_info[waitstatus].min_duration));
     InstrWaitInfo->status_info.statistics_info[waitstatus].counter++;
@@ -207,6 +222,7 @@ void UpdateWaitEventStat(WaitInfo* instrWaitInfo, uint32 wait_event_info, int64 
      * When the duration is 0, we set the duration to 1
      */
     duration = (duration == 0) ? 1 : duration;
+    instr_stmt_set_wait_events_bitmap(classId, eventId);
     switch (classId) {
         case PG_WAIT_LWLOCK:
             UpdateMinValue(duration,
@@ -235,6 +251,14 @@ void UpdateWaitEventStat(WaitInfo* instrWaitInfo, uint32 wait_event_info, int64 
             } else {
                 instrWaitInfo->event_info.io_info[eventId].counter++;
             }
+            break;
+        case PG_WAIT_DMS:
+            UpdateMinValue(duration,
+                &(instrWaitInfo->event_info.dms_info[eventId].min_duration));
+            instrWaitInfo->event_info.dms_info[eventId].counter++;
+            instrWaitInfo->event_info.dms_info[eventId].total_duration += duration;
+            UpdateMaxValue(duration, &(instrWaitInfo->event_info.dms_info[eventId].max_duration));
+            instrWaitInfo->event_info.dms_info[eventId].last_updated = currentTime;
             break;
         default:
             break;
@@ -281,6 +305,21 @@ void CollectWaitInfo(WaitInfo* gsInstrWaitInfo, WaitStatusInfo status_info, Wait
             io_info->counter += event_info.io_info[i].counter;
             io_info->total_duration += event_info.io_info[i].total_duration;
             io_info->avg_duration = io_info->total_duration / io_info->counter;
+        }
+    }
+
+    /* update Dms Event wait info */
+    for (int i = 0; i < DMS_EVENT_NUM; i++) {
+        WaitStatisticsInfo *dms_info = &gsInstrWaitInfo->event_info.dms_info[i];
+
+        update_max_last_updated(dms_info, event_info.dms_info[i].last_updated);
+        if (event_info.dms_info[i].counter != 0) {
+            updateMinValueForAtomicType(event_info.dms_info[i].min_duration,
+                &dms_info->min_duration);
+            updateMaxValueForAtomicType(event_info.dms_info[i].max_duration, &dms_info->max_duration);
+            dms_info->counter += event_info.dms_info[i].counter;
+            dms_info->total_duration += event_info.dms_info[i].total_duration;
+            dms_info->avg_duration = dms_info->total_duration / dms_info->counter;
         }
     }
 
@@ -358,6 +397,24 @@ static void set_io_event_tuple_value(WaitInfo* gsInstrWaitInfo, Datum* values, i
     values[++i] = TimestampTzGetDatum(gsInstrWaitInfo->event_info.io_info[eventId].last_updated);
 }
 
+static void set_dms_event_tuple_value(WaitInfo* gsInstrWaitInfo, Datum* values, int i, uint32 eventId)
+{
+    values[++i] = CStringGetTextDatum("DMS_EVENT");
+    values[++i] = CStringGetTextDatum(pgstat_get_wait_dms(WaitEventDMS(eventId + PG_WAIT_DMS)));
+    unsigned long long cnt = 0;
+    unsigned long long time = 0;
+    if (g_instance.dms_cxt.dmsInited) {
+        dms_get_event(dms_wait_event_t(eventId), &cnt, &time);
+    }
+    values[++i] = Int64GetDatum(cnt);
+    values[++i] = Int64GetDatum(gsInstrWaitInfo->event_info.dms_info[eventId].failed_counter);
+    values[++i] = Int64GetDatum(time);
+    values[++i] = Int64GetDatum(cnt == 0 ? 0 : time / cnt);
+    values[++i] = Int64GetDatum(gsInstrWaitInfo->event_info.dms_info[eventId].max_duration);
+    values[++i] = Int64GetDatum(gsInstrWaitInfo->event_info.dms_info[eventId].min_duration);
+    values[++i] = TimestampTzGetDatum(gsInstrWaitInfo->event_info.dms_info[eventId].last_updated);
+}
+
 static void set_lock_event_tuple_value(WaitInfo* gsInstrWaitInfo, Datum* values, int i, uint32 eventId)
 {
     values[++i] = CStringGetTextDatum("LOCK_EVENT");
@@ -406,6 +463,9 @@ static void set_tuple_value(
     } else if (call_cn < LOCK_EVENT_NUM + IO_EVENT_NUM + STATE_WAIT_NUM + LWLOCK_EVENT_NUM) {
         eventId = call_cn - LOCK_EVENT_NUM - IO_EVENT_NUM - STATE_WAIT_NUM;
         set_lwlock_event_tuple_value(gsInstrWaitInfo, values, i, eventId, nulls);
+    } else if (call_cn < LOCK_EVENT_NUM + IO_EVENT_NUM + STATE_WAIT_NUM + LWLOCK_EVENT_NUM + DMS_EVENT_NUM) {
+        eventId = call_cn - LOCK_EVENT_NUM - IO_EVENT_NUM - STATE_WAIT_NUM - LWLOCK_EVENT_NUM;
+        set_dms_event_tuple_value(gsInstrWaitInfo, values, i, eventId);
     }
 }
 
@@ -422,7 +482,7 @@ Datum get_instr_wait_event(PG_FUNCTION_ARGS)
 
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-        tupdesc = CreateTemplateTupleDesc(INSTR_WAITEVENT_ATTRUM, false, TAM_HEAP);
+        tupdesc = CreateTemplateTupleDesc(INSTR_WAITEVENT_ATTRUM, false);
 
         create_tuple_entry(tupdesc);
 
@@ -435,7 +495,7 @@ Datum get_instr_wait_event(PG_FUNCTION_ARGS)
         }
 
         funcctx->user_fctx = read_current_instr_wait_info();
-        funcctx->max_calls = STATE_WAIT_NUM + IO_EVENT_NUM + LOCK_EVENT_NUM + LWLOCK_EVENT_NUM;
+        funcctx->max_calls = STATE_WAIT_NUM + IO_EVENT_NUM + LOCK_EVENT_NUM + LWLOCK_EVENT_NUM + DMS_EVENT_NUM;
 
         MemoryContextSwitchTo(oldcontext);
 

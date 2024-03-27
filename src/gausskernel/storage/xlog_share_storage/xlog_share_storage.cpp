@@ -39,6 +39,7 @@
 #include "replication/syncrep_gramparse.h"
 #include "replication/walsender_private.h"
 #include "storage/ipc.h"
+#include "storage/file/fio_device.h"
 #include "storage/dorado_operation/dorado_fd.h"
 #include "storage/xlog_share_storage/xlog_share_storage.h"
 #include "replication/shared_storage_walreceiver.h"
@@ -138,7 +139,16 @@ void LocalXLogRead(char *buf, XLogRecPtr startptr, Size count)
             }
 
             XLByteToSeg(recptr, t_thrd.sharestoragexlogcopyer_cxt.readSegNo);
-            XLogFilePath(path, MAXPGPATH, t_thrd.xlog_cxt.ThisTimeLineID, t_thrd.sharestoragexlogcopyer_cxt.readSegNo);
+            if (SS_STANDBY_FAILOVER && SS_PRIMARY_CLUSTER_STANDBY) {
+                int nRet;                                          
+                nRet = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%08X%08X%08X", 
+                    g_instance.dms_cxt.SSRecoveryInfo.recovery_xlog_dir, t_thrd.xlog_cxt.ThisTimeLineID,
+                    (uint32)((t_thrd.sharestoragexlogcopyer_cxt.readSegNo) / XLogSegmentsPerXLogId),
+                    (uint32)((t_thrd.sharestoragexlogcopyer_cxt.readSegNo) % XLogSegmentsPerXLogId));
+                securec_check_ss(nRet, "\0", "\0"); 
+            } else {
+                XLogFilePath(path, MAXPGPATH, t_thrd.xlog_cxt.ThisTimeLineID, t_thrd.sharestoragexlogcopyer_cxt.readSegNo);
+            }
 
             t_thrd.sharestoragexlogcopyer_cxt.readFile = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
             if (t_thrd.sharestoragexlogcopyer_cxt.readFile < 0) {
@@ -298,6 +308,24 @@ void AddXLogPageHeader(char* buf, XLogRecPtr startWrite, int writeLen, XLogRecPt
         xlogPageHeader->xlp_total_len = endPtr % XLOG_BLCKSZ;
     }
 }
+void ShareStorageSleep()
+{
+    long maxSleepTime = 0;
+    for (int i = 0; i < g_instance.attr.attr_storage.max_wal_senders; i++) {
+        /* use volatile pointer to prevent code rearrangement */
+        volatile WalSnd *walsnd = &t_thrd.walsender_cxt.WalSndCtl->walsnds[i];
+        if (walsnd->pid != 0) {
+            if (maxSleepTime < g_instance.rto_cxt.rto_standby_data[i].current_sleep_time)
+                maxSleepTime = g_instance.rto_cxt.rto_standby_data[i].current_sleep_time;
+        }
+    }
+    if (maxSleepTime > 0) {
+        pgstat_report_waitevent(WAIT_EVENT_LOGCTRL_SLEEP);
+        pg_usleep_retry(maxSleepTime, 0);
+        pgstat_report_waitevent(WAIT_EVENT_END);
+        ereport(DEBUG4, (errmodule(MOD_RTO_RPO), errmsg("ShareStorageSleep : %ld", maxSleepTime)));
+    }
+}
 
 void DoXlogCopy(XLogRecPtr targetPtr)
 {
@@ -307,6 +335,7 @@ void DoXlogCopy(XLogRecPtr targetPtr)
     if (XLByteLE(targetPtr, sharestorageCtl->insertHead)) {
         return;
     }
+    ShareStorageSleep();
 
     XLogRecPtr startWrite = sharestorageCtl->insertHead - (sharestorageCtl->insertHead % XLOG_BLCKSZ);
     while (XLByteLT(startWrite, targetPtr)) {
@@ -451,6 +480,7 @@ void CheckShareStorageCtlInfo(XLogRecPtr localEnd)
                                           &shareStorageLatestRecordLen);
 
     Assert(XLByteLE(shareStorageLatestRecordStart + shareStorageLatestRecordLen, ctlInfo->insertHead));
+
     if (XLByteLT(localEnd, ctlInfo->insertHead)) {
         if (XLByteEQ(shareStorageLatestRecordStart, InvalidXLogRecPtr) ||
             !XLByteEQ(localEnd, shareStorageLatestRecordStart + MAXALIGN(shareStorageLatestRecordLen))) {
@@ -474,18 +504,25 @@ void CheckShareStorageCtlInfo(XLogRecPtr localEnd)
         UpdateShareStorageCtlInfo(ctlInfo);
         FsyncXlogToShareStorage();
     } else {
-        char path[MAXPGPATH];
-        XLogSegNo sendSegNo;
-        XLByteToSeg(ctlInfo->insertHead, sendSegNo);
-        XLogFilePath(path, MAXPGPATH, t_thrd.xlog_cxt.ThisTimeLineID, sendSegNo);
-        struct stat stat_buf;
-
-        if (stat(path, &stat_buf) != 0) {
-            ereport(FATAL, (errmsg("the local's tail is bigger than The shared storage's head %X/%X",
-                                   static_cast<uint32>(ctlInfo->insertHead >> shiftSize),
-                                   static_cast<uint32>(ctlInfo->insertHead))));
+        XLogRecPtr shareEnd = ctlInfo->insertHead;
+        if (0 == shareEnd % XLogSegSize) {
+            XLByteAdvance(shareEnd, SizeOfXLogLongPHD);
+        } else if (0 == shareEnd % XLOG_BLCKSZ) {
+            XLByteAdvance(shareEnd, SizeOfXLogShortPHD);
         }
+        if (XLByteLT(shareEnd, localEnd)) {
+            char path[MAXPGPATH];
+            XLogSegNo sendSegNo;
+            XLByteToSeg(ctlInfo->insertHead, sendSegNo);
+            XLogFilePath(path, MAXPGPATH, t_thrd.xlog_cxt.ThisTimeLineID, sendSegNo);
+            struct stat stat_buf;
 
+            if (stat(path, &stat_buf) != 0) {
+                ereport(FATAL, (errmsg("the local's tail is bigger than The shared storage's head %X/%X, path %s",
+                                       static_cast<uint32>(ctlInfo->insertHead >> shiftSize),
+                                       static_cast<uint32>(ctlInfo->insertHead), path)));
+            }
+        }
         bool crcValid = false;
 
         pg_crc32 localCheckCrc = GetXlogRecordCrc(shareStorageLatestRecordStart, crcValid, XLogPageRead, 0);
@@ -566,6 +603,7 @@ static void InitThreadSignal()
     (void)gspqsignal(SIGTTOU, SIG_DFL);
     (void)gspqsignal(SIGCONT, SIG_DFL);
     (void)gspqsignal(SIGWINCH, SIG_DFL);
+    (void)gspqsignal(SIGURG, print_stack);
 
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
@@ -575,7 +613,7 @@ void SharedStorageXlogCopyBackendMain(void)
 {
     InitThreadSignal();
     if (IS_SHARED_STORAGE_MAIN_STANDBY_MODE) {
-        CheckShareStorageWriteLock();
+        GetWritePermissionSharedStorage();
     }
     if (RecoveryInProgress() && !IS_SHARED_STORAGE_MAIN_STANDBY_MODE) {
         ereport(LOG, (errmsg("stopped xlog copy in recovery")));
@@ -603,6 +641,7 @@ void SharedStorageXlogCopyBackendMain(void)
     Assert(t_thrd.xlog_cxt.ThisTimeLineID != 0);
 
     uint64 checkLockCount = 0;
+    pgstat_report_appname("xlog copy");
     pgstat_report_activity(STATE_IDLE, NULL);
     for (;;) {
         ResetLatch(&t_thrd.proc->procLatch);
@@ -625,8 +664,9 @@ void SharedStorageXlogCopyBackendMain(void)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        bool waitCopy = CheckAndCopyXLog(false);
-        if (waitCopy) {
+        bool noNewData = CheckAndCopyXLog(false);
+        if (!noNewData) {
+            // we have more data to copy, so not to sleep
             continue;
         }
 
@@ -649,13 +689,52 @@ void WakeUpXLogCopyerBackend()
     }
 }
 
+void SSDoXLogCopyFromLocal(XLogRecPtr copyEnd)
+{
+    uint32 shiftSize = 32;
+    ShareStorageXLogCtl *ctlInfo = g_instance.xlog_cxt.shareStorageXLogCtl;
+    uint64 xlogFileSize = static_cast<uint64>(g_instance.attr.attr_storage.xlog_file_size);
+
+    GetWritePermissionSharedStorage();
+    ReadShareStorageCtlInfo(ctlInfo);
+    if (XLByteLE(copyEnd, ctlInfo->insertHead)){
+        return;
+    }
+
+    if (t_thrd.sharestoragexlogcopyer_cxt.originBuf == NULL) {
+        t_thrd.sharestoragexlogcopyer_cxt.originBuf =
+            (char *)palloc(ShareStorageBufSize + g_instance.xlog_cxt.shareStorageopCtl.blkSize);
+        t_thrd.sharestoragexlogcopyer_cxt.buf = (char *)TYPEALIGN(g_instance.xlog_cxt.shareStorageopCtl.blkSize,
+                                                                  t_thrd.sharestoragexlogcopyer_cxt.originBuf);
+    }
+
+    ereport(LOG,
+            (errmsg("start to copy xlog from local to shared storage, start: %X/%X, end: %X/%X.",
+                    static_cast<uint32>(ctlInfo->insertHead >> shiftSize), static_cast<uint32>(ctlInfo->insertHead),
+                    static_cast<uint32>(copyEnd >> shiftSize), static_cast<uint32>(copyEnd))));
+
+    DoXlogCopy(copyEnd);
+    if (t_thrd.sharestoragexlogcopyer_cxt.readFile >= 0) {
+        (void)close(t_thrd.sharestoragexlogcopyer_cxt.readFile);
+    }
+    if (t_thrd.sharestoragexlogcopyer_cxt.originBuf != NULL) {
+        pfree(t_thrd.sharestoragexlogcopyer_cxt.originBuf);
+        t_thrd.sharestoragexlogcopyer_cxt.originBuf = NULL;
+        t_thrd.sharestoragexlogcopyer_cxt.buf = NULL;
+    }
+
+    ereport(LOG,
+            (errmsg("successfully overwrite xlog from local to shared storage, shared storage's head is %X/%X",
+                    static_cast<uint32>(ctlInfo->insertHead >> shiftSize), static_cast<uint32>(ctlInfo->insertHead))));
+}
+
 static void DoXLogCopyFromLocal(XLogRecPtr copyStart, XLogRecPtr copyEnd)
 {
     uint32 shiftSize = 32;
     ShareStorageXLogCtl *ctlInfo = g_instance.xlog_cxt.shareStorageXLogCtl;
     uint64 xlogFileSize = static_cast<uint64>(g_instance.attr.attr_storage.xlog_file_size);
 
-    CheckShareStorageWriteLock();
+    GetWritePermissionSharedStorage();
     InitShareStorageCtlInfo(ctlInfo, ctlInfo->systemIdentifier);
     if (copyEnd - copyStart > xlogFileSize) {
         ctlInfo->insertHead = copyEnd - xlogFileSize;
@@ -694,12 +773,26 @@ static void DoXLogCopyFromLocal(XLogRecPtr copyStart, XLogRecPtr copyEnd)
                     static_cast<uint32>(ctlInfo->insertHead >> shiftSize), static_cast<uint32>(ctlInfo->insertHead))));
 }
 
-bool XLogOverwriteFromLocal(bool force)
+static XLogRecPtr GetMaxStartRecPtr(XLogRecPtr setStart, XLogRecPtr localStart, XLogRecPtr localEnd)
+{
+    XLogRecPtr res = InvalidXLogRecPtr;
+
+    if (XLogRecPtrIsInvalid(setStart) || XLByteLT(localEnd, setStart)) {
+        res = localStart;
+    } else {
+        res = XLByteLT(localStart, setStart) ? setStart : localStart;
+    }
+
+    return res;
+}
+
+bool XLogOverwriteFromLocal(bool force, XLogRecPtr setStart)
 {
     ShareStorageXLogCtl *ctlInfo = g_instance.xlog_cxt.shareStorageXLogCtl;
     XLogRecPtr localMaxLSN = InvalidXLogRecPtr;
     XLogRecPtr localMinLSN = InvalidXLogRecPtr;
     XLogRecPtr localMaxEnd = InvalidXLogRecPtr;
+    XLogRecPtr copyStart = InvalidXLogRecPtr;
     pg_crc32 localMaxLsnCrc = 0;
     pg_crc32 localMinLsnCrc = 0;
     uint32 localMaxLsnLen = 0;
@@ -745,7 +838,8 @@ bool XLogOverwriteFromLocal(bool force)
 
     if (force == true && ctlInfo->systemIdentifier != GetSystemIdentifier()) {
         ctlInfo->systemIdentifier = GetSystemIdentifier();
-        DoXLogCopyFromLocal(localMinLSN, localMaxEnd);
+        copyStart = GetMaxStartRecPtr(setStart, localMinLSN, localMaxEnd);
+        DoXLogCopyFromLocal(copyStart, localMaxEnd);
         return true;
     }
 
@@ -759,44 +853,43 @@ bool XLogOverwriteFromLocal(bool force)
     Assert(shareStorageLatestRecordStart != InvalidXLogRecPtr);
 
     shareStorageLatestRecordEnd = MAXALIGN(shareStorageLatestRecordStart + shareStorageLatestRecordLen);
-    if (shareStorageLatestRecordStart != InvalidXLogRecPtr) {
-        // check local maxLSN
-        if (XLByteLE(localMaxEnd, shareStorageLatestRecordEnd)) {
-            sharedStorageRecCrc = GetXlogRecordCrc(localMaxLSN, crcValid, SharedStorageXLogPageRead,
-                                                   g_instance.xlog_cxt.shareStorageopCtl.blkSize);
-            ereport(
-                LOG,
-                (errmsg(
-                    "the shared storage's latestRecordEnd(%X/%X) is greater than or equal to the local maxEnd(%X/%X,"
-                    "crc[local, share]:[%u,%u]).",
+    // check local maxLSN
+    if (XLByteLE(localMaxEnd, shareStorageLatestRecordEnd)) {
+        sharedStorageRecCrc = GetXlogRecordCrc(localMaxLSN, crcValid, SharedStorageXLogPageRead,
+                                               g_instance.xlog_cxt.shareStorageopCtl.blkSize);
+        ereport(
+            LOG,
+            (errmsg(
+                "the shared storage's latestRecordEnd(%X/%X) is greater than or equal to the local maxEnd(%X/%X,"
+                "crc[local, share]:[%u,%u]).",
+                static_cast<uint32>(shareStorageLatestRecordEnd >> shiftSize),
+                static_cast<uint32>(shareStorageLatestRecordEnd), static_cast<uint32>(localMaxEnd >> shiftSize),
+                static_cast<uint32>(localMaxEnd), localMaxLsnCrc, sharedStorageRecCrc)));
+        if (sharedStorageRecCrc == localMaxLsnCrc) {
+            ctlInfo->insertHead = localMaxEnd;
+            if (ctlInfo->insertHead > (ctlInfo->xlogFileSize + XLogSegSize)) {
+                ctlInfo->insertTail = ctlInfo->insertHead - ctlInfo->xlogFileSize;
+            } else {
+                ctlInfo->insertTail = XLogSegSize;
+            }
+            ctlInfo->crc = CalShareStorageCtlInfoCrc(ctlInfo);
+            UpdateShareStorageCtlInfo(ctlInfo);
+            FsyncXlogToShareStorage();
+            return true;
+        }
+    } else {
+        pg_crc32 localCheckCrc = GetXlogRecordCrc(shareStorageLatestRecordStart, crcValid, XLogPageRead, 0);
+        ereport(
+            LOG,
+            (errmsg("the shared storage's latestRecordEnd(%X/%X, crc[local, share]:[%u,%u]) is less than the local "
+                    "maxEnd(%X/%X).",
                     static_cast<uint32>(shareStorageLatestRecordEnd >> shiftSize),
-                    static_cast<uint32>(shareStorageLatestRecordEnd), static_cast<uint32>(localMaxEnd >> shiftSize),
-                    static_cast<uint32>(localMaxEnd), localMaxLsnCrc, sharedStorageRecCrc)));
-            if (sharedStorageRecCrc == localMaxLsnCrc) {
-                ctlInfo->insertHead = localMaxEnd;
-                if (ctlInfo->insertHead > (ctlInfo->xlogFileSize + XLogSegSize)) {
-                    ctlInfo->insertTail = ctlInfo->insertHead - ctlInfo->xlogFileSize;
-                } else {
-                    ctlInfo->insertTail = XLogSegSize;
-                }
-                ctlInfo->crc = CalShareStorageCtlInfoCrc(ctlInfo);
-                UpdateShareStorageCtlInfo(ctlInfo);
-                FsyncXlogToShareStorage();
-                return true;
-            }
-        } else {
-            pg_crc32 localCheckCrc = GetXlogRecordCrc(shareStorageLatestRecordStart, crcValid, XLogPageRead, 0);
-            ereport(
-                LOG,
-                (errmsg("the shared storage's latestRecordEnd(%X/%X, crc[local, share]:[%u,%u]) is less than the local "
-                        "maxEnd(%X/%X).",
-                        static_cast<uint32>(shareStorageLatestRecordEnd >> shiftSize),
-                        static_cast<uint32>(shareStorageLatestRecordEnd), localCheckCrc, shareStorageLatestRecordCrc,
-                        static_cast<uint32>(localMaxEnd >> shiftSize), static_cast<uint32>(localMaxEnd))));
-            if (shareStorageLatestRecordCrc == localCheckCrc) {
-                DoXLogCopyFromLocal(shareStorageLatestRecordEnd, localMaxEnd);
-                return true;
-            }
+                    static_cast<uint32>(shareStorageLatestRecordEnd), localCheckCrc, shareStorageLatestRecordCrc,
+                    static_cast<uint32>(localMaxEnd >> shiftSize), static_cast<uint32>(localMaxEnd))));
+        if (shareStorageLatestRecordCrc == localCheckCrc) {
+            copyStart = GetMaxStartRecPtr(setStart, shareStorageLatestRecordEnd, localMaxEnd);
+            DoXLogCopyFromLocal(copyStart, localMaxEnd);
+            return true;
         }
     }
     // check local minLSN
@@ -807,7 +900,8 @@ bool XLogOverwriteFromLocal(bool force)
                 (errmsg("the local minLsn(%X/%X) 's crc mismatched with shared storage, crc[local, share]:[%u,%u].",
                         (uint32)(localMinLSN >> shiftSize), (uint32)localMinLSN, localMinLsnCrc, sharedStorageRecCrc)));
     }
-    DoXLogCopyFromLocal(localMinLSN, localMaxEnd);
+    copyStart = GetMaxStartRecPtr(setStart, localMinLSN, localMaxEnd);
+    DoXLogCopyFromLocal(copyStart, localMaxEnd);
 
     return true;
 }

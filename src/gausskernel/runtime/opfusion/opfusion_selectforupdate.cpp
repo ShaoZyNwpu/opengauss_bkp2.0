@@ -47,7 +47,7 @@ void SelectForUpdateFusion::InitLocals(ParamListInfo params)
 {
     m_local.m_reslot = MakeSingleTupleTableSlot(m_global->m_tupDesc);
     if (m_global->m_table_type == TAM_USTORE) {
-        m_local.m_reslot->tts_tupslotTableAm = TAM_USTORE;
+        m_local.m_reslot->tts_tam_ops = TableAmUstore;
     }
     m_c_local.m_estate = CreateExecutorState();
     m_c_local.m_estate->es_range_table = m_global->m_planstmt->rtable;
@@ -100,9 +100,10 @@ void SelectForUpdateFusion::InitGlobals()
     Relation rel = heap_open(m_global->m_reloid, AccessShareLock);
     m_global->m_natts = RelationGetDescr(rel)->natts;
     Assert(list_length(targetList) >= 2);
-    m_global->m_tupDesc = ExecCleanTypeFromTL(targetList, false, rel->rd_tam_type);
+    m_global->m_tupDesc = ExecCleanTypeFromTL(targetList, false, rel->rd_tam_ops);
     m_global->m_is_bucket_rel = RELATION_OWN_BUCKET(rel);
     m_global->m_table_type = RelationIsUstoreFormat(rel) ? TAM_USTORE : TAM_HEAP;
+    m_global->m_tupDesc->td_tam_ops = GetTableAmRoutine(m_global->m_table_type);
     m_global->m_exec_func_ptr = (OpFusionExecfuncType)&SelectForUpdateFusion::ExecSelectForUpdate;
 
     heap_close(rel, AccessShareLock);
@@ -195,6 +196,10 @@ bool SelectForUpdateFusion::execute(long max_rows, char *completionTag)
     securec_check_ss(errorno, "\0", "\0");
 
     (void)MemoryContextSwitchTo(oldContext);
+
+    /* instr unique sql - we assume that this is no nesting calling of Fusion::execute */
+    UniqueSQLStatCountReturnedRows(nprocessed);
+
     return success;
 }
 
@@ -249,7 +254,7 @@ unsigned long SelectForUpdateFusion::ExecSelectForUpdate(Relation rel, ResultRel
         }
 
         tmptup = (HeapTuple)tableam_tops_form_tuple(m_global->m_tupDesc, m_local.m_tmpvals, m_local.m_tmpisnull,
-            tableam_tops_get_tuple_type(rel));
+            rel->rd_tam_ops);
         if (bucket_rel) {
             bucketCloseRelation(bucket_rel);
         }
@@ -269,11 +274,22 @@ unsigned long SelectForUpdateFusion::ExecSelectForUpdate(Relation rel, ResultRel
                 InvalidBuffer,           /* TO DO: survey */
                 false);                  /* don't pfree this pointer */
 
+            List* planRowMarkList = m_global->m_planstmt->rowMarks;
+            ListCell* planRowMarkCell = NULL;
+            LockWaitPolicy waitPolicy = LockWaitBlock;
+            foreach (planRowMarkCell, planRowMarkList) {
+                Node* planRowMarkNode = (Node*)lfirst(planRowMarkCell);
+                if (nodeTag(planRowMarkNode) == T_PlanRowMark) {
+                    waitPolicy = ((PlanRowMark*)planRowMarkNode)->waitPolicy;
+                    break;
+                }
+            }
+
             Relation destRel = RELATION_IS_PARTITIONED(rel) ? partRel : rel;
             tableam_tslot_getsomeattrs(m_local.m_reslot, m_global->m_tupDesc->natts);
             newtuple.t_self = ((HeapTuple)tuple)->t_self;
             result = tableam_tuple_lock(bucket_rel == NULL ? destRel : bucket_rel, &newtuple, &buffer,
-                GetCurrentCommandId(true), LockTupleExclusive, LockWaitBlock, &tmfd,
+                GetCurrentCommandId(true), LockTupleExclusive, waitPolicy, &tmfd,
                 false, // allow_lock_self (heap implementation)
 #ifdef ENABLE_MULTIPLE_NODES
                 false,
@@ -286,6 +302,9 @@ unsigned long SelectForUpdateFusion::ExecSelectForUpdate(Relation rel, ResultRel
             ReleaseBuffer(buffer);
 
             if (result == TM_SelfModified || result == TM_SelfUpdated) {
+                continue;
+            }
+            if(result == TM_WouldBlock && waitPolicy == LockWaitSkip) {
                 continue;
             }
 
@@ -360,7 +379,7 @@ unsigned long SelectForUpdateFusion::ExecSelectForUpdate(Relation rel, ResultRel
                     }
 
                     tmptup = tableam_tops_form_tuple(m_global->m_tupDesc, m_local.m_tmpvals, m_local.m_tmpisnull,
-                        tableam_tops_get_tuple_type(rel));
+                        rel->rd_tam_ops);
                     Assert(tmptup != NULL);
 
                     (void)ExecStoreTuple(tmptup, /* tuple to store */

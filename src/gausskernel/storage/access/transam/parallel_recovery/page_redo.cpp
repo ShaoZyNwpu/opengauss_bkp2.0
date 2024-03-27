@@ -44,6 +44,8 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/pagerepair.h"
 #include "storage/ipc.h"
+#include "storage/standby.h"
+#include "storage/smgr/relfilenode_hash.h"
 #include "access/nbtree.h"
 #include "utils/guc.h"
 #include "utils/palloc.h"
@@ -265,7 +267,7 @@ void HandlePageRedoInterrupts()
         t_thrd.page_redo_cxt.got_SIGHUP = false;
         ProcessConfigFile(PGC_SIGHUP);
     }
-    if (t_thrd.page_redo_cxt.check_repair) {
+    if (t_thrd.page_redo_cxt.check_repair && g_instance.pid_cxt.PageRepairPID != 0) {
         SeqCheckRemoteReadAndRepairPage();
         t_thrd.page_redo_cxt.check_repair = false;
     }
@@ -314,17 +316,19 @@ void PageRedoWorkerMain()
 
     SetupSignalHandlers();
     (void)RegisterRedoInterruptCallBack(HandlePageRedoInterrupts);
-    (void)RegisterRedoPageRepairCallBack(HandleRedoPageRepair);
+    if (g_instance.pid_cxt.PageRepairPID != 0) {
+        (void)RegisterRedoPageRepairCallBack(HandleRedoPageRepair);
+    }
 
     InitGlobals();
     ResourceManagerStartup();
-
+    InitRecoveryLockHash();
     g_redoWorker->oldCtx = MemoryContextSwitchTo(g_instance.comm_cxt.predo_cxt.parallelRedoCtx);
 
     int retCode = ApplyRedoLoop();
 
     (void)MemoryContextSwitchTo(g_redoWorker->oldCtx);
-
+    StandbyReleaseAllLocks();
     ResourceManagerStop();
     ereport(LOG, (errmsg("Page-redo-worker thread %u terminated, retcode %d.", g_redoWorker->id, retCode)));
     LastMarkReached();
@@ -362,7 +366,6 @@ static void SetupSignalHandlers()
     (void)gspqsignal(SIGINT, SIG_IGN);
     (void)gspqsignal(SIGTERM, PageRedoShutdownHandler);
     (void)gspqsignal(SIGQUIT, PageRedoQuickDie);
-    (void)gspqsignal(SIGALRM, SIG_IGN);
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, PageRedoSigUser1Handler);
     (void)gspqsignal(SIGUSR2, PageRedoUser2Handler);
@@ -371,7 +374,12 @@ static void SetupSignalHandlers()
     (void)gspqsignal(SIGTTOU, SIG_IGN);
     (void)gspqsignal(SIGCONT, SIG_IGN);
     (void)gspqsignal(SIGWINCH, SIG_IGN);
-
+    if (g_instance.attr.attr_storage.EnableHotStandby) {
+        (void)gspqsignal(SIGALRM, handle_standby_sig_alarm); /* ignored unless InHotStandby */
+    } else {
+        (void)gspqsignal(SIGALRM, SIG_IGN);
+    }
+    (void)gspqsignal(SIGURG, print_stack);
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
 }
@@ -404,6 +412,7 @@ void ApplyProcHead(RedoItem *head)
     while (head != NULL) {
         RedoItem *cur = head;
         g_redoWorker->current_item = &cur->record;
+        pg_atomic_write_u64((volatile uint64*)&g_redoWorker->curReplayingReadRecPtr, cur->record.ReadRecPtr);
         head = head->nextByWorker[g_redoWorker->id + 1];
         ApplyAndFreeRedoItem(cur);
     }
@@ -534,7 +543,7 @@ static void ApplyRecordWithoutSyncUndoLog(RedoItem *item)
 
             GetReplayedRecPtrFromUndoWorkers(&lrRead, &lrEnd);
         
-            while (XLByteLT(lrEnd, record->EndRecPtr)) {
+            while (XLByteLT(lrEnd, record->EndRecPtr) || (lrEnd == InvalidXLogRecPtr)) {
                 GetReplayedRecPtrFromUndoWorkers(&lrRead, &lrEnd);
                 RedoInterruptCallBack();
             }
@@ -963,6 +972,19 @@ XLogRecPtr GetCompletedRecPtr(PageRedoWorker *worker)
     return pg_atomic_read_u64(&worker->lastReplayedEndRecPtr);
 }
 
+XLogRecPtr GetReplyingRecPtr(PageRedoWorker *worker)
+{
+    XLogRecPtr curReplayingReadRecPtr;
+    XLogRecPtr lastReplayedEndRecPtr;
+    XLogRecPtr result;
+    pg_read_barrier();
+
+    curReplayingReadRecPtr = pg_atomic_read_u64(&worker->curReplayingReadRecPtr);
+    lastReplayedEndRecPtr = pg_atomic_read_u64(&worker->lastReplayedEndRecPtr);
+
+    return lastReplayedEndRecPtr > curReplayingReadRecPtr ? lastReplayedEndRecPtr : curReplayingReadRecPtr;
+}
+
 /* automic write for lastReplayedReadRecPtr and lastReplayedEndRecPtr */
 void SetCompletedReadEndPtr(PageRedoWorker *worker, XLogRecPtr readPtr, XLogRecPtr endPtr)
 {
@@ -1088,7 +1110,7 @@ void WaitAllPageWorkersQueueEmpty()
     if ((get_real_recovery_parallelism() > 1) && (GetPageWorkerCount() > 0)) {
         for (uint32 i = 0; i < g_dispatcher->pageWorkerCount; i++) {
             while (!SPSCBlockingQueueIsEmpty(g_dispatcher->pageWorkers[i]->queue)) {
-                HandlePageRedoInterrupts();
+                RedoInterruptCallBack();
             }
         }
     }
@@ -1134,9 +1156,10 @@ HTAB* BadBlockHashTblCreate()
 
     ctl.keysize = sizeof(RepairBlockKey);
     ctl.entrysize = sizeof(BadBlockRecEnt);
-    ctl.hash = tag_hash;
-
-    return hash_create("recovery thread bad block hashtbl", MAX_REMOTE_READ_INFO_NUM, &ctl, HASH_ELEM | HASH_FUNCTION);
+    ctl.hash = RepairBlockKeyHash;
+    ctl.match = RepairBlockKeyMatch;
+    return hash_create("recovery thread bad block hashtbl", MAX_REMOTE_READ_INFO_NUM, &ctl,
+                       HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 }
 
 /* RecordBadBlockAndPushToRemote

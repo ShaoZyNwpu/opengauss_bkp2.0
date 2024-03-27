@@ -226,6 +226,7 @@ static void AlterPublicationOptions(AlterPublicationStmt *stmt, Relation rel, He
     bool publish_update;
     bool publish_delete;
     int rc;
+    ObjectAddress obj;
 
     parse_publication_options(stmt->options, &publish_given, &publish_insert, &publish_update, &publish_delete);
 
@@ -278,6 +279,8 @@ static void AlterPublicationOptions(AlterPublicationStmt *stmt, Relation rel, He
             CacheInvalidateRelcacheAll();
         }
     }
+    ObjectAddressSet(obj, PublicationRelationId,  HeapTupleGetOid(tup));
+    EventTriggerCollectSimpleCommand(obj, InvalidObjectAddress, (Node *) stmt);
 }
 
 /*
@@ -629,53 +632,4 @@ void AlterPublicationOwner_oid(Oid subid, Oid newOwnerId)
     heap_freetuple(tup);
 
     heap_close(rel, RowExclusiveLock);
-}
-
-/*
- * Internal workhorse for rename a publication
- */
-static void RenamePublicationInternal(Relation rel, HeapTuple tup, const char *newname)
-{
-    Form_pg_publication form = (Form_pg_publication)GETSTRUCT(tup);
-
-    if (!superuser()) {
-        /* Must be owner */
-        if (!pg_publication_ownercheck(HeapTupleGetOid(tup), GetUserId())) {
-            aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_PUBLICATION, NameStr(form->pubname));
-        }
-    }
-
-    namestrcpy(&(form->pubname), newname);
-    simple_heap_update(rel, &tup->t_self, tup);
-    CatalogUpdateIndexes(rel, tup);
-}
-
-/*
- * Rename Publication
- */
-void RenamePublication(List *oldname, const char *newname)
-{
-    HeapTuple tup;
-    HeapTuple newtup;
-    Relation rel;
-    const char *pubname = strVal(linitial(oldname));
-
-    rel = heap_open(PublicationRelationId, RowExclusiveLock);
-
-    tup = SearchSysCacheCopy1(PUBLICATIONNAME, CStringGetDatum(pubname));
-    if (!HeapTupleIsValid(tup)) {
-        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("Publication \"%s\" does not exist", pubname)));
-    }
-
-    newtup = SearchSysCacheCopy1(PUBLICATIONNAME, CStringGetDatum(newname));
-    if (HeapTupleIsValid(newtup)) {
-        ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("Publication \"%s\" has already exists", newname)));
-    }
-
-    RenamePublicationInternal(rel, tup, newname);
-
-    heap_freetuple(tup);
-    heap_close(rel, RowExclusiveLock);
-
-    return;
 }

@@ -145,7 +145,9 @@ extern ListCell *dlist_tail_cell(DList *l);
 #define lfirst_node(type, lc) castNode(type, lfirst(lc))
 
 #define linitial(l) lfirst(list_head(l))
+#define linitial2(l) (l ? lfirst(list_head(l)) : 0)
 #define linitial_int(l) lfirst_int(list_head(l))
+#define linitial2_int(l) (l ? lfirst_int(list_head(l)) : 0)
 #define linitial_oid(l) lfirst_oid(list_head(l))
 #define linitial_node(type, l) castNode(type, linitial(l))
 
@@ -249,6 +251,7 @@ extern List* lcons_int(int datum, List* list);
 extern List* lcons_oid(Oid datum, List* list);
 
 extern List* list_concat(List* list1, List* list2);
+extern List* list_concat2(List* list1, List* list2);
 extern List* list_truncate(List* list, int new_size);
 
 extern void* list_nth(const List* list, int n);

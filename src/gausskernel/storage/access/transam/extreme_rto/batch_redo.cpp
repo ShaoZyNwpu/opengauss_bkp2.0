@@ -33,6 +33,7 @@
 #include "commands/dbcommands.h"
 #include "commands/tablespace.h"
 #include "storage/freespace.h"
+#include "storage/smgr/relfilenode_hash.h"
 #include "utils/relmapper.h"
 
 #include "access/extreme_rto/batch_redo.h"
@@ -70,6 +71,28 @@ void PRInitRedoItemEntry(RedoItemHashEntry *redoItemHashEntry)
     redoItemHashEntry->tail = NULL;
 }
 
+uint32 RedoItemTagHash(const void *key, Size keysize)
+{
+    RedoItemTag redoItemTag = *(const RedoItemTag *)key;
+    redoItemTag.rNode.opt = DefaultFileNodeOpt;
+    return DatumGetUInt32(hash_any((const unsigned char *)&redoItemTag, (int)keysize));
+}
+
+int RedoItemTagMatch(const void *left, const void *right, Size keysize)
+{
+    const RedoItemTag *leftKey = (const RedoItemTag *)left;
+    const RedoItemTag *rightKey = (const RedoItemTag *)right;
+    Assert(keysize == sizeof(RedoItemTag));
+
+    /* we just care whether the result is 0 or not */
+    if (RelFileNodeEquals(leftKey->rNode, rightKey->rNode) && leftKey->forkNum == rightKey->forkNum &&
+        leftKey->blockNum == rightKey->blockNum) {
+        return 0;
+    }
+
+    return 1;
+}
+
 HTAB *PRRedoItemHashInitialize(MemoryContext context)
 {
     HASHCTL ctl;
@@ -83,9 +106,10 @@ HTAB *PRRedoItemHashInitialize(MemoryContext context)
     ctl.hcxt = context;
     ctl.keysize = sizeof(RedoItemTag);
     ctl.entrysize = sizeof(RedoItemHashEntry);
-    ctl.hash = tag_hash;
+    ctl.hash = RedoItemTagHash;
+    ctl.match = RedoItemTagMatch;
     hTab = hash_create("Redo item hash by relfilenode and blocknum", INITredoItemHashSIZE, &ctl,
-                       HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+                       HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
 
     return hTab;
 }
@@ -216,14 +240,15 @@ void PRTrackDatabaseDrop(XLogRecParseState *recordBlockState, HTAB *hashMap)
 void PRTrackDropFiles(HTAB *redoItemHash, XLogBlockDdlParse *ddlParse, XLogRecPtr lsn)
 {
     ColFileNodeRel *xnodes = (ColFileNodeRel *)ddlParse->mainData;
+    bool compress = ddlParse->compress;
     for (int i = 0; i < ddlParse->rels; ++i) {
         ColFileNode colFileNode;
-        ColFileNodeRel *colFileNodeRel = xnodes + i;
-        ColFileNodeCopy(&colFileNode, colFileNodeRel);
-
-        if (IS_COMPRESS_DELETE_FORK(colFileNode.forknum)) {
-            SET_OPT_BY_NEGATIVE_FORK(colFileNode.filenode, colFileNode.forknum);
-            colFileNode.forknum = MAIN_FORKNUM;
+        if (compress) {
+            ColFileNode *colFileNodeRel = ((ColFileNode *)(void *)xnodes) + i;
+            ColFileNodeFullCopy(&colFileNode, colFileNodeRel);
+        } else {
+            ColFileNodeRel *colFileNodeRel = xnodes + i;
+            ColFileNodeCopy(&colFileNode, colFileNodeRel);
         }
 
         if (!IsValidColForkNum(colFileNode.forknum)) {

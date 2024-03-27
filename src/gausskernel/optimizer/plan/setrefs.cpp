@@ -131,6 +131,10 @@ static List* set_returning_clause_references(
 static bool fix_opfuncids_walker(Node* node, void* context);
 static bool extract_query_dependencies_walker(Node* node, PlannerInfo* context);
 static void fix_skew_quals(PlannerInfo* root, Plan* plan, indexed_tlist* subplan_itlist, int rtoffset);
+static void fix_assign_targetlists(ModifyTable* plan, Plan* subplan, List* resultRelation);
+
+static Relids offset_relid_set(Relids relids, int rtoffset);
+static void set_foreignscan_references(PlannerInfo *root, ForeignScan *fscan, int rtoffset);
 
 #ifdef PGXC
 /* References for remote plans */
@@ -320,19 +324,6 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 splan->tablesample = (TableSampleClause*)fix_scan_expr(root, (Node*)splan->tablesample, rtoffset);
             }
         } break;
-        case T_DfsScan: {
-            DfsScan* splan = (DfsScan*)plan;
-
-            splan->scanrelid += rtoffset;
-            splan->plan.targetlist = fix_scan_list(root, splan->plan.targetlist, rtoffset);
-            if (splan->plan.distributed_keys != NIL) {
-                splan->plan.distributed_keys = fix_scan_list(root, splan->plan.distributed_keys, rtoffset);
-            }
-            splan->plan.var_list = fix_scan_list(root, splan->plan.var_list, rtoffset);
-            splan->plan.qual = fix_scan_list(root, splan->plan.qual, rtoffset);
-            DfsPrivateItem* item = (DfsPrivateItem*)((DefElem*)linitial(splan->privateData))->arg;
-            fix_dfs_private_item(root, rtoffset, item);
-        } break;
         case T_IndexScan: {
             IndexScan* splan = (IndexScan*)plan;
 
@@ -370,24 +361,6 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             splan->cstorequal = fix_scan_list(root, splan->cstorequal, rtoffset);
             splan->baserelcstorequal = fix_scan_list(root, splan->baserelcstorequal, rtoffset);
             splan->indextlist = fix_scan_list(root, splan->indextlist, rtoffset);
-        } break;
-        case T_DfsIndexScan: {
-            DfsIndexScan* splan = (DfsIndexScan*)plan;
-
-            splan->scan.scanrelid += rtoffset;
-            splan->scan.plan.targetlist = fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-            if (splan->scan.plan.distributed_keys != NIL) {
-                splan->scan.plan.distributed_keys = fix_scan_list(root, splan->scan.plan.distributed_keys, rtoffset);
-            }
-            splan->indextlist = fix_scan_list(root, splan->indextlist, rtoffset);
-            splan->scan.plan.qual = fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-            splan->indexqual = fix_scan_list(root, splan->indexqual, rtoffset);
-            splan->indexqualorig = fix_scan_list(root, splan->indexqualorig, rtoffset);
-            splan->indexorderby = fix_scan_list(root, splan->indexorderby, rtoffset);
-            splan->indexorderbyorig = fix_scan_list(root, splan->indexorderbyorig, rtoffset);
-            splan->cstorequal = fix_scan_list(root, splan->cstorequal, rtoffset);
-            splan->indexScantlist = fix_scan_list(root, splan->indexScantlist, rtoffset);
-            splan->dfsScan = (DfsScan*)set_plan_refs(root, (Plan*)splan->dfsScan, rtoffset);
         } break;
         case T_BitmapIndexScan: {
             BitmapIndexScan* splan = (BitmapIndexScan*)plan;
@@ -526,22 +499,7 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             break;
         case T_ForeignScan:
         case T_VecForeignScan: {
-            ForeignScan* splan = (ForeignScan*)plan;
-
-            splan->scan.scanrelid += rtoffset;
-            splan->scan.plan.targetlist = fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
-            if (splan->scan.plan.distributed_keys != NIL) {
-                splan->scan.plan.distributed_keys = fix_scan_list(root, splan->scan.plan.distributed_keys, rtoffset);
-            }
-            splan->scan.plan.var_list = fix_scan_list(root, splan->scan.plan.var_list, rtoffset);
-            splan->scan.plan.qual = fix_scan_list(root, splan->scan.plan.qual, rtoffset);
-            splan->fdw_exprs = fix_scan_list(root, splan->fdw_exprs, rtoffset);
-
-            if (isObsOrHdfsTableFormTblOid(splan->scan_relid)) {
-                DefElem* private_data = (DefElem*)linitial(splan->fdw_private);
-                DfsPrivateItem* item = (DfsPrivateItem*)private_data->arg;
-                fix_dfs_private_item(root, rtoffset, item);
-            }
+            set_foreignscan_references(root, (ForeignScan*) plan, rtoffset);
         } break;
         case T_NestLoop:
         case T_VecNestLoop:
@@ -688,6 +646,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             /* resconstantqual can't contain any subplan variable refs */
             splan->resconstantqual = fix_scan_expr(root, splan->resconstantqual, rtoffset);
         } break;
+        case T_ProjectSet:
+            set_upper_references(root, plan, rtoffset);
+            break;
         case T_VecResult: {
             VecResult* splan = (VecResult*)plan;
 
@@ -734,7 +695,7 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 forthree(lcrl, splan->returningLists, lcrr, splan->resultRelations, lcp, splan->plans)
                 {
                     List* rlist = (List*)lfirst(lcrl);
-                    Index resultrel = lfirst_int(lcrr);
+                    Index resultrel = (Index)linitial_int((List*)lfirst(lcrr));
                     Plan* subplan = (Plan*)lfirst(lcp);
 #ifdef PGXC
                     RemoteQuery* rq = NULL;
@@ -805,6 +766,7 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
              * available as INNER_VAR and the target relation attributes
              * are available from the scan tuple.
              */
+            Index resultRelation = (Index)linitial_int((List*)linitial(splan->resultRelations));
             if (splan->mergeActionList != NIL && (IS_STREAM_PLAN || IS_SINGLE_NODE || IS_PGXC_DATANODE)) {
                 /*
                  * mergeSourceTargetList is already setup correctly to
@@ -832,11 +794,11 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
 
                     /* Fix targetList of each action. */
                     action->targetList = fix_join_expr(
-                        root, action->targetList, NULL, itlist, linitial_int(splan->resultRelations), rtoffset);
+                        root, action->targetList, NULL, itlist, resultRelation, rtoffset);
 
                     /* Fix quals too. */
                     action->qual = (Node*)fix_join_expr(
-                        root, (List*)action->qual, NULL, itlist, linitial_int(splan->resultRelations), rtoffset);
+                        root, (List*)action->qual, NULL, itlist, resultRelation, rtoffset);
                 }
             }
 
@@ -844,9 +806,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 indexed_tlist* itlist;
                 itlist = build_tlist_index(splan->exclRelTlist);
                 splan->updateTlist = fix_join_expr(root, splan->updateTlist, NULL,
-                    itlist, linitial_int(splan->resultRelations), rtoffset);
+                    itlist, resultRelation, rtoffset);
                 splan->upsertWhere = (Node*)fix_join_expr(root, (List*)splan->upsertWhere, NULL,
-                    itlist, linitial_int(splan->resultRelations), rtoffset);
+                    itlist, resultRelation, rtoffset);
                 splan->exclRelTlist =
                         fix_scan_list(root, splan->exclRelTlist, rtoffset);
             }
@@ -854,7 +816,10 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
             splan->exclRelRTIndex += rtoffset;
 
             foreach (l, splan->resultRelations) {
-                lfirst_int(l) += rtoffset;
+                List* list = (List*)lfirst(l);
+                foreach_cell (lc, list) {
+                    lfirst_int(lc) += rtoffset;
+                }
             }
             foreach (l, splan->rowMarks) {
                 PlanRowMark* rc = (PlanRowMark*)lfirst(l);
@@ -862,8 +827,21 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 rc->rti += rtoffset;
                 rc->prti += rtoffset;
             }
-            foreach (l, splan->plans) {
-                lfirst(l) = set_plan_refs(root, (Plan*)lfirst(l), rtoffset);
+            ListCell* lc = NULL;
+            forboth (l, splan->plans, lc, splan->resultRelations) {
+                List* resultRelations = (List*)lfirst(lc);
+                Plan* subplan = (Plan*)lfirst(l);
+
+                lfirst(l) = set_plan_refs(root, subplan, rtoffset);
+                /*
+                 * If the DML has mutil-relation to modify, The targetlist of each target table is arranged on the
+                 * subplan->targetlist. transform and split the original subplan->targetlist to splan->targetlists.
+                 */
+                if (list_length(resultRelations) > 1) {
+                    Assert(subplan->type == T_NestLoop || subplan->type == T_HashJoin || subplan->type == T_MergeJoin ||
+                           subplan->type == T_BaseResult);
+                    fix_assign_targetlists(splan, subplan, resultRelations);
+                }
             }
 
             /*
@@ -872,7 +850,10 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
              * resultRelIndex to reflect their starting position in the
              * global list.
              */
-            splan->resultRelIndex = list_length(root->glob->resultRelations);
+            splan->resultRelIndex = 0;
+            foreach (l, root->glob->resultRelations) {
+                splan->resultRelIndex += list_length((List*)lfirst(l));
+            }
             root->glob->resultRelations = list_concat(root->glob->resultRelations, list_copy(splan->resultRelations));
 
 #ifdef PGXC
@@ -1050,6 +1031,40 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
     plan->righttree = set_plan_refs(root, plan->righttree, rtoffset);
 
     return plan;
+}
+
+/*
+ * If multi result relations, transform and split the original Plan->targetlist to ModifyTable->targetlists.
+ * targetlists is a list that with each result relation targetlist.
+ */
+static void fix_assign_targetlists(ModifyTable* plan, Plan* subplan, List* resultRelation)
+{
+    ListCell* lcrr = NULL;
+    ListCell* lctl = NULL;
+    int resultRelationNum = list_length(resultRelation);
+    List **temp = (List**)palloc0(resultRelationNum * sizeof(List*));
+    int i = 0;
+
+    foreach (lcrr, resultRelation) {
+        Index rtindex = (Index)lfirst_int(lcrr);
+        int new_resno = 1;
+        foreach (lctl, subplan->targetlist) {
+            TargetEntry* tle = (TargetEntry*)lfirst(lctl);
+            if (tle->rtindex == 0) {
+                tle = (TargetEntry*)copyObject((void*)tle);
+                tle->resno = new_resno++;
+                temp[i] = lappend(temp[i], tle);
+            } else if (rtindex == tle->rtindex) {
+                tle->resno = new_resno++;
+                temp[i] = lappend(temp[i], tle);
+            }
+        }
+        i++;
+    }
+    for (i = 0; i < resultRelationNum; i++) {
+        plan->targetlists = lappend(plan->targetlists, temp[i]);
+    }
+    subplan->targetlist = (List*)linitial(plan->targetlists);
 }
 
 /*
@@ -1642,7 +1657,7 @@ static void set_upper_references(PlannerInfo* root, Plan* plan, int rtoffset)
 #ifdef ENABLE_MULTIPLE_NODES
         if (tle->ressortgroupref != 0 && !IsA(tle->expr, Var)) {
 #else
-        if (tle->ressortgroupref != 0 && !IsA(tle->expr, Var) && groupby_same) {
+        if (tle->ressortgroupref != 0 && groupby_same) {
 #endif
             newexpr = (Node*)search_indexed_tlist_for_sortgroupref(
                 (Node*)tle->expr, tle->ressortgroupref, subplan_itlist, OUTER_VAR);
@@ -1923,7 +1938,6 @@ static Var* search_indexed_tlist_for_non_var(Node* node, indexed_tlist* itlist, 
 
 /*
  * search_indexed_tlist_for_sortgroupref --- find a sort/group expression
- *		(which is assumed not to be just a Var)
  *
  * If a match is found, return a Var constructed to reference the tlist item.
  * If no match, return NULL.
@@ -2330,6 +2344,27 @@ void extract_query_dependencies(
     *hasHdfs = glob.vectorized;
 }
 
+static List *get_partition_indexoid_list(List *partitionOidList)
+{
+    if (partitionOidList == NULL) {
+        return NULL;
+    }
+    ListCell *cell = NULL;
+    List *indexOidList = NIL;
+    foreach (cell, partitionOidList) {
+        Oid partOid = (Oid)lfirst_oid(cell);
+        List *partIndexlist = searchPartitionIndexesByblid(partOid);
+        ListCell *indexCell = NULL;
+        foreach (indexCell, partIndexlist) {
+            HeapTuple partIndexTuple = (HeapTuple)lfirst(indexCell);
+            Oid indexOid = HeapTupleGetOid(partIndexTuple);
+            indexOidList = lappend_oid(indexOidList, indexOid);
+        }
+        freePartList(partIndexlist);
+    }
+    return indexOidList;
+}
+
 /*
  * Tree walker for extract_query_dependencies.
  *
@@ -2381,10 +2416,30 @@ static bool extract_query_dependencies_walker(Node* node, PlannerInfo* context)
                  * to false.
                  */
                 if (rte->ispartrel) {
-                    List* partitionOid = getPartitionObjectIdList(rte->relid, PART_OBJ_TYPE_TABLE_PARTITION);
-                    if (partitionOid != NULL) {
+                    List *partitionOid = getPartitionObjectIdList(rte->relid, PART_OBJ_TYPE_TABLE_PARTITION);
+                    Relation partTableRel = relation_open(rte->relid, AccessShareLock);
+                    if (RelationIsSubPartitioned(partTableRel)) {
+                        ListCell *cell = NULL;
+                        foreach (cell, partitionOid) {
+                            Oid partOid = (Oid)lfirst_oid(cell);
+                            List *subPartitionOidList =
+                                getPartitionObjectIdList(partOid, PART_OBJ_TYPE_TABLE_SUB_PARTITION);
+                            List *subPartIndexOidList = get_partition_indexoid_list(subPartitionOidList);
+                            // add subpartition index oid
+                            context->glob->relationOids = list_concat(context->glob->relationOids, subPartIndexOidList);
+                            // add subpartition oid
+                            context->glob->relationOids = list_concat(context->glob->relationOids, subPartitionOidList);
+                        }
+                        // add partition oid
+                        context->glob->relationOids = list_concat(context->glob->relationOids, partitionOid);
+                    } else {
+                        List *partIndexOidList = get_partition_indexoid_list(partitionOid);
+                        // add partition index oid
+                        context->glob->relationOids = list_concat(context->glob->relationOids, partIndexOidList);
+                        // add partition oid
                         context->glob->relationOids = list_concat(context->glob->relationOids, partitionOid);
                     }
+                    relation_close(partTableRel, AccessShareLock);
                 }
             }
         }
@@ -2663,3 +2718,75 @@ void pgxc_set_agg_references(PlannerInfo* root, Agg* aggplan)
     return;
 }
 #endif /* PGXC */
+
+/*
+ * offset_relid_set
+ * 		Apply rtoffset to the members of a Relids set.
+ */
+static Relids offset_relid_set(Relids relids, int rtoffset)
+{
+    Relids result = NULL;
+    int rtindex;
+
+    /* If there's no offset to apply, we needn't recompute the value */
+    if (rtoffset == 0) {
+        return relids;
+    }
+    rtindex = -1;
+    while ((rtindex = bms_next_member(relids, rtindex)) >= 0) {
+        result = bms_add_member(result, rtindex + rtoffset);
+    }
+    return result;
+}
+
+/*
+ * set_foreignscan_references
+ * 	   Do set_plan_references processing on a ForeignScan
+ */
+static void set_foreignscan_references(PlannerInfo *root, ForeignScan *fscan, int rtoffset)
+{
+    /* Adjust scanrelid if it's valid */
+    if (fscan->scan.scanrelid > 0) {
+        fscan->scan.scanrelid += rtoffset;
+    }
+
+    if (fscan->fdw_scan_tlist != NIL || fscan->scan.scanrelid == 0) {
+        /*
+         * Adjust tlist, qual, fdw_exprs, fdw_recheck_quals to reference
+         * foreign scan tuple
+         */
+        indexed_tlist *itlist = build_tlist_index(fscan->fdw_scan_tlist);
+
+        fscan->scan.plan.targetlist =
+            (List *)fix_upper_expr(root, (Node *)fscan->scan.plan.targetlist, itlist, INDEX_VAR, rtoffset);
+        fscan->scan.plan.qual =
+            (List *)fix_upper_expr(root, (Node *)fscan->scan.plan.qual, itlist, INDEX_VAR, rtoffset);
+        fscan->fdw_exprs = (List *)fix_upper_expr(root, (Node *)fscan->fdw_exprs, itlist, INDEX_VAR, rtoffset);
+        fscan->fdw_recheck_quals =
+            (List *)fix_upper_expr(root, (Node *)fscan->fdw_recheck_quals, itlist, INDEX_VAR, rtoffset);
+        pfree(itlist);
+        /* fdw_scan_tlist itself just needs fix_scan_list() adjustments */
+        fscan->fdw_scan_tlist = fix_scan_list(root, fscan->fdw_scan_tlist, rtoffset);
+    } else {
+        /*
+         * Adjust tlist, qual, fdw_exprs, fdw_recheck_quals in the standard
+         * way
+         */
+        fscan->scan.plan.targetlist = fix_scan_list(root, fscan->scan.plan.targetlist, rtoffset);
+        fscan->scan.plan.qual = fix_scan_list(root, fscan->scan.plan.qual, rtoffset);
+        fscan->fdw_exprs = fix_scan_list(root, fscan->fdw_exprs, rtoffset);
+        fscan->fdw_recheck_quals = fix_scan_list(root, fscan->fdw_recheck_quals, rtoffset);
+    }
+
+    if (fscan->scan.plan.distributed_keys != NIL) {
+        fscan->scan.plan.distributed_keys = fix_scan_list(root, fscan->scan.plan.distributed_keys, rtoffset);
+    }
+
+    fscan->fs_relids = offset_relid_set(fscan->fs_relids, rtoffset);
+
+    if (fscan->scan_relid > 0 && isObsOrHdfsTableFormTblOid(fscan->scan_relid)) {
+        DefElem* private_data = (DefElem*)linitial(fscan->fdw_private);
+        DfsPrivateItem* item = (DfsPrivateItem*)private_data->arg;
+        fix_dfs_private_item(root, rtoffset, item);
+    }
+}

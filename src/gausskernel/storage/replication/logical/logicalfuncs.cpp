@@ -45,6 +45,7 @@
 #include "access/xlog_internal.h"
 
 #include "storage/smgr/fd.h"
+#include "storage/file/fio_device.h"
 #define MAXPG_LSNCOMPONENT 8
 
 #define str_lsn_len 128
@@ -88,8 +89,8 @@ static void LogicalOutputWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, Tran
     str_lsn_temp = (char *)palloc0(str_lsn_len);
     rc = sprintf_s(str_lsn_temp, str_lsn_len, "%X/%X", uint32(lsn >> 32), uint32(lsn));
     securec_check_ss(rc, "", "");
-    values[0] = CStringGetTextDatum(str_lsn_temp);
-    values[1] = TransactionIdGetDatum(xid);
+    values[ARR_0] = CStringGetTextDatum(str_lsn_temp);
+    values[ARR_1] = TransactionIdGetDatum(xid);
 
     /*
      * Assert ctx->out is in database encoding when we're writing textual
@@ -100,9 +101,12 @@ static void LogicalOutputWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, Tran
     }
 
     /* ick, but cstring_to_text_with_len works for bytea perfectly fine */
-    values[2] = PointerGetDatum(cstring_to_text_with_len(ctx->out->data, (size_t)(uint)(ctx->out->len)));
+    values[ARR_2] = PointerGetDatum(cstring_to_text_with_len(ctx->out->data, (size_t)(uint)(ctx->out->len)));
 
     tuplestore_putvalues(p->tupstore, p->tupdesc, values, nulls);
+    pfree(DatumGetPointer(values[ARR_0]));
+    pfree(DatumGetPointer(values[ARR_2]));
+    pfree(str_lsn_temp);
     p->returned_rows++;
 }
 
@@ -215,7 +219,7 @@ static void XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count,
 
         /* How many bytes are within this segment? */
         if (nbytes > (XLogSegSize - startoff))
-            segbytes = XLogSegSize - startoff;
+            segbytes = (int)(XLogSegSize - startoff);
         else {
             segbytes = (int)(uint)nbytes;
         }
@@ -359,7 +363,7 @@ static Datum pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool conf
 
     Oid userId = GetUserId();
     CheckLogicalPremissions(userId);
-    ValidateName(NameStr(*name));
+    ValidateInputString(NameStr(*name));
     if (RecoveryInProgress() && confirm)
         ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("couldn't advance in recovery")));
 
@@ -367,7 +371,7 @@ static Datum pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool conf
         upto_lsn = InvalidXLogRecPtr;
     else {
         const char *str_upto_lsn = TextDatumGetCString(PG_GETARG_DATUM(1));
-        ValidateName(str_upto_lsn);
+        ValidateInputString(str_upto_lsn);
         if (!AssignLsn(&upto_lsn, str_upto_lsn)) {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid input syntax for type lsn: \"%s\" "
@@ -428,7 +432,7 @@ static Datum pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool conf
         for (i = 0; i < nelems; i += 2) {
             char *dname = TextDatumGetCString(datum_opts[i]);
             char *opt = TextDatumGetCString(datum_opts[i + 1]);
-            ValidateName(dname);
+            ValidateInputString(dname);
             options = lappend(options, makeDefElem(dname, (Node *)makeString(opt)));
         }
     }
@@ -446,7 +450,10 @@ static Datum pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool conf
 
     CheckLogicalDecodingRequirements(u_sess->proc_cxt.MyDatabaseId);
     ReplicationSlotAcquire(NameStr(*name), false);
-    rc = sprintf_s(path, sizeof(path), "pg_replslot/%s/snap", NameStr(t_thrd.slot_cxt.MyReplicationSlot->data.name));
+
+    char replslot_path[MAXPGPATH];
+    GetReplslotPath(replslot_path);
+    rc = sprintf_s(path, sizeof(path), "%s/%s/snap", replslot_path, NameStr(t_thrd.slot_cxt.MyReplicationSlot->data.name));
     securec_check_ss(rc, "", "");
     if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
         if (!rmtree(path, true))
@@ -539,7 +546,7 @@ static Datum pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool conf
     /* free context, call shutdown callback */
     FreeDecodingContext(ctx);
 
-    ReplicationSlotRelease();
+    CleanMyReplicationSlot();
     InvalidateSystemCaches();
 
     return (Datum)0;
@@ -552,7 +559,7 @@ static XLogRecPtr getStartLsn(FunctionCallInfo fcinfo)
         start_lsn = InvalidXLogRecPtr;
     else {
         const char *str_start_lsn = TextDatumGetCString(PG_GETARG_DATUM(0));
-        ValidateName(str_start_lsn);
+        ValidateInputString(str_start_lsn);
         if (!AssignLsn(&start_lsn, str_start_lsn)) {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid input syntax for type lsn: \"%s\" "
@@ -570,7 +577,7 @@ static XLogRecPtr getUpToLsn(FunctionCallInfo fcinfo)
         upto_lsn = InvalidXLogRecPtr;
     else {
         const char *str_upto_lsn = TextDatumGetCString(PG_GETARG_DATUM(1));
-        ValidateName(str_upto_lsn);
+        ValidateInputString(str_upto_lsn);
         if (!AssignLsn(&upto_lsn, str_upto_lsn)) {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid input syntax for type lsn: \"%s\" "
@@ -614,7 +621,7 @@ char* getXlogDirUpdateLsn(FunctionCallInfo fcinfo, XLogRecPtr *start_lsn, XLogRe
     ret = memset_s(str_lsn, MAXPGPATH, '\0', MAXPGPATH);
     securec_check(ret, "", "");
     sprintf_s(str_lsn, MAXPGPATH, "%X/%X000000", log, seg);
-    ValidateName(str_lsn);
+    ValidateInputString(str_lsn);
     if (!AssignLsn(start_lsn, str_lsn)) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid lsn: \"%s\" "
@@ -624,7 +631,7 @@ char* getXlogDirUpdateLsn(FunctionCallInfo fcinfo, XLogRecPtr *start_lsn, XLogRe
     ret = memset_s(str_lsn, MAXPGPATH, '\0', MAXPGPATH);
     securec_check(ret, "", "");
     sprintf_s(str_lsn, MAXPGPATH, "%X/%XFFFFFF", log, seg);
-    ValidateName(str_lsn);
+    ValidateInputString(str_lsn);
     if (!AssignLsn(upto_lsn, str_lsn)) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("invalid lsn: \"%s\" "
@@ -689,7 +696,7 @@ static Datum pg_logical_get_area_changes_guts(FunctionCallInfo fcinfo)
     upto_nchanges = getUpToNChanges(fcinfo);
     /* arg4 output format plugin */
     Name plugin = PG_GETARG_NAME(3);
-    ValidateName(NameStr(*plugin));
+    ValidateInputString(NameStr(*plugin));
 
     /* check to see if caller supports us returning a tuplestore */
     CheckSupportTupleStore(fcinfo);
@@ -713,7 +720,7 @@ static Datum pg_logical_get_area_changes_guts(FunctionCallInfo fcinfo)
     }
     /* The memory is controlled. The number of decoded files cannot exceed 10. */
     XLogRecPtr max_lsn_distance = XLOG_SEG_SIZE * 10;
-    if (upto_lsn < start_lsn) {
+    if (upto_lsn != InvalidXLogRecPtr && upto_lsn < start_lsn) {
         ereport(ERROR, (errcode(ERRCODE_LOGICAL_DECODE_ERROR), errmsg("upto_lsn can not be smaller than start_lsn.")));
     }
     if (upto_lsn == InvalidXLogRecPtr || ((upto_lsn - start_lsn) > max_lsn_distance)) {
@@ -741,7 +748,7 @@ static Datum pg_logical_get_area_changes_guts(FunctionCallInfo fcinfo)
         for (i = 0; i < nelems; i = i + 2) {
             char *dname = TextDatumGetCString(datum_opts[i]);
             char *opt = TextDatumGetCString(datum_opts[i + 1]);
-            ValidateName(dname);
+            ValidateInputString(dname);
             options = lappend(options, makeDefElem(dname, (Node *)makeString(opt)));
         }
     }

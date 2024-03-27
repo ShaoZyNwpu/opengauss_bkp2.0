@@ -53,6 +53,10 @@ static XLogRecPtr lastFlushPosition = InvalidXLogRecPtr;
 extern char* basedir;
 extern int standby_message_timeout;
 
+#define HEART_BEAT_INIT 0
+#define HEART_BEAT_RUN 1
+#define HEART_BEAT_STOP 2
+
 /*
  * The max size for single data file. copy from custorage.cpp.
  */
@@ -64,7 +68,7 @@ const int HEART_BEAT = 5;
 PGconn* xlogconn = NULL;
 pthread_t hearbeatTimerId;
 volatile uint32 timerFlag = 0;
-volatile uint32 heartbeatRunning = 0;
+volatile uint32 heartbeatRunning = HEART_BEAT_INIT;
 pthread_mutex_t heartbeatMutex;
 
 typedef enum { DO_WAL_DATA_WRITE_DONE, DO_WAL_DATA_WRITE_STOP, DO_WAL_DATA_WRITE_ERROR } DoWalDataWriteResult;
@@ -130,8 +134,8 @@ static int open_walfile(XLogRecPtr startpoint, uint32 timeline, const char* base
         MAXFNAMELEN - 1,
         "%08X%08X%08X",
         timeline,
-        (uint32)((startpoint / XLOG_SEG_SIZE) / XLogSegmentsPerXLogId),
-        (uint32)((startpoint / XLOG_SEG_SIZE) % XLogSegmentsPerXLogId));
+        (uint32)((startpoint / XLogSegSize) / XLogSegmentsPerXLogId),
+        (uint32)((startpoint / XLogSegSize) % XLogSegmentsPerXLogId));
     securec_check_ss_c(nRet, "", "");
 
     nRet = snprintf_s(fn, sizeof(fn), sizeof(fn) - 1, "%s/%s.partial", basedir, namebuf);
@@ -160,11 +164,11 @@ static int open_walfile(XLogRecPtr startpoint, uint32 timeline, const char* base
         f = -1;
         return -1;
     }
-    if (statbuf.st_size == XLogSegSize)
+    if (statbuf.st_size == (off_t)XLogSegSize)
         return f; /* File is open and ready to use */
     if (statbuf.st_size != 0) {
         pg_log(PG_PRINT,
-            _("%s: WAL segment %s is %d bytes, should be 0 or %d\n"),
+            _("%s: WAL segment %s is %d bytes, should be 0 or %lu\n"),
             progname,
             Lrealpath,
             (int)statbuf.st_size,
@@ -221,8 +225,9 @@ void* heartbeatTimerHandler(void* data)
     if (xlogconn == NULL) {
         return NULL;
     }
-    heartbeatRunning = 1;
-    while (heartbeatRunning) {
+    uint32 expected = HEART_BEAT_INIT;
+    (void)pg_atomic_compare_exchange_u32(&heartbeatRunning, &expected, HEART_BEAT_RUN);
+    while (pg_atomic_read_u32(&heartbeatRunning) == HEART_BEAT_RUN) {
         pthread_mutex_lock(&heartbeatMutex);
         (void)checkForReceiveTimeout(xlogconn);
         ping_sent = false;
@@ -266,7 +271,7 @@ void suspendHeartBeatTimer(void)
 
 void closeHearBeatTimer(void)
 {
-    heartbeatRunning = 0;
+    pg_atomic_write_u32(&heartbeatRunning, HEART_BEAT_STOP);
     pthread_mutex_unlock(&heartbeatMutex);
     (void)pthread_join(hearbeatTimerId, NULL);
     return;
@@ -302,7 +307,7 @@ static bool close_walfile(int walfile, const char* basedir, char* walname, bool 
      * Rename the .partial file only if we've completed writing the
      * whole segment or segment_complete is true.
      */
-    if (currpos == XLOG_SEG_SIZE || segment_complete) {
+    if (currpos == (off_t)XLogSegSize || segment_complete) {
         char oldfn[MAXPGPATH];
         char newfn[MAXPGPATH];
         errno_t nRet;
@@ -438,7 +443,7 @@ static bool checkForReceiveTimeout(PGconn* conn)
 static int DoWALWrite(const char* wal_buf, int len, XLogRecPtr& block_pos, const char* basedir, char* cur_wal_file,
     uint32 wal_file_timeline, int& walfile, stream_stop_callback stream_stop, PGconn* conn)
 {
-    int xlogoff = block_pos % XLOG_SEG_SIZE;
+    int xlogoff = block_pos % XLogSegSize;
     int bytes_left = len;
     int bytes_to_write = 0;
 
@@ -470,8 +475,8 @@ static int DoWALWrite(const char* wal_buf, int len, XLogRecPtr& block_pos, const
     while (bytes_left) {
 
         /* If crossing a WAL boundary, only write up until we reach XLOG_SEG_SIZE. */
-        if (xlogoff + bytes_left > XLOG_SEG_SIZE)
-            bytes_to_write = XLOG_SEG_SIZE - xlogoff;
+        if (xlogoff + bytes_left > (int)XLogSegSize)
+            bytes_to_write = (int)XLogSegSize - xlogoff;
         else
             bytes_to_write = bytes_left;
 
@@ -494,15 +499,15 @@ static int DoWALWrite(const char* wal_buf, int len, XLogRecPtr& block_pos, const
             suspendHeartBeatTimer();
             return DO_WAL_DATA_WRITE_ERROR;
         }
-
         /* Write was successful, advance our position */
         bytes_written += bytes_to_write;
         bytes_left -= bytes_to_write;
         XLByteAdvance(block_pos, bytes_to_write);
         xlogoff += bytes_to_write;
+        lastFlushPosition = block_pos;
 
         /* Did we reach the end of a WAL segment? */
-        if (block_pos % XLOG_SEG_SIZE == 0) {
+        if (block_pos % XLogSegSize == 0) {
             if (!close_walfile(walfile, basedir, cur_wal_file, false, block_pos)) {
                 suspendHeartBeatTimer();
                 /* Error message written in close_walfile() */
@@ -586,14 +591,12 @@ bool ReceiveXlogStream(PGconn* conn, XLogRecPtr startpos, uint32 timeline, const
          * so that the master can remove WAL.
          */
 
-        reportFlushPosition = true;
         ss_c = snprintf_s(slotcmd, MAXPGPATH, MAXPGPATH - 1, "SLOT \"%s\" ", replication_slot);
         securec_check_ss_c(ss_c, "", "");
     } else {
-        reportFlushPosition = false;
         slotcmd[0] = 0;
     }
-
+    reportFlushPosition = true;
     if (sysidentifier != NULL) {
         /* Validate system identifier and timeline hasn't changed */
         res = PQexec(conn, "IDENTIFY_SYSTEM");

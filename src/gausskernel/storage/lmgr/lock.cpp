@@ -49,6 +49,7 @@
 #include "executor/exec/execStream.h"
 #include "instruments/instr_event.h"
 #include "instruments/instr_statement.h"
+#include "ddes/dms/ss_dms_bufmgr.h"
 
 #define NLOCKENTS()                                           \
     mul_size(g_instance.attr.attr_storage.max_locks_per_xact, \
@@ -134,6 +135,8 @@ static PROCLOCK *FastPathGetRelationLockEntry(LOCALLOCK *locallock);
 static LockAcquireResult LockAcquireExtendedXC(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
                                                bool dontWait, bool reportMemoryError, bool only_increment,
                                                bool allow_con_update = false, int waitSec = 0);
+static bool SSDmsLockAcquire(LOCALLOCK *locallock, bool dontWait, int waitSec);
+static void SSDmsLockRelease(LOCALLOCK *locallock);
 
 #if defined(LOCK_DEBUG) || defined(USE_ASSERT_CHECKING)
 
@@ -209,10 +212,27 @@ inline static void PROCLOCK_PRINT(const char *where, const PROCLOCK *proclockP)
                              proclockP->tag.myLock, PROCLOCK_LOCKMETHOD(*(proclockP)), proclockP->tag.myProc,
                              (int)proclockP->holdMask)));
 }
+
+inline static void SSLOCK_PRINT(const char *where, const LOCALLOCK *locallock, LOCKMODE type)
+{
+    if (LOCK_DEBUG_ENABLED(&locallock->tag.lock))
+        ereport(LOG,
+                (errmsg("%s: SSlock id(%u,%u,%u,%u,%u,%u,%u) type(%s)",
+                        where,
+                        locallock->tag.lock.locktag_field1,
+                        locallock->tag.lock.locktag_field2,
+                        locallock->tag.lock.locktag_field5,
+                        locallock->tag.lock.locktag_field3,
+                        locallock->tag.lock.locktag_field4,
+                        locallock->tag.lock.locktag_type,
+                        locallock->tag.lock.locktag_lockmethodid,
+                        LockMethods[SSLOCK_LOCKMETHOD(*locallock)]->lockModeNames[type])));
+}
 #else /* not LOCK_DEBUG */
 
 #define LOCK_PRINT(where, lock, type)
 #define PROCLOCK_PRINT(where, proclockP)
+#define SSLOCK_PRINT(where, lock, type)
 #endif /* not LOCK_DEBUG */
 
 static uint32 proclock_hash(const void *key, Size keysize);
@@ -569,7 +589,7 @@ bool IsOtherProcRedistribution(PGPROC *otherProc)
  * when query run as stream mode, the topConsumer and producer thread hold differnt
  * Procs, but we treat them as one transaction
  */
-bool inline IsInSameTransaction(PGPROC *proc1, PGPROC *proc2)
+inline bool IsInSameTransaction(PGPROC *proc1, PGPROC *proc2)
 {
     return u_sess->stream_cxt.global_obj == NULL ? false
             : u_sess->stream_cxt.global_obj->inNodeGroup(proc1->pid, proc2->pid);
@@ -709,6 +729,7 @@ static LockAcquireResult LockAcquireExtendedXC(const LOCKTAG *locktag, LOCKMODE 
         locallock->numLockOwners = 0;
         locallock->maxLockOwners = 8;
         locallock->holdsStrongLockCount = FALSE;
+        locallock->ssLock = FALSE;
         locallock->lockOwners = NULL; /* in case next line fails */
         locallock->lockOwners =
             (LOCALLOCKOWNER *)MemoryContextAlloc(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE),
@@ -752,34 +773,22 @@ static LockAcquireResult LockAcquireExtendedXC(const LOCKTAG *locktag, LOCKMODE 
      *
      * First we prepare to log, then after lock acquired we issue log record.
      */
-    if (lockmode >= AccessExclusiveLock && locktag->locktag_type == LOCKTAG_RELATION && !RecoveryInProgress() &&
-        XLogStandbyInfoActive()) {
-        /*
-         * In a scenario like:
-         *
-         *	1, openGauss run vacuum full or autovacuum pg_class, insert AccessExclusiveLock xlog.
-         *	2, datanode crash, vacuum full abort.
-         *	3, datanode restart in pending mode, start recovery.
-         *	4, startup thread acquire pg_class's AccessExclusiveLock.
-         *	5, startup thread complete recovery and wait for notify.
-         *	6, cm agent connect datanode, need to init relcache file.
-         *	7, cm agent connect want to acquire pg_class's AccessShareLock,
-         *		but the AccessExclusiveLock lock is hold by startup thread.
-         *	8, dead lock, datanode hang.
-         *
-         *	Other system tables like pg_attribute/pg_type.. also have such problem.
-         *
-         *	To solve this problem, we don't insert AccessExclusiveLock xlog for system tables.
-         *	This change may cause exception when primary run vacuum full system table while
-         *	standby access the system table at the same time.
-         *
-         */
-        if (locktag->locktag_field2 > FirstNormalObjectId) {
-            LogAccessExclusiveLockPrepare();
-            log_lock = true;
-        }
+    if (lockmode >= AccessExclusiveLock && (locktag->locktag_type == LOCKTAG_RELATION ||
+        locktag->locktag_type == LOCKTAG_PARTITION || locktag->locktag_type == LOCKTAG_PARTITION_SEQUENCE) &&
+        !RecoveryInProgress() && XLogStandbyInfoActive()) {
+        LogAccessExclusiveLockPrepare();
+        log_lock = true;
     }
 
+    /* First we try to get dms lock in shared storage mode */
+    if (ENABLE_DMS && (locktag->locktag_type < (uint8)LOCKTAG_PAGE || locktag->locktag_type == (uint8)LOCKTAG_OBJECT) &&
+        !RecoveryInProgress()) {
+        bool ret = SSDmsLockAcquire(locallock, dontWait, waitSec);
+        if (!ret) {
+            instr_stmt_report_lock(LOCK_END, NoLock);
+            return LOCKACQUIRE_NOT_AVAIL;
+        }
+    }
     /*
      * Attempt to take lock via fast path, if eligible.  But if we remember
      * having filled up the fast path array, we don't attempt to make any
@@ -836,6 +845,7 @@ static LockAcquireResult LockAcquireExtendedXC(const LOCKTAG *locktag, LOCKMODE 
         BeginStrongLockAcquire(locallock, fasthashcode);
         if (!FastPathTransferRelationLocks(lockMethodTable, locktag, hashcode)) {
             AbortStrongLockAcquire();
+            SSDmsLockRelease(locallock);
             instr_stmt_report_lock(LOCK_END, NoLock);
             if (reportMemoryError)
                 ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of shared memory"),
@@ -867,6 +877,7 @@ static LockAcquireResult LockAcquireExtendedXC(const LOCKTAG *locktag, LOCKMODE 
     if (proclock == NULL) {
         AbortStrongLockAcquire();
         LWLockRelease(partitionLock);
+        SSDmsLockRelease(locallock);
         instr_stmt_report_lock(LOCK_END, NoLock);
         if (reportMemoryError)
             ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of shared memory"),
@@ -1021,6 +1032,7 @@ static LockAcquireResult LockAcquireExtendedXC(const LOCKTAG *locktag, LOCKMODE 
             LOCK_PRINT("LockAcquire: INCONSISTENT", lock, lockmode);
             /* Should we retry ? */
             LWLockRelease(partitionLock);
+            SSDmsLockRelease(locallock);
             instr_stmt_report_lock(LOCK_END, NoLock);
             ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("LockAcquire failed")));
         }
@@ -1242,6 +1254,10 @@ static void RemoveLocalLock(LOCALLOCK *locallock)
     }
     if (!hash_search(t_thrd.storage_cxt.LockMethodLocalHash, (void *)&(locallock->tag), HASH_REMOVE, NULL))
         ereport(WARNING, (errmsg("locallock table corrupted")));
+
+    if (!RecoveryInProgress()) {
+        SSDmsLockRelease(locallock);
+    }
 }
 
 bool inline IsInSameLockGroup(const PROCLOCK *proclock1, const PROCLOCK *proclock2)
@@ -1753,6 +1769,7 @@ static void WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, bool allow_con
             set_ps_display(new_status, false);
             pfree(new_status);
         }
+        SSDmsLockRelease(locallock);
         instr_stmt_report_lock(LOCK_WAIT_END);
         instr_stmt_report_lock(LOCK_END, NoLock);
 
@@ -4032,4 +4049,89 @@ int LockWaiterCount(const LOCKTAG *locktag)
     LWLockRelease(partitionLock);
 
     return waiters;
+}
+
+static bool SSDmsLockAcquire(LOCALLOCK *locallock, bool dontWait, int waitSec)
+{
+    dms_context_t dms_ctx;
+    dms_drlatch_t dlatch;
+    bool ret = true;
+    bool timeout = true;
+    bool skipAcquire = false;
+    int waitMilliSec = 0;
+    int needWaitMilliSec = 0;
+    TimestampTz startTime;
+    LOCKMODE lockmode;
+
+    InitDmsContext(&dms_ctx);
+    TransformLockTagToDmsLatch(&dlatch, locallock->tag.lock);
+
+    needWaitMilliSec = (waitSec == 0) ? u_sess->attr.attr_storage.LockWaitTimeout : waitSec * SEC2MILLISEC;
+    startTime = GetCurrentTimestamp();
+    lockmode = locallock->tag.mode;
+
+    PG_TRY();
+    {
+        do {
+            if (lockmode < AccessExclusiveLock && SS_NORMAL_STANDBY) {
+                ret = dms_latch_timed_s(&dms_ctx, &dlatch, SS_ACQUIRE_LOCK_DO_NOT_WAIT, (unsigned char)false);
+            } else if (lockmode >= AccessExclusiveLock && SS_NORMAL_PRIMARY) {
+                ret = dms_latch_timed_x(&dms_ctx, &dlatch, SS_ACQUIRE_LOCK_DO_NOT_WAIT);
+            } else {
+                // skip if lockmode do not meet ss lock request, or openGauss in reform process
+                skipAcquire = true;
+                break;
+            }
+
+            // acquire failed, and need wait
+            if (!(dontWait || ret)) {
+                CHECK_FOR_INTERRUPTS();
+
+                // first entry
+                if (waitMilliSec == 0) {
+                    SSLOCK_PRINT("WaitOnLock: sleeping on ss_lock start", locallock, lockmode);
+                    instr_stmt_report_lock(LOCK_WAIT_START, lockmode, &locallock->tag.lock);
+                }
+
+                waitMilliSec = ComputeTimeStamp(startTime);
+                timeout = (waitMilliSec >= needWaitMilliSec);
+                if (timeout) {
+                    ereport(ERROR, (errcode(ERRCODE_LOCK_WAIT_TIMEOUT),
+                        errmsg("SSLock wait timeout after %d ms", waitMilliSec)));
+                }
+                pg_usleep(SS_ACQUIRE_LOCK_RETRY_INTERVAL * MILLISEC2MICROSEC);  // 50 ms
+            }
+        } while (!(timeout || ret));
+    }
+    PG_CATCH();
+    {
+        instr_stmt_report_lock(LOCK_WAIT_END);
+        instr_stmt_report_lock(LOCK_END, NoLock);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (waitMilliSec != 0) {
+        instr_stmt_report_lock(LOCK_WAIT_END);
+        SSLOCK_PRINT("WaitOnLock: sleeping on ss_lock end", locallock, locallock->tag.mode);
+    }
+
+    locallock->ssLock = ret && !skipAcquire;
+    return ret;
+}
+
+static void SSDmsLockRelease(LOCALLOCK *locallock)
+{
+    dms_context_t dms_ctx;
+    dms_drlatch_t dlatch;
+
+    if (!locallock->ssLock) {
+        return;
+    }
+
+    InitDmsContext(&dms_ctx);
+    TransformLockTagToDmsLatch(&dlatch, locallock->tag.lock);
+
+    locallock->ssLock = FALSE;
+    dms_unlatch(&dms_ctx, &dlatch);
 }

@@ -28,6 +28,23 @@ typedef struct RoleIdHashEntry {
     int64 roleNum;
 } RoleIdHashEntry;
 
+/* Our shared memory area */
+typedef struct ProcArrayStruct {
+    int numProcs; /* number of valid procs entries */
+    int maxProcs; /* allocated size of procs array */
+
+    /* oldest xmin of any replication slot */
+    TransactionId replication_slot_xmin;
+    /* oldest catalog xmin of any replication slot */
+    TransactionId replication_slot_catalog_xmin;
+    /*
+     * We declare pgprocnos[] as 1 entry because C wants a fixed-size array,
+     * but actually it is maxProcs entries long.
+     */
+    int pgprocnos[1]; /* VARIABLE LENGTH ARRAY */
+} ProcArrayStruct;
+
+
 extern void InitRoleIdHashTable();
 extern int GetRoleIdCount(Oid roleoid);
 extern int IncreaseUserCount(Oid roleoid);
@@ -70,7 +87,7 @@ extern Snapshot GetSnapshotData(Snapshot snapshot, bool force_local_snapshot);
 
 extern Snapshot GetLocalSnapshotData(Snapshot snapshot);
 
-extern bool ProcArrayInstallImportedXmin(TransactionId xmin, TransactionId sourcexid);
+extern bool ProcArrayInstallImportedXmin(TransactionId xmin, VirtualTransactionId *sourcevxid);
 extern RunningTransactions GetRunningTransactionData(void);
 
 extern bool TransactionIdIsActive(TransactionId xid);
@@ -94,14 +111,17 @@ extern bool IsBackendPid(ThreadId pid);
 
 extern VirtualTransactionId* GetCurrentVirtualXIDs(
     TransactionId limitXmin, bool excludeXmin0, bool allDbs, int excludeVacuum, int* nvxids);
-extern VirtualTransactionId* GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid, XLogRecPtr lsn = 0);
-extern ThreadId CancelVirtualTransaction(const VirtualTransactionId& vxid, ProcSignalReason sigmode);
+extern VirtualTransactionId *GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid, XLogRecPtr lsn = 0,
+                                                       CommitSeqNo limitXminCSN = InvalidCommitSeqNo,
+                                                       TransactionId* xminArray = NULL);
+extern ThreadId CancelVirtualTransaction(const VirtualTransactionId& vxid, ProcSignalReason sigmode,
+    int retry_count);
 
 extern bool MinimumActiveBackends(int min);
 extern int CountDBBackends(Oid database_oid);
 extern int CountDBActiveBackends(Oid database_oid);
 extern int CountSingleNodeActiveBackends(Oid databaseOid, Oid userOid);
-extern void CancelDBBackends(Oid databaseid, ProcSignalReason sigmode, bool conflictPending);
+extern void CancelDBBackends(Oid databaseid, ProcSignalReason sigmode, bool conflictPending, int retry_count);
 extern void CancelSingleNodeBackends(Oid databaseOid, Oid userOid, ProcSignalReason sigmode, bool conflictPending);
 extern int CountUserBackends(Oid roleid);
 extern bool CountOtherDBBackends(Oid databaseId, int* nbackends, int* nprepared);
@@ -171,3 +191,4 @@ extern void ResetProcXidCache(PGPROC* proc, bool needlock);
 // For GTT
 extern TransactionId ListAllThreadGttFrozenxids(int maxSize, ThreadId *pids, TransactionId *xids, int *n);
 extern TransactionId GetReplicationSlotCatalogXmin();
+extern void GetOldestGlobalProcXmin(TransactionId *globalProcXmin);

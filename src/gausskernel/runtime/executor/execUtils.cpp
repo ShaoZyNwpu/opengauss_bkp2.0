@@ -63,11 +63,19 @@
 #include "optimizer/var.h"
 #include "utils/resowner.h"
 #include "miscadmin.h"
+#include "utils/date.h"
+#include "utils/nabstime.h"
+#include "utils/geo_decls.h"
+#include "utils/varbit.h"
+#include "utils/json.h"
+#include "utils/jsonb.h"
+#include "utils/xml.h"
+#include "utils/rangetypes.h"
+#include "commands/sequence.h"
 
 static bool get_last_attnums(Node* node, ProjectionInfo* projInfo);
 static bool index_recheck_constraint(
     Relation index, Oid* constr_procs, Datum* existing_values, const bool* existing_isnull, Datum* new_values);
-static void ShutdownExprContext(ExprContext* econtext, bool isCommit);
 static bool check_violation(Relation heap, Relation index, IndexInfo *indexInfo, ItemPointer tupleid, Datum *values,
                             const bool *isnull, EState *estate, bool newIndex, bool errorOK, CheckWaitMode waitMode,
                             ConflictInfoData *conflictInfo, Oid partoid = InvalidOid, int2 bucketid = InvalidBktId,
@@ -183,7 +191,7 @@ EState* CreateExecutorState(MemoryContext saveCxt)
     estate->es_recursive_next_iteration = false;
 
     estate->pruningResult = NULL;
-
+    estate->first_autoinc = 0;
     /*
      * Return the executor state structure
      */
@@ -286,6 +294,7 @@ ExprContext* CreateExprContext(EState* estate)
 
     econtext->ecxt_callbacks = NULL;
     econtext->plpgsql_estate = NULL;
+    econtext->hasSetResultStore = false;
 
     /*
      * Link the ExprContext into the EState to ensure it is shut down when the
@@ -459,7 +468,7 @@ void ExecAssignResultType(PlanState* planstate, TupleDesc tupDesc)
  *		ExecAssignResultTypeFromTL
  * ----------------
  */
-void ExecAssignResultTypeFromTL(PlanState* planstate, TableAmType tam)
+void ExecAssignResultTypeFromTL(PlanState* planstate, const TableAmRoutine* tam_ops)
 {
     bool hasoid = false;
     TupleDesc tupDesc;
@@ -476,7 +485,7 @@ void ExecAssignResultTypeFromTL(PlanState* planstate, TableAmType tam)
      * list of ExprStates.	This is good because some plan nodes don't bother
      * to set up planstate->targetlist ...
      */
-    tupDesc = ExecTypeFromTL(planstate->plan->targetlist, hasoid, false, tam);
+    tupDesc = ExecTypeFromTL(planstate->plan->targetlist, hasoid, false, tam_ops);
     ExecAssignResultType(planstate, tupDesc);
 }
 
@@ -666,7 +675,7 @@ ProjectionInfo* ExecBuildVecProjectionInfo(
             else if (variable->varattno <= inputDesc->natts) {
                 Form_pg_attribute attr;
 
-                attr = inputDesc->attrs[variable->varattno - 1];
+                attr = &inputDesc->attrs[variable->varattno - 1];
                 if (!attr->attisdropped && variable->vartype == attr->atttypid)
                     isSimpleVar = true;
             }
@@ -735,6 +744,30 @@ ProjectionInfo* ExecBuildVecProjectionInfo(
     return projInfo;
 }
 
+ProjectionInfo* ExecBuildRightRefProjectionInfo(PlanState* planState, TupleDesc inputDesc) 
+{
+    List* targetList = planState->targetlist; 
+    ExprContext* econtext = planState->ps_ExprContext; 
+    TupleTableSlot* slot = planState->ps_ResultTupleSlot;
+    
+    ProjectionInfo* projInfo = makeNode(ProjectionInfo);
+    int len = ExecTargetListLength(targetList);
+
+    econtext->rightRefState = planState->plan->rightRefState;
+    projInfo->pi_exprContext = econtext;
+    projInfo->pi_slot = slot;
+    projInfo->pi_lastInnerVar = 0;
+    projInfo->pi_lastOuterVar = 0;
+    projInfo->pi_lastScanVar = 0;
+    
+    projInfo->pi_targetlist = targetList;
+    projInfo->pi_numSimpleVars = 0;
+    projInfo->pi_directMap = false;
+    projInfo->pi_itemIsDone = (ExprDoneCond*)palloc(len * sizeof(ExprDoneCond));
+
+    return projInfo;
+}
+
 /* ----------------
  *		ExecBuildProjectionInfo
  *
@@ -774,6 +807,7 @@ ProjectionInfo* ExecBuildProjectionInfo(
     projInfo->pi_lastInnerVar = 0;
     projInfo->pi_lastOuterVar = 0;
     projInfo->pi_lastScanVar = 0;
+    projInfo->isUpsertHasRightRef = false;
 
     /*
      * We separate the target list elements into simple Var references and
@@ -796,7 +830,7 @@ ProjectionInfo* ExecBuildProjectionInfo(
             else if (variable->varattno <= inputDesc->natts) {
                 Form_pg_attribute attr;
 
-                attr = inputDesc->attrs[variable->varattno - 1];
+                attr = &inputDesc->attrs[variable->varattno - 1];
                 if (!attr->attisdropped && variable->vartype == attr->atttypid)
                     isSimpleVar = true;
             }
@@ -832,6 +866,11 @@ ProjectionInfo* ExecBuildProjectionInfo(
                     break;
             }
             numSimpleVars++;
+            
+            if (econtext && IS_ENABLE_RIGHT_REF(econtext->rightRefState)) {
+                exprlist = lappend(exprlist, gstate);
+                get_last_attnums((Node*)variable, projInfo);
+            }
         } else {
             /* Not a simple variable, add it to generic targetlist */
             exprlist = lappend(exprlist, gstate);
@@ -909,8 +948,12 @@ static bool get_last_attnums(Node* node, ProjectionInfo* projInfo)
  */
 void ExecAssignProjectionInfo(PlanState* planstate, TupleDesc inputDesc)
 {
-    planstate->ps_ProjInfo = ExecBuildProjectionInfo(
-        planstate->targetlist, planstate->ps_ExprContext, planstate->ps_ResultTupleSlot, inputDesc);
+    if (planstate->plan && IS_ENABLE_RIGHT_REF(planstate->plan->rightRefState)) {
+        planstate->ps_ProjInfo = ExecBuildRightRefProjectionInfo(planstate, inputDesc);
+    } else {
+        planstate->ps_ProjInfo = ExecBuildProjectionInfo(planstate->targetlist, planstate->ps_ExprContext,
+                                                         planstate->ps_ResultTupleSlot, inputDesc);
+    }
 }
 
 /* ----------------
@@ -1229,7 +1272,8 @@ void ExecCloseIndices(ResultRelInfo* resultRelInfo)
  * Copied from ExecInsertIndexTuples
  */
 void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* estate,
-    Relation targetPartRel, Partition p, const Bitmapset *modifiedIdxAttrs, const bool inplaceUpdated)
+    Relation targetPartRel, Partition p, const Bitmapset *modifiedIdxAttrs,
+    const bool inplaceUpdated, const bool isRollbackIndex)
 {
     ResultRelInfo* resultRelInfo = NULL;
     int numIndices;
@@ -1294,6 +1338,8 @@ void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* es
     if (!RelationIsUstoreFormat(heapRelation))
         return;
 
+    AcceptInvalidationMessages();
+
     /*
      * for each index, form and insert the index tuple
      */
@@ -1314,6 +1360,10 @@ void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* es
         /* If the index is marked as read-only, ignore it */
         /* XXXX: ???? */
         if (!indexInfo->ii_ReadyForInserts) {
+            continue;
+        }
+
+        if (!IndexIsUsable(indexRelation->rd_index)) {
             continue;
         }
 
@@ -1346,6 +1396,7 @@ void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* es
                                              estate->es_query_cxt,
                                              indexRelation,
                                              indexpartitionid,
+                                             INVALID_PARTITION_NO,
                                              actualindex,
                                              indexpartition,
                                              RowExclusiveLock);
@@ -1384,7 +1435,7 @@ void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* es
          */
         FormIndexDatum(indexInfo, slot, estate, values, isnull);
 
-        index_delete(actualindex, values, isnull, tupleid);
+        index_delete(actualindex, values, isnull, tupleid, isRollbackIndex);
     }
 
     list_free_ext(partitionIndexOidList);
@@ -1401,7 +1452,8 @@ void ExecUHeapDeleteIndexTuplesGuts(
                               exec_index_tuples_state.estate, exec_index_tuples_state.targetPartRel,
                               exec_index_tuples_state.p,
                               modifiedIdxAttrs,
-                              inplaceUpdated);
+                              inplaceUpdated,
+                              exec_index_tuples_state.rollbackIndex);
     } else {
         UHeapTuple tmpUtup = ExecGetUHeapTupleFromSlot(oldslot); // materialize the tuple
         tmpUtup->table_oid = RelationGetRelid(rel);
@@ -1410,7 +1462,90 @@ void ExecUHeapDeleteIndexTuplesGuts(
                               exec_index_tuples_state.estate, exec_index_tuples_state.targetPartRel,
                               exec_index_tuples_state.p,
                               modifiedIdxAttrs,
-                              inplaceUpdated);
+                              inplaceUpdated,
+                              exec_index_tuples_state.rollbackIndex);
+    }
+}
+
+static Tuple autoinc_modify_tuple(TupleDesc desc, EState* estate, TupleTableSlot* slot, Tuple tuple, int128 autoinc)
+{
+    uint32 natts = (uint32)desc->natts;
+    AttrNumber attnum = desc->constr->cons_autoinc->attnum;
+    MemoryContext oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+    Datum* values = (Datum *)palloc(sizeof(Datum) * natts);
+    bool* nulls = (bool *)palloc(sizeof(bool) * natts);
+    bool* replaces = (bool *)palloc0(sizeof(bool) * natts);
+    errno_t rc = memset_s(replaces, sizeof(bool) * natts, 0, sizeof(bool) * natts);
+    securec_check(rc, "\0", "\0");
+
+    values[attnum - 1] = autoinc2datum(desc->constr->cons_autoinc, autoinc);
+    nulls[attnum - 1] = false;
+    replaces[attnum - 1] = true;
+    tuple = tableam_tops_modify_tuple(tuple, desc, values, nulls, replaces);
+
+    (void)ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+    (void)MemoryContextSwitchTo(oldContext);
+    return tuple;
+}
+
+Tuple ExecAutoIncrement(Relation rel, EState* estate, TupleTableSlot* slot, Tuple tuple)
+{
+    if (rel->rd_att->constr->cons_autoinc == NULL) {
+        return tuple;
+    }
+
+    ConstrAutoInc* cons_autoinc = rel->rd_att->constr->cons_autoinc;
+    int128 autoinc;
+    AttrNumber attnum = cons_autoinc->attnum;
+    bool is_null = false;
+    bool modify_tuple = false;
+    Datum datum = tableam_tops_tuple_getattr(tuple, attnum, rel->rd_att, &is_null);
+
+    if (is_null) {
+        autoinc = 0;
+        modify_tuple = rel->rd_att->attrs[attnum - 1].attnotnull;
+    } else {
+        autoinc = datum2autoinc(cons_autoinc, datum);
+        modify_tuple = (autoinc == 0);
+    }
+    /* When datum is NULL/0, auto increase */
+    if (autoinc == 0) {
+        if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP) {
+            autoinc = tmptable_autoinc_nextval(rel->rd_rel->relfilenode, cons_autoinc->next);
+        } else {
+            autoinc = nextval_internal(cons_autoinc->seqoid);
+        }
+        if (estate->first_autoinc == 0) {
+            estate->first_autoinc = autoinc;
+        }
+        if (modify_tuple) {
+            tuple = autoinc_modify_tuple(rel->rd_att, estate, slot, tuple, autoinc);
+        }
+    }
+    return tuple;
+}
+
+static void UpdateAutoIncrement(Relation rel, Tuple tuple, EState* estate)
+{
+    if (!RelHasAutoInc(rel)) {
+        return;
+    }
+
+    bool isnull = false;
+    ConstrAutoInc* cons_autoinc = rel->rd_att->constr->cons_autoinc;
+    Datum datum = tableam_tops_tuple_getattr(tuple, cons_autoinc->attnum, rel->rd_att, &isnull);
+
+    if (!isnull) {
+        int128 autoinc = datum2autoinc(cons_autoinc, datum);
+        if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP) {
+            tmptable_autoinc_setval(rel->rd_rel->relfilenode, cons_autoinc->next, autoinc, true);
+        } else {
+            autoinc_setval(cons_autoinc->seqoid, autoinc, true);
+        }
+    }
+
+    if (estate->first_autoinc != 0 && u_sess->cmd_cxt.last_insert_id != estate->first_autoinc) {
+        u_sess->cmd_cxt.last_insert_id = estate->first_autoinc;
     }
 }
 
@@ -1544,6 +1679,7 @@ bool ExecCheckIndexConstraints(TupleTableSlot *slot, EState *estate, Relation ta
      * constraint.
      */
     for (i = 0; i < numIndices; i++) {
+        actualHeap = targetRel;
         Relation indexRelation = relationDescs[i];
         IndexInfo* indexInfo = NULL;
         bool satisfiesConstraint = false;
@@ -1589,6 +1725,7 @@ bool ExecCheckIndexConstraints(TupleTableSlot *slot, EState *estate, Relation ta
                 estate->es_query_cxt,
                 indexRelation,
                 indexpartitionid,
+                INVALID_PARTITION_NO,
                 actualIndex,
                 indexpartition,
                 RowExclusiveLock);
@@ -1772,6 +1909,7 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
                 estate->es_query_cxt,
                 indexRelation,
                 indexpartitionid,
+                INVALID_PARTITION_NO,
                 actualindex,
                 indexpartition,
                 RowExclusiveLock);
@@ -1825,13 +1963,12 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
         if (!indexRelation->rd_index->indisunique) {
             checkUnique = UNIQUE_CHECK_NO;
         } else if (conflict != NULL) {
-            checkUnique = UNIQUE_CHECK_UPSERT;
+            checkUnique = UNIQUE_CHECK_PARTIAL;
         } else if (indexRelation->rd_index->indimmediate) {
             checkUnique = UNIQUE_CHECK_YES;
         } else {
             checkUnique = UNIQUE_CHECK_PARTIAL;
         }
-
         satisfiesConstraint = index_insert(actualindex, /* index relation */
             values,                                     /* array of index Datums */
             isnull,                                     /* null flags */
@@ -1857,7 +1994,7 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
                 actualheap, actualindex, indexInfo, tupleid, values, isnull, estate, false, errorOK);
         }
 
-        if ((IndexUniqueCheckNoError(checkUnique) || indexInfo->ii_ExclusionOps != NULL) && !satisfiesConstraint) {
+        if ((checkUnique == UNIQUE_CHECK_PARTIAL || indexInfo->ii_ExclusionOps != NULL) && !satisfiesConstraint) {
             /*
              * The tuple potentially violates the uniqueness or exclusion
              * constraint, so make a note of the index so that we can re-check
@@ -1869,6 +2006,10 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
                 *conflict = true;
             }
         }
+    }
+
+    if (result == NULL) {
+        UpdateAutoIncrement(heapRelation, slot->tts_tuple, estate);
     }
 
     list_free_ext(partitionIndexOidList);
@@ -1990,7 +2131,7 @@ bool check_violation(Relation heap, Relation index, IndexInfo *indexInfo, ItemPo
      * to this slot.  Be sure to save and restore caller's value for
      * scantuple.
      */
-    existing_slot = MakeSingleTupleTableSlot(RelationGetDescr(heap), false, heap->rd_tam_type);
+    existing_slot = MakeSingleTupleTableSlot(RelationGetDescr(heap), false, heap->rd_tam_ops);
     econtext = GetPerTupleExprContext(estate);
     save_scantuple = econtext->ecxt_scantuple;
     econtext->ecxt_scantuple = existing_slot;
@@ -2247,7 +2388,7 @@ void UnregisterExprContextCallback(ExprContext* econtext, ExprContextCallbackFun
  * If isCommit is false, just clean the callback list but don't call 'em.
  * (See comment for FreeExprContext.)
  */
-static void ShutdownExprContext(ExprContext* econtext, bool isCommit)
+void ShutdownExprContext(ExprContext* econtext, bool isCommit)
 {
     ExprContext_CB* ecxt_callback = NULL;
     MemoryContext oldcontext;
@@ -2428,5 +2569,305 @@ void PthreadRwLockInit(pthread_rwlock_t* rwlock, pthread_rwlockattr_t *attr)
     if (ret != 0) {
         ereport(ERROR,
             (errcode(ERRCODE_INITIALIZE_FAILED), errmsg("init rwlock failed")));
+    }
+}
+
+/*
+ * Get defaulted value of specific type
+ */
+Datum GetTypeZeroValue(Form_pg_attribute att_tup)
+{
+    Datum result;
+    switch (att_tup->atttypid) {
+        case TIMESTAMPOID: {
+            result = (Datum)DirectFunctionCall3(timestamp_in, CStringGetDatum("now"), ObjectIdGetDatum(InvalidOid),
+                                                Int32GetDatum(-1));
+            break;
+        }
+        case TIMESTAMPTZOID: {
+            result = clock_timestamp(NULL);
+            break;
+        }
+        case TIMETZOID: {
+            result = (Datum)DirectFunctionCall3(
+                timetz_in, CStringGetDatum("00:00:00"), ObjectIdGetDatum(0), Int32GetDatum(-1));
+            break;
+        }
+        case INTERVALOID: {
+            result = (Datum)DirectFunctionCall3(
+                interval_in, CStringGetDatum("00:00:00"), ObjectIdGetDatum(0), Int32GetDatum(-1));
+            break;
+        }
+        case TINTERVALOID: {
+            Datum epoch = (Datum)DirectFunctionCall1(timestamp_abstime, (TimestampGetDatum(SetEpochTimestamp())));
+            result = (Datum)DirectFunctionCall2(mktinterval, epoch, epoch);
+            break;
+        }
+        case SMALLDATETIMEOID: {
+            result = (Datum)DirectFunctionCall3(
+                smalldatetime_in, CStringGetDatum("1970-01-01 00:00:00"), ObjectIdGetDatum(0), Int32GetDatum(-1));
+            break;
+        }
+        case DATEOID: {
+            result = timestamp2date(SetEpochTimestamp());
+            break;
+        }
+        case UUIDOID: {
+            result = (Datum)DirectFunctionCall3(uuid_in, CStringGetDatum("00000000-0000-0000-0000-000000000000"),
+                                                ObjectIdGetDatum(0), Int32GetDatum(-1));
+            break;
+        }
+        case NAMEOID: {
+            result = (Datum)DirectFunctionCall1(namein, CStringGetDatum(""));
+            break;
+        }
+        case POINTOID: {
+            result = (Datum)DirectFunctionCall1(point_in, CStringGetDatum("(0,0)"));
+            break;
+        }
+        case PATHOID: {
+            result = (Datum)DirectFunctionCall1(path_in, CStringGetDatum("0,0"));
+            break;
+        }
+        case POLYGONOID: {
+            result = (Datum)DirectFunctionCall1(poly_in, CStringGetDatum("(0,0)"));
+            break;
+        }
+        case CIRCLEOID: {
+            result = (Datum)DirectFunctionCall1(circle_in, CStringGetDatum("0,0,0"));
+            break;
+        }
+        case LSEGOID:
+        case BOXOID: {
+            result = (Datum)DirectFunctionCall1(box_in, CStringGetDatum("0,0,0,0"));
+            break;
+        }
+        case JSONOID: {
+            result = (Datum)DirectFunctionCall1(json_in, CStringGetDatum("null"));
+            break;
+        }
+        case JSONBOID: {
+            result = (Datum)DirectFunctionCall1(jsonb_in, CStringGetDatum("null"));
+            break;
+        }
+        case XMLOID: {
+            result = (Datum)DirectFunctionCall1(xml_in, CStringGetDatum("null"));
+            break;
+        }
+        case BITOID: {
+            result = (Datum)DirectFunctionCall3(bit_in, CStringGetDatum(""), ObjectIdGetDatum(0), Int32GetDatum(-1));
+            break;
+        }
+        case VARBITOID: {
+            result = (Datum)DirectFunctionCall3(varbit_in, CStringGetDatum(""), ObjectIdGetDatum(0), Int32GetDatum(-1));
+            break;
+        }
+        case NUMERICOID: {
+            result =
+                (Datum)DirectFunctionCall3(numeric_in, CStringGetDatum("0"), ObjectIdGetDatum(0), Int32GetDatum(0));
+            break;
+        }
+        case CIDROID: {
+            result = DirectFunctionCall1(cidr_in, CStringGetDatum("0.0.0.0"));
+            break;
+        }
+        case INETOID: {
+            result = DirectFunctionCall1(inet_in, CStringGetDatum("0.0.0.0"));
+            break;
+        }
+        case MACADDROID: {
+            result = (Datum)DirectFunctionCall1(macaddr_in, CStringGetDatum("00:00:00:00:00:00"));
+            break;
+        }
+        case NUMRANGEOID:
+        case INT8RANGEOID:
+        case INT4RANGEOID: {
+            Type targetType = typeidType(att_tup->atttypid);
+            result = stringTypeDatum(targetType, "(0,0)", att_tup->atttypmod, true);
+            ReleaseSysCache(targetType);
+            break;
+        }
+        case TSRANGEOID:
+        case TSTZRANGEOID: {
+            Type targetType = typeidType(att_tup->atttypid);
+            result = stringTypeDatum(targetType, "(1970-01-01 00:00:00,1970-01-01 00:00:00)", att_tup->atttypmod, true);
+            ReleaseSysCache(targetType);
+            break;
+        }
+        case DATERANGEOID: {
+            Type targetType = typeidType(att_tup->atttypid);
+            result = stringTypeDatum(targetType, "(1970-01-01,1970-01-01)", att_tup->atttypmod, true);
+            ReleaseSysCache(targetType);
+            break;
+        }
+        case HASH16OID: {
+            Type targetType = typeidType(att_tup->atttypid);
+            result = stringTypeDatum(targetType, "0", att_tup->atttypmod, true);
+            ReleaseSysCache(targetType);
+            break;
+        }
+        case HASH32OID: {
+            Type targetType = typeidType(att_tup->atttypid);
+            result = stringTypeDatum(targetType, "00000000000000000000000000000000", att_tup->atttypmod, true);
+            ReleaseSysCache(targetType);
+            break;
+        }
+        case TSVECTOROID: {
+            Type targetType = typeidType(att_tup->atttypid);
+            result = stringTypeDatum(targetType, "", att_tup->atttypmod, true);
+            ReleaseSysCache(targetType);
+            break;
+        }
+        default: {
+            bool typeIsVarlena = (!att_tup->attbyval) && (att_tup->attlen == -1);
+            if (typeIsVarlena) {
+                result = CStringGetTextDatum("");
+            } else {
+                result = (Datum)0;
+            }
+            break;
+        }
+    }
+    return result;
+}
+
+/*
+ * Replace tuple from the slot with a new one. The new tuple will replace null column with defaulted values according to
+ * its type.
+ */
+Tuple ReplaceTupleNullCol(TupleDesc tupleDesc, TupleTableSlot *slot)
+{
+    /* find out all null column first */
+    int natts = tupleDesc->natts;
+    Datum values[natts];
+    bool replaces[natts];
+    bool nulls[natts];
+    errno_t rc;
+
+    rc = memset_s(values, sizeof(values), 0, sizeof(values));
+    securec_check(rc, "\0", "\0");
+    rc = memset_s(nulls, sizeof(nulls), false, sizeof(nulls));
+    securec_check(rc, "\0", "\0");
+    rc = memset_s(replaces, sizeof(replaces), false, sizeof(replaces));
+    securec_check(rc, "\0", "\0");
+
+    int attrChk;
+    for (attrChk = 1; attrChk <= natts; attrChk++) {
+        if (tupleDesc->attrs[attrChk - 1].attnotnull && tableam_tslot_attisnull(slot, attrChk)) {
+            values[attrChk - 1] = GetTypeZeroValue(&tupleDesc->attrs[attrChk - 1]);
+            replaces[attrChk - 1] = true;
+        }
+    }
+    Tuple oldTup = slot->tts_tuple;
+    Tuple newTup = tableam_tops_modify_tuple(oldTup, tupleDesc, values, nulls, replaces);
+    
+    /* revise members of slot */
+    slot->tts_tuple = newTup;
+    for (attrChk = 1; attrChk <= natts; attrChk++) {
+        if (!replaces[attrChk - 1]) {
+            continue;
+        }
+        slot->tts_isnull[attrChk - 1] = false;
+        slot->tts_values[attrChk - 1] = values[attrChk - 1];
+    }
+    
+    tableam_tops_free_tuple(oldTup);
+    return newTup;
+}
+
+
+void InitOutputValues(RightRefState* refState, GenericExprState* targetArr[],
+                      Datum* values, bool* isnull, int targetCount, bool* hasExecs)
+{
+    if (!IS_ENABLE_RIGHT_REF(refState)) {
+        return;
+    }
+
+    refState->values = values;
+    refState->isNulls = isnull;
+    refState->hasExecs = hasExecs;
+    int colCnt = refState->colCnt;
+    for (int i = 0; i < colCnt; ++i) {
+        hasExecs[i] = false;
+    }
+
+    if (IS_ENABLE_INSERT_RIGHT_REF(refState)) {
+        for (int i = 0; i < targetCount; ++i) {
+            Const* con = refState->constValues[i];
+            if (con) {
+                values[i] = con->constvalue;
+                isnull[i] = con->constisnull;
+            } else {
+                values[i] = (Datum)0;
+                isnull[i] = true;
+            }
+        }
+    }
+}
+
+void SortTargetListAsArray(RightRefState* refState, List* targetList, GenericExprState* targetArr[])
+{
+    ListCell* lc = NULL;
+    if (IS_ENABLE_INSERT_RIGHT_REF(refState)) {
+        const int len = list_length(targetList);
+        GenericExprState* tempArr[len];
+        int tempIndex = 0;
+        foreach(lc, targetList) {
+            tempArr[tempIndex++] = (GenericExprState*)lfirst(lc);
+        }
+
+        for (int i = 0; i < refState->explicitAttrLen; ++i) {
+            int explIndex = refState->explicitAttrNos[i] - 1;
+            targetArr[i] = tempArr[explIndex];
+            tempArr[explIndex] = nullptr;
+        }
+
+        int defaultNodeOffset = refState->explicitAttrLen;
+        for (int i = 0; i < len; ++i) {
+            if (tempArr[i]) {
+                targetArr[defaultNodeOffset++] = tempArr[i];
+            }
+        }
+
+        if (defaultNodeOffset != len) {
+            /* this should never happen, the system must come in mess */
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_STATUS),
+                 errmsg("the number of elements put up does not match the length of targetlist, array:%d, list:%d",
+                        defaultNodeOffset, len)));
+        }
+    } else if (IS_ENABLE_UPSERT_RIGHT_REF(refState)) {
+        const int len = list_length(targetList);
+        GenericExprState* tempArr[len];
+        int tempIndex = 0;
+        foreach(lc, targetList) {
+            tempArr[tempIndex++] = (GenericExprState*)lfirst(lc);
+        }
+
+        for (int i = 0; i < refState->usExplicitAttrLen; ++i) {
+            int explIndex = refState->usExplicitAttrNos[i] - 1;
+            targetArr[i] = tempArr[explIndex];
+            tempArr[explIndex] = nullptr;
+        }
+
+        int defaultNodeOffset = refState->usExplicitAttrLen;
+        for (int i = 0; i < len; ++i) {
+            if (tempArr[i]) {
+                targetArr[defaultNodeOffset++] = tempArr[i];
+            }
+        }
+
+        if (defaultNodeOffset != len) {
+            /* this should never happen, the system must come in mess */
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_STATUS),
+                 errmsg("the number of elements put up does not match the length of targetlist, array:%d, list:%d",
+                        defaultNodeOffset, len)));
+        }
+    } else {
+        int index = 0;
+        foreach(lc, targetList) {
+            targetArr[index++] = (GenericExprState*)lfirst(lc);
+        }
     }
 }

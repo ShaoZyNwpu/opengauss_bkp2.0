@@ -298,7 +298,9 @@ static bool TrFetchOrinameImpl(Oid nspId, const char *oriname, TrObjType type,
         F_NAMEEQ, CStringGetDatum(oriname));
 
     sd = systable_beginscan(rbRel, RecyclebinDbidNspOrinameIndexId, true, NULL, 3, skey);
-    while ((tup = systable_getnext(sd)) != NULL) {
+    /* restore drop/truncate use the latest version, purge use the oldest version */
+    ScanDirection scan_direct = (operMode == RB_OPER_PURGE) ? ForwardScanDirection : BackwardScanDirection;
+    while ((tup = (HeapTuple)index_getnext(sd->iscan, scan_direct)) != NULL) {
         Form_pg_recyclebin rbForm = (Form_pg_recyclebin)GETSTRUCT(tup);
         if ((rbForm->rcytype != type && rbForm->rcytype == RB_OBJ_TABLE) ||
             (rbForm->rcytype != type && rbForm->rcytype == RB_OBJ_INDEX) ||
@@ -344,7 +346,6 @@ bool TrFetchName(const char *rcyname, TrObjType type, TrObjDesc *desc, TrOperMod
             ereport(ERROR,
                 (errmsg("recycle object \"%s\" desired does not exist", rcyname)));
         }
-        
         found = true;
         TrDescRead(desc, tup);
     }
@@ -731,7 +732,7 @@ bool NeedTrComm(Oid relid)
         /* table is non ordinary table, or */
         classForm->relkind != RELKIND_RELATION ||
         /* is non heap table, or */
-        rel->rd_tam_type == TAM_HEAP ||
+        rel->rd_tam_ops == TableAmHeap ||
         /* is non regular table, or */
         classForm->relpersistence != RELPERSISTENCE_PERMANENT ||
         /* is shared table across databases, or */
@@ -984,6 +985,7 @@ static bool TrPurgeBatch(TrFetchBeginHook beginHook, TrFetchMatchHook matchHook,
             } else {
                 PG_RE_THROW();
             }
+            FlushErrorState();
         }
         PG_END_TRY();
 
@@ -1829,12 +1831,12 @@ bool TrIsRefRbObjectEx(Oid classid, Oid objid, const char *objname)
         return false;
     }
 
-    /* Note: we preserve rule origin name when RbDrop. */
-    if (TrRbIsEmptyDb(u_sess->proc_cxt.MyDatabaseId)) {
+    if (classid != RewriteRelationId && objname && strncmp(objname, "BIN$", 4) != 0) {
         return false;
     }
 
-    if (classid != RewriteRelationId && objname && strncmp(objname, "BIN$", 4) != 0) {
+    /* Note: we preserve rule origin name when RbDrop. */
+    if (TrRbIsEmptyDb(u_sess->proc_cxt.MyDatabaseId)) {
         return false;
     }
 
@@ -1873,7 +1875,7 @@ void TrForbidAccessRbObject(Oid classid, Oid objid, const char *objname)
         return;
     }
 
-    if (TrRbIsEmptyDb(u_sess->proc_cxt.MyDatabaseId) || !TrMaybeRbObject(classid, objid, objname)) {
+    if (!TrMaybeRbObject(classid, objid, objname) || TrRbIsEmptyDb(u_sess->proc_cxt.MyDatabaseId)) {
         return;
     }
 
@@ -1889,6 +1891,16 @@ Datum gs_is_recycle_object(PG_FUNCTION_ARGS)
 {
     int classid = PG_GETARG_INT32(0);
     int objid = PG_GETARG_INT32(1);
+    Name objname = PG_GETARG_NAME(2);
+    bool result = false;
+    result = TrIsRefRbObjectEx(classid, objid, NameStr(*objname));
+    PG_RETURN_BOOL(result);
+}
+
+Datum gs_is_recycle_obj(PG_FUNCTION_ARGS)
+{
+    Oid classid = PG_GETARG_OID(0);
+    Oid objid = PG_GETARG_OID(1);
     Name objname = PG_GETARG_NAME(2);
     bool result = false;
     result = TrIsRefRbObjectEx(classid, objid, NameStr(*objname));

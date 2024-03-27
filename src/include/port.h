@@ -48,6 +48,7 @@ extern void make_native_path(char* path);
 extern bool path_contains_parent_reference(const char* path);
 extern bool path_is_relative_and_below_cwd(const char* path);
 extern bool path_is_prefix_of_path(const char* path1, const char* path2);
+extern void get_top_path(char *path);
 extern const char* get_progname(const char* argv0);
 extern void get_share_path(const char* my_exec_path, char* ret_path);
 extern void get_etc_path(const char* my_exec_path, char* ret_path, size_t ret_path_len);
@@ -303,8 +304,9 @@ extern off_t ftello(FILE* stream);
 #endif
 
 extern double pg_erand48(unsigned short xseed[3]);
-extern long pg_lrand48(void);
-extern void pg_srand48(long seed);
+extern long pg_lrand48(unsigned short rand48_seed[3] = NULL);
+extern void pg_srand48(long seed, unsigned short rand48_seed[3] = NULL);
+extern void pg_srand48_default(unsigned short rand48_seed[3]);
 extern long free_list_lrand48(void);
 extern void free_list_srand48(long seed);
 extern void pg_reset_srand48(unsigned short xseed[3]);
@@ -376,7 +378,7 @@ extern int pqGethostbyname(
     const char* name, struct hostent* resultbuf, char* buffer, size_t buflen, struct hostent** result, int* herrno);
 
 extern void pg_qsort(void* base, size_t nel, size_t elsize, int (*cmp)(const void*, const void*));
-
+extern int pg_qsort_strcmp(const void *a, const void *b);
 #define qsort(a, b, c, d) pg_qsort(a, b, c, d)
 
 typedef int (*qsort_arg_comparator)(const void* a, const void* b, void* arg);
@@ -427,6 +429,7 @@ extern struct dirent* gs_readdir(DIR* dir);
 
 /*env thread safe version*/
 extern int gs_putenv_r(char* envvar);
+extern int gs_setenv_r(const char* name, const char* envvar, int overwrite);
 extern char* gs_getenv_r(const char* name);
 
 #endif /* PG_PORT_H */

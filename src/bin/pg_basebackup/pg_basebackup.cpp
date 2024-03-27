@@ -31,13 +31,17 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
 
+#include "tool_common.h"
 #include "getopt_long.h"
 #include "receivelog.h"
 #include "streamutil.h"
 #include "gs_tar_const.h"
 #include "bin/elog.h"
 #include "lib/string.h"
+#include "PageCompression.h"
+
 
 #ifdef ENABLE_MOT
 #include "fetchmot.h"
@@ -54,7 +58,13 @@ typedef struct TablespaceList {
     TablespaceListCell* tail;
 } TablespaceList;
 
-
+typedef struct {
+    PGconn *bgconn;
+    XLogRecPtr startptr;
+    char xlogdir[MAXPGPATH];
+    char *sysidentifier;
+    int timeline;
+} logstreamer_param;
 
 /* Global options */
 char* basedir = NULL;
@@ -67,12 +77,14 @@ int compresslevel = 0;
 bool includewal = true;
 bool streamwal = true;
 bool fastcheckpoint = false;
+logstreamer_param *g_childParam = NULL;
 
 extern char **tblspaceDirectory;
 extern int tblspaceCount;
 extern int tblspaceIndex;
 
 extern int standby_message_timeout; /* 10 sec = default */
+
 
 /* Progress counters */
 static uint64 totalsize;
@@ -139,6 +151,17 @@ static void TablespaceValueCheck(TablespaceListCell* cell, const char* arg)
         fprintf(stderr, _("%s: new directory is not an absolute path in tablespace mapping: %s\n"), progname,
                 cell->new_dir);
         exit(1);
+    }
+}
+
+static void isPortNumber(const char *portarg)
+{
+    int len = strlen(portarg);
+    for (int i = 0; i < len; i++) {
+        if (!(portarg[i] >= '0' && portarg[i] <= '9')) {
+            fprintf(stderr, _("invalid port number \"%s\"\n"), portarg);
+            exit(1);
+        }
     }
 }
 
@@ -257,6 +280,8 @@ static void GsTarUsage(void)
     printf(_("\nOptions controlling the output:\n"));
     printf(_("  -D, --destination=DIRECTORY   untar files into directory\n"));
     printf(_("  -F, --filename=FILENAME       filename to be untar\n"));
+    printf(_("  -V, --version                 output version information, then exit\n"));
+    printf(_("  -?, --help                    show this help, then exit\n"));
 }
 
 static void tablespace_list_create()
@@ -365,29 +390,26 @@ static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline, bool seg
     return false;
 }
 
-typedef struct {
-    PGconn *bgconn;
-    XLogRecPtr startptr;
-    char xlogdir[MAXPGPATH];
-    char *sysidentifier;
-    int timeline;
-} logstreamer_param;
-
 static int LogStreamerMain(logstreamer_param *param)
 {
+    int ret = 0;
+
+    /* get second connection info in child process for the sake of memmory leak */
+    param->bgconn = GetConnection();
     if (!ReceiveXlogStream(param->bgconn, param->startptr, param->timeline, (const char *)param->sysidentifier,
-        (const char *)param->xlogdir, reached_end_position, standby_message_timeout_local, true))
+        (const char *)param->xlogdir, reached_end_position, standby_message_timeout_local, true)) {
 
         /*
          * Any errors will already have been reported in the function process,
          * but we need to tell the parent that we didn't shutdown in a nice
          * way.
          */
-        return 1;
+        ret = 1;
+    }
 
     PQfinish(param->bgconn);
     param->bgconn = NULL;
-    return 0;
+    return ret;
 }
 
 /*
@@ -397,44 +419,30 @@ static int LogStreamerMain(logstreamer_param *param)
  */
 static void StartLogStreamer(const char *startpos, uint32 timeline, char *sysidentifier)
 {
-    logstreamer_param *param = NULL;
     uint32 hi, lo;
     uint32 pathlen = 0;
     errno_t errorno = EOK;
 
-    param = (logstreamer_param *)xmalloc0(sizeof(logstreamer_param));
-    param->timeline = timeline;
-    param->sysidentifier = sysidentifier;
-
     /* Convert the starting position */
     if (sscanf_s(startpos, "%X/%X", &hi, &lo) != 2) {
         pg_log(stderr, _("%s: could not parse transaction log location \"%s\"\n"), progname, startpos);
-        PQfreemem(param);
-        param = NULL;
         disconnect_and_exit(1);
     }
-    param->startptr = ((uint64)hi) << 32 | lo;
-    /* Round off to even segment position */
-    param->startptr -= param->startptr % XLOG_SEG_SIZE;
 
 #ifndef WIN32
     /* Create our background pipe */
     if (pipe(bgpipe) < 0) {
         pg_log(stderr, _("%s: could not create pipe for background process: %s\n"), progname, strerror(errno));
-        PQfreemem(param);
-        param = NULL;
         disconnect_and_exit(1);
     }
 #endif
 
-    /* Get a second connection */
-    param->bgconn = GetConnection();
-    if (NULL == param->bgconn) {
-        /* Error message already written in GetConnection() */
-        PQfreemem(param);
-        param = NULL;
-        exit(1);
-    }
+    g_childParam = (logstreamer_param *)xmalloc0(sizeof(logstreamer_param));
+    g_childParam->timeline = timeline;
+    g_childParam->sysidentifier = sysidentifier;
+    g_childParam->startptr = ((uint64)hi) << 32 | lo;
+    /* Round off to even segment position */
+    g_childParam->startptr -= g_childParam->startptr % XLOG_SEG_SIZE;
 
     /*
      * Always in plain format, so we can write to basedir/pg_xlog. But the
@@ -442,10 +450,10 @@ static void StartLogStreamer(const char *startpos, uint32 timeline, char *syside
      * created before we start.
      */
     pathlen = strlen("pg_xlog") + 1 + strlen(basedir) + 1;
-    errorno = snprintf_s(param->xlogdir, sizeof(param->xlogdir), pathlen, "%s/pg_xlog", basedir);
+    errorno = snprintf_s(g_childParam->xlogdir, sizeof(g_childParam->xlogdir), pathlen, "%s/pg_xlog", basedir);
     securec_check_ss_c(errorno, "", "");
 
-    verify_dir_is_empty_or_create(param->xlogdir);
+    verify_dir_is_empty_or_create(g_childParam->xlogdir);
 
     /*
      * Start a child process and tell it to start streaming. On Unix, this is
@@ -454,12 +462,16 @@ static void StartLogStreamer(const char *startpos, uint32 timeline, char *syside
 #ifndef WIN32
     bgchild = fork();
     if (bgchild == 0) {
-        /* in child process */
-        exit(LogStreamerMain(param));
+        /*
+         * In child process.
+         * Receive SIGKILL when main process exits.
+         */
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        exit(LogStreamerMain(g_childParam));
     } else if (bgchild < 0) {
         fprintf(stderr, _("%s: could not create background process: %s\n"), progname, strerror(errno));
-        PQfreemem(param);
-        param = NULL;
+        PQfreemem(g_childParam);
+        g_childParam = NULL;
         disconnect_and_exit(1);
     }
 
@@ -628,11 +640,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                     duplicatedfd = -1;
                     disconnect_and_exit(1);
                 }
-                close(duplicatedfd);
-                duplicatedfd = -1;
             } else
 #endif
                 tarfile = stdout;
+
             errorno = strcpy_s(filename, MAXPGPATH, "-");
             securec_check_c(errorno, "\0", "\0");
         } else {
@@ -684,6 +695,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
             /* Compression is in use */
             pg_log(stderr, _("%s: could not create compressed file \"%s\": %s\n"), progname, filename,
                 get_gz_error(ztarfile));
+            if(duplicatedfd != -1) {
+                close(duplicatedfd);
+                duplicatedfd = -1;
+            }
             disconnect_and_exit(1);
         }
     } else
@@ -726,6 +741,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                         progname,
                         filename,
                         get_gz_error(ztarfile));
+                    if (duplicatedfd != -1) {
+                        close(duplicatedfd);
+                        duplicatedfd = -1;
+                    }
                     disconnect_and_exit(1);
                 }
             } else
@@ -756,6 +775,10 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
                     progname,
                     filename,
                     get_gz_error(ztarfile));
+                if (duplicatedfd != -1) {
+                    close(duplicatedfd);
+                    duplicatedfd = -1;
+                }
                 disconnect_and_exit(1);
             }
         } else
@@ -771,6 +794,12 @@ static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
             progress_report(rownum, filename);
     } /* while (1) */
 
+#ifdef HAVE_LIBZ
+    if (duplicatedfd != -1) {
+        close(duplicatedfd);
+        duplicatedfd = -1;
+    }
+#endif
     if (copybuf != NULL) {
         PQfreemem(copybuf);
         copybuf = NULL;
@@ -903,6 +932,8 @@ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
              * End of chunk
              */
             if (file != NULL) {
+                /* punch hole before closing file */
+                PunchHoleForCompressedFile(file, filename);
                 fclose(file);
                 file = NULL;
             }
@@ -1047,7 +1078,7 @@ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
             /*
              * regular file
              */
-            file = fopen(filename, "wb");
+            file = fopen(filename, IsCompressedFile(filename, strlen(filename)) ? "wb+" : "wb");
             if (NULL == file) {
                 pg_log(stderr, _("%s: could not create file \"%s\": %s\n"), progname, filename, strerror(errno));
                 disconnect_and_exit(1);
@@ -1099,6 +1130,9 @@ static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
                  * expected. Close the file and move on to the next tar
                  * header.
                  */
+
+                /* punch hole before closing file */
+                PunchHoleForCompressedFile(file, filename);
                 fclose(file);
                 file = NULL;
                 continue;
@@ -1140,8 +1174,6 @@ static void BaseBackup(void)
     if (NULL == conn)
         /* Error message already written in GetConnection() */
         exit(1);
-
-    ClearAndFreePasswd();
 
     /*
      * Run IDENTIFY_SYSTEM so we can get the timeline
@@ -1322,6 +1354,7 @@ static void BaseBackup(void)
         StartLogStreamer((const char *)xlogstart, timeline, sysidentifier);
     }
 
+    ClearAndFreePasswd();
     /* free sysidentifier after use */
     PQfreemem(sysidentifier);
     sysidentifier = NULL;
@@ -1470,6 +1503,10 @@ static void BaseBackup(void)
 
     PQfinish(conn);
     conn = NULL;
+    if (g_childParam != NULL) {
+        PQfreemem(g_childParam);
+        g_childParam = NULL;
+    }
 
     if (format == 'p') {
         /* delete dw file if exists, recreate it and write a page of zero */
@@ -1511,13 +1548,13 @@ static void backup_dw_file(const char *target_dir)
     char *unaligned_buf = NULL;
 
     /* Delete the dw file, if it exists. */
-    remove_dw_file(OLD_DW_FILE_NAME, target_dir, real_file_path);
+    remove_dw_file(T_OLD_DW_FILE_NAME, target_dir, real_file_path);
 
     rc = memset_s(real_file_path, (PATH_MAX + 1), 0, (PATH_MAX + 1));
     securec_check_c(rc, "\0", "\0");
 
     /* Delete the dw build file, if it exists. */
-    remove_dw_file(DW_BUILD_FILE_NAME, target_dir, real_file_path);
+    remove_dw_file(T_DW_BUILD_FILE_NAME, target_dir, real_file_path);
 
     /* Create the dw build file. */
     if ((fd = open(real_file_path, (DW_FILE_FLAG | O_CREAT), DW_FILE_PERM)) < 0) {
@@ -1557,6 +1594,7 @@ int main(int argc, char **argv)
         return GsTar(argc, argv);
     } else {
         fprintf(stderr, _("unsupported progname: %s"), progname);
+        GS_FREE(progname);
         return 0;
     }
 }
@@ -1567,7 +1605,7 @@ static void GsTarHelp(int argc, char** argv) {
             GsTarUsage();
             exit(0);
         } else if (strcmp(argv[1], "-V") == 0 || strcmp(argv[1], "--version") == 0) {
-            puts("gs_basebackup " DEF_GS_VERSION);
+            puts("gs_tar " DEF_GS_VERSION);
             exit(0);
         }
     }
@@ -1612,7 +1650,8 @@ static int GsTar(int argc, char** argv)
     int c;
     int option_index;
     char* tarfilename = NULL;
-
+    GS_FREE(progname);
+    progname = "gs_tar";
     GsTarHelp(argc, argv);
 
     while ((c = getopt_long(argc, argv, "D:F:", long_options, &option_index)) != -1) {
@@ -1679,6 +1718,8 @@ static int GsTar(int argc, char** argv)
              * End of chunk
              */
             if (file != NULL) {
+                /* punch hole before closing file */
+                PunchHoleForCompressedFile(file, filename);
                 CLOSE_AND_SET_NULL(file);
             }
             break;
@@ -1857,6 +1898,9 @@ static int GsTar(int argc, char** argv)
                  * expected. Close the file and move on to the next tar
                  * header.
                  */
+
+                /* punch hole before closing file */
+                PunchHoleForCompressedFile(file, filename);
                 CLOSE_AND_SET_NULL(file);
                 continue;
             }
@@ -1898,6 +1942,7 @@ static int GsBaseBackup(int argc, char** argv)
                                            {"progress", no_argument, NULL, 'P'},
                                            {NULL, 0, NULL, 0}};
     int c = 0, option_index = 0;
+    GS_FREE(progname);
     progname = "gs_basebackup";
     set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("gs_basebackup"));
 
@@ -1911,17 +1956,62 @@ static int GsBaseBackup(int argc, char** argv)
         }
     }
 
+    char optstring[] = "D:l:c:h:p:U:s:X:F:T:Z:t:wWvPxz";
+    /* check if a required_argument option has a void argument */
+    int i;
+    for (i = 0; i < argc; i++) {
+        char *optstr = argv[i];
+        int is_only_shortbar;
+        if (strlen(optstr) == 1) {
+            is_only_shortbar = optstr[0] == '-' ? 1 : 0;
+        } else {
+            is_only_shortbar = 0;
+        }
+        if (is_only_shortbar) {
+            fprintf(stderr, _("%s: The option '-' is not a valid option.\n"), progname);
+            exit(1);
+        }
+
+        char *oli = strchr(optstring, optstr[1]);
+        int is_shortopt_with_space;
+        if (oli != NULL && strlen(optstr) >= 1 && strlen(oli) >= 2) {
+            is_shortopt_with_space =
+                optstr[0] == '-' && oli != NULL && oli[1] == ':' && oli[2] != ':' && optstr[2] == '\0';
+        } else {
+            is_shortopt_with_space = 0;
+        }
+        if (is_shortopt_with_space) {
+            if (i == argc - 1) {
+                fprintf(stderr, _("%s: The option '-%c' need a parameter.\n"), progname, optstr[1]);
+                exit(1);
+            }
+
+            char *next_optstr = argv[i + 1];
+            char *next_oli = strchr(optstring, next_optstr[1]);
+            int is_arg_optionform = next_optstr[0] == '-' && next_oli != NULL;
+            if (is_arg_optionform) {
+                fprintf(stderr, _("%s: The option '-%c' need a parameter.\n"), progname, optstr[1]);
+                exit(1);
+            }
+        }
+    }
+
     while ((c = getopt_long(argc, argv, "D:l:c:h:p:U:s:X:F:T:Z:t:wWvPxz", long_options, &option_index)) != -1) {
         switch (c) {
             case 'D': {
                 GS_FREE(basedir);
                 check_env_value_c(optarg);
                 char realDir[PATH_MAX] = {0};
-                if (realpath(optarg, realDir) == nullptr) {
+                bool argIsMinus = (strcmp(optarg, "-") == 0);
+                if (!argIsMinus && realpath(optarg, realDir) == nullptr) {
                     pg_log(stderr, _("%s: realpath dir \"%s\" failed: %m\n"), progname, optarg);
                     exit(1);
                 }
-                basedir = xstrdup(realDir);
+                if (argIsMinus) {
+                    basedir = xstrdup(optarg);
+                } else {
+                    basedir = xstrdup(realDir);
+                }
                 break;
             }
             case 'F':
@@ -2005,6 +2095,7 @@ static int GsBaseBackup(int argc, char** argv)
             case 'p':
                 GS_FREE(dbport);
                 check_env_value_c(optarg);
+                isPortNumber(optarg);
                 dbport = inc_dbport(optarg);
                 break;
             case 'U':
@@ -2048,7 +2139,7 @@ static int GsBaseBackup(int argc, char** argv)
                 break;
         }
     }
-    
+
     /* If port is not specified by using -p, obtain the port through environment variables */
     if (dbport == NULL) {
         char *value = NULL;
@@ -2059,6 +2150,7 @@ static int GsBaseBackup(int argc, char** argv)
         } else {
             fprintf(stderr, _("%s:The specified port is missing, it can be specified by -p parameter "
                    "or import environment variables PGPORT.\n"), progname);
+            fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
             exit(1); 
         }
     }

@@ -467,8 +467,6 @@ bool do_copy(const char* args)
 {
     PQExpBufferData query;
     FILE* copystream = NULL;
-    FILE* save_file = NULL;
-    FILE** override_file = NULL;
     struct copy_options* options = NULL;
     bool success = true;
     struct stat st;
@@ -484,8 +482,6 @@ bool do_copy(const char* args)
         canonicalize_path(options->file);
 
     if (options->from) {
-        override_file = &pset.cur_cmd_source;
-
         if (NULL != options->file)
             copystream = fopen(options->file, PG_BINARY_R);
         else if (!options->psql_inout)
@@ -493,8 +489,6 @@ bool do_copy(const char* args)
         else
             copystream = stdin;
     } else {
-        override_file = &pset.queryFout;
-
         if (options->file != NULL) {
             canonicalize_path(options->file);
             copystream = fopen(options->file, PG_BINARY_W);
@@ -534,15 +528,13 @@ bool do_copy(const char* args)
         appendPQExpBufferStr(&query, options->after_tofrom);
 
     /* Run it like a user command, interposing the data source or sink. */
-    save_file = *override_file;
-    *override_file = copystream;
+    pset.copyStream = copystream;
     if (IsParallelCopyFrom(options)) {
         success = MakeCopyWorker(query.data, options->parallel);
     } else {
         success = SendQuery(query.data);
     }
-    
-    *override_file = save_file;
+    pset.copyStream = NULL;
     termPQExpBuffer(&query);
 
     if (options->file != NULL) {
@@ -787,11 +779,19 @@ bool handleCopyIn(PGconn* conn, FILE* copystream, bool isbinary)
                         copydone = true;
                         break;
                     }
+
+                    free(pset.decryptInfo.decryptBuff);
+                    pset.decryptInfo.decryptBuff = NULL;
                 }
             }
             if (copystream == pset.cur_cmd_source)
                 pset.lineno++;
         }
+    }
+
+    if (pset.decryptInfo.decryptBuff != NULL) {
+        free(pset.decryptInfo.decryptBuff);
+        pset.decryptInfo.decryptBuff = NULL;
     }
 
     /* Check for read error */
@@ -832,7 +832,7 @@ copyin_cleanup:
 bool ParallelCopyIn(const CopyInArgs* copyarg, const char** errMsg)
 {
     PGconn* conn = copyarg->conn;
-    FILE* copystream = pset.cur_cmd_source;
+    FILE* copystream = pset.copyStream ? pset.copyStream : pset.cur_cmd_source;
     bool OK = true;
     char buf[COPYBUFSIZ];
     PGresult* res = NULL;
@@ -896,7 +896,8 @@ bool ParallelCopyIn(const CopyInArgs* copyarg, const char** errMsg)
             }
         }
 
-        pset.lineno++;
+        if (copystream == pset.cur_cmd_source)
+            pset.lineno++;
     }
 
     /* Check for read error */

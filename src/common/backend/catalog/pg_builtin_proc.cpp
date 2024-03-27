@@ -38,6 +38,10 @@
 static_assert(sizeof(true) == sizeof(char), "illegal bool size");
 static_assert(sizeof(false) == sizeof(char), "illegal bool size");
 
+#define CUR_THR_IS_WORKER() (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER ||\
+    t_thrd.role == STREAM_WORKER || t_thrd.role == THREADPOOL_STREAM || t_thrd.role == WAL_DB_SENDER||\
+    t_thrd.role == PARALLEL_DECODE || t_thrd.role == JOB_WORKER)
+
 #ifdef ENABLE_MULTIPLE_NODES
     FuncGroup g_func_groups[] = {
         #include "builtin_funcs.ini"
@@ -52,7 +56,11 @@ static_assert(sizeof(false) == sizeof(char), "illegal bool size");
 static struct HTAB* nameHash = NULL;
 static struct HTAB* oidHash = NULL;
 
-/* for b_sql_plugin */
+/* for whale */
+struct HTAB* a_nameHash = NULL;
+struct HTAB* a_oidHash = NULL;
+
+/* for dolphin */
 struct HTAB* b_nameHash = NULL;
 struct HTAB* b_oidHash = NULL;
 
@@ -108,6 +116,34 @@ static void InitHashTable(int size)
                                 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 }
 
+static HTAB* get_name_hash_table_type() 
+{
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+    if (CUR_THR_IS_WORKER() && IsNormalProcessingMode()) {
+        if (a_nameHash != NULL && DB_IS_CMPT(A_FORMAT)) {
+            return a_nameHash;
+        } else if (b_nameHash != NULL && DB_IS_CMPT(B_FORMAT)) {
+            return b_nameHash;
+        }
+    }
+#endif
+    return nameHash;
+}
+
+static HTAB* get_oid_hash_table_type()
+{
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+    if (CUR_THR_IS_WORKER() && IsNormalProcessingMode()) {
+        if (a_oidHash != NULL && DB_IS_CMPT(A_FORMAT)) {
+            return a_oidHash;
+        } else if (b_oidHash != NULL && DB_IS_CMPT(B_FORMAT)) {
+            return b_oidHash;
+        }
+    }
+#endif
+    return oidHash;
+}
+
 static const FuncGroup* NameHashTableAccess(HASHACTION action, const char* name, const FuncGroup* group)
 {
     char temp_name[MAX_PROC_NAME_LEN] = {0};
@@ -117,12 +153,7 @@ static const FuncGroup* NameHashTableAccess(HASHACTION action, const char* name,
     bool found = false;
 
     Assert(name != NULL);
-
-    if (DB_IS_CMPT(B_FORMAT) && b_nameHash != NULL && u_sess->attr.attr_sql.b_sql_plugin) {
-        result = (HashEntryNameToFuncGroup *)hash_search(b_nameHash, &temp_name, action, &found);
-    } else {
-        result = (HashEntryNameToFuncGroup *)hash_search(nameHash, &temp_name, action, &found);
-    }
+    result = (HashEntryNameToFuncGroup *)hash_search(get_name_hash_table_type(), &temp_name, action, &found);
     if (action == HASH_ENTER) {
         Assert(!found);
         result->group = group;
@@ -143,12 +174,7 @@ static const Builtin_func* OidHashTableAccess(HASHACTION action, Oid oid, const 
     HashEntryOidToBuiltinFunc *result = NULL;
     bool found = false;
     Assert(oid > 0);
-
-    if (DB_IS_CMPT(B_FORMAT) && b_oidHash != NULL && u_sess->attr.attr_sql.b_sql_plugin) {
-        result = (HashEntryOidToBuiltinFunc *)hash_search(b_oidHash, &oid, action, &found);
-    } else {
-        result = (HashEntryOidToBuiltinFunc *)hash_search(oidHash, &oid, action, &found);
-    }
+    result = (HashEntryOidToBuiltinFunc *)hash_search(get_oid_hash_table_type(), &oid, action, &found);
     if (action == HASH_ENTER) {
         Assert(!found);
         result->func = func;

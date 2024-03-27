@@ -28,8 +28,6 @@
 
 #include "access/cstore_insert.h"
 #include "access/cstore_update.h"
-#include "access/dfs/dfs_insert.h"
-#include "access/dfs/dfs_update.h"
 #include "executor/executor.h"
 #include "executor/exec/execMerge.h"
 #include "executor/node/nodeModifyTable.h"
@@ -72,7 +70,7 @@ static VectorBatch* extract_scan_batch(
     }
 
     for (index = 0; index < tup_desc->natts; index++) {
-        if (tup_desc->attrs[index]->attisdropped == true) {
+        if (tup_desc->attrs[index].attisdropped == true) {
             scan_batch->m_arr[index].SetAllNull();
             continue;
         }
@@ -110,7 +108,7 @@ static JunkFilter* build_dummy_junk_filter(
         }
     }
 
-    junk_filter = ExecInitJunkFilter(new_targetlist, false, ExecInitExtraTupleSlot(estate));
+    junk_filter = ExecInitJunkFilter(new_targetlist, false, ExecInitExtraTupleSlot(estate), TableAmHeap);
 
     junk_filter->jf_junkAttNo = ExecFindJunkAttribute(junk_filter, "ctid");
     if (!AttributeNumberIsValid(junk_filter->jf_junkAttNo)) {
@@ -302,9 +300,6 @@ void ExecVecMerge(VecModifyTableState* mtstate)
                 if (RelationIsCUFormat(result_relation_desc)) {
                     (void*)ExecVecUpdate<CStoreUpdate>(
                         mtstate, (CStoreUpdate*)batch_opt_update, result_batch, estate, mtstate->canSetTag, update_options);
-                } else if (RelationIsPAXFormat(result_relation_desc)) {
-                    (void*)ExecVecUpdate<DfsUpdate>(
-                        mtstate, (DfsUpdate*)batch_opt_update, result_batch, estate, mtstate->canSetTag, update_options);
                 } else {
                     Assert(false);
                     ereport(ERROR, (errcode(ERRCODE_INVALID_OPERATION),
@@ -347,10 +342,6 @@ void ExecVecMerge(VecModifyTableState* mtstate)
                         (void*)ExecVecInsert<CStoreInsert>(mtstate,
                             (CStoreInsert*)batch_opt_insert, result_batch, plan_batch,
                             estate, mtstate->canSetTag, insert_options);
-                    } else if (RelationIsPAXFormat(result_relation_desc)) {
-                        (void*)ExecVecInsert<DfsInsertInter>(mtstate,
-                            (DfsInsertInter*)batch_opt_insert, result_batch, plan_batch,
-                            estate,  mtstate->canSetTag, insert_options);
                     } else {
                         Assert(false);
                         ereport(ERROR, (errcode(ERRCODE_INVALID_OPERATION),
@@ -373,9 +364,6 @@ void ExecVecMerge(VecModifyTableState* mtstate)
         if (RelationIsCUFormat(result_relation_desc)) {
             ((CStoreUpdate*)batch_opt_update)->EndUpdate(update_options);
             DELETE_EX_TYPE(batch_opt_update, CStoreUpdate);
-        } else if (RelationIsPAXFormat(result_relation_desc)) {
-            ((DfsUpdate*)batch_opt_update)->EndUpdate(update_options);
-            DELETE_EX_TYPE(batch_opt_update, DfsUpdate);
         }
     }
 
@@ -386,8 +374,6 @@ void ExecVecMerge(VecModifyTableState* mtstate)
             if (RelationIsCUFormat(result_relation_desc)) {
                 FLUSH_DATA(batch_opt_insert, CStoreInsert);
                 CStoreInsert::DeInitInsertArg(args);
-            } else if (RelationIsPAXFormat(result_relation_desc)) {
-                FLUSH_DATA(batch_opt_insert, DfsInsertInter);
             }
         }
     }

@@ -36,12 +36,16 @@
 #include "utils/numeric_gs.h"
 #include "utils/plancache.h"
 #include "utils/syscache.h"
+#include "instruments/instr_unique_sql.h"
 
 class OpFusion;
 typedef unsigned long (OpFusion::*OpFusionExecfuncType)(Relation rel, ResultRelInfo* resultRelInfo);
 
 extern void report_qps_type(CmdType commandType);
 extern void ExecCheckXactReadOnly(PlannedStmt* plannedstmt);
+extern bool IsRightRefState(List* plantreeList);
+EState* CreateExecutorStateForOpfusion(MemoryContext saveCxt, MemoryContext tmpCxt);
+void FreeExecutorStateForOpfusion(EState* estate);
 
 /*
  * The variables in OpFusion is always in two parts: global's variables and local's variables.
@@ -88,6 +92,8 @@ public:
 
     void CheckLogDuration();
 
+    void checkLogStatement(const char* portal_name, bool execute_is_fetch);
+
     virtual bool execute(long max_rows, char* completionTag)
     {
         Assert(false);
@@ -119,7 +125,7 @@ public:
 
     void executeInit();
 
-    bool executeEnd(const char* portal_name, bool* completionTag);
+    bool executeEnd(const char* portal_name, bool* completionTag, long max_rows);
 
     void auditRecord();
 
@@ -147,6 +153,13 @@ public:
     {
         pg_memory_barrier();
         return (m_global && m_global->m_is_global);
+    }
+
+    inline static bool IsSqlBypass(CachedPlanSource* psrc, List* stmtList)
+    {
+        return (IS_PGXC_DATANODE && !psrc->gpc.status.InShareTable() &&
+            psrc->cplan == NULL && psrc->is_checked_opfusion == false &&
+            !IsRightRefState(stmtList));
     }
 
 public:
@@ -240,6 +253,8 @@ public:
         FusionType m_optype;
 
         ResourceOwner m_resOwner;
+
+        bool m_has_init_param;
     };
 
     OpFusionLocaleVariable m_local;

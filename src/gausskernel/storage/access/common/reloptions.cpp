@@ -26,6 +26,7 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
+#include "commands/view.h"
 #include "nodes/makefuncs.h"
 #include "pgxc/redistrib.h"
 #ifdef ENABLE_MULTIPLE_NODES
@@ -42,6 +43,8 @@
 #include "utils/rel_gs.h"
 #include "tde_key_management/tde_key_manager.h"
 #include "tde_key_management/tde_key_storage.h"
+
+#define RS_CUSTOM_VALUE_TEN 10
 
 /*
  * Contents of pg_class.reloptions
@@ -113,10 +116,9 @@ static relopt_bool boolRelOpts[] = {
     {{ "crossbucket", "Enables cross bucket index creation in this index relation", RELOPT_KIND_BTREE}, false },
     {{ "enable_tde", "enable table's level transparent data encryption", RELOPT_KIND_HEAP }, false },
     {{ "hasuids", "Enables uids in this relation", RELOPT_KIND_HEAP }, false },
-    {{ "compress_byte_convert", "Whether do byte convert in compression", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE},
-     false },
+    {{ "compress_byte_convert", "Whether do byte convert in compression", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, false},
     {{ "compress_diff_convert", "Whether do diiffer convert in compression", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE},
-     false },
+     false},
     /* list terminator */
     {{NULL}}
 };
@@ -238,7 +240,7 @@ static relopt_int intRelOpts[] = {
         0, 1, 32
     },
     {{ "compress_level", "Level of page compression.", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, 0, -31, 31},
-    {{ "compresstype", "compress type (none, pglz or zstd).", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, 0, 0, 2},
+    {{ "compresstype", "compress type (none, pglz or zstd or pgzstd).", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE}, 0, 0, 3},
     {{ "compress_chunk_size", "Size of chunk to store compressed page.", RELOPT_KIND_HEAP | RELOPT_KIND_BTREE},
      BLCKSZ / 2,
      BLCKSZ / 16,
@@ -247,6 +249,7 @@ static relopt_int intRelOpts[] = {
      0,
      0,
      7},
+    {{ "collate", "set relation default collation", RELOPT_KIND_HEAP }, 0, 0, 2000000000 },
     /* list terminator */
     {{NULL}}
 };
@@ -333,10 +336,10 @@ static relopt_string stringRelOpts[] = {
     },
     {
         {"indexsplit", "default, insertpt", RELOPT_KIND_BTREE},
-        7,
+        8,
         false,
         ValidateStrOptIndexsplit,
-        INDEXSPLIT_OPT_DEFAULT,
+        INDEXSPLIT_OPT_INSERTPT,
     },
     {
         { "ttl", "time to live for timeseries data management", RELOPT_KIND_HEAP },
@@ -509,6 +512,13 @@ static relopt_string stringRelOpts[] = {
         false,
         ValidateStrOptStringOptimize,
         COLUMN_UNDEFINED,
+    },
+    {
+        {"check_option", "View has WITH CHECK OPTION defined (local or cascaded).", RELOPT_KIND_VIEW},
+        0,
+        true,
+        validateWithCheckOption,
+        NULL
     },
     /* list terminator */
     {{NULL}}
@@ -1823,6 +1833,19 @@ void ForbidToSetOptionsForUstoreTbl(List *options)
 }
 
 /*
+ * @Description: check relation options for not ustore table
+ * @Param[IN] options: input user options
+ */
+void ForbidToSetOptionsForNotUstoreTbl(List *options)
+{
+    static const char *unsupported[] = {
+        "init_td"
+    };
+
+    ForbidUserToSetUnsupportedOptions(options, unsupported, lengthof(unsupported), "relations except for ustore relation");
+}
+
+/*
  * @Description: check relation options for timeseries table
  * @Param[IN] options: input user options
  * @See also:
@@ -1963,19 +1986,20 @@ bytea *default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
         { "encrypt_algo", RELOPT_TYPE_STRING, offsetof(StdRdOptions, encrypt_algo)},
         { "enable_tde", RELOPT_TYPE_BOOL, offsetof(StdRdOptions, enable_tde)},
         { "hasuids", RELOPT_TYPE_BOOL, offsetof(StdRdOptions, hasuids) },
-        { "compresstype", RELOPT_TYPE_INT, 
-          offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressType)},
+        { "compresstype", RELOPT_TYPE_INT,
+            offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressType)},
         { "compress_level", RELOPT_TYPE_INT,
-          offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressLevel)},
+            offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressLevel)},
         { "compress_chunk_size", RELOPT_TYPE_INT,
-          offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressChunkSize)},
-        {"compress_prealloc_chunks", RELOPT_TYPE_INT,
+            offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressChunkSize)},
+        { "compress_prealloc_chunks", RELOPT_TYPE_INT,
           offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressPreallocChunks)},
         { "compress_byte_convert", RELOPT_TYPE_BOOL,
           offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressByteConvert)},
         { "compress_diff_convert", RELOPT_TYPE_BOOL,
           offsetof(StdRdOptions, compress) + offsetof(PageCompressOpts, compressDiffConvert)},
-
+        { "check_option", RELOPT_TYPE_STRING, offsetof(StdRdOptions, check_option_offset)},
+        { "collate", RELOPT_TYPE_INT, offsetof(StdRdOptions, collate)}
     };
 
     options = parseRelOptions(reloptions, validate, kind, &numoptions);
@@ -2419,9 +2443,9 @@ static void ValidateStrOptTableAccessMethod(const char* val)
  */
 static void ValidateStrOptSpcFileSystem(const char *val)
 {
-    if ((0 != pg_strcasecmp(val, FILESYSTEM_GENERAL)) && 0 != pg_strcasecmp(val, FILESYSTEM_HDFS)) {
+    if (0 != pg_strcasecmp(val, FILESYSTEM_GENERAL)) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Invalid string for  \"filesystem\" option."),
-                        errdetail("Valid string are \"general\", \"hdfs\".")));
+                        errdetail("Valid string are \"general\".")));
     }
 }
 
@@ -2635,8 +2659,35 @@ void ForbidUserToSetCompressedOptions(List *options)
     if (FindInvalidOption(options, unSupportOptions, lengthof(unSupportOptions), &firstInvalidOpt)) {
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 (errmsg("Un-support feature"), errdetail("Option \"%s\" doesn't allow ALTER on uncompressed table",
+                 (errmsg("Un-support feature"), errdetail("Option \"%s\" doesn't allow ALTER",
                                                           unSupportOptions[firstInvalidOpt]))));
+    }
+}
+
+void check_collate_in_options(List *user_options)
+{
+    ListCell *opt = NULL;
+    HeapTuple tp;
+
+    foreach(opt, user_options) {
+        DefElem *def = (DefElem *)lfirst(opt);
+
+        if (pg_strcasecmp(def->defname, "collate") == 0) {
+            Oid collate = IsA(def->arg, Integer) ? intVal(def->arg) : pg_strtoint32(strVal(def->arg));
+            if (!DB_IS_CMPT(B_FORMAT))
+                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        (errmsg("Un-support feature"),
+                         errdetail("Forbid to set or change \"%s\" in non-B format", "collate"))));
+
+            if (!COLLATION_IN_B_FORMAT(collate) && collate != DEFAULT_COLLATION_OID)
+                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("this collation only cannot be specified here")));
+            tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collate));
+            if (!HeapTupleIsValid(tp))
+                ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for collation %u", collate)));
+            ReleaseSysCache(tp);
+        }
     }
 }
 
@@ -2660,6 +2711,7 @@ void ForbidOutUsersToSetInnerOptions(List *userOptions)
                             errdetail("Forbid to set or change inner option \"%s\"", innnerOpts[firstInvalidOpt])));
         }
     }
+    check_collate_in_options(userOptions);
 }
 
 void ForbidUserToSetDefinedIndexOptions(List *options)
@@ -2935,11 +2987,22 @@ bool is_cstore_option(char relkind, Datum reloptions)
     return result;
 }
 
+bool ReadBoolFromDefElem(DefElem* defElem)
+{
+    bool result = false;
+    char *boolStr = defGetString(defElem);
+    if (!parse_bool_with_len(boolStr, strlen(boolStr), &result)) {
+        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("%s requires a Boolean value", defElem->defname)));
+    }
+    return result;
+}
+
 void SetOneOfCompressOption(DefElem* defElem, TableCreateSupport* tableCreateSupport)
 {
     auto defname = defElem->defname;
     if (pg_strcasecmp(defname, "compresstype") == 0) {
-        tableCreateSupport->compressType = defGetInt64(defElem);
+        /* compresstype must be a valid number type */
+        tableCreateSupport->compressType = (int)strtol(defGetString(defElem), NULL, RS_CUSTOM_VALUE_TEN);
     } else if (pg_strcasecmp(defname, "compress_chunk_size") == 0) {
         tableCreateSupport->compressChunkSize = true;
     } else if (pg_strcasecmp(defname, "compress_prealloc_chunks") == 0) {
@@ -2947,14 +3010,28 @@ void SetOneOfCompressOption(DefElem* defElem, TableCreateSupport* tableCreateSup
     } else if (pg_strcasecmp(defname, "compress_level") == 0) {
         tableCreateSupport->compressLevel = true;
     } else if (pg_strcasecmp(defname, "compress_byte_convert") == 0) {
-        tableCreateSupport->compressByteConvert = true;
+        tableCreateSupport->compressByteConvert = ReadBoolFromDefElem(defElem);
     } else if (pg_strcasecmp(defname, "compress_diff_convert") == 0) {
-        tableCreateSupport->compressDiffConvert = true;
+        tableCreateSupport->compressDiffConvert = ReadBoolFromDefElem(defElem);
+    } else if (pg_strcasecmp(defname, "orientation") == 0 &&
+               pg_strcasecmp(defGetString(defElem), ORIENTATION_ROW) != 0) {
+        tableCreateSupport->is_orientation_row = false;
+    } else if (pg_strcasecmp(defname, "storage_type") == 0 &&
+               pg_strcasecmp(defGetString(defElem), TABLE_ACCESS_METHOD_USTORE) == 0) {
+        tableCreateSupport->is_storage_type_ustore = true;
     }
 }
 
 void CheckCompressOption(TableCreateSupport *tableCreateSupport)
 {
+    if (tableCreateSupport->compressType != (int)COMPRESS_TYPE_NONE && !tableCreateSupport->is_orientation_row) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
+                        errmsg("row-compression feature only support orientation is row.")));
+    }
+	if (tableCreateSupport->compressType == (int)COMPRESS_TYPE_PGZSTD) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
+                        errmsg("row-compression feature current not support algorithm is PGZSTD.")));
+    }
     if (!tableCreateSupport->compressType && HasCompressOption(tableCreateSupport)) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
                         errmsg("compress_chunk_size/compress_prealloc_chunks/compress_level/compress_byte_convert/"
@@ -2964,8 +3041,16 @@ void CheckCompressOption(TableCreateSupport *tableCreateSupport)
         ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
                         errmsg("compress_diff_convert should be used with compress_byte_convert.")));
     }
-    if (tableCreateSupport->compressType != COMPRESS_TYPE_ZSTD && tableCreateSupport->compressLevel) {
+    if (tableCreateSupport->compressType != (int)COMPRESS_TYPE_ZSTD && tableCreateSupport->compressLevel) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
             errmsg("compress_level should be used with ZSTD algorithm.")));
+    }
+    if (tableCreateSupport->compressType == (int)COMPRESS_TYPE_PGZSTD && tableCreateSupport->compressByteConvert) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
+            errmsg("Algorithm PGZSTD should not be used with ByteConvert.")));
+    }
+    if (tableCreateSupport->compressType == (int)COMPRESS_TYPE_PGZSTD && tableCreateSupport->is_storage_type_ustore) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_OPTION),
+            errmsg("Algorithm PGZSTD current not support ustore.")));
     }
 }

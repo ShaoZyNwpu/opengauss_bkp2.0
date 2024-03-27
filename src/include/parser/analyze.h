@@ -33,7 +33,7 @@ extern Query* parse_analyze_varparams(Node* parseTree, const char* sourceText, O
 
 extern Query* parse_sub_analyze(Node* parseTree, ParseState* parentParseState, CommonTableExpr* parentCTE,
     bool locked_from_parent, bool resolve_unknowns);
-
+extern Node* parse_into_claues(Node* parse_tree, IntoClause* intoClause);
 extern List* transformInsertRow(ParseState* pstate, List* exprlist, List* stmtcols, List* icolumns, List* attrnos);
 extern Query* transformTopLevelStmt(
     ParseState* pstate, Node* parseTree, bool isFirstNode = true, bool isCreateView = false);
@@ -42,11 +42,10 @@ extern Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNod
 extern bool analyze_requires_snapshot(Node* parseTree);
 
 extern void CheckSelectLocking(Query* qry);
-extern void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, bool noWait, bool pushedDown,
+extern void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, LockWaitPolicy waitPolicy, bool pushedDown,
                                int waitSec);
 #ifdef ENABLE_MOT
 extern void CheckTablesStorageEngine(Query* qry, StorageEngineType* type);
-extern bool CheckMotIndexedColumnUpdate(Query* qry);
 
 typedef struct RTEDetectorContext {
     bool isMotTable;
@@ -54,12 +53,6 @@ typedef struct RTEDetectorContext {
     List* queryNodes;
     int sublevelsUp;
 } RTEDetectorContext;
-
-typedef struct UpdateDetectorContext {
-    bool isIndexedColumnUpdate;
-    List* queryNodes;
-    int sublevelsUp;
-} UpdateDetectorContext;
 #endif
 
 /* Record the rel name and corresponding columan name info */
@@ -98,6 +91,7 @@ extern void resetOperatorPlusFlag();
 
 extern void fixResTargetNameWithTableNameRef(Relation rd, RangeVar* rel, ResTarget* res);
 extern void fixResTargetListWithTableNameRef(Relation rd, RangeVar* rel, List* clause_list);
+extern void UpdateParseCheck(ParseState *pstate, Node *qry);
 #endif /* !FRONTEND_PARSER */
 
 extern bool getOperatorPlusFlag();

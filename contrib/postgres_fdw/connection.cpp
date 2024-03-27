@@ -28,7 +28,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "storage/ipc.h"
-
+#include "executor/executor.h"
 
 /*
  * Connection cache hash table entry
@@ -241,6 +241,39 @@ PGconn *GetConnection(ForeignServer *server, UserMapping *user, bool will_prep_s
     entry->have_prep_stmt = entry->have_prep_stmt || will_prep_stmt;
 
     return entry->conn;
+}
+
+PGconn* GetConnectionByFScanState(ForeignScanState* node, bool will_prep_stmt)
+{
+    ForeignScan* fsplan = (ForeignScan *)node->ss.ps.plan;
+    EState* estate = node->ss.ps.state;
+    RangeTblEntry* rte = NULL;
+    Oid userid;
+    ForeignTable* table = NULL;
+    ForeignServer* server = NULL;
+    UserMapping* user = NULL;
+    int rtindex;
+
+    /*
+     * Identify which user to do the remote access as.  This should match what
+     * ExecCheckRTEPerms() does.  In case of a join or aggregate, use the
+     * lowest-numbered member RTE as a representative; we would get the same
+     * result from any.
+     */
+    if (fsplan->scan.scanrelid > 0) {
+        rtindex = fsplan->scan.scanrelid;
+    } else {
+        rtindex = bms_next_member(fsplan->fs_relids, -1);
+    }
+    rte = exec_rt_fetch(rtindex, estate);
+    userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+
+    /* Get info about foreign table. */
+    table = GetForeignTable(rte->relid);
+    server = GetForeignServer(table->serverid);
+    user = GetUserMapping(userid, table->serverid);
+
+    return GetConnection(server, user, will_prep_stmt);
 }
 
 /*
@@ -761,6 +794,16 @@ static void pgfdw_xact_callback(XactEvent event, void *arg)
     if (!FDW_XACT_GOT_CONN) {
         return;
     }
+
+#ifdef ENABLE_MOT
+    /*
+     * These events are added only for MOT FDW. So, others can safely ignore these event.
+     */
+    if (event == XACT_EVENT_START || event == XACT_EVENT_RECORD_COMMIT || event == XACT_EVENT_PREROLLBACK_CLEANUP ||
+        event == XACT_EVENT_POST_COMMIT_CLEANUP || event == XACT_EVENT_STMT_FINISH) {
+        return;
+    }
+#endif
 
     /*
      * Scan all connection cache entries to find open remote transactions, and

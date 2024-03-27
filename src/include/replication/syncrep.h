@@ -49,6 +49,39 @@ extern volatile bool most_available_sync;
 #define GetWalsndSyncRepConfig(walsnder)  \
     (t_thrd.syncrep_cxt.SyncRepConfig[(walsnder)->sync_standby_group])
 
+#define IfIgnoreStandbyLsn(nowTime, lastTime) \
+    (t_thrd.walsender_cxt.WalSndCtl->most_available_sync && \
+    u_sess->attr.attr_storage.ignore_standby_lsn_window > 0 && \
+    timestamptz_cmp_internal(nowTime, TimestampTzPlusMilliseconds(lastTime, \
+    u_sess->attr.attr_storage.ignore_standby_lsn_window)) >= 0)
+
+/*
+ * SyncRepGetCandidateStandbys returns an array of these structs,
+ * one per candidate synchronous walsender.
+ */
+typedef struct SyncRepStandbyData
+{
+    /* Copies of relevant fields from WalSnd shared-memory struct */
+    ThreadId    pid;
+    int         lwpId;
+    XLogRecPtr  receive;
+    XLogRecPtr  write;
+    XLogRecPtr  flush;
+    XLogRecPtr  apply;
+    uint8       sync_standby_group;
+    int         sync_standby_priority;
+    /* Index of this walsender in the WalSnd shared-memory array */
+    int         walsnd_index;
+    /* This flag indicates whether this struct is about our own process */
+    bool        is_me;
+    bool        is_cross_cluster;
+    bool        receive_too_old;
+    bool        write_too_old;
+    bool        flush_too_old;
+    bool        apply_too_old;
+} SyncRepStandbyData;
+
+
 /*
  * Struct for the configuration of synchronous replication.
  *
@@ -65,8 +98,19 @@ typedef struct SyncRepConfigData {
     char member_names[FLEXIBLE_ARRAY_MEMBER];
 } SyncRepConfigData;
 
+typedef enum
+{
+	NOT_REQUEST,
+	NOT_SET_STANDBY_DEFINED,
+	REPSYNCED,
+	STAND_ALONE,
+	NOT_WAIT_CATCHUP,
+	SYNC_COMPLETE,
+	STOP_WAIT
+} SyncWaitRet;
+
 /* called by user backend */
-extern void SyncRepWaitForLSN(XLogRecPtr XactCommitLSN, bool enableHandleCancel = true);
+extern SyncWaitRet SyncRepWaitForLSN(XLogRecPtr XactCommitLSN, bool enableHandleCancel = true);
 extern bool SyncPaxosWaitForLSN(XLogRecPtr PaxosConsensusLSN);
 
 /* called at backend exit */
@@ -85,7 +129,7 @@ extern void SyncRepUpdateSyncStandbysDefined(void);
 extern void SyncRepCheckSyncStandbyAlive(void);
 
 /* called by wal sender and user backend */
-extern List* SyncRepGetSyncStandbys(bool* am_sync, List** catchup_standbys = NULL);
+extern int SyncRepGetSyncStandbys(SyncRepStandbyData** sync_standbys, List** catchup_standbys = NULL);
 
 extern bool check_synchronous_standby_names(char** newval, void** extra, GucSource source);
 extern void assign_synchronous_standby_names(const char* newval, void* extra);
@@ -107,6 +151,9 @@ typedef union syncrep_scanner_YYSTYPE {
 extern int syncrep_scanner_yylex(syncrep_scanner_YYSTYPE* lvalp, YYLTYPE* llocp, syncrep_scanner_yyscan_t yyscanner);
 extern void syncrep_scanner_yyerror(const char* message, syncrep_scanner_yyscan_t yyscanner);
 extern bool SyncRepGetSyncRecPtr(XLogRecPtr* receivePtr, XLogRecPtr* writePtr, XLogRecPtr* flushPtr, XLogRecPtr* replayPtr, bool* am_sync, bool check_am_sync = true);
+#ifndef ENABLE_MULTIPLE_NODES
+extern void SetXactLastCommitToSyncedStandby(XLogRecPtr recptr);
+#endif
 
 #ifndef ENABLE_MULTIPLE_NODES
 /*
@@ -125,4 +172,13 @@ typedef enum {
 } Sync_Config_Strategy;
 #endif
 
+const char *const SyncWaitRetDesc[] = {
+    "no sync rep request",
+    "sync standbys_defined not set",
+    "commit lsn has already synced",
+    "sync_master_standalone is set",
+    "no wait for standby catch up",
+    "sync standby complete",
+    "stop to wait sync, see warning detail"
+};
 #endif /* _SYNCREP_H */

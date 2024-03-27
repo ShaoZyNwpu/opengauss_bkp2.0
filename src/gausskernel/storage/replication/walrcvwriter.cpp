@@ -29,6 +29,7 @@
 #include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/smgr/smgr.h"
+#include "storage/file/fio_device.h"
 #include "utils/guc.h"
 #include "access/xlog.h"
 #include "access/multi_redo_api.h"
@@ -175,10 +176,10 @@ static void XLogWalRcvWrite(WalRcvCtlBlock *walrcb, char *buf, Size nbytes, XLog
         }
 
         /* Calculate the start offset of the received logs */
-        startoff = recptr % XLogSegSize;
+        startoff = (int)(recptr % XLogSegSize);
 
         if (startoff + nbytes > XLogSegSize)
-            segbytes = XLogSegSize - startoff;
+            segbytes = (int)(XLogSegSize - startoff);
         else
             segbytes = nbytes;
 
@@ -679,7 +680,7 @@ void walrcvWriterMain(void)
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, WalRcvWriterProcSigUsr1Handler);
     (void)gspqsignal(SIGUSR2, SIG_IGN);
-
+    (void)gspqsignal(SIGURG, print_stack);
     /*
      * Reset some signals that are accepted by postmaster but not here
      */
@@ -814,6 +815,8 @@ void walrcvWriterMain(void)
     setWalRcvWriterLatch();
 
     t_thrd.walrcvwriter_cxt.walStreamWrite = GetXLogReplayRecPtr(NULL);
+    pgstat_report_appname("Wal Receive Writer");
+    pgstat_report_activity(STATE_IDLE, NULL);
 
     /*
      * Loop forever

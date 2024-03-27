@@ -71,11 +71,13 @@
 #include "replication/libpqwalreceiver.h"
 #include "replication/worker_internal.h"
 #include "replication/origin.h"
+#include "replication/libpqsw.h"
 #include "catalog/pg_subscription.h"
 #include "port/pg_crc32c.h"
-#define MAX_PATH_LEN 1024
+#include "ddes/dms/ss_common_attr.h"
 
-#define RESERVE_SIZE 52
+#define MAX_PATH_LEN 1024
+extern const int g_reserve_param_num;
 #define PARTKEY_VALUE_MAXNUM 64
 
 typedef struct ResourceOwnerData* ResourceOwner;
@@ -391,7 +393,7 @@ typedef struct knl_t_xact_context {
      */
     struct SERIALIZABLEXACT* MySerializableXact;
     bool MyXactDidWrite;
-    bool applying_subxact_undo;
+    bool executeSubxactUndo;
 
 #ifdef PGXC
     bool useLocalSnapshot;
@@ -410,12 +412,12 @@ typedef struct knl_t_xact_context {
     TransactionId XactXidStoreForCheck;
     Oid ActiveLobRelid;
     bool isSelectInto;
+    bool callPrint;
 } knl_t_xact_context;
 typedef struct knl_t_resource_manager_context{
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t got_SIGTERM;
 }knl_t_resource_manager_context;
-
 typedef struct RepairBlockKey RepairBlockKey;
 typedef void (*RedoInterruptCallBackFunc)(void);
 typedef void (*RedoPageRepairCallBackFunc)(RepairBlockKey key, XLogPhyBlock pblk);
@@ -968,6 +970,25 @@ typedef struct knl_t_undo_context {
     bool fetchRecord;
 } knl_t_undo_context;
 
+typedef struct knl_u_ustore_context {
+#define MAX_UNDORECORDS_PER_OPERATION 2 /* multi-insert may need special handling */
+    class URecVector *urecvec;
+    class UndoRecord *undo_records[MAX_UNDORECORDS_PER_OPERATION];
+
+/*
+ * Caching several undo buffers.
+ * max undo buffers per record = 2
+ * max undo records per operation = 2
+ */
+#define MAX_UNDO_BUFFERS 16 /* multi-insert may need special handling */
+    struct UndoBuffer *undo_buffers;
+    int undo_buffer_idx;
+
+#define TD_RESERVATION_TIMEOUT_MS (60 * 1000) // 60 seconds
+    TimestampTz tdSlotWaitFinishTime;
+    bool tdSlotWaitActive;
+} knl_u_ustore_context;
+
 typedef struct knl_t_index_context {
     typedef uint64 XLogRecPtr;
     struct ginxlogInsertDataInternal* ptr_data;
@@ -1024,6 +1045,9 @@ typedef struct knl_t_wlmthrd_context {
 
     /*check if current stmt has recorded cursor*/
     bool has_cursor_record;
+
+    /*Check whether memory snapshot has been taken in this cycle*/
+    bool has_do_memory_snapshot;
 
     /* alarm finish time */
     TimestampTz wlmalarm_fin_time;
@@ -1192,6 +1216,8 @@ typedef struct knl_t_log_context {
     struct StringInfoData* msgbuf;
 
     unsigned char* module_logging_configure;
+
+    bool output_backtrace_log;
 
 } knl_t_log_context;
 
@@ -1402,6 +1428,7 @@ typedef struct knl_t_interrupt_context {
 
     volatile bool ignoreBackendSignal; /* ignore signal for threadpool worker */
 
+    volatile bool ignoreSessionBackendSignal; /* ignore signal for u_session */
 } knl_t_interrupt_context;
 
 typedef int64 pg_time_t;
@@ -1576,8 +1603,6 @@ typedef struct knl_t_pagewriter_context {
     int pagewriter_id;
     uint64 next_flush_time;
     uint64 next_scan_time;
-    uint64 smgrwrite_time;
-    uint64 writeback_time;
 } knl_t_pagewriter_context;
 
 typedef struct knl_t_pagerepair_context {
@@ -1670,9 +1695,8 @@ typedef struct knl_t_postgres_context {
     /* clear key message that may appear in core file for security */
     bool clear_key_memory;
 
-    /* true if create table in create table as select' has been done */
-    bool table_created_in_CTAS;
     const char* debug_query_string; /* client-supplied query string */
+    NodeTag cur_command_tag; /* current execute sql nodetag */
     bool isInResetUserName;
 
     /* Note: whereToSendOutput is initialized for the bootstrap/standalone case */
@@ -1795,8 +1819,10 @@ typedef struct knl_t_utils_context {
     struct ResourceOwnerData* STPSavedResourceOwner;
     struct ResourceOwnerData* CurTransactionResourceOwner;
     struct ResourceOwnerData* TopTransactionResourceOwner;
+
+    /* flag to indicate g_instance.baselock is help by current thread */
+    bool holdProcBaseLock;
     bool SortColumnOptimize;
-    struct RelationData* pRelatedRel;
 
 #ifndef WIN32
     timer_t sigTimerId;
@@ -1960,6 +1986,14 @@ typedef struct knl_t_snapcapturer_context {
 
     struct TxnSnapCapShmemStruct *snapCapShmem;
 } knl_t_snapcapturer_context;
+
+typedef struct knl_t_cfs_shrinker_context {
+    /* signal handle flags */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+
+    struct CfsShrinkerShmemStruct *cfsShrinkerShmem;
+} knl_t_cfs_shrinker_context;
 
 typedef struct knl_t_rbcleaner_context {
     /* private variables for rbcleaner thread */
@@ -2294,6 +2328,7 @@ typedef struct knl_t_walsender_context {
     /* My slot in the shared memory array */
     struct WalSnd* MyWalSnd;
     int logical_xlog_advanced_timeout; /* maximum time to write xlog * of logical slot advance */
+    int logical_slot_advanced_timeout; /* maximum time to notify primary advance logical slot */
     typedef int ServerMode;
     typedef int DemoteMode;
     DemoteMode Demotion;
@@ -2364,6 +2399,10 @@ typedef struct knl_t_walsender_context {
      * Timestamp of the last logical xlog advanced is written.
      */
     TimestampTz last_logical_xlog_advanced_timestamp;
+    /*
+     * Timestamp of the last primary logical slot advanced is written.
+     */
+    TimestampTz last_logical_slot_advanced_timestamp;
     /* Have we sent a heartbeat message asking for reply, since last reply? */
     bool waiting_for_ping_response;
     /* Flags set by signal handlers for later service in main loop */
@@ -2394,6 +2433,13 @@ typedef struct knl_t_walsender_context {
     /* Timestamp of the last check-timeout time in WalSndCheckTimeOut. */
     TimestampTz last_check_timeout_timestamp;
 
+    /*
+     * Actual timeout for guc wal_sender_timeout, default value is wal_sender_timeout.
+     * timeoutCheckInternal will greater than or equal to 30 minutes for gs_probackup. It is so
+     * hackly of 30 minutes, but now, 30 minutes is enough.
+     */
+    int timeoutCheckInternal;
+
     /* Read data from WAL into xlogReadBuf, then compress it to compressBuf */
     char *xlogReadBuf;
     char *compressBuf;
@@ -2408,6 +2454,8 @@ typedef struct knl_t_walsender_context {
     bool is_obsmode;
     bool standbyConnection;
     bool cancelLogCtl;
+    bool isUseSnapshot;
+    XLogRecPtr firstConfirmedFlush;
 } knl_t_walsender_context;
 
 typedef struct knl_t_walreceiverfuncs_context {
@@ -2451,26 +2499,23 @@ typedef struct knl_t_logical_context {
     bool ExportInProgress;
     bool IsAreaDecode;
     ResourceOwner SavedResourceOwnerDuringExport;
+    int dispatchSlotId;
 } knl_t_logical_context;
 
 extern struct ParallelDecodeWorker** parallelDecodeWorker;
 
 typedef struct knl_t_parallel_decode_worker_context {
-    volatile sig_atomic_t shutdown_requested;
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t sleep_long;
-    int slotId;
     int parallelDecodeId;
 } knl_t_parallel_decode_worker_context;
 
 typedef struct knl_t_logical_read_worker_context {
-    volatile sig_atomic_t shutdown_requested;
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t sleep_long;
     volatile sig_atomic_t got_SIGTERM;
     MemoryContext ReadWorkerCxt;
     ParallelDecodeWorker** parallelDecodeWorkers;
-    int slotId;
     int totalWorkerCount;
 } knl_t_logical_read_worker_context;
 
@@ -2514,8 +2559,10 @@ typedef struct knl_t_storage_context {
     TransactionId latestObservedXid;
     struct RunningTransactionsData* CurrentRunningXacts;
     struct VirtualTransactionId* proc_vxids;
+    TransactionId* xminArray;
     union BufferDescPadded* BufferDescriptors;
     char* BufferBlocks;
+    char* NvmBufferBlocks;
     struct WritebackContext* BackendWritebackContext;
     struct HTAB* SharedBufHash;
     struct HTAB* BufFreeListHash;
@@ -2547,8 +2594,8 @@ typedef struct knl_t_storage_context {
      * are still pinned at the end of transactions and when exiting.
      *
      *
-     * To avoid - as we used to - requiring an array with g_instance.attr.attr_storage.NBuffers entries to keep
-     * track of local buffers we use a small sequentially searched array
+     * To avoid - as we used to - requiring an array with NBuffers entries to keep
+     * track of local buffers, we use a small sequentially searched array
      * (PrivateRefCountArray) and a overflow hash table (PrivateRefCountHash) to
      * keep track of backend local pins.
      *
@@ -2559,11 +2606,19 @@ typedef struct knl_t_storage_context {
      *
      * Note that in most scenarios the number of pinned buffers will not exceed
      * REFCOUNT_ARRAY_ENTRIES.
+     *
+     *
+     * To enter a buffer into the refcount tracking mechanism first reserve a free
+     * entry using ReservePrivateRefCountEntry() and then later, if necessary,
+     * fill it with NewPrivateRefCountEntry(). That split lets us avoid doing
+     * memory allocations in NewPrivateRefCountEntry() which can be important
+     * because in some scenarios it's called with a spinlock held...
      */
     struct PrivateRefCountEntry* PrivateRefCountArray;
     struct HTAB* PrivateRefCountHash;
     int32 PrivateRefCountOverflowed;
     uint32 PrivateRefCountClock;
+    PrivateRefCountEntry* ReservedRefCountEntry;
     /*
      * Information saved between calls so we can determine the strategy
      * point's advance rate and avoid scanning already-cleaned buffers.
@@ -2595,7 +2650,7 @@ typedef struct knl_t_storage_context {
     CacheSlotId_t CacheBlockInProgressUncompress;
     CacheSlotId_t MetaBlockInProgressIO;
 
-    List* RecoveryLockList;
+    HTAB* RecoveryLockList;
     int standbyWait_us;
     /*
      * All accesses to pg_largeobject and its index make use of a single Relation
@@ -2701,7 +2756,9 @@ typedef struct knl_t_storage_context {
 
     /* global variable */
     char* pageCopy;
+    char* pageCopy_ori;
     char* segPageCopy;
+    char* segPageCopyOri;
 
     bool isSwitchoverLockHolder;
     int num_held_lwlocks;
@@ -2750,9 +2807,11 @@ typedef struct knl_t_storage_context {
     int max_safe_fds; /* default if not changed */
     /* reserve `1000' for thread-private file id */
     int max_userdatafiles;
-
     int timeoutRemoteOpera;
-
+    char* PcaBufferBlocks;
+    dms_buf_ctrl_t* dmsBufCtl;
+    char* ondemandXLogMem;
+    struct HTAB* ondemandXLogFileIdCache;
 } knl_t_storage_context;
 
 typedef struct knl_t_port_context {
@@ -2779,7 +2838,8 @@ typedef enum {
     OLD_REPL_CHANGE_IP_OR_PORT,
     ADD_REPL_CONN_INFO_WITH_OLD_LOCAL_IP_PORT,
     ADD_REPL_CONN_INFO_WITH_NEW_LOCAL_IP_PORT,
-    ADD_DISASTER_RECOVERY_INFO
+    ADD_DISASTER_RECOVERY_INFO,
+    REMOVE_DISASTER_RECOVERY_INFO,
 } ReplConnInfoChangeType;
 
 
@@ -2805,20 +2865,21 @@ typedef struct knl_t_postmaster_context {
      * ReplConn*2 is used to connect secondary on primary or standby, or connect primary
      * or standby on secondary.
      */
-    struct replconninfo* ReplConnArray[DOUBLE_MAX_REPLNODE_NUM + 1];
-    int ReplConnChangeType[DOUBLE_MAX_REPLNODE_NUM + 1];
+    struct replconninfo* ReplConnArray[MAX_REPLNODE_NUM];
+    int ReplConnChangeType[MAX_REPLNODE_NUM];
     struct replconninfo* CrossClusterReplConnArray[MAX_REPLNODE_NUM];
     bool CrossClusterReplConnChanged[MAX_REPLNODE_NUM];
     struct hashmemdata* HaShmData;
+    char LocalAddrList[MAXLISTEN][IP_LEN];  /* use for sub thread which is IsUnderPostmaster */
+    int LocalIpNum;  /* use for sub thread which is IsUnderPostmaster */
 
-    /* The socket(s) we're listening to. */
-    pgsocket ListenSocket[MAXLISTEN];
-    char LocalAddrList[MAXLISTEN][IP_LEN];
-    int LocalIpNum;
-    int listen_sock_type[MAXLISTEN]; /* ori type: enum ListenSocketType */
     gs_thread_t CurExitThread;
 
     bool IsRPCWorkerThread;
+    bool can_listen_addresses_reload;
+    bool is_listen_addresses_reload;
+    bool all_listen_addr_can_stop[MAXLISTEN];
+    bool local_listen_addr_can_stop[MAXLISTEN];
 
     /* private variables for reaper backend thread */
     Latch ReaperBackendLatch;
@@ -2988,6 +3049,12 @@ typedef struct knl_t_statement_context {
     int slow_sql_retention_time;
     int full_sql_retention_time;
     void *instr_prev_post_parse_analyze_hook;
+    
+    /* using for standby, memory and disk size for slow and fast sql mem-file chain */
+    int slow_max_mblock;
+    int slow_max_block;
+    int fast_max_mblock;
+    int fast_max_block;
 } knl_t_statement_context;
 
 /* Default send interval is 1s */
@@ -3043,6 +3110,17 @@ typedef struct knl_t_index_advisor_context {
     List* stmt_target_list;
 }
 knl_t_index_advisor_context;
+
+/* the struct is for page compression, for improving the proformance */
+typedef struct knl_t_page_compression_context {
+    knl_thread_role thrd_role;
+    void *zstd_cctx;    /* ctx for compression */
+    void *zstd_dctx;    /* ctx for decompression */
+}knl_t_page_compression_context;
+
+typedef struct knl_t_sql_patch_context {
+    void *sql_patch_prev_post_parse_analyze_hook;
+} knl_t_sql_patch_context;
 
 #ifdef ENABLE_MOT
 /* MOT thread attributes */
@@ -3111,6 +3189,12 @@ typedef struct knl_t_barrier_preparse_context {
 typedef struct knl_t_proxy_context {
     char identifier[IDENTIFIER_LENGTH];
 } knl_t_proxy_context;
+
+#define RC_MAX_NUM 16
+typedef struct knl_t_rc_context {
+    int rcNum;
+    Oid rcData[RC_MAX_NUM];
+} knl_t_rc_context;
 
 #define DCF_MAX_NODES 10
 /* For log ctrl. Willing let standby flush and apply log under RTO seconds */
@@ -3209,7 +3293,17 @@ typedef struct knl_t_lsc_context {
     LocalSysDBCache *lsc;
     bool enable_lsc;
     FetTupleFrom FetchTupleFromCatCList;
-}knl_t_lsc_context;
+    /*
+     * A seqno for each worker/session attachement to identify if rd_smgr's "smgr_targblock"
+     * needs cleanup, its value starts with 0, when equals to rd_smgr->xact_xeqno means the
+     * rd_smgr is open and used in current transaction then do nothing, otherwise we reset
+     * rd_smgr->smgr_targblock to InvalidBlockNumber to avoid incorrect target block and force
+     * it to be re-fetched
+     */
+    uint64 xact_seqno;
+    /* used for query lsc/gsc out of transaction */
+    ResourceOwner local_sysdb_resowner;
+} knl_t_lsc_context;
 
 /* replication apply launcher, for subscription */
 typedef struct knl_t_apply_launcher_context {
@@ -3240,13 +3334,46 @@ typedef struct knl_t_apply_worker_context {
     MemoryContext messageContext;
     MemoryContext logicalRepRelMapContext;
     MemoryContext applyContext;
+    StringInfo copybuf;
+    bool tableStatesValid;
+    List *tableStates;
+    XLogRecPtr remoteFinalLsn;
+    CommitSeqNo curRemoteCsn;
+    bool isSkipTransaction;
 } knl_t_apply_worker_context;
 
 typedef struct knl_t_publication_context {
     bool publications_valid;
     /* Map used to remember which relation schemas we sent. */
     HTAB* RelationSyncCache;
+    bool updateConninfoNeeded;
+    bool firstTimeSendConninfo;
 } knl_t_publication_context;
+
+typedef struct knl_t_dms_context {
+    MemoryContext msgContext;
+    bool buf_in_aio;
+    bool is_reform_proc;
+    bool CloseAllSessionsFailed;
+    char *origin_buf; /* origin buffer for unaligned read/write */
+    char *aligned_buf;
+    int size; /* aligned buffer size */
+    int offset; /* current read/write position in aligned_buf */
+    int file_size; /* initialized as pg_internal.init file size, will decrease after read */
+    char msg_backup[24]; // 24 is sizeof mes_message_head_t
+    bool flush_copy_get_page_failed; //used in flush copy
+    uint32 srsn; /* session rsn used for DMS page request ordering */
+} knl_t_dms_context;
+
+typedef struct knl_t_ondemand_xlog_copy_context {
+    int openLogFile;
+    XLogSegNo openLogSegNo;
+    uint32 openLogOff;
+} knl_t_ondemand_xlog_copy_context;
+
+typedef struct knl_t_dms_auxiliary_context {
+    volatile sig_atomic_t shutdown_requested;
+} knl_t_dms_auxiliary_context;
 
 /* thread context. */
 typedef struct knl_thrd_context {
@@ -3367,13 +3494,13 @@ typedef struct knl_thrd_context {
     knl_t_undolauncher_context undolauncher_cxt;
     knl_t_undoworker_context undoworker_cxt;
     knl_t_undorecycler_context undorecycler_cxt;
+    knl_u_ustore_context ustore_cxt;
     knl_t_rollback_requests_context rollback_requests_cxt;
     knl_t_ts_compaction_context ts_compaction_cxt;
     knl_t_ash_context ash_cxt;
     knl_t_statement_context statement_cxt;
     knl_t_streaming_context streaming_cxt;
     knl_t_csnmin_sync_context csnminsync_cxt;
-    
 #ifdef ENABLE_MOT
     knl_t_mot_context mot_cxt;
 #endif
@@ -3393,6 +3520,13 @@ typedef struct knl_thrd_context {
     knl_t_apply_worker_context applyworker_cxt;
     knl_t_publication_context publication_cxt;
     knl_t_resource_manager_context resource_manager_cxt;
+    knl_t_page_compression_context page_compression_cxt;
+    knl_t_cfs_shrinker_context cfs_shrinker_cxt;
+    knl_t_sql_patch_context sql_patch_cxt;
+    knl_t_dms_context dms_cxt;
+    knl_t_ondemand_xlog_copy_context ondemand_xlog_copy_cxt;
+    knl_t_rc_context rc_cxt;
+    knl_t_dms_auxiliary_context dms_aux_cxt;
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT
@@ -3418,9 +3552,22 @@ inline bool StreamTopConsumerAmI()
     return (t_thrd.subrole == TOP_CONSUMER);
 }
 
+inline bool WLMThreadAmI()
+{
+    return (t_thrd.role == WLM_WORKER || t_thrd.role == WLM_MONITOR ||
+        t_thrd.role == WLM_ARBITER || t_thrd.role == WLM_CPMONITOR);
+}
+
+inline bool ParallelLogicalWorkerThreadAmI()
+{
+    return (t_thrd.role == LOGICAL_READ_RECORD || t_thrd.role == PARALLEL_DECODE);
+}
+
 RedoInterruptCallBackFunc RegisterRedoInterruptCallBack(RedoInterruptCallBackFunc func);
 void RedoInterruptCallBack();
 RedoPageRepairCallBackFunc RegisterRedoPageRepairCallBack(RedoPageRepairCallBackFunc func);
 void RedoPageRepairCallBack(RepairBlockKey key, XLogPhyBlock pblk);
+extern void VerifyMemoryContext();
+
 
 #endif /* SRC_INCLUDE_KNL_KNL_THRD_H_ */

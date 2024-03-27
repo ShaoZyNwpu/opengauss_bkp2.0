@@ -366,6 +366,7 @@ struct pg_conn {
                                 * retransmits */
     char* keepalives_count;    /* maximum number of TCP keepalive
                                 * retransmits */
+    char* tcp_user_timeout;
     char* rw_timeout;          /* read-write timeout during idle connection.*/
     char* sslmode;             /* SSL mode (require,prefer,allow,disable) */
     char* sslcompression;      /* SSL compression (0 or 1) */
@@ -652,6 +653,8 @@ extern int pqPuts(const char* s, PGconn* conn);
 extern int pqGetnchar(char* s, size_t len, PGconn* conn);
 extern int pqSkipnchar(size_t len, PGconn* conn);
 extern int pqPutnchar(const char* s, size_t len, PGconn* conn);
+extern int pqPutncharMsgEnd(PGconn* conn);
+
 extern int pqGetInt(int* result, size_t bytes, PGconn* conn);
 extern int64 pqGetInt64(int64 *result, PGconn *conn);
 extern int pqPutInt(int value, size_t bytes, PGconn* conn);

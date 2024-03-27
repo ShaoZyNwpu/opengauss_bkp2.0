@@ -39,6 +39,11 @@
 #include "utils/inval.h"
 #include "utils/relfilenodemap.h"
 #include "pgxc/execRemote.h"
+#include "ddes/dms/ss_transaction.h"
+#include "storage/file/fio_device.h"
+#include "libaio.h"
+
+static void SSInitSegLogicFile(SegSpace *spc);
 
 void spc_lock(SegSpace *spc)
 {
@@ -100,6 +105,28 @@ void spc_write_block(SegSpace *spc, RelFileNode relNode, ForkNumber forknum, con
     SegExtentGroup *seg = &spc->extent_group[egid][forknum];
 
     df_pwrite_block(seg->segfile, buffer, blocknum);
+}
+
+int32 spc_aio_prep_pwrite(SegSpace *spc, RelFileNode relNode, ForkNumber forknum, BlockNumber blocknum,
+    const char *buffer, void *iocb_ptr)
+{
+    int egid = EXTENT_TYPE_TO_GROUPID(relNode.relNode);
+    SegExtentGroup *seg = &spc->extent_group[egid][forknum];
+
+    off_t offset = ((off_t)blocknum) * BLCKSZ;
+    int sliceno = DF_OFFSET_TO_SLICENO(offset);
+    off_t roffset = DF_OFFSET_TO_SLICE_OFFSET(offset);
+
+    SegPhysicalFile spf = df_get_physical_file(seg->segfile, sliceno, blocknum);
+    int32 ret;
+    if (is_dss_fd(spf.fd)) {
+        ret = dss_aio_prep_pwrite(iocb_ptr, spf.fd, (void *)buffer, BLCKSZ, roffset);
+    } else {
+        io_prep_pwrite((struct iocb *)iocb_ptr, spf.fd, (void *)buffer, BLCKSZ, roffset);
+        ret = DSS_SUCCESS;
+    }
+
+    return ret;
 }
 
 void spc_writeback(SegSpace *spc, int extent_size, ForkNumber forknum, BlockNumber blocknum, BlockNumber nblocks)
@@ -216,6 +243,10 @@ void InitSpaceNode(SegSpace *spc, Oid spcNode, Oid dbNode, bool is_redo)
             eg_ctrl_init(spc, &spc->extent_group[egid][forknum], EXTENT_GROUPID_TO_SIZE(egid), forknum);
         }
     }
+
+    if (SS_STANDBY_MODE) {
+        SSInitSegLogicFile(spc);
+    }
 }
 
 void spc_clean_extent_groups(SegSpace *spc)
@@ -275,6 +306,29 @@ SegSpace *spc_open(Oid spcNode, Oid dbNode, bool create, bool isRedo)
     return entry;
 }
 
+void spc_drop_space_node(Oid spcNode, Oid dbNode)
+{
+    if (ENABLE_DMS && SS_PRIMARY_MODE) {
+        SSBCastDropSegSpace(spcNode, dbNode);
+    }
+
+    SegSpace *spc = spc_init_space_node(spcNode, dbNode);
+    SegSpcTag tag = {.spcNode = spcNode, .dbNode = dbNode};
+    bool found = false;
+    AutoMutexLock spc_lock(&spc->lock);
+    spc_lock.lock();
+
+    SpaceDataFileStatus dataStatus = spc_status(spc);
+    if (dataStatus != SpaceDataFileStatus::EMPTY) {
+        spc_clean_extent_groups(spc);
+        spc_lock.unLock();
+        AutoMutexLock spc_lock(&segspace_lock);
+        spc_lock.lock();
+        (void)hash_search(t_thrd.storage_cxt.SegSpcCache, (void *)&tag, HASH_REMOVE, &found);
+        SegmentCheck(found);
+    }
+}
+
 /*
  * Check whether the space is empty, if so, drop all metadata buffers.
  *
@@ -282,6 +336,10 @@ SegSpace *spc_open(Oid spcNode, Oid dbNode, bool create, bool isRedo)
  */
 SegSpace *spc_drop(Oid spcNode, Oid dbNode, bool redo)
 {
+    if (ENABLE_DMS && SS_PRIMARY_MODE) {
+        SSBCastDropSegSpace(spcNode, dbNode);
+    }
+
     SegSpace *spc = spc_init_space_node(spcNode, dbNode);
     AutoMutexLock spc_lock(&spc->lock);
     spc_lock.lock();
@@ -331,6 +389,47 @@ SegSpace *spc_drop(Oid spcNode, Oid dbNode, bool redo)
     }
 
     return spc;
+}
+
+static void SSClose_seg_files(SegSpace *spc)
+{
+    for (int egid = 0; egid < EXTENT_TYPES; egid++) {
+        for (int j = 0; j <= SEGMENT_MAX_FORKNUM; j++) {
+            SegExtentGroup *eg = &spc->extent_group[egid][j];
+            SegLogicFile *sf = eg->segfile;
+            AutoMutexLock filelock(&sf->filelock);
+            filelock.lock();
+
+            for (int i = sf->file_num - 1; i >= 0; i--) {
+                (void)close(sf->segfiles[i].fd);
+                sf->segfiles[i].fd = -1;
+                sf->file_num--;
+            }
+            sf->file_num = 0;
+            filelock.unLock();
+        }
+    }
+}
+
+void SSDrop_seg_space(Oid spcNode, Oid dbNode)
+{
+    SegSpace *entry = NULL;
+    AutoMutexLock spc_lock(&segspace_lock);
+    SegSpcTag tag = {.spcNode = spcNode, .dbNode = dbNode};
+    SegmentCheck(t_thrd.storage_cxt.SegSpcCache != NULL);
+    spc_lock.lock();
+    entry = (SegSpace *)hash_search(t_thrd.storage_cxt.SegSpcCache, (void *)&tag, HASH_FIND, NULL);
+    spc_lock.unLock();
+
+    if (entry != NULL) {
+        if(entry->status == OPENED) {
+            SSClose_seg_files(entry);
+            SegDropSpaceMetaBuffers(spcNode, dbNode);
+        }
+        spc_lock.lock();
+        (void)hash_search(t_thrd.storage_cxt.SegSpcCache, (void *)&tag, HASH_REMOVE, NULL);
+    }
+    return;
 }
 
 /*
@@ -412,7 +511,15 @@ Buffer try_get_moved_pagebuf(RelFileNode *rnode, int forknum, BlockNumber logic_
 static void copy_extent(SegExtentGroup *seg, RelFileNode logic_rnode, uint32 logic_start_blocknum,
                         BlockNumber nblocks, BlockNumber phy_from_extent, BlockNumber phy_to_extent)
 {
-    char *content = (char *)palloc(BLCKSZ);
+    char *content = NULL;
+    char *unaligned_content = NULL;
+    if (ENABLE_DSS) {
+        unaligned_content = (char*)palloc(BLCKSZ + ALIGNOF_BUFFER);
+        content = (char*)BUFFERALIGN(unaligned_content);
+    } else {
+        content = (char *)palloc(BLCKSZ);
+    }
+
     char *pagedata = NULL;
     for (int i = 0; i < seg->extent_size; i++) {
         /* 
@@ -478,20 +585,23 @@ static void copy_extent(SegExtentGroup *seg, RelFileNode logic_rnode, uint32 log
             PageSetLSN(pagedata, recptr);
 
             /* 2. double write */
-            bool flush_old_file = false;
-            uint32 pos = seg_dw_single_flush_without_buffer(tag, (Block)pagedata, &flush_old_file);
-            t_thrd.proc->dw_pos = pos;
-            t_thrd.proc->flush_new_dw = !flush_old_file;
-
-            /* 3. checksum and write to file */
-            PageSetChecksumInplace((Page)pagedata, to_block);
-            df_pwrite_block(seg->segfile, pagedata, to_block);
-            if (flush_old_file) {
-                g_instance.dw_single_cxt.recovery_buf.single_flush_state[pos] = true;
+            if (dw_enabled() && pg_atomic_read_u32(&g_instance.ckpt_cxt_ctl->current_page_writer_count) > 0) {
+                bool flush_old_file = false;
+                uint16 pos = seg_dw_single_flush_without_buffer(tag, (Block)pagedata, &flush_old_file);
+                t_thrd.proc->dw_pos = pos;
+                t_thrd.proc->flush_new_dw = !flush_old_file;
+                PageSetChecksumInplace((Page)pagedata, to_block);
+                df_pwrite_block(seg->segfile, pagedata, to_block);
+                if (flush_old_file) {
+                    g_instance.dw_single_cxt.recovery_buf.single_flush_state[pos] = true;
+                } else {
+                    g_instance.dw_single_cxt.single_flush_state[pos] = true;
+                }
+                t_thrd.proc->dw_pos = -1;
             } else {
-                g_instance.dw_single_cxt.single_flush_state[pos] = true;
+                PageSetChecksumInplace((Page)pagedata, to_block);
+                df_pwrite_block(seg->segfile, pagedata, to_block);
             }
-            t_thrd.proc->dw_pos = -1;
         }
         END_CRIT_SECTION();
 
@@ -499,14 +609,19 @@ static void copy_extent(SegExtentGroup *seg, RelFileNode logic_rnode, uint32 log
 
         if (BufferIsValid(buf)) {
             BufferDesc *bufdesc = GetBufferDescriptor(buf - 1);
-            SegmentCheck(bufdesc->seg_fileno == seg->rnode.relNode);
-            bufdesc->seg_blockno = to_block;
+            SegmentCheck(bufdesc->extra->seg_fileno == seg->rnode.relNode);
+            bufdesc->extra->seg_blockno = to_block;
 
             LockBuffer(buf, BUFFER_LOCK_UNLOCK);
             UnpinBuffer(bufdesc, true);
         }
     }
-    pfree(content);
+
+    if (ENABLE_DSS) {
+        pfree(unaligned_content);
+    } else {
+        pfree(content);
+    }
 }
 
 /*
@@ -568,12 +683,8 @@ RelFileNode get_segment_logic_rnode(SegSpace *spc, BlockNumber head_blocknum, in
 
 Oid get_relation_oid(Oid spcNode, Oid relNode)
 {
-    Oid relation_oid = RelidByRelfilenode(spcNode, relNode, true);
-    if (!OidIsValid(relation_oid)) {
-        /* Try pg_partition */
-        Oid toastid, partition_oid;
-        relation_oid = PartitionRelidByRelfilenode(spcNode, relNode, toastid, &partition_oid, true);
-    }
+    Oid toastid = InvalidOid;
+    Oid relation_oid = HeapGetRelid(spcNode, relNode, toastid, NULL, true);
     return relation_oid;
 }
 
@@ -1129,6 +1240,10 @@ Datum gs_space_shrink(PG_FUNCTION_ARGS)
                 errmsg("Don't shrink space, for recovery is in progress.")));
     }
 
+    if (SS_STANDBY_MODE) {
+        ereport(ERROR, (errmsg("SS standby cannot perform gs_space_shrink")));
+    }
+
     Oid spaceid = PG_GETARG_OID(0);
     Oid dbid = PG_GETARG_OID(1);
     uint32 extent_type = PG_GETARG_UINT32(2);
@@ -1142,6 +1257,10 @@ Datum local_space_shrink(PG_FUNCTION_ARGS)
     if (!XLogInsertAllowed()) {
         ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("Don't shrink space locally, for recovery is in progress.")));
+    }
+
+    if (SS_STANDBY_MODE) {
+        ereport(ERROR, (errmsg("SS standby cannot perform local_space_shrink")));
     }
 
     char *tablespacename = text_to_cstring(PG_GETARG_TEXT_PP(0));
@@ -1165,6 +1284,10 @@ Datum global_space_shrink(PG_FUNCTION_ARGS)
                 errmsg("Don't shrink space globally, for recovery is in progress.")));
     }
 
+    if (SS_STANDBY_MODE) {
+        ereport(ERROR, (errmsg("SS standby cannot perform global_space_shrink")));
+    }
+
     char *tablespacename = text_to_cstring(PG_GETARG_TEXT_PP(0));
     char *dbname = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
@@ -1181,7 +1304,7 @@ Datum global_space_shrink(PG_FUNCTION_ARGS)
 
     StringInfoData buf;
     initStringInfo(&buf);
-    appendStringInfo(&buf, "select local_space_shrink(\'%s\', \'%s\')", tablespacename, dbname);
+    appendStringInfo(&buf, "select pg_catalog.local_space_shrink(\'%s\', \'%s\')", tablespacename, dbname);
     ParallelFunctionState* state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_DATANODES, true);
     FreeParallelFunctionState(state);
 
@@ -1242,3 +1365,153 @@ void InitSegSpcCache(void)
     }
 }
 
+static bool SSCheckIfSegLogicFileNormal(SegExtentGroup *seg)
+{
+    SegLogicFile *sf = seg->segfile;
+    if (sf->total_blocks < DF_FILE_MIN_BLOCKS) {
+        return false;
+    }
+
+    int fd = BasicOpenFile(sf->filename, O_RDWR | PG_BINARY, S_IWUSR | S_IRUSR);
+    if (fd < 0) {
+        ereport(ERROR, (errmsg("open_file failed filename: %s, fd is %d, %d", sf->filename, fd, errno)));
+    }
+    sf->segfiles[0].fd = fd;
+    char* buffer = (char *)palloc(BLCKSZ + ALIGNOF_BUFFER);
+    char* aligned_buffer = (char *)BUFFERALIGN(buffer);
+    int nbytes = pread(fd, aligned_buffer, BLCKSZ, DF_MAP_HEAD_PAGE * BLCKSZ);
+    if (nbytes != BLCKSZ) {
+        ereport(ERROR, (errmsg("could not read segment meta block in file %s, %d", sf->filename, errno)));
+    }
+
+    if (!PageIsVerified((Page)aligned_buffer, DF_MAP_HEAD_PAGE)) {
+        pfree(buffer);
+        return false;
+    }
+
+    df_map_head_t *map_head = (df_map_head_t *)PageGetContents((Page)aligned_buffer);
+    if (map_head->bit_unit != seg->extent_size) {
+        pfree(buffer);
+        return false;
+    }
+
+    pfree(buffer);
+    return true;
+}
+
+static void SSUpdateSegLogicFileSize(SegSpace *spc)
+{
+    bool is_normal = true;
+    bool is_meta_normal = false;
+
+    for (int egid = 0; egid < EXTENT_GROUPS; egid++) {
+        for (int forknum = 0; forknum <= SEGMENT_MAX_FORKNUM; forknum++) {
+            SegLogicFile *sf = spc->extent_group[egid][forknum].segfile;
+            if (sf->file_num == 0) {
+                continue;
+            }
+
+            struct stat statbuf;
+            if (sf->file_num == 1) {
+                if (stat(sf->filename, &statbuf) == 0) {
+                    sf->total_blocks = statbuf.st_size / BLCKSZ;
+                } else {
+                    ereport(ERROR, (errmsg("failed stat file %s during init segment file.", sf->filename)));
+                }
+            } else {
+                char fullpath[MAXPGPATH];
+                errno_t rc = sprintf_s(fullpath, MAXPGPATH, "%s.%d", sf->filename, sf->file_num - 1);
+                securec_check_ss(rc, "\0", "\0");
+                if (stat(fullpath, &statbuf) == 0) {
+                    sf->total_blocks = statbuf.st_size / BLCKSZ + (sf->file_num - 1) * EXT_SIZE_1024_TOTAL_PAGES;
+                } else {
+                    ereport(ERROR, (errmsg("failed stat file %s during init segment file.", fullpath)));
+                }
+            }
+
+            if (!is_normal) {
+                continue;
+            }
+
+            /* we can set spc status to open here, only need to open sf->filename and read one block to verify */
+            if (is_normal && SSCheckIfSegLogicFileNormal(&(spc->extent_group[egid][forknum]))) {
+                if (egid == 0 && forknum == 0) {
+                    is_meta_normal = true;
+                }
+            } else {
+                is_normal = false;
+            }
+        }
+    }
+
+    if (is_meta_normal && is_normal) {
+        spc->status = OPENED;
+    }
+}
+
+static void SSUpdateSegLogicFileNum(SegLogicFile* sf, char* dirpath, char* filename)
+{
+    int sliceno = sf->file_num + 1;
+    if (sliceno > sf->vector_capacity) {
+        df_extend_file_vector(sf);
+    }
+    sf->segfiles[sf->file_num].sliceno = sf->file_num;
+    sf->file_num++;
+}
+
+static void SSInitSegLogicFile(SegSpace *spc)
+{
+    if (spc->extent_group[0][0].segfile == NULL) {
+        return;
+    }
+    SegmentCheck(spc->extent_group[0][0].segfile->filename[0] != '\0');
+    /* Get path of dir from seg filename */
+    char dirpath[MAXPGPATH];
+    int count = strlen(spc->extent_group[0][0].segfile->filename) - SEG_MAINFORK_FILENAME_LEN;
+    int rc = EOK;
+    rc = strncpy_s(dirpath, MAXPGPATH, spc->extent_group[0][0].segfile->filename, count);
+    securec_check_c(rc, "\0", "\0");
+
+    /*
+     * Read dir and fill seg logic file except fd.
+     * For filenum and total block, we only need to check the filename and size under the dir.
+     * For fd, we can construct the filename and open it when we really need use the file.
+     */
+    DIR *data_dir = NULL;
+    struct dirent *data_de = NULL;
+    data_dir = opendir(dirpath);
+    if (data_dir == NULL) {
+        ereport(ERROR,
+            (errcode_for_file_access(), errmsg("could not open data dir %s during init segment file.", dirpath)));
+    }
+
+    while ((data_de = readdir(data_dir)) != NULL) {
+        if (!isdigit(data_de->d_name[0])) {
+            continue;
+        }
+
+        char tmp_path[MAXPGPATH];
+        int suffix = 0;
+        rc = sscanf_s(data_de->d_name, "%[^.].%d", tmp_path, MAXPGPATH, &suffix);
+        if (rc <= 0) {
+            ereport(LOG, (errmsg("skip %s as it is not segment file.", data_de->d_name)));
+            continue;
+        }
+        int extent_size = tmp_path[0] - '0';
+        int tmp_length = strlen(tmp_path);
+        if (strstr(tmp_path, "_vm") != NULL && tmp_length == SEG_VMFORK_FILENAME_LEN && extent_size >= EXTENT_1 &&
+            extent_size <= EXTENT_8192) {
+            SSUpdateSegLogicFileNum(spc->extent_group[extent_size - 1][VISIBILITYMAP_FORKNUM].segfile, dirpath,
+                data_de->d_name);
+        } else if (strstr(tmp_path, "_fsm") != NULL && tmp_length == SEG_FSMFORK_FILENAME_LEN &&
+            extent_size >= EXTENT_1 && extent_size <= EXTENT_8192) {
+            SSUpdateSegLogicFileNum(spc->extent_group[extent_size - 1][FSM_FORKNUM].segfile, dirpath, data_de->d_name);
+        } else if (tmp_length == 1 && extent_size >= EXTENT_1 && extent_size <= EXTENT_8192) {
+            SSUpdateSegLogicFileNum(spc->extent_group[extent_size - 1][MAIN_FORKNUM].segfile, dirpath, data_de->d_name);
+        } else {
+            ereport(LOG, (errmsg("skip %s as it is not segment file.", data_de->d_name)));
+        }
+    }
+    SSUpdateSegLogicFileSize(spc);
+    closedir(data_dir);
+}

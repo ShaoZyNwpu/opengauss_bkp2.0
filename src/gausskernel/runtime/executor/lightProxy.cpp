@@ -36,6 +36,7 @@
 #include "utils/snapmgr.h"
 #include "pgstat.h"
 #include "pgaudit.h"
+#include "auditfuncs.h"
 #include "pgxc/route.h"
 #include "libpq/pqformat.h"
 #include "gs_policy/policy_common.h"
@@ -135,8 +136,8 @@ static void report_iud_time_for_lightproxy(const Query* query)
     if (query->rtable == NULL)
         return;
 
-    if (query->resultRelation <= list_length(query->rtable)) {
-        RangeTblEntry* rte = (RangeTblEntry*)list_nth(query->rtable, query->resultRelation - 1);
+    if (linitial_int(query->resultRelations) <= list_length(query->rtable)) {
+        RangeTblEntry* rte = (RangeTblEntry*)list_nth(query->rtable, linitial_int(query->resultRelations) - 1);
         if (RTE_RELATION != rte->rtekind)
             return;
 
@@ -1019,8 +1020,9 @@ void lightProxy::runSimpleQuery(StringInfo exec_message)
     handleResponse();
 
     /* pgaudit */
-    if ((u_sess->attr.attr_security.Audit_DML_SELECT != 0 || u_sess->attr.attr_security.Audit_DML != 0) &&
-        u_sess->attr.attr_security.Audit_enabled && IsPostmasterEnvironment) {
+    bool is_full_audit_user = audit_check_full_audit_user();
+    if ((u_sess->attr.attr_security.Audit_DML_SELECT != 0 || u_sess->attr.attr_security.Audit_DML != 0 ||
+        is_full_audit_user) && u_sess->attr.attr_security.Audit_enabled && IsPostmasterEnvironment) {
         light_pgaudit_ExecutorEnd(m_query);
     }
     /* unified auditing policy */
@@ -1040,7 +1042,7 @@ void lightProxy::runSimpleQuery(StringInfo exec_message)
 
     /* update unique sql stat */
     if (is_unique_sql_enabled() && is_local_unique_sql()) {
-        UpdateUniqueSQLStat(NULL, NULL, GetCurrentStatementLocalStartTimestamp());
+        instr_unique_sql_report_elapse_time(GetCurrentStatementLocalStartTimestamp());
     }
     pgstate_update_percentile_responsetime();
     // no more proxy
@@ -1055,6 +1057,9 @@ int lightProxy::runBatchMsg(StringInfo batch_message, bool sendDMsg, int batch_c
 
     SetUniqueSQLIdFromCachedPlanSource(this->m_cplan);
 
+    /* Must set snapshot before starting executor. */
+    PushActiveSnapshot(GetTransactionSnapshot(GTM_LITE_MODE));
+
     connect();
 
     LPROXY_DEBUG(ereport(DEBUG2,(errmodule(MOD_LIGHTPROXY),
@@ -1062,9 +1067,6 @@ int lightProxy::runBatchMsg(StringInfo batch_message, bool sendDMsg, int batch_c
         m_handle->nodeoid,
         m_stmtName,
         m_cplan->query_string))));
-
-    /* Must set snapshot before starting executor. */
-    PushActiveSnapshot(GetTransactionSnapshot(GTM_LITE_MODE));
 
     proxyNodeBegin(m_cplan->is_read_only);
 
@@ -1097,8 +1099,9 @@ int lightProxy::runBatchMsg(StringInfo batch_message, bool sendDMsg, int batch_c
     CommandCounterIncrement();
 
     /* pgaudit */
-    if ((u_sess->attr.attr_security.Audit_DML_SELECT != 0 || u_sess->attr.attr_security.Audit_DML != 0) &&
-        u_sess->attr.attr_security.Audit_enabled && IsPostmasterEnvironment) {
+    bool is_full_audit_user = audit_check_full_audit_user();
+    if ((u_sess->attr.attr_security.Audit_DML_SELECT != 0 || u_sess->attr.attr_security.Audit_DML != 0 ||
+        is_full_audit_user) && u_sess->attr.attr_security.Audit_enabled && IsPostmasterEnvironment) {
         for (int i = 0; i < batch_count; i++)
             light_pgaudit_ExecutorEnd((Query*)linitial(m_cplan->query_list));
     }
@@ -1140,6 +1143,9 @@ void lightProxy::runMsg(StringInfo exec_message)
                     "commands ignored until end of transaction block, firstChar[%c]",
                     u_sess->proc_cxt.firstChar), 0));
 
+    /* Must set snapshot before starting executor. */
+    PushActiveSnapshot(GetTransactionSnapshot(GTM_LITE_MODE));
+
     connect();
 
     LPROXY_DEBUG(ereport(DEBUG2,(errmodule(MOD_LIGHTPROXY),
@@ -1160,15 +1166,6 @@ void lightProxy::runMsg(StringInfo exec_message)
 
     /* Set after start transaction in case there is no CurrentResourceOwner */
     SetUniqueSQLIdFromCachedPlanSource(this->m_cplan);
-
-    /* Must set snapshot before starting executor, unless it is a MOT tables transaction. */
-#ifdef ENABLE_MOT
-    if (!IsMOTEngineUsed()) {
-#endif
-        PushActiveSnapshot(GetTransactionSnapshot(GTM_LITE_MODE));
-#ifdef ENABLE_MOT
-    }
-#endif
 
     proxyNodeBegin(m_cplan->is_read_only);
     /* check if we need to send parse or not */
@@ -1201,13 +1198,7 @@ void lightProxy::runMsg(StringInfo exec_message)
     m_msgctl->hasResult = (m_cplan->resultDesc != NULL) ? true : false;
     handleResponse();
 
-#ifdef ENABLE_MOT
-    if (!IsMOTEngineUsed()) {
-#endif
-        PopActiveSnapshot();
-#ifdef ENABLE_MOT
-    }
-#endif
+    PopActiveSnapshot();
 
     /*
      * We need a CommandCounterIncrement after every query, except
@@ -1225,8 +1216,9 @@ void lightProxy::runMsg(StringInfo exec_message)
     }
 
     /* pgaudit */
-    if ((u_sess->attr.attr_security.Audit_DML_SELECT != 0 || u_sess->attr.attr_security.Audit_DML != 0) &&
-        u_sess->attr.attr_security.Audit_enabled && IsPostmasterEnvironment) {
+    bool is_full_audit_user = audit_check_full_audit_user();
+    if ((u_sess->attr.attr_security.Audit_DML_SELECT != 0 || u_sess->attr.attr_security.Audit_DML != 0 ||
+        is_full_audit_user) && u_sess->attr.attr_security.Audit_enabled && IsPostmasterEnvironment) {
         light_pgaudit_ExecutorEnd((Query*)linitial(m_cplan->query_list));
     }
     /* unified auditing policy */
@@ -1249,7 +1241,7 @@ void lightProxy::runMsg(StringInfo exec_message)
 
     /* update unique sql stat */
     if (is_unique_sql_enabled() && is_local_unique_sql()) {
-        UpdateUniqueSQLStat(NULL, NULL, GetCurrentStatementLocalStartTimestamp());
+        instr_unique_sql_report_elapse_time(GetCurrentStatementLocalStartTimestamp());
     }
     pgstate_update_percentile_responsetime();
     setCurrentProxy(NULL);

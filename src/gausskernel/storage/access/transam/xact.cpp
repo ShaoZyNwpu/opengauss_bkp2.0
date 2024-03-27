@@ -105,6 +105,7 @@
 #include "commands/sequence.h"
 #include "postmaster/bgworker.h"
 #include "replication/walreceiver.h"
+#include "ddes/dms/ss_common_attr.h"
 #ifdef ENABLE_MULTIPLE_NODES
 #include "tsdb/cache/queryid_cachemgr.h"
 #include "tsdb/cache/part_cachemgr.h"
@@ -112,7 +113,6 @@
 #endif   /* ENABLE_MULTIPLE_NODES */
 
 extern void CodeGenThreadTearDown();
-extern void CleanupDfsHandlers(bool isTop);
 extern void deleteGlobalOBSInstrumentation();
 extern void CancelAutoAnalyze();
 extern void rollback_searchlet();
@@ -125,105 +125,11 @@ THR_LOCAL bool TwoPhaseCommit = false;
 
 
 extern bool is_user_name_changed();
-extern void HDFSAbortCacheBlock();
 extern THR_LOCAL Oid lastUDFOid;
 #define MAX_GID_LENGTH 256
 
 #define SPI_COMMIT 0
 #define SPI_ROLLBACK 1
-
-/*
- *	transaction states - transaction state from server perspective
- */
-typedef enum TransState {
-    TRANS_DEFAULT,    /* idle */
-    TRANS_START,      /* transaction starting */
-    TRANS_INPROGRESS, /* inside a valid transaction */
-    TRANS_COMMIT,     /* commit in progress */
-    TRANS_ABORT,      /* abort in progress */
-    TRANS_PREPARE,     /* prepare in progress */
-    TRANS_UNDO        /* applying undo */
-} TransState;
-
-/*
- *	transaction block states - transaction state of client queries
- *
- * Note: the subtransaction states are used only for non-topmost
- * transactions; the others appear only in the topmost transaction.
- */
-typedef enum TBlockState {
-    /* not-in-transaction-block states */
-    TBLOCK_DEFAULT, /* idle */
-    TBLOCK_STARTED, /* running single-query transaction */
-
-    /* transaction block states */
-    TBLOCK_BEGIN,         /* starting transaction block */
-    TBLOCK_INPROGRESS,    /* live transaction */
-    TBLOCK_END,           /* COMMIT received */
-    TBLOCK_ABORT,         /* failed xact, awaiting ROLLBACK */
-    TBLOCK_ABORT_END,     /* failed xact, ROLLBACK received */
-    TBLOCK_ABORT_PENDING, /* live xact, ROLLBACK received */
-    TBLOCK_PREPARE,       /* live xact, PREPARE received */
-    TBLOCK_UNDO,          /* Need rollback to be executed for this topxact */
-
-    /* subtransaction states */
-    TBLOCK_SUBBEGIN,         /* starting a subtransaction */
-    TBLOCK_SUBINPROGRESS,    /* live subtransaction */
-    TBLOCK_SUBRELEASE,       /* RELEASE received */
-    TBLOCK_SUBCOMMIT,        /* COMMIT received while TBLOCK_SUBINPROGRESS */
-    TBLOCK_SUBABORT,         /* failed subxact, awaiting ROLLBACK */
-    TBLOCK_SUBABORT_END,     /* failed subxact, ROLLBACK received */
-    TBLOCK_SUBABORT_PENDING, /* live subxact, ROLLBACK received */
-    TBLOCK_SUBRESTART,       /* live subxact, ROLLBACK TO received */
-    TBLOCK_SUBABORT_RESTART, /* failed subxact, ROLLBACK TO received */
-    TBLOCK_SUBUNDO           /* Need rollback to be executed for this subxact */
-} TBlockState;
-
-/*
- *	transaction state structure
- */
-struct TransactionStateData {
-#ifdef PGXC /* PGXC_COORD */
-    /* my GXID, or Invalid if none */
-    GlobalTransactionId transactionId;
-    GTM_TransactionKey txnKey;
-    bool isLocalParameterUsed; /* Check if a local parameter is active
-                                * in transaction block (SET LOCAL, DEFERRED) */
-    DList *savepointList;      /* SavepointData list */
-#else
-    TransactionId transactionId; /* my XID, or Invalid if none */
-#endif
-    SubTransactionId subTransactionId;   /* my subxact ID */
-    char *name;                          /* savepoint name, if any */
-    int savepointLevel;                  /* savepoint level */
-    TransState state;                    /* low-level state */
-    TBlockState blockState;              /* high-level state */
-    int nestingLevel;                    /* transaction nesting depth */
-    int gucNestLevel;                    /* GUC context nesting depth */
-    MemoryContext curTransactionContext; /* my xact-lifetime context */
-    ResourceOwner curTransactionOwner;   /* my query resources */
-    TransactionId *childXids;            /* subcommitted child XIDs, in XID order */
-    int nChildXids;                      /* # of subcommitted child XIDs */
-    int maxChildXids;                    /* allocated size of childXids[] */
-    Oid prevUser;                        /* previous CurrentUserId setting */
-    int prevSecContext;                  /* previous SecurityRestrictionContext */
-    bool prevXactReadOnly;               /* entry-time xact r/o state */
-    bool startedInRecovery;              /* did we start in recovery? */
-    bool didLogXid;                      /* has xid been included in WAL record? */
-    struct TransactionStateData* parent; /* back link to parent */
-
-#ifdef ENABLE_MOT
-    /* which storage engine tables are used in current transaction for D/I/U/S statements */
-    StorageEngineType storageEngineType;
-#endif
-
-    UndoRecPtr first_urp[UNDO_PERSISTENCE_LEVELS]; /* First UndoRecPtr create by this transaction */
-    UndoRecPtr latest_urp[UNDO_PERSISTENCE_LEVELS]; /* Last UndoRecPtr created by this transaction */
-    UndoRecPtr latest_urp_xact[UNDO_PERSISTENCE_LEVELS]; /* Last UndoRecPtr created by this transaction including its
-                                                          * parent if any */
-    bool perform_undo;
-    bool  subXactLock;
-};
 
 /*
  * CurrentTransactionState always points to the current transaction state
@@ -364,6 +270,7 @@ static const char *TransStateAsString(TransState state);
 static void PrepareTransaction(bool STP_commit = false);
 
 extern void print_leak_warning_at_commit();
+static void AtEOXact_Proceed_PatchSeq();
 #ifndef ENABLE_LLT
 extern void clean_ec_conn();
 extern void delete_ec_ctrl();
@@ -600,8 +507,13 @@ bool WorkerThreadCanSeekAnotherMission(ThreadStayReason* reason)
             *reason = TWORKER_UNCONSUMEMESSAGE;
             return false;
         } else {
-            *reason = TWORKER_CANSEEKNEXTSESSION;
-            return true;
+            if (libpqsw_can_seek_next_session()) {
+                *reason = TWORKER_CANSEEKNEXTSESSION;
+                return true;
+            } else {
+                *reason = TWORKER_UNCONSUMEMESSAGE;
+                return false;
+            }
         }
     }
 }
@@ -756,16 +668,6 @@ TransactionId GetStableLatestTransactionId(void)
     return t_thrd.xact_cxt.stablexid;
 }
 
-/* Get parent xid if any, return InvalidTransactionId if it is top transaction */
-TransactionId GetParentTransactionIdIfAny(const TransactionState s)
-{
-    if (s->parent != NULL) {
-        return s->parent->transactionId;
-    } else {
-        return InvalidTransactionId;
-    }
-}
-
 #ifdef PGXC
 /*
  *	GetCurrentLocalParamStatus
@@ -869,7 +771,7 @@ static void AssignTransactionId(TransactionState s)
         log_unknown_top = true;
 
     /* allocate undo zone before generate a new xid. */
-    if (!isSubXact && IsUnderPostmaster) {
+    if (!isSubXact && IsUnderPostmaster && !ENABLE_DSS) {
         undo::AllocateUndoZone();
         pg_memory_barrier();
     }
@@ -1117,35 +1019,6 @@ TimestampTz GetCurrentStatementStartTimestamp(void)
 TimestampTz GetCurrentStatementLocalStartTimestamp(void)
 {
     return t_thrd.xact_cxt.stmtStartTimestamp;
-}
-
-/*
- *	GetCurrentTransactionStopTimestamp
- *
- * We return current time if the transaction stop time hasn't been set
- * (which can happen if we decide we don't need to log an XLOG record).
- */
-TimestampTz GetCurrentTransactionStopTimestamp(void)
-{
-    /*
-     * As for Statement start timestamp, stop timestamp has to
-     * be adjusted with the delta value calculated with the
-     * timestamp received from GTM and the local node clock.
-     */
-#ifdef PGXC
-    TimestampTz timestamp;
-
-    if (t_thrd.xact_cxt.xactStopTimestamp != 0)
-        return t_thrd.xact_cxt.xactStopTimestamp + t_thrd.xact_cxt.GTMdeltaTimestamp;
-
-    timestamp = GetCurrentTimestamp() + t_thrd.xact_cxt.GTMdeltaTimestamp;
-
-    return timestamp;
-#else
-    if (t_thrd.xact_cxt.xactStopTimestamp != 0)
-        return t_thrd.xact_cxt.xactStopTimestamp;
-    return GetCurrentTimestamp();
-#endif
 }
 
 #ifdef PGXC
@@ -1429,7 +1302,7 @@ static void AtStart_ResourceOwner(void)
     /* We shouldn't have a transaction resource owner already. */
     Assert(t_thrd.utils_cxt.TopTransactionResourceOwner == NULL);
     Assert(CurrentResourceOwnerIsEmpty(t_thrd.utils_cxt.CurrentResourceOwner));
-    Assert(!EnableLocalSysCache() || CurrentResourceOwnerIsEmpty(t_thrd.lsc_cxt.lsc->local_sysdb_resowner));
+    Assert(!EnableLocalSysCache() || CurrentResourceOwnerIsEmpty(t_thrd.lsc_cxt.local_sysdb_resowner));
 
     /* Create a toplevel resource owner for the transaction. */
     s->curTransactionOwner = ResourceOwnerCreate(NULL, "TopTransaction",
@@ -1493,6 +1366,10 @@ void UpdateNextMaxKnownCSN(CommitSeqNo csn)
      * GTM mode update nextCommitSeqNo in UpdateCSNAtTransactionCommit.
      * GTM-Lite mode update nextCommitSeqNo in this function.
      */
+    if (ENABLE_DMS) {
+        return;
+    }
+
     if (!GTM_LITE_MODE) {
         return;
     }
@@ -1530,6 +1407,16 @@ void XLogInsertStandbyCSNCommitting(TransactionId xid, CommitSeqNo csn, Transact
     XLogInsert(RM_STANDBY_ID, XLOG_STANDBY_CSN_COMMITTING);
 }
 
+#ifndef ENABLE_MULTIPLE_NODES
+static inline void ResetPartitionLockInfo()
+{
+    list_free_ext(u_sess->storage_cxt.partition_dml_oids);
+    u_sess->storage_cxt.partition_dml_oids = NIL;
+    list_free_ext(u_sess->storage_cxt.partition_ddl_oids);
+    u_sess->storage_cxt.partition_ddl_oids = NIL;
+}
+#endif
+
 /* ----------------------------------------------------------------
  *						CommitTransaction stuff
  * ----------------------------------------------------------------
@@ -1547,7 +1434,7 @@ static TransactionId RecordTransactionCommit(void)
     TransactionId latestXid = InvalidTransactionId;
     int nrels;
     int temp_nrels = 0;
-    ColFileNodeRel *rels = NULL;
+    ColFileNode *rels = NULL;
     int nchildren;
     TransactionId *children = NULL;
     int nmsgs = 0;
@@ -1597,12 +1484,8 @@ static TransactionId RecordTransactionCommit(void)
          */
         CallXactCallbacks(XACT_EVENT_RECORD_COMMIT);
 
-        /*
-         * For MOT, XLOG entries will be written in the above callback for XACT_EVENT_RECORD_COMMIT.
-         * So, we should re-check and update wrote_xlog accordingly.
-         */
-        if (t_thrd.xlog_cxt.XactLastRecEnd != 0) {
-            wrote_xlog = true;
+        if (!wrote_xlog) {
+            Assert(t_thrd.xlog_cxt.XactLastRecEnd == 0);
         }
 #endif
 
@@ -1674,7 +1557,7 @@ static TransactionId RecordTransactionCommit(void)
                 {
                     /* Then get a new csn from gtm */
                     ereport(LOG, (errmsg("Set a new csn from gtm for auto commit transactions.")));
-                    setCommitCsn(CommitCSNGTM(true));
+                    setCommitCsn(CommitCSNGTM(true, NULL));
                 }
                 PG_CATCH();
                 {
@@ -1694,6 +1577,14 @@ static TransactionId RecordTransactionCommit(void)
          * This should be done after setCommitCsn for the transaction.
          */
         CallXactCallbacks(XACT_EVENT_RECORD_COMMIT);
+
+        /*
+         * For MOT, XLOG entries will be written in the above callback for XACT_EVENT_RECORD_COMMIT.
+         * So, we should re-check and update wrote_xlog accordingly.
+         */
+        if (t_thrd.xlog_cxt.XactLastRecEnd != 0) {
+            wrote_xlog = true;
+        }
 #endif
 
 
@@ -1757,7 +1648,13 @@ static TransactionId RecordTransactionCommit(void)
 
             /* dump rels to delete */
             if (nrels > 0) {
-                XLogRegisterData((char *)rels, nrels * sizeof(ColFileNodeRel));
+                if (unlikely((long)(t_thrd.proc->workingVersionNum < PAGE_COMPRESSION_VERSION))) {
+                    /* Warning: rels cant be inline. rel will be free at the end of function */
+                    rels = (ColFileNode *)(void *)ConvertToOldColFileNode(rels, nrels);
+                    XLogRegisterData((char*)rels, (int)(nrels * sizeof(ColFileNodeRel)));
+                } else {
+                    XLogRegisterData((char*)rels, (int)(nrels * sizeof(ColFileNode)));
+                }
                 (void)LWLockAcquire(DelayDDLLock, LW_SHARED);
             }
 
@@ -1788,7 +1685,11 @@ static TransactionId RecordTransactionCommit(void)
             /* we allow filtering by xacts */
             XLogIncludeOrigin();
 
-            commitRecLSN = XLogInsert(RM_XACT_ID, XLOG_XACT_COMMIT);
+            int1 info = XLOG_XACT_COMMIT;
+            if (t_thrd.proc->workingVersionNum >= PAGE_COMPRESSION_VERSION) {
+                info |= XLR_REL_COMPRESS;
+            }
+            commitRecLSN = XLogInsert(RM_XACT_ID, (uint8)info);
 
             if (nrels > 0) {
                 globalDelayDDLLSN = GetDDLDelayStartPtr();
@@ -1824,8 +1725,11 @@ static TransactionId RecordTransactionCommit(void)
 
             /* we allow filtering by xacts */
             XLogIncludeOrigin();
-
-            (void)XLogInsert(RM_XACT_ID, XLOG_XACT_COMMIT_COMPACT);
+            int1 info = XLOG_XACT_COMMIT_COMPACT;
+            if (t_thrd.proc->workingVersionNum >= PAGE_COMPRESSION_VERSION) {
+                info |= XLR_REL_COMPRESS;
+            }
+            (void)XLogInsert(RM_XACT_ID, (uint8)info);
         }
     }
 
@@ -1878,6 +1782,11 @@ static TransactionId RecordTransactionCommit(void)
              * clog and still show as running in the procarray and continue to hold locks.
              */
             if (wrote_xlog && u_sess->attr.attr_storage.guc_synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH) {
+#ifndef ENABLE_MULTIPLE_NODES
+                if (g_instance.attr.attr_storage.enable_save_confirmed_lsn) {
+                    t_thrd.proc->syncSetConfirmedLSN = t_thrd.xlog_cxt.ProcLastRecPtr;
+                }
+#endif
                 SyncRepWaitForLSN(t_thrd.xlog_cxt.XactLastRecEnd, !markXidCommitted);
                 g_instance.comm_cxt.localinfo_cxt.set_term = true;
             }
@@ -1964,6 +1873,9 @@ static void AtCommit_Memory(void)
     u_sess->top_transaction_mem_cxt = NULL;
     t_thrd.mem_cxt.cur_transaction_mem_cxt = NULL;
     CurrentTransactionState->curTransactionContext = NULL;
+    if (ENABLE_CACHEDPLAN_MGR) {
+        u_sess->pcache_cxt.action = NULL;
+    }
 
     t_thrd.xact_cxt.PGXCBucketMap = NULL;
     t_thrd.xact_cxt.PGXCBucketCnt = 0;
@@ -2098,7 +2010,7 @@ static TransactionId RecordTransactionAbort(bool isSubXact)
     xl_xact_abort xlrec;
     int nrels = 0;
     int temp_nrels = 0;
-    ColFileNodeRel *rels = NULL;
+    ColFileNode *rels = NULL;
     int nchildren = 0;
     TransactionId *children = NULL;
     int nlibrary = 0;
@@ -2180,7 +2092,13 @@ static TransactionId RecordTransactionAbort(bool isSubXact)
 
         /* dump rels to delete */
         if (nrels > 0) {
-            XLogRegisterData((char *)rels, nrels * sizeof(ColFileNodeRel));
+            if (unlikely((long)(t_thrd.proc->workingVersionNum < PAGE_COMPRESSION_VERSION))) {
+                /* Warning: rels cant be inline. rel will be free at the end of function */
+                rels = (ColFileNode *)(void *)ConvertToOldColFileNode(rels, nrels);
+                XLogRegisterData((char *)rels, (int)(nrels * sizeof(ColFileNodeRel)));
+            } else {
+                XLogRegisterData((char *)rels, (int)(nrels * sizeof(ColFileNode)));
+            }
             (void)LWLockAcquire(DelayDDLLock, LW_SHARED);
         }
 
@@ -2200,15 +2118,15 @@ static TransactionId RecordTransactionAbort(bool isSubXact)
         if (nlibrary > 0) {
             XLogRegisterData((char *)library_name, library_length);
         }
-
+        int info = t_thrd.proc->workingVersionNum >= PAGE_COMPRESSION_VERSION ? XLR_REL_COMPRESS : 0;
 #ifndef ENABLE_MULTIPLE_NODES
         if (t_thrd.proc->workingVersionNum >= DECODE_ABORT_VERSION_NUM && XLogLogicalInfoActive()) {
-            abortRecLSN = XLogInsert(RM_XACT_ID, XLOG_XACT_ABORT_WITH_XID);
+            abortRecLSN = XLogInsert(RM_XACT_ID, XLOG_XACT_ABORT_WITH_XID | info);
         } else {
-            abortRecLSN = XLogInsert(RM_XACT_ID, XLOG_XACT_ABORT);
+            abortRecLSN = XLogInsert(RM_XACT_ID, (uint8)XLOG_XACT_ABORT | info);
         }
 #else
-        abortRecLSN = XLogInsert(RM_XACT_ID, XLOG_XACT_ABORT);
+        abortRecLSN = XLogInsert(RM_XACT_ID, (uint8)(XLOG_XACT_ABORT | info));
 #endif
 
         if (nrels > 0) {
@@ -2451,17 +2369,30 @@ static void StartTransaction(bool begin_on_gtm)
         u_sess->attr.attr_common.XactReadOnly = true;
     } else {
         s->startedInRecovery = false;
-        u_sess->attr.attr_common.XactReadOnly = u_sess->attr.attr_storage.DefaultXactReadOnly;
+        u_sess->attr.attr_common.XactReadOnly = u_sess->attr.attr_storage.DefaultXactReadOnly ||
+            g_instance.streaming_dr_cxt.isInSwitchover;
 #ifdef PGXC
         /* Save Postgres-XC session as read-only if necessary */
         if (!u_sess->attr.attr_common.xc_maintenance_mode)
             u_sess->attr.attr_common.XactReadOnly = u_sess->attr.attr_common.XactReadOnly || IsPGXCNodeXactReadOnly();
 #endif
-        /* if the transaction comes from cm_agent, we always treat it as writable */
-        if (u_sess->libpq_cxt.IsConnFromCmAgent) {
+        /* if the transaction comes from cm_agent or om tool in restore mode, we always treat it as writable */
+        if (u_sess->libpq_cxt.IsConnFromCmAgent ||
+            (strcasecmp(u_sess->attr.attr_common.application_name, "OM") == 0 && isRestoreMode)) {
             u_sess->attr.attr_common.XactReadOnly = false;
         }
     }
+
+    if (ENABLE_DMS) {
+        if (u_sess->attr.attr_common.DefaultXactIsoLevel != XACT_READ_COMMITTED) {
+            ereport(ERROR,
+                (errmsg("Only support read committed transcation isolation level while DMS and DSS enabled.")));
+        }
+        if (!SS_OFFICIAL_PRIMARY) {
+            u_sess->attr.attr_common.XactReadOnly = true;
+        }
+    }
+
     u_sess->attr.attr_storage.XactDeferrable = u_sess->attr.attr_storage.DefaultXactDeferrable;
 #ifdef PGXC
     /* PGXC - PGXC doesn't support 9.1 serializable transactions. They are
@@ -2479,7 +2410,6 @@ static void StartTransaction(bool begin_on_gtm)
     t_thrd.xact_cxt.XactLocalNodeCanAbort = true;
     t_thrd.xact_cxt.XactPrepareSent = false;
     t_thrd.xact_cxt.AlterCoordinatorStmt = false;
-    t_thrd.utils_cxt.pRelatedRel = NULL;
 
     /* reinitialize within-transaction counters */
     s->subTransactionId = TopSubTransactionId;
@@ -2596,6 +2526,10 @@ static void StartTransaction(bool begin_on_gtm)
 #endif
     ResetBCMArray();
 
+#ifndef ENABLE_MULTIPLE_NODES
+    ResetPartitionLockInfo();
+#endif
+
     /* 
      * Get node group status and save in cache,
      * if we are doing two phase commit, skip init cache.
@@ -2667,6 +2601,11 @@ static void CommitTransaction(bool STP_commit)
 
     ShowTransactionState("CommitTransaction");
 
+#ifndef ENABLE_MULTIPLE_NODES
+    LockPartitionDDLOperation();
+    ResetPartitionLockInfo();
+#endif
+
     /* Check relcache init flag */
     if (needNewLocalCacheFile) {
         ereport(WARNING, (errcode(ERRCODE_WARNING), errmsg("Wrong flag of relcache init flag at commit transaction.")));
@@ -2704,7 +2643,7 @@ static void CommitTransaction(bool STP_commit)
 
     if (!STP_commit) {
         /* release ref for spi's cachedplan */
-        ReleaseSpiPlanRef();
+        ReleaseSpiPlanRef(s->subTransactionId);
 
         /* reset store procedure transaction context */
         stp_reset_xact();
@@ -3102,6 +3041,11 @@ static void CommitTransaction(bool STP_commit)
         g_instance.plan_cache->Commit();
     }
 
+#ifdef ENABLE_MOT
+    /* Post commit cleanup of MOT JIT sources. */
+    CallXactCallbacks(XACT_EVENT_POST_COMMIT_CLEANUP);
+#endif
+
     /*
      * Likewise, dropping of files deleted during the transaction is best done
      * after releasing relcache and buffer pins.  (This is not strictly
@@ -3216,6 +3160,7 @@ static void CommitTransaction(bool STP_commit)
 
     RESUME_INTERRUPTS();
 
+    AtEOXact_Proceed_PatchSeq();
     AtEOXact_Remote();
     /* flush all profile log about this worker thread */
     flush_plog();
@@ -3240,7 +3185,7 @@ static int finish_txn_gtm_lite(bool commit, bool is_write)
         if (commit) {
             if (is_write) {
                 /* We will always call CommitCSNGTM() in CN. */
-                csn = CommitCSNGTM(false);
+                csn = CommitCSNGTM(false, NULL);
                 setCommitCsn(csn);
                 ret = (csn == InvalidCommitSeqNo) ? -1 : 0;
             }
@@ -3255,7 +3200,7 @@ static int finish_txn_gtm_lite(bool commit, bool is_write)
             IsStatementFlushProcess() || IsJobAspProcess()) {
             if (commit) {
                 if (GlobalTransactionIdIsValid(s->transactionId)) {
-                    csn = CommitCSNGTM(false);
+                    csn = CommitCSNGTM(false, NULL);
                     setCommitCsn(csn);
                     ret = (csn == InvalidCommitSeqNo) ? -1 : 0;
                 }
@@ -3683,7 +3628,10 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
     TransactionState s = CurrentTransactionState;
     TransactionId latestXid;
     t_thrd.xact_cxt.bInAbortTransaction = true;
-    t_thrd.utils_cxt.pRelatedRel = NULL;
+
+#ifndef ENABLE_MULTIPLE_NODES
+    ResetPartitionLockInfo();
+#endif
 
     /* clean stream snapshot register info */
     ForgetRegisterStreamSnapshots();
@@ -3724,16 +3672,14 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
     CStoreAbortCU();
     /* abort async io, must before LWlock release */
     AbortAsyncListIO();
-    /* abort orc metadata block */
-    HDFSAbortCacheBlock();
 
     /*
      * clean urecvec when transaction is aborted
      * no need to release locks all released
      * need free memory before releasing portal context
      */
-    if (u_sess->ustore_cxt.urecvec) {
-        u_sess->ustore_cxt.urecvec->Reset(false);
+    if (t_thrd.ustore_cxt.urecvec) {
+        t_thrd.ustore_cxt.urecvec->Reset(false);
     }
 
     /*
@@ -3765,12 +3711,6 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
 
     ResetWlmCatalogFlag();
     /*
-     * @dfs
-     * Clean up DfsReaders that miss invoking deconstructors of dfs::reader::Reader
-     * to release the memory not allocated in memory context
-     */
-    CleanupDfsHandlers(true);
-    /*
      * Note that parent thread will do abort transaction.
      * Stream thread should read only, no change to xlog files.
      */
@@ -3787,7 +3727,7 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
 
     if (!STP_rollback) {
         /* release ref for spi's cachedplan */
-        ReleaseSpiPlanRef();
+        ReleaseSpiPlanRef(s->subTransactionId);
 
         /* reset store procedure transaction context */
         stp_reset_xact();
@@ -3949,6 +3889,9 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
     CallXactCallbacks(XACT_EVENT_PREROLLBACK_CLEANUP);
 #endif
 
+    if(ENABLE_CACHEDPLAN_MGR && u_sess->pcache_cxt.action != NULL){
+        u_sess->pcache_cxt.action = NULL;
+    }
     AtAbort_Portals(STP_rollback);
     AtEOXact_LargeObject(false);
     AtAbort_Notify();
@@ -4081,6 +4024,9 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
     t_thrd.xact_cxt.enable_lock_cancel = false;
     t_thrd.xact_cxt.ActiveLobRelid = InvalidOid;
     t_thrd.xact_cxt.isSelectInto = false;
+    t_thrd.xact_cxt.callPrint = false;
+    u_sess->catalog_cxt.myLobTempToastNamespace = InvalidOid;
+    u_sess->plsql_cxt.ActiveLobToastOid = InvalidOid;
 }
 
 static void CleanupTransaction(void)
@@ -4527,7 +4473,6 @@ void AbortCurrentTransaction(bool STP_rollback)
      * risk of deadlock.
      */
     SetUndoActionsInfo();
-
     switch (s->blockState) {
         case TBLOCK_DEFAULT:
             if (s->state == TRANS_DEFAULT) {
@@ -4554,8 +4499,12 @@ void AbortCurrentTransaction(bool STP_rollback)
         case TBLOCK_STARTED:
             AbortTransaction(PerfectRollback, STP_rollback);
             ApplyUndoActions();
-            CleanupTransaction();
-            s->blockState = TBLOCK_DEFAULT;
+            if (u_sess->attr.attr_storage.phony_autocommit || STP_rollback) {
+                CleanupTransaction();
+                s->blockState = TBLOCK_DEFAULT;
+            } else {
+                s->blockState = TBLOCK_ABORT;
+            }
             break;
 
             /*
@@ -6032,7 +5981,6 @@ void FreeSavepointList()
 void AbortOutOfAnyTransaction(bool reserve_topxact_abort)
 {
     TransactionState s = CurrentTransactionState;
-
     /*
      * Get out of any transaction or nested transaction
      */
@@ -6365,16 +6313,6 @@ static void CommitSubTransaction(bool STP_commit)
     CommandCounterIncrement();
 
     /*
-     * clean dfs handler for sub transaction in such condition:
-     * start transaction;
-     * savepoint s1;
-     * execute direct on (datanode1) 'select cursor_demo()';
-     * rollback;
-     * ps: the procedure includes exceptions and don't close the cursor
-     * */
-    CleanupDfsHandlers(false);
-
-    /*
      * Prior to 8.4 we marked subcommit in clog at this point.	We now only
      * perform that step, if required, as part of the atomic update of the
      * whole transaction tree at top level commit or abort.
@@ -6410,6 +6348,10 @@ static void CommitSubTransaction(bool STP_commit)
                             g_instance.attr.attr_common.PGXCNodeName, s->name)));
         }
 #endif
+    }
+    if (!STP_commit) {
+        /* release ref for spi's cachedplan */
+        ReleaseSpiPlanRef(s->subTransactionId);
     }
 
     ResourceOwnerRelease(s->curTransactionOwner, RESOURCE_RELEASE_BEFORE_LOCKS, true, false);
@@ -6485,13 +6427,6 @@ void AbortSubTxnRuntimeContext(TransactionState s, bool inPL)
 {
     u_sess->exec_cxt.isLockRows = false;
 
-    /*
-     * @dfs
-     * Clean up DfsReaders that miss invoking deconstructors of dfs::reader::Reader
-     * to release the memory not allocated in memory context
-     */
-    CleanupDfsHandlers(false);
-
     /* clean up ec connection */
 #ifndef ENABLE_LLT
     clean_ec_conn();
@@ -6519,8 +6454,6 @@ void AbortSubTxnRuntimeContext(TransactionState s, bool inPL)
     CStoreAbortCU();
     /* abort async io, must before LWlock release */
     AbortAsyncListIO();
-
-    HDFSAbortCacheBlock();
 
     /*
      * Release any LW locks we might be holding as quickly as possible.
@@ -6599,6 +6532,15 @@ void AbortSubTransaction(bool STP_rollback)
     s->state = TRANS_ABORT;
 
     /*
+     * clean urecvec when subtransaction is aborted
+     * no need to release locks all released later
+     * need free memory before releasing portal context
+     */
+    if (t_thrd.ustore_cxt.urecvec) {
+        t_thrd.ustore_cxt.urecvec->Reset(false);
+    }
+
+    /*
      * Wait data replicate in AbortSubTransaction. As related relation info has been cleared in
      * AbortSubTransaction. AtSubAbort_smgr e.g. In AbortTransaction, related info is missing.
      * So we should Data sync here for sub xacts abort.
@@ -6649,6 +6591,10 @@ void AbortSubTransaction(bool STP_rollback)
 #ifdef ENABLE_MULTIPLE_NODES
         reset_handles_at_abort();
 #endif
+        if (!STP_rollback) {
+            /* release ref for spi's cachedplan */
+            ReleaseSpiPlanRef(s->subTransactionId);
+        }
 
         ResourceOwnerRelease(s->curTransactionOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
         AtEOSubXact_RelationCache(false, s->subTransactionId, s->parent->subTransactionId);
@@ -6680,6 +6626,8 @@ void AbortSubTransaction(bool STP_rollback)
 
     t_thrd.xact_cxt.bInAbortTransaction = false;
     t_thrd.xact_cxt.ActiveLobRelid = InvalidOid;
+    u_sess->catalog_cxt.myLobTempToastNamespace = InvalidOid;
+    u_sess->plsql_cxt.ActiveLobToastOid = InvalidOid;
 
     RESUME_INTERRUPTS();
 }
@@ -6973,6 +6921,8 @@ static const char *TransStateAsString(TransState state)
             return "ABORT";
         case TRANS_PREPARE:
             return "PREPARE";
+        case TRANS_UNDO:
+            return "UNDO";
         default:
             break;
     }
@@ -7104,7 +7054,7 @@ static void xact_redo_forget_alloc_segs(TransactionId xid, TransactionId *subXid
     remainSegsLock.unLock();
 }
 
-static void xact_redo_log_drop_segs(_in_ ColFileNodeRel *xnodes, _in_ int nrels, XLogRecPtr lsn)
+static void xact_redo_log_drop_segs(_in_ ColFileNode *xnodes, _in_ int nrels, XLogRecPtr lsn)
 {
     bool isNeedLogRemainSegs = IsNeedLogRemainSegs(lsn);
     if (!isNeedLogRemainSegs) {
@@ -7119,9 +7069,9 @@ static void xact_redo_log_drop_segs(_in_ ColFileNodeRel *xnodes, _in_ int nrels,
 
     for (int i = 0; i < nrels; ++i) {
         ColFileNode colFileNode;
-        ColFileNodeRel *colFileNodeRel = xnodes + i;
+        ColFileNode *colFileNodeRel = xnodes + i;
 
-        ColFileNodeCopy(&colFileNode, colFileNodeRel);
+        ColFileNodeFullCopy(&colFileNode, colFileNodeRel);
 
         if (!IsValidColForkNum(colFileNode.forknum) && IsSegmentFileNode(colFileNode.filenode)) {
             RemainExtentHashTag remainExtentHashTag;
@@ -7150,7 +7100,7 @@ static void xact_redo_log_drop_segs(_in_ ColFileNodeRel *xnodes, _in_ int nrels,
 }
 
 /* This function cannot be used to process segment tables. */
-void push_unlink_rel_to_hashtbl(ColFileNodeRel *xnodes, int nrels)
+void push_unlink_rel_to_hashtbl(ColFileNode *xnodes, int nrels)
 {
     HTAB *relfilenode_hashtbl = g_instance.bgwriter_cxt.unlink_rel_hashtbl;
     uint del_rel_num = 0;
@@ -7162,15 +7112,11 @@ void push_unlink_rel_to_hashtbl(ColFileNodeRel *xnodes, int nrels)
     LWLockAcquire(g_instance.bgwriter_cxt.rel_hashtbl_lock, LW_EXCLUSIVE);
     for (int i = 0; i < nrels; i++) {
         ColFileNode colFileNode;
-        ColFileNodeRel *colFileNodeRel = xnodes + i;
+        ColFileNode *colFileNodeRel = xnodes + i;
         bool found = false;
         DelFileTag *entry = NULL;
 
-        ColFileNodeCopy(&colFileNode, colFileNodeRel);
-        if (IS_COMPRESS_DELETE_FORK(colFileNode.forknum)) {
-            SET_OPT_BY_NEGATIVE_FORK(colFileNode.filenode, colFileNode.forknum);
-            colFileNode.forknum = MAIN_FORKNUM;
-        }
+        ColFileNodeFullCopy(&colFileNode, colFileNodeRel);
         if (!IsValidColForkNum(colFileNode.forknum) && !IsSegmentFileNode(colFileNode.filenode)) {
             entry = (DelFileTag*)hash_search(relfilenode_hashtbl, &(colFileNode.filenode), HASH_ENTER, &found);
             if (!found) {
@@ -7180,6 +7126,7 @@ void push_unlink_rel_to_hashtbl(ColFileNodeRel *xnodes, int nrels)
                 entry->rnode.bucketNode = colFileNode.filenode.bucketNode;
                 entry->rnode.opt = colFileNode.filenode.opt;
                 entry->maxSegNo = -1;
+                entry->fileUnlink = false;
                 del_rel_num++;
             }
             BatchClearBadBlock(colFileNode.filenode, colFileNode.forknum, 0);
@@ -7198,7 +7145,7 @@ void push_unlink_rel_to_hashtbl(ColFileNodeRel *xnodes, int nrels)
 /*
  *	XLOG support routines
  */
-static void unlink_relfiles(_in_ ColFileNodeRel *xnodes, _in_ int nrels)
+static void unlink_relfiles(_in_ ColFileNode *xnodes, _in_ int nrels)
 {
     ColMainFileNodesCreate();
 
@@ -7213,13 +7160,9 @@ static void unlink_relfiles(_in_ ColFileNodeRel *xnodes, _in_ int nrels)
 
     for (int i = 0; i < nrels; ++i) {
         ColFileNode colFileNode;
-        ColFileNodeRel *colFileNodeRel = xnodes + i;
+        ColFileNode *colFileNodeRel = xnodes + i;
 
-        ColFileNodeCopy(&colFileNode, colFileNodeRel);
-        if (IS_COMPRESS_DELETE_FORK(colFileNode.forknum)) {
-            SET_OPT_BY_NEGATIVE_FORK(colFileNode.filenode, colFileNode.forknum);
-            colFileNode.forknum = MAIN_FORKNUM;
-        }
+        ColFileNodeFullCopy(&colFileNode, colFileNodeRel);
         if (!IsValidColForkNum(colFileNode.forknum)) {
             RelFileNode relFileNode = colFileNode.filenode;
             ForkNumber fork;
@@ -7231,25 +7174,6 @@ static void unlink_relfiles(_in_ ColFileNodeRel *xnodes, _in_ int nrels)
             }
 
             LockRelFileNode(relFileNode, AccessExclusiveLock);
-
-            /* drop hdfs directories just on CN during redo. */
-            if (IS_PGXC_COORDINATOR && IsValidPaxDfsForkNum(colFileNode.forknum)) {
-                ClearDfsStorage(&colFileNode, 1, true, true);
-            }
-
-            /*
-             * For truncate dfs table:
-             * -During redo commit, if we found mapper file and dfs file list,
-             * we will delete the corresponding files in dfs file list, then drop
-             * the mapper and dfs file list.
-             * If we can not find the mapper or dfs file list, we will not issue error.
-             * -During redo abort, nrels is 0, we will not enter here
-             */
-            if (!IS_PGXC_COORDINATOR && IsTruncateDfsForkNum(colFileNode.forknum)) {
-                ClearDfsDirectory(&colFileNode, true);
-                DropMapperFile(colFileNode.filenode);
-                DropDfsFilelist(colFileNode.filenode);
-            }
 
             SMgrRelation srel = smgropen(relFileNode, InvalidBackendId);
             smgrdounlink(srel, true);
@@ -7289,7 +7213,7 @@ static void unlink_relfiles(_in_ ColFileNodeRel *xnodes, _in_ int nrels)
 static void xact_redo_commit_internal(TransactionId xid, XLogRecPtr lsn, TransactionId* sub_xids, int nsubxacts,
                                       SharedInvalidationMessage* inval_msgs, int nmsgs, ColFileNodeRel* xnodes,
                                       int nrels, int nlibrary, Oid dbId, Oid tsId, uint32 xinfo,
-                                      uint64 csn, TransactionId newStandbyXmin, RepOriginId originId)
+                                      uint64 csn, TransactionId newStandbyXmin, RepOriginId originId, bool compress)
 {
     TransactionId max_xid;
     XLogRecPtr globalDelayDDLLSN;
@@ -7316,14 +7240,10 @@ static void xact_redo_commit_internal(TransactionId xid, XLogRecPtr lsn, Transac
 
     if (t_thrd.xlog_cxt.standbyState == STANDBY_DISABLED) {
 #ifdef ENABLE_MOT
-        /*
-         * Report committed transaction to MOT Engine.
-         * If (XactMOTEngineUsed(xinfo)) - This is an optimization to avoid calling
-         * MOT redo commit callbacks in case of commit does not have MOT records.
-         * It is disabled for the time being since data used to identify storage
-         * engine type is cleared in 2phase commit prepare phase.
-         */
-        CallRedoCommitCallback(xid);
+    /*
+     * Report committed transaction to MOT Engine.
+     */
+    CallRedoCommitCallback(xid);
 #endif
 
         /*
@@ -7360,14 +7280,10 @@ static void xact_redo_commit_internal(TransactionId xid, XLogRecPtr lsn, Transac
         CSNLogRecordAssignedTransactionId(max_xid);
 
 #ifdef ENABLE_MOT
-        /*
-         * Report committed transaction to MOT Engine.
-         * If (XactMOTEngineUsed(xinfo)) - This is an optimization to avoid calling
-         * MOT redo commit callbacks in case of commit does not have MOT records.
-         * It is disabled for the time being since data used to identify storage
-         * engine type is cleared in 2phase commit prepare phase.
-         */
-        CallRedoCommitCallback(xid);
+    /*
+     * Report committed transaction to MOT Engine.
+     */
+    CallRedoCommitCallback(xid);
 #endif
 
         /*
@@ -7455,25 +7371,38 @@ static void xact_redo_commit_internal(TransactionId xid, XLogRecPtr lsn, Transac
         t_thrd.xact_cxt.xactDelayDDL =
             ((!XLogRecPtrIsInvalid(globalDelayDDLLSN) && XLByteLT(globalDelayDDLLSN, lsn)) ? true : false);
 
-        unlink_relfiles(xnodes, nrels);
-        xact_redo_log_drop_segs(xnodes, nrels, lsn);
+        ColFileNode *newColFileNodes = (ColFileNode *)(void *)xnodes;
+        /* nrels > 0 */
+        if (unlikely((long)!compress)) {
+            ColFileNodeRel *colFileNodeRel = (ColFileNodeRel *)xnodes;
+            newColFileNodes = (ColFileNode *)palloc0((uint32)nrels * (uint32)sizeof(ColFileNode));
+            for (int i = 0; i < nrels; i++) {
+                ColFileNodeCopy(&newColFileNodes[i], &colFileNodeRel[i]);
+            }
+        }
+        unlink_relfiles(newColFileNodes, nrels);
+        xact_redo_log_drop_segs(newColFileNodes, nrels, lsn);
+        if (unlikely((long)!compress)) {
+            pfree(newColFileNodes);
+        }
     }
 
     /* remove library file */
     if (nlibrary > 0) {
+        size_t structSize = compress ? sizeof(ColFileNode) : sizeof(ColFileNodeRel);
 #ifdef ENABLE_MULTIPLE_NODES
-        char* filename = (char*)xnodes + (nrels * sizeof(ColFileNodeRel)) + (nsubxacts * sizeof(TransactionId)) +
-                         (nmsgs * sizeof(SharedInvalidationMessage));
+        char* filename = (char*)xnodes + (nrels * (long)structSize) + (nsubxacts * (int)sizeof(TransactionId)) +
+                         (nmsgs * (int)sizeof(SharedInvalidationMessage));
 #else
-        char* filename = (char*)xnodes + (nrels * sizeof(ColFileNodeRel)) + ((nsubxacts + 1) * sizeof(TransactionId)) +
-                         (nmsgs * sizeof(SharedInvalidationMessage));
+        char* filename = (char*)xnodes + (long)((nrels * structSize) + ((nsubxacts + 1) * sizeof(TransactionId)) +
+                         (nmsgs * sizeof(SharedInvalidationMessage)));
 #endif
         parseAndRemoveLibrary(filename, nlibrary);
     }
 
     if (xinfo & XACT_HAS_ORIGIN) {
         xl_xact_origin *origin = (xl_xact_origin *)GetRepOriginPtr((char*)xnodes, xinfo, nsubxacts,
-            nmsgs, nrels, nlibrary);
+            nmsgs, nrels, nlibrary, compress);
         /* recover apply progress */
         replorigin_advance(originId, origin->origin_lsn, lsn, false, false);
     }
@@ -7497,12 +7426,18 @@ static void xact_redo_commit_internal(TransactionId xid, XLogRecPtr lsn, Transac
     if (RemoveCommittedCsnInfo(xid)) {
         XactLockTableDelete(xid);
     }
+    if(t_thrd.xlog_cxt.server_mode == STANDBY_MODE ||
+        t_thrd.xlog_cxt.server_mode == CASCADE_STANDBY_MODE ||
+        t_thrd.xlog_cxt.server_mode == STANDBY_CLUSTER_MODE ||
+        t_thrd.xlog_cxt.server_mode == MAIN_STANDBY_MODE)
+        set_walrcv_reply_dueto_commit(true);
 }
 
 /*
  * Utility function to call xact_redo_commit_internal after breaking down xlrec
  */
-static void xact_redo_commit(xl_xact_commit *xlrec, TransactionId xid, XLogRecPtr lsn, RepOriginId originId)
+static void xact_redo_commit(xl_xact_commit * xlrec, TransactionId xid, XLogRecPtr lsn, RepOriginId originId,
+                             bool compress)
 {
     TransactionId* subxacts = NULL;
     SharedInvalidationMessage* inval_msgs = NULL;
@@ -7511,7 +7446,7 @@ static void xact_redo_commit(xl_xact_commit *xlrec, TransactionId xid, XLogRecPt
     Assert(TransactionIdIsValid(xid));
 
     /* subxid array follows relfilenodes */
-    subxacts = (TransactionId *)&(xlrec->xnodes[xlrec->nrels]);
+    subxacts = GET_SUB_XACTS(xlrec->xnodes, xlrec->nrels, compress);
 
     /* invalidation messages array follows subxids */
     inval_msgs = (SharedInvalidationMessage*)&(subxacts[xlrec->nsubxacts]);
@@ -7534,7 +7469,8 @@ static void xact_redo_commit(xl_xact_commit *xlrec, TransactionId xid, XLogRecPt
         xlrec->xinfo,
         xlrec->csn,
         newStandbyXmin,
-        originId);
+        originId,
+        compress);
 }
 
 /*
@@ -7565,7 +7501,8 @@ static void xact_redo_commit_compact(xl_xact_commit_compact *xlrec, TransactionI
         0,           /* xinfo */
         xlrec->csn, /* csn */
         globalXmin, /* recent_xmin */
-        InvalidRepOriginId);
+        InvalidRepOriginId,
+        false /* invalid value */);
 }
 
 /*
@@ -7577,7 +7514,8 @@ static void xact_redo_commit_compact(xl_xact_commit_compact *xlrec, TransactionI
  * topxid != xid, whereas in commit we would find topxid == xid always
  * because subtransaction commit is never WAL logged.
  */
-static void xact_redo_abort(xl_xact_abort *xlrec, TransactionId xid, XLogRecPtr lsn, bool abortXlogNewVersion)
+static void xact_redo_abort(xl_xact_abort *xlrec, TransactionId xid, XLogRecPtr lsn,
+                            bool abortXlogNewVersion, bool compress)
 {
     TransactionId *sub_xids = NULL;
     TransactionId max_xid;
@@ -7585,7 +7523,7 @@ static void xact_redo_abort(xl_xact_abort *xlrec, TransactionId xid, XLogRecPtr 
 
     Assert(TransactionIdIsValid(xid));
 
-    sub_xids = (TransactionId *)&(xlrec->xnodes[xlrec->nrels]);
+    sub_xids = GET_SUB_XACTS(xlrec->xnodes, xlrec->nrels, compress);
 
     max_xid = TransactionIdLatest(xid, xlrec->nsubxacts, sub_xids);
 
@@ -7634,14 +7572,28 @@ static void xact_redo_abort(xl_xact_abort *xlrec, TransactionId xid, XLogRecPtr 
             t_thrd.xact_cxt.xactDelayDDL = false;
         UpdateMinRecoveryPoint(lsn, false);
         /* Make sure files supposed to be dropped are dropped */
-        unlink_relfiles(xlrec->xnodes, xlrec->nrels);
-        xact_redo_log_drop_segs(xlrec->xnodes, xlrec->nrels, lsn);
+        ColFileNode *newColFileNodes = (ColFileNode *)(void *)xlrec->xnodes;
+        /* xlrec->nrels > 0 */
+        if (unlikely((long)!compress)) {
+            ColFileNodeRel *colFileNodeRel = (ColFileNodeRel *)xlrec->xnodes;
+            newColFileNodes = (ColFileNode *)palloc0((uint32)xlrec->nrels * (uint32)sizeof(ColFileNode));
+            for (int i = 0; i < xlrec->nrels; i++) {
+                ColFileNodeCopy(&newColFileNodes[i], &colFileNodeRel[i]);
+                newColFileNodes[i].filenode.opt = 0;
+            }
+        }
+        unlink_relfiles(newColFileNodes, xlrec->nrels);
+        xact_redo_log_drop_segs(newColFileNodes, xlrec->nrels, lsn);
+        if (unlikely((long)!compress)) {
+            pfree(newColFileNodes);
+        }
     }
 
     if (xlrec->nlibrary) {
         /* ship rel and TransactionId */
         char *filename = NULL;
-        filename = (char *)xlrec->xnodes + ((unsigned)xlrec->nrels * sizeof(ColFileNodeRel)) +
+        size_t structSize = compress ? sizeof(ColFileNode) : sizeof(ColFileNodeRel);
+        filename = (char *)xlrec->xnodes + ((unsigned)xlrec->nrels * structSize) +
                    ((unsigned)xlrec->nsubxacts * sizeof(TransactionId));
         if (abortXlogNewVersion) {
             filename += sizeof(TransactionId);
@@ -7670,6 +7622,7 @@ void xact_redo(XLogReaderState *record)
 {
     XLogRecPtr lsn = record->EndRecPtr;
     uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+    bool compress = (bool)(XLogRecGetInfo(record) & XLR_REL_COMPRESS);
     bool abortXlogNewVersion = (info == XLOG_XACT_ABORT_WITH_XID);
     /* Backup blocks are not used in xact records */
     Assert(!XLogRecHasAnyBlockRefs(record));
@@ -7680,11 +7633,11 @@ void xact_redo(XLogReaderState *record)
         xact_redo_commit_compact(xlrec, XLogRecGetXid(record), lsn);
     } else if (info == XLOG_XACT_COMMIT) {
         xl_xact_commit *xlrec = (xl_xact_commit *)XLogRecGetData(record);
-        xact_redo_commit(xlrec, XLogRecGetXid(record), lsn, XLogRecGetOrigin(record));
+        xact_redo_commit(xlrec, XLogRecGetXid(record), lsn, XLogRecGetOrigin(record), compress);
     } else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_WITH_XID) {
         xl_xact_abort *xlrec = (xl_xact_abort *)XLogRecGetData(record);
 
-        xact_redo_abort(xlrec, XLogRecGetXid(record), lsn, abortXlogNewVersion);
+        xact_redo_abort(xlrec, XLogRecGetXid(record), lsn, abortXlogNewVersion, compress);
     } else if (info == XLOG_XACT_PREPARE) {
         TransactionId xid = XLogRecGetXid(record);
         Assert(TransactionIdIsValid(xid));
@@ -7697,7 +7650,7 @@ void xact_redo(XLogReaderState *record)
         (void)TWOPAHSE_LWLOCK_ACQUIRE(xid, LW_EXCLUSIVE);
         PrepareRedoAdd(XLogRecGetData(record), record->ReadRecPtr, record->EndRecPtr);
 
-        if (IS_DISASTER_RECOVER_MODE) {
+        if (IS_MULTI_DISASTER_RECOVER_MODE) {
             TwoPhaseFileHeader *hdr = (TwoPhaseFileHeader *) XLogRecGetData(record);
             XactLockTableInsert(hdr->xid);
         }
@@ -7709,24 +7662,24 @@ void xact_redo(XLogReaderState *record)
     } else if (info == XLOG_XACT_COMMIT_PREPARED) {
         xl_xact_commit_prepared *xlrec = (xl_xact_commit_prepared *)XLogRecGetData(record);
 
-        xact_redo_commit(&xlrec->crec, xlrec->xid, lsn, XLogRecGetOrigin(record));
+        xact_redo_commit(&xlrec->crec, xlrec->xid, lsn, XLogRecGetOrigin(record), compress);
 
         /* Delete TwoPhaseState gxact entry and/or 2PC file. */
         (void)TWOPAHSE_LWLOCK_ACQUIRE(xlrec->xid, LW_EXCLUSIVE);
         PrepareRedoRemove(xlrec->xid, false);
-        if (IS_DISASTER_RECOVER_MODE) {
+        if (IS_MULTI_DISASTER_RECOVER_MODE) {
             XactLockTableDelete(xlrec->xid);
         }
         TWOPAHSE_LWLOCK_RELEASE(xlrec->xid);
     } else if (info == XLOG_XACT_ABORT_PREPARED) {
         xl_xact_abort_prepared *xlrec = (xl_xact_abort_prepared *)XLogRecGetData(record);
 
-        xact_redo_abort(&xlrec->arec, xlrec->xid, lsn, abortXlogNewVersion);
+        xact_redo_abort(&xlrec->arec, xlrec->xid, lsn, abortXlogNewVersion, compress);
 
         /* Delete TwoPhaseState gxact entry and/or 2PC file. */
         (void)TWOPAHSE_LWLOCK_ACQUIRE(xlrec->xid, LW_EXCLUSIVE);
         PrepareRedoRemove(xlrec->xid, false);
-        if (IS_DISASTER_RECOVER_MODE) {
+        if (IS_MULTI_DISASTER_RECOVER_MODE) {
             XactLockTableDelete(xlrec->xid);
         }
         TWOPAHSE_LWLOCK_RELEASE(xlrec->xid);
@@ -7737,11 +7690,12 @@ void xact_redo(XLogReaderState *record)
     }
 }
 
-void XactGetRelFiles(XLogReaderState *record, ColFileNodeRel **xnodesPtr, int *nrelsPtr)
+void XactGetRelFiles(XLogReaderState *record, ColFileNode **xnodesPtr, int *nrelsPtr, bool *compress)
 {
     Assert(XLogRecGetRmid(record) == RM_XACT_ID);
 
     uint8 info = (XLogRecGetInfo(record) & (~XLR_INFO_MASK));
+    *compress = (bool)(XLogRecGetInfo(record) & XLR_REL_COMPRESS);
     xl_xact_commit *commit = NULL;
     xl_xact_abort *abort = NULL;
 
@@ -7769,10 +7723,10 @@ void XactGetRelFiles(XLogReaderState *record, ColFileNodeRel **xnodesPtr, int *n
     }
 
     if (commit != NULL) {
-        *xnodesPtr = commit->xnodes;
+        *xnodesPtr = (ColFileNode*)(void *)commit->xnodes;
         *nrelsPtr = commit->nrels;
     } else if (abort != NULL) {
-        *xnodesPtr = abort->xnodes;
+        *xnodesPtr = (ColFileNode*)(void *)abort->xnodes;
         *nrelsPtr = abort->nrels;
     } else {
         *xnodesPtr = NULL;
@@ -7789,13 +7743,14 @@ bool XactWillRemoveRelFiles(XLogReaderState *record)
      * applying transaction log record.
      */
     int nrels = 0;
-    ColFileNodeRel *xnodes = NULL;
+    ColFileNode *xnodes = NULL;
+    bool compress = false;
 
     if (XLogRecGetRmid(record) != RM_XACT_ID) {
         return false;
     }
 
-    XactGetRelFiles(record, &xnodes, &nrels);
+    XactGetRelFiles(record, &xnodes, &nrels, &compress);
 
     return (nrels > 0);
 }
@@ -7803,28 +7758,29 @@ bool XactWillRemoveRelFiles(XLogReaderState *record)
 bool xactWillRemoveRelFiles(XLogReaderState *record)
 {
     int nrels = 0;
-    ColFileNodeRel *xnodes = NULL;
+    ColFileNode *xnodes = NULL;
 
     Assert(XLogRecGetRmid(record) == RM_XACT_ID);
-    XactGetRelFiles(record, &xnodes, &nrels);
+    bool compress;
+    XactGetRelFiles(record, &xnodes, &nrels, &compress);
     return nrels > 0;
 }
 
 void xactApplyXLogDropRelation(XLogReaderState *record)
 {
     int nrels = 0;
-    ColFileNodeRel *xnodes = NULL;
-
-    XactGetRelFiles(record, &xnodes, &nrels);
+    ColFileNode *xnodes = NULL;
+    bool compress;
+    XactGetRelFiles(record, &xnodes, &nrels, &compress);
     for (int i = 0; i < nrels; i++) {
         RelFileNodeBackend rbnode;
         ColFileNode node;
-        ColFileNodeRel *nodeRel = xnodes + i;
-
-        ColFileNodeCopy(&node, nodeRel);
-        if (IS_COMPRESS_DELETE_FORK(node.forknum)) {
-            SET_OPT_BY_NEGATIVE_FORK(node.filenode, node.forknum);
-            node.forknum = MAIN_FORKNUM;
+        if (compress) {
+            ColFileNode *colFileNodeRel = xnodes + i;
+            ColFileNodeFullCopy(&node, colFileNodeRel);
+        } else {
+            ColFileNodeRel *colFileNodeRel = ((ColFileNodeRel *)xnodes) + i;
+            ColFileNodeCopy(&node, colFileNodeRel);
         }
         if (!IsValidColForkNum(node.forknum)) {
             for (int fork = 0; fork <= MAX_FORKNUM; fork++)
@@ -8227,11 +8183,17 @@ UndoRecPtr GetCurrentTransactionUndoRecPtr(UndoPersistence upersistence)
 
 void TryExecuteUndoActions(TransactionState s, UndoPersistence pLevel)
 {
+    if (!u_sess->attr.attr_storage.enable_ustore_sync_rollback &&
+        !(IsSubTransaction() || pLevel == UNDO_TEMP || pLevel == UNDO_UNLOGGED)) {
+        return;
+    }
+
     uint32 saveHoldoff = t_thrd.int_cxt.InterruptHoldoffCount;
     bool error = false;
     undo::TransactionSlot *slot = (undo::TransactionSlot *)t_thrd.undo_cxt.slots[pLevel];
     Assert(slot->XactId() != InvalidTransactionId);
     Assert(slot->DbId() == u_sess->proc_cxt.MyDatabaseId);
+    MemoryContext currentContext = CurrentMemoryContext;
     PG_TRY();
     {
         UndoSlotPtr slotPtr = t_thrd.undo_cxt.slotPtr[pLevel];
@@ -8240,6 +8202,7 @@ void TryExecuteUndoActions(TransactionState s, UndoPersistence pLevel)
     }
     PG_CATCH();
     {
+        (void)MemoryContextSwitchTo(currentContext);
         if (pLevel == UNDO_TEMP || pLevel == UNDO_UNLOGGED) {
             PgRethrowAsFatal();
         }
@@ -8266,7 +8229,8 @@ void TryExecuteUndoActions(TransactionState s, UndoPersistence pLevel)
          * while applying undo for the subtransaction.  See errstart.
          * So, we should never reach here for such a case.
          */
-        Assert(!t_thrd.xact_cxt.applying_subxact_undo);
+        Assert(!t_thrd.xact_cxt.executeSubxactUndo);
+        FlushErrorState();
     }
     PG_END_TRY();
 
@@ -8283,8 +8247,20 @@ void ApplyUndoActions()
 {
     TransactionState s = CurrentTransactionState;
 
-    if (!s->perform_undo)
+    if (!s->perform_undo) {
         return;
+    }
+
+    if (t_thrd.xact_cxt.executeSubxactUndo) {
+        ereport(WARNING, (errmodule(MOD_USTORE),
+            errmsg("Failed to execute undo for subxact, rollback of the entire transaction will be done by "
+                "asynchronous rollback or page-level rollback. Remark info, firstUrp(%lu,%lu,%lu), "
+                "lastestUrp(%lu,%lu,%lu), lastestXactUrp(%lu,%lu,%lu).",
+                s->first_urp[0], s->first_urp[1], s->first_urp[UNDO_PERSISTENCE_LEVELS - 1],
+                s->latest_urp[0], s->latest_urp[1], s->latest_urp[UNDO_PERSISTENCE_LEVELS - 1],
+                s->latest_urp_xact[0], s->latest_urp_xact[1], s->latest_urp_xact[UNDO_PERSISTENCE_LEVELS - 1])));
+        return;
+    }
 
     /*
      * State should still be TRANS_ABORT from AbortTransaction().
@@ -8297,7 +8273,7 @@ void ApplyUndoActions()
      * undo for the subtransaction.  See errstart.  So, we should never reach
      * here for such a case.
      */
-    Assert(!t_thrd.xact_cxt.applying_subxact_undo);
+    Assert(!t_thrd.xact_cxt.executeSubxactUndo);
 
     /*
      * Do abort cleanup processing before applying the undo actions.  We must
@@ -8307,7 +8283,7 @@ void ApplyUndoActions()
     if (IsSubTransaction()) {
         AtSubCleanup_Portals(s->subTransactionId);
         s->blockState = TBLOCK_SUBUNDO;
-        t_thrd.xact_cxt.applying_subxact_undo = true;
+        t_thrd.xact_cxt.executeSubxactUndo = true;
 
         /* We can't afford to allow cancel of subtransaction's rollback. */
         HOLD_CANCEL_INTERRUPTS();
@@ -8332,7 +8308,7 @@ void ApplyUndoActions()
     /* Reset undo information */
     ResetUndoActionsInfo();
 
-    t_thrd.xact_cxt.applying_subxact_undo = false;
+    t_thrd.xact_cxt.executeSubxactUndo = false;
 
     /* Release the locks after applying undo actions. */
     if (IsSubTransaction()) {
@@ -8404,19 +8380,28 @@ void XactCleanExceptionSubTransaction(SubTransactionId head)
         if (IS_PGXC_DATANODE) {
             OpFusion::ClearInSubUnexpectSituation(s->curTransactionOwner);
         }
-
+        /* release ref for spi's cachedplan */
+        ReleaseSpiPlanRef(s->subTransactionId);
         /* reset cursor's attribute var */
         ResetPortalCursor(s->subTransactionId, InvalidOid, 0);
 
-        AtSubAbort_Portals(s->subTransactionId, s->parent->subTransactionId,
-                           s->curTransactionOwner, s->parent->curTransactionOwner, true);
+        /*
+         * We can skip all this stuff if the subxact failed before creating a
+         * ResourceOwner...
+         */
+        if (s->curTransactionOwner) {
+            AtSubAbort_Portals(s->subTransactionId, s->parent->subTransactionId,
+                               s->curTransactionOwner, s->parent->curTransactionOwner, true);
 
-        ResourceOwnerRelease(s->curTransactionOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
-        ResourceOwnerRelease(s->curTransactionOwner, RESOURCE_RELEASE_AFTER_LOCKS, false, false);
+            CallSubXactCallbacks(SUBXACT_EVENT_CLEANUP_SUB, s->subTransactionId, s->parent->subTransactionId);
 
-        AtEOSubXact_HashTables(false, s->nestingLevel);
-        AtEOSubXact_PgStat(false, s->nestingLevel);
-        AtSubAbort_Snapshot(s->nestingLevel);
+            ResourceOwnerRelease(s->curTransactionOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, false);
+            ResourceOwnerRelease(s->curTransactionOwner, RESOURCE_RELEASE_AFTER_LOCKS, false, false);
+
+            AtEOSubXact_HashTables(false, s->nestingLevel);
+            AtEOSubXact_PgStat(false, s->nestingLevel);
+            AtSubAbort_Snapshot(s->nestingLevel);
+        }
 
         s = s->parent;
     }
@@ -8434,3 +8419,28 @@ char* GetCurrentTransactionName()
     return CurrentTransactionState->name;
 }
 
+static void AtEOXact_Proceed_PatchSeq()
+{
+    /* proceed the instance-level patch id */
+    if (u_sess->opt_cxt.xact_modify_sql_patch) {
+        (void)pg_atomic_add_fetch_u64(&g_instance.cost_cxt.sql_patch_sequence_id, 1);
+        ereport(DEBUG2, (errmodule(MOD_SQLPATCH),
+            errmsg("[SQLPatch] global patch sequence id is proceeded to %lu",
+            pg_atomic_read_u64(&g_instance.cost_cxt.sql_patch_sequence_id))));
+        u_sess->opt_cxt.xact_modify_sql_patch = false;
+    }
+}
+
+bool IsTransactionInProgressState()
+{
+    TransactionState s = CurrentTransactionState;
+    return (s->blockState == TBLOCK_INPROGRESS) || (s->blockState == TBLOCK_SUBINPROGRESS);
+}
+
+void BeginTxnForAutoCommitOff()
+{
+    TransactionState s = CurrentTransactionState;
+    if (s->blockState == TBLOCK_STARTED) {
+        s->blockState = TBLOCK_INPROGRESS;
+    }
+}

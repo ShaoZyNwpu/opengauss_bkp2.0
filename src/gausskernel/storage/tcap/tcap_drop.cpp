@@ -64,11 +64,13 @@
 #include "catalog/pg_ts_template.h"
 #include "catalog/pgxc_class.h"
 #include "catalog/storage.h"
+#include "client_logic/client_logic.h"
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "commands/directory.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sec_rls_cmds.h"
@@ -730,6 +732,17 @@ static void TrDoDropSynonym(TrObjDesc *baseDesc, ObjectAddress *object)
     return;
 }
 
+static void TrDoDropPublicationRel(TrObjDesc *baseDesc, ObjectAddress *object)
+{
+    if (TrNeedLogicDrop(object)) {
+        /* nothing to do as no name attribute in system catalog */
+    } else {
+        RemovePublicationRelById(object->objectId);
+    }
+
+    return;
+}
+
 /*
  * doDeletion: delete a single object
  * return false if logic deleted,
@@ -886,6 +899,10 @@ static void TrDoDrop(TrObjDesc *baseDesc, ObjectAddress *object)
 
         case OCLASS_SYNONYM:
             TrDoDropSynonym(baseDesc, object);
+            break;
+
+        case OCLASS_PUBLICATION_REL:
+            TrDoDropPublicationRel(baseDesc, object);
             break;
 
         default:
@@ -1158,13 +1175,24 @@ static void TrTagDependentObjects(Relation depRel, ObjectAddresses *targetObject
     return;
 }
 
+static bool NeedTrFullEncryptedRel(Oid relid)
+{
+    Relation rel = relation_open(relid, NoLock);
+    if (is_full_encrypted_rel(rel)) {
+        relation_close(rel, NoLock);
+        return false;
+    }
+    relation_close(rel, NoLock);
+    return true;
+}
+
 bool TrCheckRecyclebinDrop(const DropStmt *stmt, ObjectAddresses *objects)
 {
     Relation depRel;
     bool rbDrop = false;
 
     /* No work if no objects... */
-    if (objects->numrefs <= 0)
+    if (objects->numrefs != 1)
         return false;
 
     if (/*
@@ -1181,6 +1209,9 @@ bool TrCheckRecyclebinDrop(const DropStmt *stmt, ObjectAddresses *objects)
     }
 
     if (!NeedTrComm(objects->refs->objectId)) {
+        return false;
+    }
+    if (!NeedTrFullEncryptedRel(objects->refs->objectId)) {
         return false;
     }
 
@@ -1304,7 +1335,7 @@ void TrRestoreDrop(const TimeCapsuleStmt *stmt)
     if (desc.relid != 0 && (desc.type == RB_OBJ_TABLE)) {
         stmt->relation->relname = desc.name;
         rel = heap_openrv(stmt->relation, AccessExclusiveLock);
-        if (rel->rd_tam_type == TAM_HEAP) {
+        if (rel->rd_tam_ops == TableAmHeap) {
             heap_close(rel, NoLock);
             elog(ERROR, "timecapsule does not support astore yet");
             return;

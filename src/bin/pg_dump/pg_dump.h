@@ -92,7 +92,9 @@ typedef enum {
     DO_RLSPOLICY,       /* dump row level security policy of table */
     DO_PUBLICATION,
     DO_PUBLICATION_REL,
-    DO_SUBSCRIPTION
+    DO_SUBSCRIPTION,
+    DO_EVENT,
+    DO_EVENT_TRIGGER
 } DumpableObjectType;
 
 typedef struct _dumpableObject {
@@ -108,11 +110,22 @@ typedef struct _dumpableObject {
     int allocDeps;                  /* allocated size of dependencies[] */
 } DumpableObject;
 
+typedef struct _evttriggerInfo {
+    DumpableObject dobj;
+    char       *evtname;
+    char       *evtevent;
+    char       *evtowner;
+    char       *evttags;
+    char       *evtfname;
+    char        evtenabled;
+} EventTriggerInfo;
+
 typedef struct _namespaceInfo {
     DumpableObject dobj;
     char* rolname; /* name of owner, or empty string */
     char* nspacl;
     bool hasBlockchain;
+    int collate;
 } NamespaceInfo;
 
 typedef struct _extensionInfo {
@@ -216,6 +229,7 @@ typedef struct _tableInfo {
     char relreplident;        /* replica identifier */
     char* reltablespace;      /* relation tablespace */
     char* reloptions;         /* options specified by WITH (...) */
+    char* checkoption;        /* WITH CHECK OPTION */
     Oid   relbucket;          /* relation bucket OID */	    
     char* toast_reloptions;   /* ditto, for the TOAST table */
     bool hasindex;            /* does it have any indexes? */
@@ -239,7 +253,10 @@ typedef struct _tableInfo {
     bool isIncremental; /* for matview, true if is an incremental type */
 
     bool interesting; /* true if need to collect more data */
-
+    int autoinc_attnum;
+    DumpId autoincconstraint;
+    DumpId autoincindex;
+    char* autoinc_seqname;
 #ifdef PGXC
     /* PGXC table locator Data */
     char pgxclocatortype;  /* Type of PGXC table locator */
@@ -289,6 +306,7 @@ typedef struct _attrDefInfo {
     char* adef_expr;     /* decompiled DEFAULT expression */
     bool separate;       /* TRUE if must dump as separate item */
     char generatedCol;
+    char* adupd_expr;    /* on update expression of on update timestamp syntax on Mysql dbcompatibility */
 } AttrDefInfo;
 
 typedef struct _tableDataInfo {
@@ -312,6 +330,7 @@ typedef struct _indxInfo {
     bool indisclustered;
     bool indisusable;
     bool indisreplident;
+    bool indisvisible;
     /* if there is an associated constraint object, its dumpId: */
     DumpId indexconstraint;
 } IndxInfo;
@@ -354,7 +373,22 @@ typedef struct _triggerInfo {
     bool tgdeferrable;
     bool tginitdeferred;
     char* tgdef;
+    bool tgdb;
+    bool tgbodybstyle;
 } TriggerInfo;
+typedef struct _eventInfo {
+    DumpableObject dobj;
+    char* evdefiner;
+    char* evname;
+    char* nspname;
+    char* starttime;
+    char* endtime;
+    char* intervaltime;
+    bool autodrop;
+    bool evstatus;
+    char* comment;
+    char* evbody;
+}EventInfo;
 
 /*
  * struct ConstraintInfo is used for all constraint types.	However we
@@ -498,6 +532,7 @@ typedef struct _SubscriptionInfo {
     char *subslotname;
     char *subsynccommit;
     char *subpublications;
+    char *subbinary;
 } SubscriptionInfo;
 
 /* global decls */
@@ -566,6 +601,7 @@ extern void getConstraints(Archive* fout, TableInfo tblinfo[], int numTables);
 extern RuleInfo* getRules(Archive* fout, int* numRules);
 extern void getRlsPolicies(Archive* fout, TableInfo tblinfo[], int numTables);
 extern void getTriggers(Archive* fout, TableInfo tblinfo[], int numTables);
+extern EventInfo *getEvents(Archive *fout, int *numEvents);
 extern ProcLangInfo* getProcLangs(Archive* fout, int* numProcLangs);
 extern CastInfo* getCasts(Archive* fout, int* numCasts);
 extern void getTableAttrs(Archive* fout, TableInfo* tbinfo, int numTables);
@@ -584,6 +620,7 @@ extern uint32 GetVersionNum(Archive* fout);
 extern void getPublications(Archive *fout);
 extern void getPublicationTables(Archive *fout, TableInfo tblinfo[], int numTables);
 extern void getSubscriptions(Archive *fout);
+extern EventTriggerInfo *getEventTriggers(Archive *fout, int *numEventTriggers);
 
 #ifdef GSDUMP_LLT
 void stopLLT();

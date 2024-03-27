@@ -90,6 +90,7 @@
 #include "commands/dbcommands.h"
 #include "commands/vacuum.h"
 #include "commands/matview.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "libpq/pqsignal.h"
@@ -160,9 +161,9 @@ static void FreeWorkerInfo(int code, Datum arg);
 /* add parameter toast_table_map by data partition. */
 static autovac_table* table_recheck_autovac(
     vacuum_object* vacObj, HTAB* table_toast_map, HTAB* toast_table_map, TupleDesc pg_class_desc);
-static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_class classForm, HeapTuple tuple,
-    PgStat_StatTabEntry* tabentry, bool allowAnalyze, bool allowVacuum, bool is_recheck, bool* dovacuum,
-    bool* doanalyze, bool* need_freeze);
+static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, bytea* rawRelopts, Form_pg_class classForm,
+    HeapTuple tuple, PgStat_StatTabEntry* tabentry, bool allowAnalyze, bool allowVacuum, bool is_recheck,
+    bool* dovacuum, bool* doanalyze, bool* need_freeze);
 
 static void autovacuum_do_vac_analyze(autovac_table* tab, BufferAccessStrategy bstrategy);
 static void autovacuum_local_vac_analyze(autovac_table* tab, BufferAccessStrategy bstrategy);
@@ -257,7 +258,7 @@ NON_EXEC_STATIC void AutoVacLauncherMain()
     gspqsignal(SIGUSR2, avl_sigusr2_handler);
     gspqsignal(SIGFPE, FloatExceptionHandler);
     gspqsignal(SIGCHLD, SIG_DFL);
-
+    gspqsignal(SIGURG, print_stack);
     /* Early initialization */
     BaseInit();
 
@@ -1162,16 +1163,6 @@ static void avl_sigterm_handler(SIGNAL_ARGS)
 /********************************************************************
  *					  AUTOVACUUM WORKER CODE
  ********************************************************************/
-#ifdef EXEC_BACKEND
-/*
- * We need this set from the outside, before InitProcess is called
- */
-void AutovacuumWorkerIAm(void)
-{
-    t_thrd.role = AUTOVACUUM_WORKER;
-}
-#endif
-
 /*
  * AutoVacWorkerMain
  */
@@ -1221,7 +1212,7 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
     (void)gspqsignal(SIGFPE, FloatExceptionHandler);
     (void)gspqsignal(SIGCHLD, SIG_DFL);
     (void)gspqsignal(SIGHUP, SIG_IGN);
-
+    (void)gspqsignal(SIGURG, print_stack);
     /* Early initialization */
     BaseInit();
 
@@ -1355,10 +1346,17 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
         t_thrd.proc_cxt.PostInit->SetDatabaseAndUser(NULL, dbid, NULL);
         t_thrd.proc_cxt.PostInit->InitAutoVacWorker();
         t_thrd.proc_cxt.PostInit->GetDatabaseName(dbname);
-
+#ifndef ENABLE_MULTIPLE_NODES
+        /* forbid smp in autovacuum thread */
+        AutoDopControl dopControl;
+        dopControl.CloseSmp();
+#endif
         SetProcessingMode(NormalProcessing);
+        pgstat_report_appname("AutoVacWorker");
+        pgstat_report_activity(STATE_IDLE, NULL);
+
         set_ps_display(dbname, false);
-        ereport(LOG, (errmsg("start autovacuum on database \"%s\"", dbname)));
+        ereport(GetVacuumLogLevel(), (errmsg("start autovacuum on database \"%s\"", dbname)));
 
         if (u_sess->attr.attr_security.PostAuthDelay)
             pg_usleep(u_sess->attr.attr_security.PostAuthDelay * 1000000L);
@@ -1706,7 +1704,12 @@ void relation_support_autoavac(HeapTuple tuple, bool* enable_analyze, bool* enab
         *enable_analyze = false;
         *is_internal_relation = false;
     }
-    if (RELKIND_RELATION != classForm->relkind) {
+    /* It's useless to  vacuum toast directly at CN in distribute mode, ignore it */
+    if (RELKIND_RELATION != classForm->relkind
+#ifndef ENABLE_MULTIPLE_NODES
+        && RELKIND_TOASTVALUE != classForm->relkind
+#endif
+        ) {
         *enable_vacuum = false;
     }
 }
@@ -1756,9 +1759,11 @@ static void fetch_global_autovac_info()
 
     initStringInfo(&buf);
     if (DO_VACUUM) {
-        appendStringInfo(&buf, "with f as (select nspname, relname, partname, sum(n_dead_tuples) as n_dead_tuples, "
-            "sum(n_live_tuples) as n_live_tuples, sum(changes_since_analyze) as changes_since_analyze, "
-            "count(1) as count from pg_total_autovac_tuples(%s) group by nspname, relname, partname), "
+        appendStringInfo(&buf,
+            "with f as (select nspname, relname, partname, pg_catalog.sum(n_dead_tuples) as n_dead_tuples, "
+            "pg_catalog.sum(n_live_tuples) as n_live_tuples, pg_catalog.sum(changes_since_analyze) "
+            "as changes_since_analyze, pg_catalog.count(1) as count from "
+            "pg_catalog.pg_total_autovac_tuples(%s) group by nspname, relname, partname), "
             "t as(SELECT c.oid as relid,n.nspname AS nspname, c.relname AS relname, "
             "case when p.parttype = 'r' then null else p.oid end as partid, "
             "case when p.parttype = 'r' then null else p.relname end as partname, x.pclocatortype as locatortype "
@@ -1773,9 +1778,9 @@ static void fetch_global_autovac_info()
             "from t inner join f on (t.nspname = f.nspname and t.relname = f.relname "
             "and (t.partname = f.partname or (t.partname is null and f.partname is null))) ", "false");
     } else {
-        appendStringInfo(&buf, "with f as (select nspname, relname, sum(n_dead_tuples) as n_dead_tuples, "
-            "sum(changes_since_analyze) as changes_since_analyze, count(1) as count "
-            "from pg_total_autovac_tuples(%s) group by nspname, relname), t as(SELECT c.oid as relid, "
+        appendStringInfo(&buf, "with f as (select nspname, relname, pg_catalog.sum(n_dead_tuples) as n_dead_tuples, "
+            "pg_catalog.sum(changes_since_analyze) as changes_since_analyze, pg_catalog.count(1) as count "
+            "from pg_catalog.pg_total_autovac_tuples(%s) group by nspname, relname), t as(SELECT c.oid as relid, "
             "n.nspname AS nspname, c.relname AS relname, x.pclocatortype as locatortype FROM pg_class c "
             "INNER JOIN pg_namespace n ON n.oid = c.relnamespace INNER JOIN pgxc_class x on x.pcrelid = c.oid "
             "WHERE c.relkind = 'r' and c.relpersistence = 'p' and n.nspname not in ('pg_toast','cstore'))"
@@ -1896,6 +1901,7 @@ static void do_autovacuum(void)
     bool is_internal_relation = false;  /* whether current relation is an internal relation */
     ScanKeyData key[1];
     TableScanDesc partScan;
+    TableScanDesc subpartScan;
     Relation partRel;
     HeapTuple partTuple;
     TupleDesc pg_class_desc;
@@ -2097,7 +2103,7 @@ static void do_autovacuum(void)
         relation_support_autoavac(tuple, &enable_analyze, &enable_vacuum, &is_internal_relation);
 
         /* Check if it needs vacuum or analyze */
-        relation_needs_vacanalyze(relid, relopts, classForm, tuple, tabentry, enable_analyze, enable_vacuum,
+        relation_needs_vacanalyze(relid, relopts, rawRelopts, classForm, tuple, tabentry, enable_analyze, enable_vacuum,
             false, &dovacuum, &doanalyze, &need_freeze);
 
         if (freeze_autovacuum) {
@@ -2105,16 +2111,23 @@ static void do_autovacuum(void)
             doanalyze = false;
         }
 
+        /* Here we skipped relation_support_autoavac() and relation_needs_vacanalyze() checks
+         * for Ustore partitioned tables
+         */
+        bool isUstorePartitionTable = (rawRelopts != NULL && RelationIsTableAccessMethodUStoreType(rawRelopts) &&
+            isPartitionedRelation(classForm));
+
         /* relations that need work are added to table_oids */
-        if (dovacuum || doanalyze) {
+        if (dovacuum || doanalyze || isUstorePartitionTable) {
             vacObj = (vacuum_object*)palloc(sizeof(vacuum_object));
             vacObj->tab_oid = relid;
             vacObj->parent_oid = InvalidOid;
-            vacObj->dovacuum = dovacuum;
+            vacObj->dovacuum = isUstorePartitionTable ? true : dovacuum;
             vacObj->dovacuum_toast = false;
             vacObj->doanalyze = doanalyze;
-            vacObj->need_freeze = need_freeze;
-            vacObj->is_internal_relation = is_internal_relation;
+            vacObj->need_freeze = isUstorePartitionTable ? false : need_freeze;
+            vacObj->is_internal_relation = isUstorePartitionTable ? false : is_internal_relation;
+            vacObj->gpi_vacuumed = false;
             vacObj->flags = (isPartitionedRelation(classForm) ? VACFLG_MAIN_PARTITION : VACFLG_SIMPLE_HEAP);
             table_oids = lappend(table_oids, vacObj);
         }
@@ -2135,6 +2148,7 @@ static void do_autovacuum(void)
                 ap_entry->at_doanalyze = doanalyze;
                 ap_entry->at_dovacuum = dovacuum;
                 ap_entry->at_needfreeze = need_freeze;
+                ap_entry->at_gpivacuumed = false;
             }
         }
 
@@ -2209,6 +2223,12 @@ static void do_autovacuum(void)
     partScan = tableam_scan_begin(partRel, SnapshotNow, 1, key);
     while (NULL != (partTuple = (HeapTuple) tableam_scan_getnexttuple(partScan, ForwardScanDirection))) {
         Form_pg_partition partForm = (Form_pg_partition)GETSTRUCT(partTuple);
+        /* If relfilenode is invalid, means it's a partition of subpartition. We don't do vacuum on it, instead, we will
+         * vacuum the subpartition later. */
+        if (!OidIsValid(partForm->relfilenode)) {
+            continue;
+        }
+
         PgStat_StatTabEntry* tabentry = NULL;
         AutoVacOpts* relopts = NULL;
         bool dovacuum = false;
@@ -2259,6 +2279,7 @@ static void do_autovacuum(void)
             vacObj->doanalyze = doanalyze;
             vacObj->need_freeze = need_freeze;
             vacObj->is_internal_relation = false;
+            vacObj->gpi_vacuumed = false;
             vacObj->flags = VACFLG_SUB_PARTITION;
             table_oids = lappend(table_oids, vacObj);
         }
@@ -2300,6 +2321,115 @@ static void do_autovacuum(void)
     heap_close(partRel, AccessShareLock);
     DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "AUTOVAC TIMER: Scan pg_partition to determine which partitions to vacuum");
 
+    /*
+     * Meanwhile, to collect all the subpartitions in the pg_partition,
+     * and also the partitioned table relid to TOAST relid mapping.
+     */
+    ScanKeyInit(&key[0], Anum_pg_partition_parttype, BTEqualStrategyNumber, F_CHAREQ,
+        CharGetDatum(PART_OBJ_TYPE_TABLE_SUB_PARTITION));
+
+    partRel = heap_open(PartitionRelationId, AccessShareLock);
+    subpartScan = tableam_scan_begin(partRel, SnapshotNow, 1, key);
+    while (NULL != (partTuple = (HeapTuple) tableam_scan_getnexttuple(subpartScan, ForwardScanDirection))) {
+        Form_pg_partition partForm = (Form_pg_partition)GETSTRUCT(partTuple);
+        PgStat_StatTabEntry* tabentry = NULL;
+        AutoVacOpts* relopts = NULL;
+        bool dovacuum = false;
+        bool doanalyze = false;
+        bool need_freeze = false;
+        Oid partOid;
+        Oid tableOid;
+        bool found = false;
+        av_relation* ar_hentry = NULL;
+        at_partitioned_table* ap_entry = NULL;
+
+        /* we get the subpartitioned table's oid first */
+        tableOid = partid_get_parentid(partForm->parentid);
+        if (!OidIsValid(tableOid)) {
+            continue;
+        }
+        /*
+         * 'found = false' means partitioned table do autovac on other coordiantor
+         * coordiantor that analyze table partition is consistent with the coordiantor
+         * that analyze partition table.
+         */
+        ar_hentry = (av_relation*)hash_search(table_relopt_map, &tableOid, HASH_FIND, &found);
+        if (!found)
+            continue;
+
+        if (ar_hentry->ar_hasrelopts)
+            relopts = &ar_hentry->ar_reloptions;
+
+        ap_entry = (at_partitioned_table*)hash_search(partitioned_tables_map, &tableOid, HASH_FIND, &found);
+        if (!found) {
+            ereport(defence_errlevel(), (errcode(ERRCODE_DATA_CORRUPTED), errmsg("Oid: %u does not "
+                "find in partitioned tables map.", tableOid)));
+        }
+
+        /* Every partition table is local */
+        partOid = HeapTupleGetOid(partTuple);
+        tabentry = get_pgstat_tabentry_relid(partOid, false, tableOid, shared, dbentry);
+
+        /* Check if it needs vacuum or analyze */
+        partition_needs_vacanalyze(
+            partOid, relopts, partForm, partTuple, ap_entry, tabentry, false, &dovacuum, &doanalyze, &need_freeze);
+        Assert(false == doanalyze);
+        if (freeze_autovacuum) {
+            dovacuum = need_freeze;
+        }
+
+        /* Partition that need work are added to table_oids */
+        if (dovacuum) {
+            vacObj = (vacuum_object*)palloc(sizeof(vacuum_object));
+            vacObj->tab_oid = partOid;
+            vacObj->parent_oid = partForm->parentid;
+            vacObj->dovacuum = dovacuum;
+            vacObj->dovacuum_toast = false;
+            vacObj->doanalyze = doanalyze;
+            vacObj->need_freeze = need_freeze;
+            vacObj->is_internal_relation = false;
+            vacObj->gpi_vacuumed = false;
+            vacObj->flags = VACFLG_SUB_PARTITION;
+            table_oids = lappend(table_oids, vacObj);
+        }
+
+        /* just save partitioned tableis oid as mainid for partition */
+        if (OidIsValid(partForm->reltoastrelid)) {
+            av_toastid_mainid* at_entry = NULL;
+
+            at_entry = (av_toastid_mainid*)hash_search(toast_table_map, &(partForm->reltoastrelid), HASH_ENTER, &found);
+            if (!found) {
+                at_entry->at_relid = partOid;
+                at_entry->at_parentid = partForm->parentid;
+                at_entry->at_allowvacuum = ap_entry->at_allowvacuum;
+                at_entry->at_doanalyze = doanalyze | ap_entry->at_doanalyze;
+                at_entry->at_dovacuum = dovacuum | ap_entry->at_dovacuum;
+                at_entry->at_needfreeze = need_freeze;
+                at_entry->at_internal = false;
+            }
+            /* 
+             * if we found map but parentid doesn't equal to partFrom->parentid
+             * may be the reltoastrelid has been exchanged by some one,
+             * (e.g. alter table exchange partition)
+             * just skip it this time.
+             */
+            if (found && (at_entry->at_parentid != partForm->parentid)) {
+                if (hash_search(toast_table_map, &(partForm->reltoastrelid), HASH_REMOVE, NULL) != NULL) {
+                    ereport(LOG, (errmsg("reltoastrelid: %u toast table map "
+                        "has been changed, skip it.", partForm->reltoastrelid)));
+                } else {
+                    ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("toast table map hash table corrupted.")));
+                }
+            } else {
+                Assert(OidIsValid(at_entry->at_relid) && OidIsValid(at_entry->at_parentid));
+            }
+        }
+    }
+    /* Close the pg_partition */
+    tableam_scan_end(subpartScan);
+    heap_close(partRel, AccessShareLock);
+    DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "AUTOVAC TIMER: Scan pg_partition to determine which subpartitions to vacuum");
+
     /* On the third pass: check TOAST tables */
     ScanKeyInit(&key[0], Anum_pg_class_relkind, BTEqualStrategyNumber, F_CHAREQ, CharGetDatum(RELKIND_TOASTVALUE));
     relScan = tableam_scan_begin(classRel, SnapshotNow, 1, &key[0]);
@@ -2308,6 +2438,7 @@ static void do_autovacuum(void)
         Oid relid = HeapTupleGetOid(tuple);
         PgStat_StatTabEntry* tabentry = NULL;
         AutoVacOpts* relopts = NULL;
+        bytea *rawRelopts = NULL;
         bool isReloptsReferenceOther = false;
         bool dovacuum = false;
         bool doanalyze = false;
@@ -2337,6 +2468,7 @@ static void do_autovacuum(void)
          * main rel
          */
         relopts = extract_autovac_opts(tuple, pg_class_desc);
+        rawRelopts = extractRelOptions(tuple, pg_class_desc, InvalidOid);
         /*
          * we must get main table id first, and then get the
          * reloptions according to the main table id
@@ -2355,8 +2487,8 @@ static void do_autovacuum(void)
         /* Fetch the pgstat entry for this table */
         tabentry = get_pgstat_tabentry_relid(relid, classForm->relisshared, InvalidOid, shared, dbentry);
         relation_support_autoavac(tuple, &enable_analyze, &enable_vacuum, &is_internal_relation);
-        relation_needs_vacanalyze(relid, relopts, classForm, tuple, tabentry, enable_analyze, enable_vacuum, true,
-            &dovacuum, &doanalyze, &need_freeze);
+        relation_needs_vacanalyze(relid, relopts, rawRelopts, classForm, tuple, tabentry, enable_analyze, enable_vacuum,
+            true, &dovacuum, &doanalyze, &need_freeze);
 
         if (freeze_autovacuum) {
             if (ISMATMAP(classForm->relname.data) || ISMLOG(classForm->relname.data)) {
@@ -2420,8 +2552,10 @@ static void do_autovacuum(void)
         autovac_table* tab = NULL;
         WorkerInfo worker = NULL;
         bool skipit = false;
+        bool found = false;
         int stdVacuumCostDelay;
         int stdVacuumCostLimit;
+        at_partitioned_table* ap_entry = NULL;
 
         vacObj = (vacuum_object*)lfirst(cell);
         relid = vacObj->tab_oid;
@@ -2562,12 +2696,20 @@ static void do_autovacuum(void)
          */
         if (vacuumPartition((uint32)(vacObj->flags))) {
             Oid at_parentid = partid_get_parentid(tab->at_relid);
-
-            tab->at_partname = getPartitionName(tab->at_relid, false);
-            tab->at_relname = get_rel_name(at_parentid);
-            tab->at_nspname = get_namespace_name(get_rel_namespace(at_parentid));
-
+            Oid at_grandparentid = partid_get_parentid(at_parentid);
+            if (OidIsValid(at_grandparentid)) {
+                tab->at_subpartname = getPartitionName(tab->at_relid, false);
+                tab->at_partname = NULL;
+                tab->at_relname = get_rel_name(at_grandparentid);
+                tab->at_nspname = get_namespace_name(get_rel_namespace(at_grandparentid));
+            } else {
+                tab->at_subpartname = NULL;
+                tab->at_partname = getPartitionName(tab->at_relid, false);
+                tab->at_relname = get_rel_name(at_parentid);
+                tab->at_nspname = get_namespace_name(get_rel_namespace(at_parentid));
+            }
         } else {
+            tab->at_subpartname = NULL;
             tab->at_partname = NULL;
             tab->at_relname = get_rel_name(tab->at_relid);
             tab->at_nspname = get_namespace_name(get_rel_namespace(tab->at_relid));
@@ -2613,6 +2755,20 @@ static void do_autovacuum(void)
             else
                 autovacuum_do_vac_analyze(tab, bstrategy);
 
+            if (vacObj->flags & VACFLG_SUB_PARTITION) {
+                // Get partitioned/subpartitioned table's oid
+                Oid table_oid = parentid;
+                Oid grandparentid = partid_get_parentid(parentid);
+                if (OidIsValid(grandparentid)) {
+                    table_oid = grandparentid;
+                }
+                // Update ap_entry->at_gpivacuumed
+                ap_entry = (at_partitioned_table*)hash_search(partitioned_tables_map, &table_oid, HASH_FIND, &found);
+                if (found && !ap_entry->at_gpivacuumed && tab->at_gpivacuumed) {
+                    ap_entry->at_gpivacuumed = tab->at_gpivacuumed;
+                }
+            }
+
             /* Cancel any active statement timeout before committing */
             disable_sig_alarm(true);
 
@@ -2657,15 +2813,18 @@ static void do_autovacuum(void)
             MemoryContextResetAndDeleteChildren(t_thrd.mem_cxt.msg_mem_cxt);
             MemoryContextResetAndDeleteChildren(t_thrd.mem_cxt.portal_mem_cxt);
 
-            if (timeout_flag)
-                pgstat_report_autovac_timeout(vacObj->tab_oid, vacObj->parent_oid, tab->at_sharedrel);
-
             /* for some cases, we could not response any signal here, so we need unblock signals */
             gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
             (void)gs_signal_unblock_sigusr2();
 
             /* restart our transaction for the following operations */
             StartTransactionCommand();
+            if (timeout_flag) {
+                Oid grandparent_oid = partid_get_parentid(vacObj->parent_oid);
+                Oid statFlag = OidIsValid(grandparent_oid) ? grandparent_oid : vacObj->parent_oid;
+                pgstat_report_autovac_timeout(vacObj->tab_oid, statFlag, tab->at_sharedrel);
+            }
+
             RESUME_INTERRUPTS();
             /* vacuum must hold RowExclusiveLock on db for a new transaction */
             LockSharedObject(DatabaseRelationId, u_sess->proc_cxt.MyDatabaseId, 0, RowExclusiveLock);
@@ -2867,18 +3026,8 @@ static autovac_table* table_recheck_autovac(
         return NULL;
     classForm = (Form_pg_class)GETSTRUCT(classTup);
     bytea *rawRelopts = extractRelOptions(classTup, pg_class_desc, InvalidOid);
-    /* this is Ustore partitioned table, use another bypass */
-    if (rawRelopts != NULL && RelationIsTableAccessMethodUStoreType(rawRelopts) &&
-        isPartitionedRelation(classForm)) {
-        avopts = extract_autovac_opts(classTup, pg_class_desc);
-        tab = calculate_vacuum_cost_and_freezeages(avopts, false, false);
-        if (tab != NULL) {
-            tab->at_relid = relid;
-            tab->at_sharedrel = classForm->relisshared;
-            tab->at_dovacuum = true;
-        }
-        return tab;
-    }
+    bool isUstorePartitionTable = (rawRelopts != NULL && RelationIsTableAccessMethodUStoreType(rawRelopts) &&
+        isPartitionedRelation(classForm));
 
     /*
      * Get the applicable reloptions.  If it is a TOAST table, try to get the
@@ -2906,8 +3055,8 @@ static autovac_table* table_recheck_autovac(
     /* fetch the pgstat table entry */
     tabentry = get_pgstat_tabentry_relid(relid, classForm->relisshared, InvalidOid, shared, dbentry);
     relation_support_autoavac(classTup, &enable_analyze, &enable_vacuum, &is_internal_relation);
-    relation_needs_vacanalyze(relid, avopts, classForm, classTup, tabentry, enable_analyze, enable_vacuum, true,
-        &dovacuum, &doanalyze, &need_freeze);
+    relation_needs_vacanalyze(relid, avopts, rawRelopts, classForm, classTup, tabentry, enable_analyze, enable_vacuum,
+        true, &dovacuum, &doanalyze, &need_freeze);
 
     /* ignore ANALYZE for toast tables */
     if (classForm->relkind == RELKIND_TOASTVALUE)
@@ -2920,12 +3069,13 @@ static autovac_table* table_recheck_autovac(
     }
 
     /* OK, it needs something done */
-    if (doanalyze || dovacuum || dovacuum_toast) {
+    if (doanalyze || dovacuum || dovacuum_toast || isUstorePartitionTable) {
         tab = calculate_vacuum_cost_and_freezeages(avopts, doanalyze, need_freeze);
         if (tab != NULL) {
             tab->at_relid = relid;
             tab->at_sharedrel = classForm->relisshared;
-            tab->at_dovacuum = dovacuum || dovacuum_toast;
+            tab->at_dovacuum = isUstorePartitionTable ? true : (dovacuum || dovacuum_toast);
+            tab->at_gpivacuumed = vacObj->gpi_vacuumed;
         }
     }
 
@@ -3019,8 +3169,8 @@ static void determine_vacuum_params(float4& vac_scale_factor, int& vac_base_thre
  * value < 0 is substituted with the value of
  * autovacuum_vacuum_scale_factor GUC variable.  Ditto for analyze.
  */
-static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_class classForm, HeapTuple tuple,
-    PgStat_StatTabEntry* tabentry, bool allowAnalyze, bool allowVacuum, bool is_recheck,
+static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, bytea* rawRelopts, Form_pg_class classForm,
+    HeapTuple tuple, PgStat_StatTabEntry* tabentry, bool allowAnalyze, bool allowVacuum, bool is_recheck,
     /* output params below */
     bool* dovacuum, bool* doanalyze, bool* need_freeze)
 {
@@ -3028,6 +3178,7 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
     avw_info* avwentry = NULL;
     bool found = false;
     bool force_vacuum = false;
+    bool delta_vacuum = false;
     bool av_enabled = false;
     bool userEnabled = true;
     /* pg_class.reltuples */
@@ -3086,6 +3237,20 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
     *need_freeze = force_vacuum;
     AUTOVAC_LOG(DEBUG2, "vac \"%s\": need freeze is %s", NameStr(classForm->relname), force_vacuum ? "true" : "false");
 
+    /* Is time to move rows from delta to main cstore table by vacuum? */
+    if (rawRelopts != NULL && StdRelOptIsColStore(rawRelopts) &&
+        g_instance.attr.attr_storage.enable_delta_store && DO_VACUUM) {
+        PgStat_StatDBEntry *dbentry = pgstat_fetch_stat_dbentry(u_sess->proc_cxt.MyDatabaseId);;
+        PgStat_StatDBEntry *shared = pgstat_fetch_stat_dbentry(InvalidOid);
+
+        /* delta table's relisshared is same to main cstore table */
+        PgStat_StatTabEntry *deltaTabentry = get_pgstat_tabentry_relid(classForm->reldeltarelid,
+            classForm->relisshared, InvalidOid, shared, dbentry);
+        if (deltaTabentry != NULL) {
+            delta_vacuum = (deltaTabentry->n_live_tuples >= ((StdRdOptions*)rawRelopts)->delta_rows_threshold);
+        }
+    }
+
     /* User disabled it in pg_class.reloptions?  (But ignore if at risk) */
     if (!force_vacuum && (!av_enabled || !u_sess->attr.attr_storage.autovacuum_start_daemon)) {
         userEnabled = false;
@@ -3121,7 +3286,7 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
         }
 
         /* Determine if this table needs vacuum. */
-        *dovacuum = force_vacuum;
+        *dovacuum = force_vacuum || delta_vacuum;
         *doanalyze = false;
 
         if (false == *dovacuum && allowVacuum)
@@ -3172,6 +3337,7 @@ static void fill_in_vac_stmt(VacuumStmt& vacstmt, const autovac_table& tab, Rang
     /* we pass the OID, but might need this anyway for an error message */
     vacstmt.relation = rangevar;
     vacstmt.va_cols = NIL;
+    vacstmt.gpi_vacuumed = tab.at_gpivacuumed;
 }
 
 /*
@@ -3184,7 +3350,6 @@ static void autovacuum_do_vac_analyze(autovac_table* tab, BufferAccessStrategy b
     RangeVar rangevar;
     const char* nspname = NULL;
     const char* relname = NULL;
-    const char* partname = NULL;
     StringInfoData str;
     errno_t rc = EOK;
 
@@ -3200,13 +3365,14 @@ static void autovacuum_do_vac_analyze(autovac_table* tab, BufferAccessStrategy b
     if (NULL != tab->at_partname) {
         rangevar.ispartition = true;
         rangevar.partitionname = tab->at_partname;
+    } else if (NULL != tab->at_subpartname) {
+        rangevar.issubpartition = true;
+        rangevar.subpartitionname = tab->at_subpartname;
     }
     rangevar.location = -1;
 
     nspname = quote_identifier(tab->at_nspname);
     relname = quote_identifier(tab->at_relname);
-    if (NULL != tab->at_partname)
-        partname = quote_identifier(tab->at_partname);
 
     fill_in_vac_stmt(vacstmt, *tab, &rangevar);
     initStringInfo(&str);
@@ -3215,8 +3381,11 @@ static void autovacuum_do_vac_analyze(autovac_table* tab, BufferAccessStrategy b
     if (tab->at_doanalyze)
         appendStringInfo(&str, "ANALYZE ");
     appendStringInfo(&str, "%s.%s", nspname, relname);
-    if (NULL != tab->at_partname)
-        appendStringInfo(&str, " PARTITION (%s)", partname);
+    if (NULL != tab->at_partname) {
+        appendStringInfo(&str, " PARTITION (%s)", quote_identifier(tab->at_partname));
+    } else if (NULL != tab->at_subpartname) {
+        appendStringInfo(&str, " SUBPARTITION (%s)", quote_identifier(tab->at_subpartname));
+    }
 
     WaitStatePhase oldPhase = pgstat_report_waitstatus_phase(PHASE_AUTOVACUUM);
     DEBUG_MOD_START_TIMER(MOD_AUTOVAC);
@@ -3245,6 +3414,7 @@ static void autovacuum_local_vac_analyze(autovac_table* tab, BufferAccessStrateg
     rangevar.schemaname = tab->at_nspname;
     rangevar.relname = tab->at_relname;
     rangevar.partitionname = tab->at_partname;
+    rangevar.subpartitionname = tab->at_subpartname;
     rangevar.location = -1;
 
     fill_in_vac_stmt(vacstmt, *tab, &rangevar);
@@ -3253,6 +3423,7 @@ static void autovacuum_local_vac_analyze(autovac_table* tab, BufferAccessStrateg
     WaitStatePhase oldPhase = pgstat_report_waitstatus_phase(PHASE_AUTOVACUUM);
     DEBUG_MOD_START_TIMER(MOD_AUTOVAC);
     vacuum(&vacstmt, tab->at_relid, false, bstrategy, true);
+    tab->at_gpivacuumed = vacstmt.gpi_vacuumed;
     DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "AUTOVAC TIMER: %s", tab->at_relname);
     pgstat_report_waitstatus_phase(oldPhase);
 }
@@ -3305,7 +3476,8 @@ static void autovac_report_activity(autovac_table* tab)
  */
 bool AutoVacuumingActive(void)
 {
-    if (!u_sess->attr.attr_storage.autovacuum_start_daemon || !u_sess->attr.attr_common.pgstat_track_counts)
+    if (!u_sess->attr.attr_storage.autovacuum_start_daemon || !u_sess->attr.attr_common.pgstat_track_counts ||
+        SSIsServerModeReadOnly())
         return false;
     return true;
 }
@@ -3438,6 +3610,8 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
     bool found = false;
     bool av_enabled = false;
     bool force_vacuum = false;
+    bool delta_vacuum = false;
+    bytea* partoptions = NULL;
     /* pg_partition.reltuples */
     float4 reltuples;
 
@@ -3494,10 +3668,26 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
         force_vacuum = (MultiXactIdIsValid(relminmxid) && MultiXactIdPrecedes(relminmxid, multiForceLimit));
     }
 #endif
+    Datum partoptsdatum = fastgetattr(partTuple, Anum_pg_partition_reloptions, RelationGetDescr(rel), &isNull);
     heap_close(rel, AccessShareLock);
 
     force_vacuum = (TransactionIdIsNormal(relfrozenxid) && TransactionIdPrecedes(relfrozenxid, xidForceLimit));
     *need_freeze = force_vacuum;
+
+    /* Is time to move rows from delta to main cstore table by vacuum? */
+    partoptions = heap_reloptions(RELKIND_RELATION, partoptsdatum, false);
+    if (partoptions != NULL && StdRelOptIsColStore(partoptions) &&
+        g_instance.attr.attr_storage.enable_delta_store && DO_VACUUM) {
+        PgStat_StatDBEntry *dbentry = pgstat_fetch_stat_dbentry(u_sess->proc_cxt.MyDatabaseId);;
+        PgStat_StatDBEntry *shared = pgstat_fetch_stat_dbentry(InvalidOid);
+
+        /* Every partition table is local */
+        PgStat_StatTabEntry *deltaTabentry = get_pgstat_tabentry_relid(partForm->reldeltarelid, false,
+            InvalidOid, shared, dbentry);
+        if (deltaTabentry != NULL) {
+            delta_vacuum = (deltaTabentry->n_live_tuples >= ((StdRdOptions*)partoptions)->delta_rows_threshold);
+        }
+    }
 
     /* User disabled it in pg_class.reloptions?  (But ignore if at risk) */
     if (!force_vacuum && (!av_enabled || !u_sess->attr.attr_storage.autovacuum_start_daemon)) {
@@ -3506,14 +3696,25 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
         return;
     }
 
+#ifndef ENABLE_MULTIPLE_NODES
+    if (!force_vacuum && !(ap_entry->at_allowvacuum && ap_entry->at_dovacuum)) { 
+#else
     if (!force_vacuum && (!ap_entry->at_allowvacuum || ap_entry->at_dovacuum)) {
+#endif
         *doanalyze = false;
-        *dovacuum = false;
+        *dovacuum = delta_vacuum;
         return;
     }
 
-    relname = get_rel_name(partForm->parentid);
-    nameSpaceOid = get_rel_namespace(partForm->parentid);
+    Oid relid = InvalidOid;
+    if (partForm->parttype == PART_OBJ_TYPE_TABLE_SUB_PARTITION) {
+        relid = partid_get_parentid(partForm->parentid);
+    } else {
+        relid = partForm->parentid;
+    }
+
+    relname = get_rel_name(relid);
+    nameSpaceOid = get_rel_namespace(relid);
     partname = NameStr(partForm->relname);
 
     reltuples = partForm->reltuples;
@@ -3521,7 +3722,7 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
     vacthresh = (float4)vac_base_thresh + vac_scale_factor * reltuples;
 
     if (NULL != t_thrd.autovacuum_cxt.pgStatAutoVacInfo) {
-        tablekey.statFlag = partForm->parentid;
+        tablekey.statFlag = relid;
         tablekey.tableid = partid;
         avwentry =
             (avw_info*)hash_search(t_thrd.autovacuum_cxt.pgStatAutoVacInfo, (void*)(&tablekey), HASH_FIND, &found);
@@ -3529,7 +3730,7 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
 
     if ((avwentry == NULL) && (tabentry == NULL)) {
         *doanalyze = false;
-        *dovacuum = force_vacuum;
+        *dovacuum = force_vacuum || delta_vacuum;
     } else {
         if (tabentry && (tabentry->changes_since_analyze || tabentry->n_dead_tuples)) {
             vactuples = tabentry->n_dead_tuples;
@@ -3556,7 +3757,7 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
         }
 
         /* Determine if this partition needs vacuum. */
-        *dovacuum = force_vacuum;
+        *dovacuum = force_vacuum || delta_vacuum;
         if (false == *dovacuum)
             *dovacuum = (vactuples > vacthresh);
 
@@ -3575,7 +3776,7 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
             *dovacuum ? "true" : "false", vactuples, vacthresh);
     }
 
-    DEBUG_VACUUM_LOG(partForm->parentid, nameSpaceOid, LOG, "vac table \"%s\" partition(\"%s\"): recheck = %s "
+    DEBUG_VACUUM_LOG(relid, nameSpaceOid, LOG, "vac table \"%s\" partition(\"%s\"): recheck = %s "
         "need_freeze = %s dovacuum = %s (dead tuples %ld vacuum threshold %.0f) reltuple = %.0f",
         relname, partname, is_recheck ? "true" : "false", *need_freeze ? "true" : "false",
         *dovacuum ? "true" : "false", vactuples, vacthresh, reltuples);
@@ -3612,7 +3813,11 @@ static autovac_table* partition_recheck_autovac(
         return NULL;
 
     partForm = (Form_pg_partition)GETSTRUCT(partTuple);
-    relid = partForm->parentid;
+    if (partForm->parttype == PART_OBJ_TYPE_TABLE_SUB_PARTITION) {
+        relid = partid_get_parentid(partForm->parentid);
+    } else {
+        relid = partForm->parentid;
+    }
     shared = pgstat_fetch_stat_dbentry(InvalidOid);
     dbentry = pgstat_fetch_stat_dbentry(u_sess->proc_cxt.MyDatabaseId);
 
@@ -3625,10 +3830,10 @@ static autovac_table* partition_recheck_autovac(
     avopts = &(hentry->ar_reloptions);
 
     /* fetch the pgstat table entry */
-    ap_entry = (at_partitioned_table*)hash_search(partitioned_tables_map, &partForm->parentid, HASH_FIND, &found);
+    ap_entry = (at_partitioned_table*)hash_search(partitioned_tables_map, &relid, HASH_FIND, &found);
     if (!found) {
         ereport(defence_errlevel(), (errcode(ERRCODE_DATA_CORRUPTED), errmsg("Oid: %u does not "
-            "find in partitioned tables map.", partForm->parentid)));
+            "find in partitioned tables map.", relid)));
     }
     tabentry = get_pgstat_tabentry_relid(partid, false, relid, shared, dbentry);
     partition_needs_vacanalyze(
@@ -3641,6 +3846,7 @@ static autovac_table* partition_recheck_autovac(
             tab->at_relid = partid;
             tab->at_sharedrel = false;
             tab->at_dovacuum = dovacuum || dovacuum_toast;
+            tab->at_gpivacuumed = ap_entry->at_gpivacuumed;
         }
     }
 

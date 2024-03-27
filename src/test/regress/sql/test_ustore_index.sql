@@ -1,3 +1,4 @@
+set ustore_attr='ustore_verify_level=slow;ustore_verify_module=all';
 set enable_seqscan to false;
 set enable_indexonlyscan to true;
 set enable_indexscan to true;
@@ -245,3 +246,45 @@ explain SELECT /*+ tablescan(t1) */c1 FROM t1 WHERE c1 = 50;
 explain SELECT /*+ indexonlyscan(t1) */c1 FROM t1 WHERE c1 = 50;
 
 drop table t1;
+
+-- test ustore index trace
+create table t(a int, b int) with(storage_type=USTORE);
+create index on t(a, b);
+insert into t values(generate_series(1, 10), generate_series(1, 10));
+delete from t where a % 2 = 0;
+
+set ustore_attr="index_trace_level=all;enable_log_tuple=on";
+
+select /*+ indexscan(t) */ * from t where a = 1;
+
+set ustore_attr="index_trace_level=no;enable_log_tuple=off";
+drop table t;
+
+-- test ustore querying with bitmapindexscan when updated in the same transaction
+set enable_indexscan to off;
+set enable_indexonlyscan to off;
+set enable_seqscan to off;
+set enable_bitmapscan to on;
+
+drop table if exists test;
+create table test(a int);
+create index test_idx on test(a);
+insert into test values(2);
+insert into test values(2);
+insert into test values(1);
+insert into test values(1);
+
+begin;
+declare c1 cursor for select a from test where a = 2;
+update test set a = 2;
+fetch next from c1;
+fetch next from c1;
+fetch next from c1;
+fetch next from c1;
+rollback;
+
+drop table if exists test;
+reset enable_indexscan;
+reset enable_indexonlyscan;
+reset enable_seqscan;
+reset enable_bitmapscan;

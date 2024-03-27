@@ -56,6 +56,9 @@ void seg_physical_write(SegSpace *spc, RelFileNode &rNode, ForkNumber forknum, B
                         bool skipFsync);
 XLogRecPtr seg_get_headlsn(SegSpace *spc, BlockNumber blockNum, bool isbucket);
 
+int32 seg_physical_aio_prep_pwrite(SegSpace *spc, RelFileNode &rNode, ForkNumber forknum, BlockNumber blocknum,
+    const char *buffer, void *iocb_ptr);
+
 /* segment sync callback */
 void forget_space_fsync_request(SegSpace *spc);
 void seg_register_dirty_file(SegLogicFile *sf, int segno);
@@ -64,6 +67,7 @@ int seg_sync_filetag(const FileTag *ftag, char *path);
 int seg_unlink_filetag(const FileTag *ftag, char *path);
 void segForgetDatabaseFsyncRequests(Oid dbid);
 bool seg_filetag_matches(const FileTag *ftag, const FileTag *candidate);
+void df_extend_file_vector(SegLogicFile *sf);
 
 /*
  * XLog Atomic Operation APIs
@@ -127,6 +131,8 @@ DecodedXLogBlockOp XLogAtomicDecodeBlockData(char *data, int len);
  * APIs used for segment store metadata.
  */
 BufferDesc *SegBufferAlloc(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum, BlockNumber blockNum, bool *foundPtr);
+Buffer ReadSegBufferForDMS(BufferDesc* bufHdr, ReadBufferMode mode, SegSpace *spc = NULL);
+void ReadSegBufferForCheck(BufferDesc* bufHdr, ReadBufferMode mode, SegSpace *spc, Block bufBlock);
 Buffer ReadBufferFast(SegSpace *spc, RelFileNode rnode, ForkNumber forkNum, BlockNumber blockNum, ReadBufferMode mode);
 void SegReleaseBuffer(Buffer buffer);
 void SegUnlockReleaseBuffer(Buffer buffer);
@@ -138,6 +144,13 @@ void FlushDataBufferOfSegment(SegSpace *spc, BlockNumber head_block, ForkNumber 
 void FlushOneSegmentBuffer(Buffer buffer);
 void FlushOneBufferIncludeDW(BufferDesc *buf_desc);
 Buffer try_get_moved_pagebuf(RelFileNode *rnode, int forknum, BlockNumber logic_blocknum);
+
+void SetInProgressFlags(BufferDesc *bufDesc, bool input);
+bool HasInProgressBuf(void);    
+void SegTerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits);
+#ifdef USE_ASSERT_CHECKING
+void SegFlushCheckDiskLSN(SegSpace *spc, RelFileNode rNode, ForkNumber forknum, BlockNumber blocknum, char *buf);
+#endif
 
 /* Segment Remain API */
 enum StatRemainExtentType {
@@ -160,8 +173,10 @@ typedef struct ExtentTag {
     XLogRecPtr lsn;
 } ExtentTag;
 
-#define XLOG_REMAIN_SEGS_FILE_PATH "global/pg_remain_segs"
-#define XLOG_REMAIN_SEGS_BACKUP_FILE_PATH "global/pg_remain_segs.backup"
+#define XLOG_REMAIN_SEGS_FILE_PATH (g_instance.attr.attr_storage.dss_attr.ss_enable_dss ? \
+                                    ((char*)"pg_remain_segs") : ((char*)"global/pg_remain_segs"))
+#define XLOG_REMAIN_SEGS_BACKUP_FILE_PATH (g_instance.attr.attr_storage.dss_attr.ss_enable_dss ? \
+                                           ((char*)"pg_remain_segs.backup") : ((char*)"global/pg_remain_segs.backup"))
 #define XLOG_REMAIN_SEGS_SIZE 8192
 #define XLOG_REMAIN_SEG_FILE_LEAST_LEN (sizeof(XLogRecPtr) + sizeof(uint32) * 3)
 #define XLOG_REMAIN_SEGS_BATCH_NUM 20
@@ -188,5 +203,7 @@ extern Oid get_tablespace_oid_by_name(const char *tablespacename);
 extern void redo_xlog_deal_alloc_seg(uint8 opCode, Buffer buffer, const char* data, int data_len,
     TransactionId xid);
 extern StorageType PartitionGetStorageType(Partition partition, Oid parentOid);
+extern bool repair_check_physical_type(uint32 spcNode, uint32 dbNode, int32 forkNum, uint32 *relNode, uint32 *blockNum);
+extern RelFileNode get_segment_logic_rnode(SegSpace *spc, BlockNumber head_blocknum, int aim_fork);
 
 #endif

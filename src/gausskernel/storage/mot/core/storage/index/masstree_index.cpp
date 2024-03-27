@@ -24,6 +24,7 @@
 
 #include "masstree_index.h"
 #include "mot_engine.h"
+#include "object_pool_compact.h"
 
 namespace MOT {
 typedef MasstreePrimaryIndex::IndexImpl PrimaryMasstree;
@@ -69,14 +70,17 @@ Sentinel* MasstreePrimaryIndex::IndexInsertImpl(const Key* key, Sentinel* sentin
     mtSessionThreadInfo->set_gc_session(
         MOTEngine::GetInstance()->GetCurrentGcSession());  // set current GC session in thread-pooled envelope
 
-    existingItem = m_index.insert(key, sentinel, inserted, pid);
+    mtSessionThreadInfo->set_last_error(MT_MERR_OK);
+
+    existingItem = m_index.insert(key->GetKeyBuf(), key->GetKeyLength(), sentinel, inserted, pid);
 
     mtSessionThreadInfo->set_gc_session(NULL);
     mtSessionThreadInfo->set_working_index(NULL);
 
-    if (!inserted) {  // key mapping already exists in unique index
-        result = reinterpret_cast<Sentinel*>(existingItem);
-    }  // otherwise return null pointer
+    if (!inserted && existingItem) {  // key mapping already exists in unique index
+        result = static_cast<Sentinel*>(existingItem);
+    }  // otherwise return null pointer (if !inserted && !existingItem, Key does not exist and insertation failed due to
+       // memory issue)
 
     return result;
 }
@@ -88,10 +92,10 @@ Sentinel* MasstreePrimaryIndex::IndexReadImpl(const Key* key, uint32_t pid) cons
     void* output = nullptr;
 
     // Operation does not allocate memory from pools nor remove nodes. No need to set index's ptr
-    m_index.find(key, output, result, pid);
+    m_index.find(key->GetKeyBuf(), key->GetKeyLength(), output, result, pid);
 
     if (result) {
-        sentinel = reinterpret_cast<Sentinel*>(output);
+        sentinel = static_cast<Sentinel*>(output);
     }
 
     return sentinel;
@@ -108,54 +112,69 @@ Sentinel* MasstreePrimaryIndex::IndexRemoveImpl(const Key* key, uint32_t pid)
     mtSessionThreadInfo->set_gc_session(
         MOTEngine::GetInstance()->GetCurrentGcSession());  // set current GC session in thread-pooled envelope
 
+    mtSessionThreadInfo->set_last_error(MT_MERR_OK);
+
     output = m_index.remove(key->GetKeyBuf(), key->GetKeyLength(), result, pid);
 
     mtSessionThreadInfo->set_gc_session(NULL);
     mtSessionThreadInfo->set_working_index(NULL);
 
     if (result) {
-        sentinel = reinterpret_cast<Sentinel*>(output);
+        sentinel = static_cast<Sentinel*>(output);
     }
 
     return sentinel;
 }
 
-uint64_t MasstreePrimaryIndex::GetIndexSize()
+uint64_t MasstreePrimaryIndex::GetIndexSize(uint64_t& netTotal)
 {
     PoolStatsSt stats;
+
+    uint64_t res = Index::GetIndexSize(netTotal);
 
     errno_t erc = memset_s(&stats, sizeof(PoolStatsSt), 0, sizeof(PoolStatsSt));
     securec_check(erc, "\0", "\0");
     stats.m_type = PoolStatsT::POOL_STATS_ALL;
-    m_keyPool->GetStats(stats);
-    uint64_t res = stats.m_poolCount * stats.m_poolGrossSize;
-    uint64_t netto = (stats.m_totalObjCount - stats.m_freeObjCount) * stats.m_objSize;
-
-    erc = memset_s(&stats, sizeof(PoolStatsSt), 0, sizeof(PoolStatsSt));
-    securec_check(erc, "\0", "\0");
-    stats.m_type = PoolStatsT::POOL_STATS_ALL;
-    m_sentinelPool->GetStats(stats);
-    res += stats.m_poolCount * stats.m_poolGrossSize;
-    netto += (stats.m_totalObjCount - stats.m_freeObjCount) * stats.m_objSize;
-
-    erc = memset_s(&stats, sizeof(PoolStatsSt), 0, sizeof(PoolStatsSt));
-    securec_check(erc, "\0", "\0");
-    stats.m_type = PoolStatsT::POOL_STATS_ALL;
     m_leafsPool->GetStats(stats);
+    m_leafsPool->PrintStats(stats, "Leafs Pool", LogLevel::LL_INFO);
     res += stats.m_poolCount * stats.m_poolGrossSize;
-    netto += (stats.m_totalObjCount - stats.m_freeObjCount) * stats.m_objSize;
+    netTotal += (stats.m_totalObjCount - stats.m_freeObjCount) * stats.m_objSize;
 
     erc = memset_s(&stats, sizeof(PoolStatsSt), 0, sizeof(PoolStatsSt));
     securec_check(erc, "\0", "\0");
     stats.m_type = PoolStatsT::POOL_STATS_ALL;
     m_internodesPool->GetStats(stats);
+    m_internodesPool->PrintStats(stats, "Internodes Pool", LogLevel::LL_INFO);
     res += stats.m_poolCount * stats.m_poolGrossSize;
-    netto += (stats.m_totalObjCount - stats.m_freeObjCount) * stats.m_objSize;
+    netTotal += (stats.m_totalObjCount - stats.m_freeObjCount) * stats.m_objSize;
 
-    m_ksuffixSlab->GetSize(res, netto);
+    m_ksuffixSlab->Print("Ksuffix Slab", LogLevel::LL_INFO);
+    m_ksuffixSlab->GetSize(res, netTotal);
 
-    MOT_LOG_INFO("Index %s memory size: gross: %lu, netto: %lu", m_name.c_str(), res, netto);
+    MOT_LOG_INFO("Masstree Index %s memory size - Gross: %lu, NetTotal: %lu", m_name.c_str(), res, netTotal);
     return res;
+}
+
+void MasstreePrimaryIndex::Compact(Table* table, uint32_t pid)
+{
+    Index::Compact(table, pid);
+
+    char prefix[256];
+    errno_t erc = snprintf_s(prefix, sizeof(prefix), sizeof(prefix) - 1, "%s(leafs pool)", m_name.c_str());
+    securec_check_ss(erc, "\0", "\0");
+    prefix[erc] = 0;
+    CompactHandler chLeafs(m_leafsPool, prefix);
+    chLeafs.StartCompaction(CompactTypeT::COMPACT_SIMPLE);
+    chLeafs.EndCompaction();
+
+    erc = snprintf_s(prefix, sizeof(prefix), sizeof(prefix) - 1, "%s(internodes pool)", m_name.c_str());
+    securec_check_ss(erc, "\0", "\0");
+    prefix[erc] = 0;
+    CompactHandler chInternodes(m_internodesPool, prefix);
+    chInternodes.StartCompaction(CompactTypeT::COMPACT_SIMPLE);
+    chInternodes.EndCompaction();
+
+    m_ksuffixSlab->Compact();
 }
 
 // Iterator API
@@ -166,7 +185,7 @@ IndexIterator* MasstreePrimaryIndex::Begin(uint32_t pid, bool passive) const
 
     return Search(minKey, /* search key */
         0,                /* key size. Ignored if key is null */
-        true,             /* match key*/
+        true,             /* match key */
         true,             /* Forward */
         pid,              /* pid */
         result,           /* found */
@@ -176,13 +195,7 @@ IndexIterator* MasstreePrimaryIndex::Begin(uint32_t pid, bool passive) const
 IndexIterator* MasstreePrimaryIndex::Search(
     const Key* key, bool matchKey, bool forward, uint32_t pid, bool& found, bool passive) const
 {
-    return Search(reinterpret_cast<char const*>(key->GetKeyBuf()),
-        ALIGN8(key->GetKeyLength()),
-        matchKey,
-        forward,
-        pid,
-        found,
-        passive);
+    return Search((const char*)(key->GetKeyBuf()), ALIGN8(key->GetKeyLength()), matchKey, forward, pid, found, passive);
 }
 
 IndexIterator* MasstreePrimaryIndex::Search(

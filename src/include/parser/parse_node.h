@@ -69,6 +69,7 @@ typedef enum ParseExprKind
     EXPR_KIND_FUNCTION_DEFAULT, /* default parameter value for function */
     EXPR_KIND_INDEX_EXPRESSION, /* index expression */
     EXPR_KIND_INDEX_PREDICATE,    /* index predicate */
+    EXPR_KIND_STATS_EXPRESSION, /* extended statistics expression */
     EXPR_KIND_ALTER_COL_TRANSFORM,    /* transform expr in ALTER COLUMN TYPE */
     EXPR_KIND_EXECUTE_PARAMETER,    /* parameter value in EXECUTE */
     EXPR_KIND_TRIGGER_WHEN,        /* WHEN condition in CREATE TRIGGER */
@@ -78,6 +79,8 @@ typedef enum ParseExprKind
     EXPR_KIND_CALL_ARGUMENT,    /* procedure argument in CALL */
     EXPR_KIND_COPY_WHERE,        /* WHERE condition in COPY FROM */
     EXPR_KIND_GENERATED_COLUMN, /* generation expression for a column */
+    EXPR_KIND_MERGE_WHEN,        /* WHEN condition in MERTE stmt */
+    EXPR_KIND_CYCLE_MARK,        /* cycle mark value */
 } ParseExprKind;
 
 /*
@@ -156,6 +159,7 @@ struct ParseState {
     List* p_relnamespace;                /* current namespace for relations */
     List* p_varnamespace;                /* current namespace for columns */
     bool  p_lateral_active;              /* p_lateral_only items visible? */
+    bool  p_is_flt_frame;                /* Indicates whether it is a flattened expr frame */
     List* p_ctenamespace;                /* current namespace for common table exprs */
     List* p_future_ctes;                 /* common table exprs not yet in namespace */
     CommonTableExpr* p_parent_cte;       /* this query's containing CTE */
@@ -169,15 +173,18 @@ struct ParseState {
     /* Flags telling about things found in the query: */
     bool p_hasAggs;
     bool p_hasWindowFuncs;
+    bool p_hasTargetSRFs;
     bool p_hasSubLinks;
     bool p_hasModifyingCTE;
     bool p_is_insert;
     bool p_locked_from_parent;
     bool p_resolve_unknowns; /* resolve unknown-type SELECT outputs as type text */
     bool p_hasSynonyms;
-    Relation p_target_relation;
-    RangeTblEntry* p_target_rangetblentry;
-    bool p_is_case_when;
+    List* p_target_relation;
+    List* p_target_rangetblentry;
+    bool p_is_decode;
+
+    Node *p_last_srf; /* most recent set-returning func/op found */
 
     /*
      * used for start with...connect by rewrite
@@ -189,6 +196,7 @@ struct ParseState {
     List *sw_fromClause;
     WithClause *origin_with;
     bool p_hasStartWith;
+    bool p_has_ignore;  /* whether SQL has ignore hint */
 
     /*
      * Optional hook functions for parser callbacks.  These are null unless
@@ -258,6 +266,24 @@ struct ParseState {
                      */
 
     PlusJoinRTEInfo* p_plusjoin_rte_info; /* The RTE info while processing "(+)" */
+    List* p_updateRelations; /* For multiple-update, this is used to record the target table in the
+                              * update statement, then assign to qry->resultRelations.
+                              */
+    List* p_updateRangeVars; /* For multiple-update, use relationClase to generate RangeVar list. */
+
+    RightRefState* rightRefState;
+
+    /*
+     * whether to record the columns referenced by the ORDER BY statement
+     * when transforming the SortClause.
+     */
+    bool shouldCheckOrderbyCol;
+    /*
+     * store the columns that ORDER BY statement referencing
+     * if shouldCheckOrderbyCol is true else NIL.
+     */
+    List* orderbyCols; 
+    List* p_indexhintLists; /*Force or use index in index hint list*/
 };
 
 /* An element of p_relnamespace or p_varnamespace */

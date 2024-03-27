@@ -72,6 +72,7 @@ typedef struct CreateReplicationSlotCmd {
     ReplicationKind kind;
     XLogRecPtr init_slot_lsn;
     char* plugin;
+    bool useSnapshot;
 } CreateReplicationSlotCmd;
 
 /* ----------------------
@@ -81,6 +82,7 @@ typedef struct CreateReplicationSlotCmd {
 typedef struct DropReplicationSlotCmd {
     NodeTag type;
     char* slotname;
+    bool wait;
 } DropReplicationSlotCmd;
 
 /* ----------------------
@@ -123,4 +125,21 @@ typedef struct FetchMotCheckpointCmd {
     NodeTag type;
 } FetchMotCheckpointCmd;
 
+/* ----------------------
+ *		SQL commands
+ * ----------------------
+ */
+typedef struct SQLCmd
+{
+    NodeTag type;
+} SQLCmd;
+/* ----------------------
+ *		ADVANCE_CATALOG_XMIN command
+ * ----------------------
+ */
+typedef struct AdvanceCatalogXminCmd {
+    NodeTag type;
+    char* slotname;
+    TransactionId catalogXmin;
+} AdvanceCatalogXminCmd;
 #endif /* REPLNODES_H */

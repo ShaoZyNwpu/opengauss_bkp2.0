@@ -41,12 +41,12 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/snapcapturer.h"
+#include "postmaster/cfs_shrinker.h"
 #include "postmaster/rbcleaner.h"
 #include "storage/smgr/fd.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/proc.h"
-#include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -62,6 +62,8 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "gs_policy/policy_common.h"
+#include "storage/file/fio_device.h"
+#include "ddes/dms/ss_reform_common.h"
 
 #ifdef ENABLE_MULTIPLE_NODES
 #include "tsdb/compaction/compaction_entry.h"
@@ -71,6 +73,8 @@
 #define DIRECTORY_LOCK_FILE "postmaster.pid"
 
 #define INIT_SESSION_MAX_INT32_BUFF 20
+
+#define InvalidPid ((pid_t)(-1))
 
 Alarm alarmItemTooManyDbUserConn[1] = {ALM_AI_Unknown, ALM_AS_Normal, 0, 0, 0, 0, {0}, {0}, NULL};
 
@@ -338,6 +342,24 @@ Oid GetUserId(void)
 Oid GetCurrentUserId(void)
 {
     return u_sess->misc_cxt.CurrentUserId;
+}
+
+Oid GetOldUserId(bool isReceive)
+{
+    if (isReceive) {
+        return u_sess->misc_cxt.RecOldUserId;
+    } else {
+        return u_sess->misc_cxt.SendOldUserId;
+    }
+}
+
+void SetOldUserId(Oid userId, bool isReceive)
+{
+    if (isReceive) {
+        u_sess->misc_cxt.RecOldUserId = userId;
+    } else {
+        u_sess->misc_cxt.SendOldUserId = userId;
+    }
 }
 
 /*
@@ -621,7 +643,7 @@ Oid get_pgxc_logic_groupoid(const char* rolename)
     Oid group_id;
     HeapTuple roleTup;
 
-    roleTup = SearchSysCache1(AUTHNAME, CStringGetDatum(rolename));
+    roleTup = SearchUserHostName(rolename, NULL);
 
     if (!HeapTupleIsValid(roleTup)) {
         return InvalidOid;
@@ -674,15 +696,21 @@ static void RegisterNodeGroupCacheCallback()
  * with guc.c's internal state, so SET ROLE has to be disallowed.
  *
  * SECURITY_RESTRICTED_OPERATION indicates that we are inside an operation
- * that does not wish to trust called user-defined functions at all.  This
- * bit prevents not only SET ROLE, but various other changes of session state
- * that normally is unprotected but might possibly be used to subvert the
- * calling session later.  An example is replacing an existing prepared
- * statement with new code, which will then be executed with the outer
- * session's permissions when the prepared statement is next used.  Since
- * these restrictions are fairly draconian, we apply them only in contexts
- * where the called functions are really supposed to be side-effect-free
- * anyway, such as VACUUM/ANALYZE/REINDEX.
+ * that does not wish to trust called user-defined functions at all.  The
+ * policy is to use this before operations, e.g. autovacuum and REINDEX, that
+ * enumerate relations of a database or schema and run functions associated
+ * with each found relation.  The relation owner is the new user ID.  Set this
+ * as soon as possible after locking the relation.  Restore the old user ID as
+ * late as possible before closing the relation; restoring it shortly after
+ * close is also tolerable.  If a command has both relation-enumerating and
+ * non-enumerating modes, e.g. ANALYZE, both modes set this bit.  This bit
+ * prevents not only SET ROLE, but various other changes of session state that
+ * normally is unprotected but might possibly be used to subvert the calling
+ * session later.  An example is replacing an existing prepared statement with
+ * new code, which will then be executed with the outer session's permissions
+ * when the prepared statement is next used.  These restrictions are fairly
+ * draconian, but the functions called in relation-enumerating operations are
+ * really supposed to be side-effect-free anyway.
  *
  * Unlike GetUserId, GetUserIdAndSecContext does *not* Assert that the current
  * value of u_sess->misc_cxt.CurrentUserId is valid; nor does SetUserIdAndSecContext require
@@ -721,6 +749,21 @@ bool InSecurityRestrictedOperation(void)
     return (u_sess->misc_cxt.SecurityRestrictionContext & SECURITY_RESTRICTED_OPERATION) != 0;
 }
 
+/*
+ * InReceivingLocalUserIdChange - are we inside a dn get cn's userid change?
+ */
+bool InReceivingLocalUserIdChange()
+{
+    return (u_sess->misc_cxt.SecurityRestrictionContext & RECEIVER_LOCAL_USERID_CHANGE) != 0;
+}
+
+/*
+ * InSendingLocalUserIdChange - are we inside cn send user to dn change?
+ */
+bool InSendingLocalUserIdChange()
+{
+    return (u_sess->misc_cxt.SecurityRestrictionContext & SENDER_LOCAL_USERID_CHANGE) != 0;
+}
 /*
  * These are obsolete versions of Get/SetUserIdAndSecContext that are
  * only provided for bug-compatibility with some rather dubious code in
@@ -832,7 +875,7 @@ void InitializeSessionUserId(const char* rolename, bool ispoolerreuse, Oid usero
     }
 
     if (rolename != NULL) {
-        roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
+        roleTup = SearchUserHostName(rolename, NULL);
     } else {
         roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(useroid));
     }
@@ -968,13 +1011,14 @@ void InitializeSessionUserIdStandalone(void)
      */
 #ifdef ENABLE_MULTIPLE_NODES
     AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsJobSchedulerProcess() || IsJobWorkerProcess() ||
-        AM_WAL_SENDER || IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsUndoWorkerProcess() ||
+        AM_WAL_SENDER || IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsUndoWorkerProcess() ||  IsCfsShrinkerProcess() ||
         CompactionProcess::IsTsCompactionProcess() || IsRbCleanerProcess() || IsRbWorkerProcess() ||
         t_thrd.role == PARALLEL_DECODE || t_thrd.role == LOGICAL_READ_RECORD);
 #else   /* ENABLE_MULTIPLE_NODES */
     AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsJobSchedulerProcess() || IsJobWorkerProcess() ||
-        AM_WAL_SENDER || IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsUndoWorkerProcess() || IsRbCleanerProcess() ||
-        IsRbWorkerProcess() || t_thrd.role == PARALLEL_DECODE || t_thrd.role == LOGICAL_READ_RECORD);
+                AM_WAL_SENDER || IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsUndoWorkerProcess() ||
+                IsRbCleanerProcess() || IsCfsShrinkerProcess() ||
+                IsRbWorkerProcess() || t_thrd.role == PARALLEL_DECODE || t_thrd.role == LOGICAL_READ_RECORD);
 #endif   /* ENABLE_MULTIPLE_NODES */
 
     /* In pooler stateless reuse mode, to reset session userid */
@@ -1173,6 +1217,41 @@ static void CreatePidLockFile(const char* filename)
     on_proc_exit(UnLockPidLockFile, Int32GetDatum(fd));
 }
 
+/* Get tgid of input process id */
+pid_t getProcessTgid(pid_t pid)
+{
+#define TGID_ITEM_NUM 2
+    char pid_path[MAXPGPATH];
+    FILE *fp = NULL;
+    char getBuff[MAXPGPATH];
+    char paraName[MAXPGPATH];
+    pid_t tgid = InvalidPid;
+    int rc;
+
+    rc = snprintf_s(pid_path, MAXPGPATH, MAXPGPATH - 1, "/proc/%d/status", pid);
+    securec_check_ss(rc, "\0", "\0");
+
+    /* may fail because of ENOENT or privilege */
+    fp = fopen(pid_path, "r");
+    if (fp == NULL) {
+        return InvalidPid;
+    }
+
+    /* parse process's status file */
+    while (fgets(getBuff, MAXPGPATH, fp) != NULL) {
+        if (strstr(getBuff, "Tgid:") != NULL &&
+            sscanf_s(getBuff, "%s   %d", paraName, MAXPGPATH, &tgid) == TGID_ITEM_NUM) {
+            break;
+        } else {
+            tgid = InvalidPid;
+        }
+    }
+
+    (void)fclose(fp);
+
+    return tgid;
+}
+
 /*
  * Create a lockfile.
  *
@@ -1188,6 +1267,7 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
     int len;
     int encoded_pid;
     pid_t other_pid;
+    pid_t other_tgid;
     pid_t my_pid, my_p_pid, my_gp_pid;
     const char* envvar = NULL;
 
@@ -1304,6 +1384,8 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
                     buffer)));
         }
 
+        other_tgid = getProcessTgid(other_pid);
+
         /*
          * Check to see if the other process still exists
          *
@@ -1329,7 +1411,8 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
          * someone else, at least on machines where /tmp hasn't got a
          * stickybit.)
          */
-        if (other_pid != my_pid && other_pid != my_p_pid && other_pid != my_gp_pid) {
+        if (other_pid != my_pid && other_pid != my_p_pid && other_pid != my_gp_pid &&
+        (other_tgid == InvalidPid || (other_tgid != my_pid && other_tgid != my_p_pid && other_tgid != my_gp_pid))) {
             if (kill(other_pid, 0) == 0 || (errno != ESRCH && errno != EPERM)) {
 /* lockfile belongs to a live process */
 #ifndef WIN32
@@ -1596,6 +1679,9 @@ void AddToDataDirLockFile(int target_line, const char* str)
     int lineno;
     char* ptr = NULL;
     char buffer[BLCKSZ];
+    char temp[BLCKSZ] = {0};
+    char new_file[MAXPGPATH];
+    bool has_split = false;
 
     fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
 
@@ -1635,12 +1721,59 @@ void AddToDataDirLockFile(int target_line, const char* str)
         ptr++;
     }
 
+#ifndef ENABLE_MULTIPLE_NODES
+    /* If there are extra info, we should copy the string to right place in buffer */
+    if (target_line == LOCK_FILE_LINE_LISTEN_ADDR && ptr != NULL && strlen(ptr) != 0) {
+        char *end = ptr;
+        end = strchr(end, '\n');
+
+        if (end != NULL) {
+            end++;
+            /* set last character to '\0' */
+            char *invalid = strchr(end, '\n');
+            if (invalid != NULL) {
+                *(invalid + 1) = '\0';
+            }
+            int rcs = strcpy_s(temp, BLCKSZ - 1, end);
+            securec_check(rcs, "\0", "\0");
+            has_split = true;
+        }
+    }
+#endif
+
     /*
      * Write or rewrite the target line.
      */
     int rcs = snprintf_s(ptr, buffer + sizeof(buffer) - ptr, buffer + sizeof(buffer) - ptr - 1, "%s\n", str);
     securec_check_ss(rcs, "\0", "\0");
 
+    if (has_split) {
+        /* reload listen_addresses, we will write IP to postmaster.pid.new and then rename it to postmaster.pid */
+        size_t str_len = strlen(str);
+        rcs = snprintf_s(ptr + str_len + 1, buffer + sizeof(buffer) - ptr - str_len - 1,
+            buffer + sizeof(buffer) - ptr - str_len - 1 - 1, "%s", temp);
+        securec_check_ss(rcs, "\0", "\0");
+
+        rcs = snprintf_s(new_file, MAXPGPATH, MAXPGPATH - 1, "%s.new", DIRECTORY_LOCK_FILE);
+        securec_check_ss(rcs, "\0", "\0");
+        close(fd);
+        fd = open(new_file, O_RDWR | O_CREAT, 0600);
+
+        if (fd < 0) {
+            ereport(LOG, (errcode_for_file_access(),
+                errmsg("could not open new temp file \"%s\": %m", new_file)));
+            return;
+        }
+        pgstat_report_waitevent(WAIT_EVENT_LOCK_FILE_ADDTODATADIR_WRITE);
+        if (ftruncate(fd, (off_t)0) != 0) {
+            pgstat_report_waitevent(WAIT_EVENT_END);
+            ereport(LOG, (errcode_for_file_access(),
+                errmsg("could not clear file \"%s\": %m", DIRECTORY_LOCK_FILE)));
+            close(fd);
+            return;
+        }
+        pgstat_report_waitevent(WAIT_EVENT_END);
+    }
     /*
      * And rewrite the data.  Since we write in a single kernel call, this
      * update should appear atomic to onlookers.
@@ -1670,6 +1803,13 @@ void AddToDataDirLockFile(int target_line, const char* str)
     if (close(fd) != 0) {
         ereport(LOG, (errcode_for_file_access(), errmsg("could not write to file \"%s\": %m", DIRECTORY_LOCK_FILE)));
     }
+
+    if (has_split) {
+        if (rename(new_file, DIRECTORY_LOCK_FILE)) {
+            ereport(LOG, (errcode_for_file_access(),
+                errmsg("failed to rename file \"%s\": %m", new_file)));
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -1693,6 +1833,11 @@ void ValidatePgVersion(const char* path)
     char* endptr = NULL;
     const char* version_string = PG_VERSION;
     errno_t rc;
+
+    // skip in dss mode
+    if (ENABLE_DSS) {
+        return;
+    }
 
     my_major = strtol(version_string, &endptr, 10);
 
@@ -1902,4 +2047,120 @@ bool contain_backend_version(uint32 version_number) {
     return ((version_number >= V5R1C20_BACKEND_VERSION_NUM &&
              version_number < V5R2C00_START_VERSION_NUM) ||
             (version_number >= V5R2C00_BACKEND_VERSION_NUM));
+}
+
+void ss_initdwsubdir(char *dssdir, int instance_id)
+{
+    int rc;
+
+    /* file correspanding to double write directory */
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwOldPath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/pg_dw", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwPathPrefix, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/pg_dw_", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwSinglePath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/pg_dw_single", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwBuildPath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/pg_dw.build", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwUpgradePath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/dw_upgrade", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwBatchUpgradeMetaPath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/dw_batch_upgrade_meta", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwBatchUpgradeFilePath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/dw_batch_upgrade_files", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwMetaPath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/pg_dw_meta", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.dw_subdir_cxt.dwExtChunkPath, MAXPGPATH, MAXPGPATH - 1,
+        "%s/pg_doublewrite%d/pg_dw_ext_chunk", dssdir, instance_id);
+    securec_check_ss(rc, "", "");
+
+    g_instance.datadir_cxt.dw_subdir_cxt.dwStorageType = (uint8)DEV_TYPE_DSS;
+}
+
+void initDssPath(char *dssdir)
+{
+    errno_t rc = EOK;
+
+    rc = snprintf_s(g_instance.datadir_cxt.baseDir, MAXPGPATH, MAXPGPATH - 1, "%s/base", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.globalDir, MAXPGPATH, MAXPGPATH - 1, "%s/global", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.locationDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_location", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.tblspcDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_tblspc", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.clogDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_clog", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.csnlogDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_csnlog", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.serialDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_serial", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.twophaseDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_twophase", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.multixactDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_multixact", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.xlogDir, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog%d", dssdir,
+        g_instance.attr.attr_storage.dms_attr.instance_id);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.controlPath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_control", dssdir);
+    securec_check_ss(rc, "", "");
+
+    rc = snprintf_s(g_instance.datadir_cxt.controlBakPath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_control.backup",
+        dssdir);
+    securec_check_ss(rc, "", "");
+
+    ss_initdwsubdir(dssdir, g_instance.attr.attr_storage.dms_attr.instance_id);
+}
+
+void initDSSConf(void)
+{
+    if (!ENABLE_DSS) {
+        return;
+    }
+
+    // check whether dss connect is successful.
+    struct stat st;
+    if (stat(g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+            errmsg("Could not connect dssserver, vgname: \"%s\", socketpath: \"%s\"",
+            g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name,
+            g_instance.attr.attr_storage.dss_attr.ss_dss_conn_path),
+            errhint("Check vgname and socketpath and restart later.")));
+    } else {
+        char *dssdir = g_instance.attr.attr_storage.dss_attr.ss_dss_vg_name;
+
+        // do not overwrite
+        if (strncmp(g_instance.datadir_cxt.baseDir, dssdir, strlen(dssdir)) != 0) {
+            initDssPath(dssdir);
+        }
+    }
+
+    /* set xlog seg size to 1GB */
+    XLogSegmentSize = DSS_XLOG_SEG_SIZE;
 }

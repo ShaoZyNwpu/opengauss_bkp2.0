@@ -1178,6 +1178,7 @@ typedef enum WaitState {
     STATE_WAIT_FLUSH_DATA,
     STATE_WAIT_RESERVE_TD,
     STATE_WAIT_TD_ROLLBACK,
+    STATE_WAIT_AVAILABLE_TD,
     STATE_WAIT_TRANSACTION_ROLLBACK,
     STATE_PRUNE_TABLE,
     STATE_PRUNE_INDEX,
@@ -1229,6 +1230,8 @@ typedef enum WaitState {
     STATE_WAIT_SYNC_PRODUCER_NEXT_STEP,
     STATE_GTM_SET_CONSISTENCY_POINT,
     STATE_WAIT_SYNC_BGWORKERS,
+    STATE_STANDBY_READ_RECOVERY_CONFLICT,
+    STATE_STANDBY_GET_SNAPSHOT,
     STATE_WAIT_NUM  // MUST be last, DO NOT use this value.
 } WaitState;
 
@@ -1255,6 +1258,8 @@ typedef enum WaitStatePhase {
 #define PG_WAIT_LOCK 0x03000000U
 #define PG_WAIT_IO 0x0A000000U
 #define PG_WAIT_SQL 0x0B000000U
+#define PG_WAIT_STATE 0x0C000000U
+#define PG_WAIT_DMS 0x0D000000U
 
 /* ----------
  * Wait Events - IO
@@ -1338,8 +1343,62 @@ typedef enum WaitEventIO {
     WAIT_EVENT_LOGCTRL_SLEEP,
     WAIT_EVENT_COMPRESS_ADDRESS_FILE_FLUSH,
     WAIT_EVENT_COMPRESS_ADDRESS_FILE_SYNC,
+    WAIT_EVENT_LOGICAL_SYNC_DATA,
+    WAIT_EVENT_LOGICAL_SYNC_STATE_CHANGE,
+    WAIT_EVENT_REPLICATION_ORIGIN_DROP,
+    WAIT_EVENT_REPLICATION_SLOT_DROP,
     IO_EVENT_NUM = WAIT_EVENT_LOGCTRL_SLEEP - WAIT_EVENT_BUFFILE_READ + 1  // MUST be last, DO NOT use this value.
 } WaitEventIO;
+
+typedef enum WaitEventDMS {
+    WAIT_EVENT_IDLE_WAIT = PG_WAIT_DMS,
+
+    WAIT_EVENT_GC_BUFFER_BUSY,
+    WAIT_EVENT_DCS_REQ_MASTER4PAGE_1WAY,
+    WAIT_EVENT_DCS_REQ_MASTER4PAGE_2WAY,
+    WAIT_EVENT_DCS_REQ_MASTER4PAGE_3WAY,
+    WAIT_EVENT_DCS_REQ_MASTER4PAGE_TRY,
+    WAIT_EVENT_DCS_REQ_OWNER4PAGE,
+    WAIT_EVENT_DCS_CLAIM_OWNER,
+    WAIT_EVENT_DCS_RELEASE_OWNER,
+    WAIT_EVENT_DCS_INVLDT_SHARE_COPY_REQ,
+    WAIT_EVENT_DCS_INVLDT_SHARE_COPY_PROCESS,
+    WAIT_EVENT_DCS_TRANSFER_PAGE_LATCH,
+    WAIT_EVENT_DCS_TRANSFER_PAGE_READONLY2X,
+    WAIT_EVENT_DCS_TRANSFER_PAGE_FLUSHLOG,
+    WAIT_EVENT_DCS_TRANSFER_PAGE,
+    WAIT_EVENT_PCR_REQ_BTREE_PAGE,
+    WAIT_EVENT_PCR_REQ_HEAP_PAGE,
+    WAIT_EVENT_PCR_REQ_MASTER,
+    WAIT_EVENT_PCR_REQ_OWNER,
+    WAIT_EVENT_PCR_CHECK_CURR_VISIBLE,
+    WAIT_EVENT_TXN_REQ_INFO,
+    WAIT_EVENT_TXN_REQ_SNAPSHOT,
+    WAIT_EVENT_DLS_REQ_LOCK,
+    WAIT_EVENT_DLS_REQ_TABLE,
+    WAIT_EVENT_DLS_REQ_PART_X,
+    WAIT_EVENT_DLS_REQ_PART_S,
+    WAIT_EVENT_DLS_WAIT_TXN,
+    WAIT_EVENT_DEAD_LOCK_TXN,
+    WAIT_EVENT_DEAD_LOCK_TABLE,
+    WAIT_EVENT_DEAD_LOCK_ITL,
+    WAIT_EVENT_BROADCAST_BTREE_SPLIT,
+    WAIT_EVENT_BROADCAST_ROOT_PAGE,
+    WAIT_EVENT_QUERY_OWNER_ID,
+    WAIT_EVENT_LATCH_X,
+    WAIT_EVENT_LATCH_S,
+    WAIT_EVENT_LATCH_X_REMOTE,
+    WAIT_EVENT_LATCH_S_REMOTE,
+    WAIT_EVENT_ONDEMAND_REDO,
+    WAIT_EVENT_PAGE_STATUS_INFO,
+    WAIT_EVENT_OPENGAUSS_SEND_XMIN,
+    WAIT_EVENT_DCS_REQ_CREATE_XA_RES,
+    WAIT_EVENT_DCS_REQ_DELETE_XA_RES,
+    WAIT_EVENT_DCS_REQ_XA_OWNER_ID,
+    WAIT_EVENT_DCS_REQ_XA_IN_USE,
+    WAIT_EVENT_DCS_REQ_END_XA,
+    DMS_EVENT_NUM = WAIT_EVENT_DCS_REQ_END_XA - WAIT_EVENT_IDLE_WAIT + 1  // MUST be last, DO NOT use this value.
+} WaitEventDMS;
 
 /* ----------
  * Wait Events - SQL
@@ -1473,6 +1532,7 @@ typedef struct WaitEventInfo {
     int64 start_time;  // current wait starttime
     int64 duration;    // current wait duration
     WaitStatisticsInfo io_info[IO_EVENT_NUM];
+    WaitStatisticsInfo dms_info[DMS_EVENT_NUM];
     WaitStatisticsInfo lock_info[LOCK_EVENT_NUM];
     WaitStatisticsInfo lwlock_info[LWLOCK_EVENT_NUM];
 } WaitEventInfo;
@@ -1741,6 +1801,7 @@ extern void pgstat_couple_decouple_session(bool is_couple);
 extern void pgstat_beshutdown_session(int ctrl_index);
 
 extern const char* pgstat_get_wait_io(WaitEventIO w);
+extern const char* pgstat_get_wait_dms(WaitEventDMS w);
 extern void pgstat_report_activity(BackendState state, const char* cmd_str);
 extern void pgstat_report_tempfile(size_t filesize);
 extern void pgstat_report_memReserved(int4 memReserved, int reserve_or_release);
@@ -1756,6 +1817,7 @@ extern void pgstat_report_unique_sql_id(bool resetUniqueSql);
 extern void pgstat_report_global_session_id(GlobalSessionId globalSessionId);
 extern void pgstat_report_jobid(uint64 jobid);
 extern void pgstat_report_parent_sessionid(uint64 sessionid, uint32 level = 0);
+extern void pgstat_report_bgworker_parent_sessionid(uint64 sessionid);
 extern void pgstat_report_smpid(uint32 smpid);
 
 extern void pgstat_report_blocksid(void* waitLockThrd, uint64 blockSessionId);
@@ -2352,6 +2414,8 @@ extern void getSessionID(char* sessid, pg_time_t startTime, ThreadId Threadid);
 extern void getThrdID(char* thrdid, pg_time_t startTime, ThreadId Threadid);
 
 #define NUM_MOT_SESSION_MEMORY_DETAIL_ELEM 4
+#define NUM_MOT_JIT_DETAIL_ELEM 11
+#define NUM_MOT_JIT_PROFILE_ELEM 12
 
 typedef struct MotSessionMemoryDetail {
     ThreadId threadid;
@@ -2377,8 +2441,39 @@ typedef struct MotMemoryDetailPad {
     MotMemoryDetail* memoryDetail;
 } MotMemoryDetailPad;
 
+typedef struct MotJitDetail {
+    Oid procOid;
+    char* query;
+    char* nameSpace;
+    char* jittableStatus;
+    char* validStatus;
+    TimestampTz lastUpdatedTimestamp;
+    char* planType;
+    int64 codegenTime;
+    int64 verifyTime;
+    int64 finalizeTime;
+    int64 compileTime;
+} MotJitDetail;
+
+typedef struct MotJitProfile {
+    Oid procOid;
+    int32 id;
+    int32 parentId;
+    char* query;
+    char* nameSpace;
+    float4 weight;
+    int64 totalTime;
+    int64 selfTime;
+    int64 childGrossTime;
+    int64 childNetTime;
+    int64 defVarsTime;
+    int64 initVarsTime;
+} MotJitProfile;
+
 extern MotSessionMemoryDetail* GetMotSessionMemoryDetail(uint32* num);
 extern MotMemoryDetail* GetMotMemoryDetail(uint32* num, bool isGlobal);
+extern MotJitDetail* GetMotJitDetail(uint32* num);
+extern MotJitProfile* GetMotJitProfile(uint32* num);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 typedef enum { STANDARD_DUMP, SHARED_DUMP } DUMP_TYPE;
@@ -2503,6 +2598,7 @@ extern void reportRedoWrite(PgStat_Counter blks, PgStat_Counter tim);
 
 typedef struct PgStat_FileEntry {
     int changeCount;
+    TimestampTz time;
 
     Oid dbid;
     Oid spcid;
@@ -2693,6 +2789,22 @@ typedef struct {
     uint32 	pinning_backends;
 } BufferCachePagesRec;
 
+typedef struct {
+    int bufferid;
+    uint8 is_remote_dirty;
+    uint8 lock_mode;
+    uint8 is_edp;
+    uint8 force_request;
+    uint8 need_flush;
+    int buf_id;
+    uint32 state;
+    uint32 pblk_relno;
+    uint32 pblk_blkno;
+    uint64 pblk_lsn;
+    uint8 seg_fileno;
+    uint32 seg_blockno;
+} SSBufferCtrlRec;
+
 /*
  * Function context for data persisting over repeated calls.
  */
@@ -2700,6 +2812,11 @@ typedef struct {
     TupleDesc tupdesc;
     BufferCachePagesRec* record;
 } BufferCachePagesContext;
+
+typedef struct {
+    TupleDesc tupdesc;
+    SSBufferCtrlRec* record;
+} SSBufferCtrlContext;
 
 /* Function context for table distribution over repeated calls. */
 typedef struct TableDistributionInfo {
@@ -2954,6 +3071,8 @@ typedef struct IoWaitStatGlobalInfo {
 } IoWaitStatGlobalInfo;
 
 void pgstat_release_session_memory_entry();
+extern void gs_stat_free_stat_node(PgBackendStatusNode* node);
+extern void gs_stat_free_stat_beentry(PgBackendStatus* beentry);
 
 #define MAX_PATH 256
 

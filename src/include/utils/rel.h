@@ -134,6 +134,8 @@ typedef struct RelationData {
     char rd_indexvalid;               /* state of rd_indexlist: 0 = not valid, 1 =
                                        * valid, 2 = temporarily forced */
     bool rd_islocaltemp;              /* rel is a temp rel of this session */
+    bool is_compressed;
+    bool rd_isblockchain; /* relation is in blockchain schema */
 
     /*
      * rd_createSubid is the ID of the highest subtransaction the rel has
@@ -150,8 +152,9 @@ typedef struct RelationData {
 
     Form_pg_class rd_rel; /* RELATION tuple */
     TupleDesc rd_att;     /* tuple descriptor */
+    const TableAmRoutine* rd_tam_ops; /* implementation of table AM */
     Oid rd_id;            /* relation's object id */
-    bool rd_isblockchain; /* relation is in blockchain schema */
+    char relreplident;    /* see REPLICA_IDENTITY_xxx constants  */
 
     LockInfoData rd_lockInfo;  /* lock mgr's info for locking relation */
     RuleLock* rd_rules;        /* rewrite rules */
@@ -193,9 +196,10 @@ typedef struct RelationData {
     /* use "struct" here to avoid needing to include htup.h: */
     struct HeapTupleData* rd_indextuple; /* all of pg_index tuple */
     Form_pg_am rd_am;                    /* pg_am tuple for index's AM */
+    /* use "struct" here to avoid needing to include amapi.h*/
+    struct IndexAmRoutine* rd_amroutine; /* index AM's API struct */
 
     int rd_indnkeyatts;     /* index relation's indexkey nums */
-    TableAmType rd_tam_type; /*Table accessor method type*/
     int1 rd_indexsplit;  /* determines the page split method to use */
 
     /*
@@ -291,9 +295,9 @@ typedef struct RelationData {
     /* Is under the context of creating crossbucket index? */
     bool newcbi;
 
-    bool is_compressed;
+    bool come_from_partrel;
     /* used only for gsc, keep it preserved if you modify the rel, otherwise set it null */
-    struct LocalRelationEntry *entry; 
+    struct LocalRelationEntry *entry;
 } RelationData;
 
 /*
@@ -332,10 +336,8 @@ typedef enum RedisRelAction {
 
 /* PageCompressOpts->compressType values */
 typedef enum CompressTypeOption {
-    COMPRESS_TYPE_NONE = 0, COMPRESS_TYPE_PGLZ = 1, COMPRESS_TYPE_ZSTD = 2
+    COMPRESS_TYPE_NONE = 0, COMPRESS_TYPE_PGLZ = 1, COMPRESS_TYPE_ZSTD = 2, COMPRESS_TYPE_PGZSTD = 3
 } CompressTypeOption;
-
-
 typedef struct StdRdOptions {
     int32 vl_len_;           /* varlena header (do not touch directly!) */
     int fillfactor;          /* page fill factor in percent (0..100) */
@@ -405,6 +407,8 @@ typedef struct StdRdOptions {
     bool enable_tde;     /* switch flag for table-level TDE encryption */
     bool on_commit_delete_rows; /* global temp table */
     PageCompressOpts compress; /* page compress related reloptions. */
+    int check_option_offset; /* for views */
+    Oid collate; /* table's default collation in b format. */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR 10
@@ -413,9 +417,6 @@ typedef struct StdRdOptions {
 #define UHEAP_MIN_TD 2
 #define UHEAP_MAX_TD 128
 #define UHEAP_DEFAULT_TD 4
-
-#define RelationGetTupleType(relation) \
-    ((relation)->rd_tam_type + 1)
 
 /*
  * RelationIsUsedAsCatalogTable
@@ -462,6 +463,39 @@ typedef struct StdRdOptions {
  */
 #define RelationIsSecurityView(relation) \
     ((relation)->rd_options ? ((StdRdOptions*)(relation)->rd_options)->security_barrier : false)
+
+/*
+ * RelationHasCheckOption
+ *		Returns true if the relation is a view defined with either the local
+ *		or the cascaded check option.
+ */
+#define RelationHasCheckOption(relation)                                  \
+    ((relation)->rd_options &&                                            \
+     ((StdRdOptions *) (relation)->rd_options)->check_option_offset != 0)
+
+/*
+ * RelationHasLocalCheckOption
+ *		Returns true if the relation is a view defined with the local check
+ *		option.
+ */
+#define RelationHasLocalCheckOption(relation)                               \
+    ((relation)->rd_options &&                                              \
+    ((StdRdOptions *) (relation)->rd_options)->check_option_offset != 0 ?   \
+    strcmp((char *) (relation)->rd_options +                                \
+            ((StdRdOptions *) (relation)->rd_options)->check_option_offset, \
+            "local") == 0 : false)
+
+/*
+ * RelationHasCascadedCheckOption
+ *		Returns true if the relation is a view defined with the cascaded check
+ *		option.
+ */
+#define RelationHasCascadedCheckOption(relation)                            \
+    ((relation)->rd_options &&                                              \
+     ((StdRdOptions *) (relation)->rd_options)->check_option_offset != 0 ?  \
+     strcmp((char *) (relation)->rd_options +                               \
+            ((StdRdOptions *) (relation)->rd_options)->check_option_offset, \
+            "cascaded") == 0 : false)
 
 /*
  * RelationGetParallelWorkers
@@ -612,6 +646,7 @@ extern TransactionId PartGetRelFrozenxid64(Partition part);
  */
 #define RelationIsMapped(relation) ((relation)->rd_rel->relfilenode == InvalidOid)
 
+extern void TryFreshSmgrCache(struct SMgrRelationData *smgr);
 /*
  * RelationOpenSmgr
  *		Open the relation at the smgr level, if not already done.
@@ -620,6 +655,9 @@ extern TransactionId PartGetRelFrozenxid64(Partition part);
     do {                                                                                                 \
         if ((relation)->rd_smgr == NULL)                                                                 \
             smgrsetowner(&((relation)->rd_smgr), smgropen((relation)->rd_node, (relation)->rd_backend)); \
+        else {                                                                                           \
+            TryFreshSmgrCache((relation)->rd_smgr);                                                      \
+        }                                                                                                \
     } while (0)
 
 /*
@@ -811,5 +849,7 @@ extern void RelationDecrementReferenceCount(Oid relationId);
 extern void GetTdeInfoFromRel(Relation rel, TdeInfo *tde_info);
 extern char RelationGetRelReplident(Relation r);
 extern void SetupPageCompressForRelation(RelFileNode* node, PageCompressOpts* compressOpts, const char* name);
+extern bool IsRelationReplidentKey(Relation r, int attno);
+
 #endif /* REL_H */
 

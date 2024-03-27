@@ -38,7 +38,6 @@
 #include "gssignal/gs_signal.h"
 #include "storage/pmsignal.h"
 #include "access/gtm.h"
-#include "access/dfs/dfs_am.h"
 #include "access/ustore/undo/knl_uundoapi.h"
 #include "workload/workload.h"
 #include "postmaster/syslogger.h"
@@ -66,6 +65,7 @@ extern "C" {
 /* postmaster need wait some thread in immediate shutdown */
 #define NUMWAITTHREADS 1
 #define WAITTIME 15
+#define WAIT_DMS_INIT_TIMEOUT 100
 
 volatile unsigned int alive_threads_waitted = NUMWAITTHREADS;
 
@@ -85,7 +85,6 @@ static const pg_on_exit_callback on_sess_exit_list[] = {
     ShutdownPostgres,
     PGXCNodeCleanAndRelease,
     PlDebugerCleanUp,
-    cleanGPCPlanProcExit,
 #ifdef ENABLE_MOT
     /*
      * 1. Must come after ShutdownPostgres(), in case there is abort/rollback callback.
@@ -97,7 +96,8 @@ static const pg_on_exit_callback on_sess_exit_list[] = {
     pq_close,
     AtProcExit_Files,
     audit_processlogout,
-    log_disconnections
+    log_disconnections,
+    libpqsw_cleanup
 };
 
 static const int on_sess_exit_size = lengthof(on_sess_exit_list);
@@ -158,13 +158,22 @@ void proc_exit_prepare(int code);
  */
 void proc_exit(int code)
 {
-    DynamicFileList* file_scanner = NULL;
+    if (ENABLE_DMS && t_thrd.proc_cxt.MyProcPid == PostmasterPid) {
+        // add cnt to avoid DmsCallbackThreadShmemInit to use UsedShmemSegAddr
+        (void)pg_atomic_add_fetch_u32(&g_instance.dms_cxt.inProcExitCnt, 1);
+        while (pg_atomic_read_u32(&g_instance.dms_cxt.inDmsThreShmemInitCnt) > 0) {
+            // if some threads call DmsCallbackThreadShmemInit, wait until they finish
+            pg_usleep(WAIT_DMS_INIT_TIMEOUT);
+        }
+    }
 
     if (t_thrd.utils_cxt.backend_reserved) {
         ereport(DEBUG2, (errmodule(MOD_MEM),
             errmsg("[BackendReservedExit] current thread role is: %d, used memory is: %d MB\n",
             t_thrd.role, t_thrd.utils_cxt.trackedMemChunks)));
     }
+
+    AtEOXact_SysDBCache(false);
 
     audit_processlogout_unified();
 
@@ -251,20 +260,17 @@ void proc_exit(int code)
     }
     RemoveFromDnHashTable();
 
-    /* Clean up Dfs Reader stuffs */
-    CleanupDfsHandlers(true);
-
     BgworkerListSyncQuit();
 
     /* Clean up Allocated descs */
     FreeAllAllocatedDescs();
 
-    /* Clean up everything that must be cleaned up */
-    proc_exit_prepare(code);
-
     if (u_sess->SPI_cxt.autonomous_session) {
         DestoryAutonomousSession(true);
     }
+
+    /* Clean up everything that must be cleaned up */
+    proc_exit_prepare(code);
 
     /*
      * Protect the node group incase the ShutPostgres Callback function
@@ -320,22 +326,8 @@ void proc_exit(int code)
         if (t_thrd.postmaster_cxt.redirection_done)
             ereport(LOG, (errmsg("Gaussdb exit(%d)", code)));
 
-        while (file_list != NULL) {
-            file_scanner = file_list;
-            file_list = file_list->next;
-#ifndef ENABLE_MEMORY_CHECK
-            /* 
-             * in the senario of ImmediateShutdown, it is not safe to close plugin 
-             * as PM thread will not wait for all children threads exist(will send SIGQUIT signal) referring to pmdie
-             */
-            if (g_instance.status != ImmediateShutdown) {
-                (void)pg_dlclose(file_scanner->handle);
-            }
-#endif
-            pfree((char*)file_scanner);
-            file_scanner = NULL;
-        }
-        file_list = file_tail = NULL;
+        /* release all library at proc exit. */
+        internal_delete_library();
 
         if (u_sess->attr.attr_resource.use_workload_manager)
             gscgroup_free();

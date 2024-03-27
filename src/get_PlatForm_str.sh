@@ -23,6 +23,9 @@ then
 elif [ -f "/etc/openEuler-release" ]
 then
     kernel=$(cat /etc/openEuler-release | awk -F ' ' '{print $1}' | tr A-Z a-z)
+elif [ -f "/etc/FusionOS-release" ]
+then
+    kernel=$(cat /etc/FusionOS-release | awk -F ' ' '{print $1}' | tr A-Z a-z)
 elif [ -f "/etc/centos-release" ]
 then
     kernel=$(cat /etc/centos-release | awk -F ' ' '{print $1}' | tr A-Z a-z)
@@ -125,15 +128,21 @@ fi
 
 
 ##################################################################################
+# fusionos platform
+# the result form like this: fusionos_x86_64
+##################################################################################
+if [ "$kernel"x = "fusionos"x ]
+then
+    plat_form_str=fusionos_"$cpu_bit"
+fi
+
+
+##################################################################################
 # kylin platform
 # the result form like this: kylin_aarch64
 ##################################################################################
 if [ "$kernel"x = "kylin"x ];then
-    if [ "$cpu_bit"x = "aarch64"x ];then
-        plat_form_str=kylinv10_sp1_"$cpu_bit"
-    else
-        plat_form_str=kylinv10_sp1_"$cpu_bit"_intel
-    fi
+    plat_form_str=kylinv10_sp1_"$cpu_bit"
 fi
 
 ##################################################################################
@@ -143,6 +152,29 @@ fi
 if [ "$kernel"x = "ubuntu"x ]
 then
     plat_form_str=ubuntu18.04_"$cpu_bit"
+fi
+
+##################################################################################
+# the modification here will also lead to the synchronous modification of the 3rd-party compilation library path
+# PR link : https://gitee.com/opengauss/openGauss-third_party/pulls/130
+# redflag platform  
+# the result form like this: asianux_x86_64
+##################################################################################
+if [ "$kernel"x = "redflag"x ]
+then
+    plat_form_str=asianux7.6_"$cpu_bit"
+fi
+
+
+##################################################################################
+# the modification here will also lead to the synchronous modification of the 3rd-party compilation library path
+# PR link : https://gitee.com/opengauss/openGauss-third_party/pulls/130
+# asianux platform
+# the result form like this: asianux_aarch64
+##################################################################################
+if [ "$kernel"x = "asianux"x ]
+then
+    plat_form_str=asianux7.5_"$cpu_bit"
 fi
 
 ##################################################################################

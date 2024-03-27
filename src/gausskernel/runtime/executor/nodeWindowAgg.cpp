@@ -52,6 +52,7 @@
 #include "utils/syscache.h"
 #include "windowapi.h"
 
+static TupleTableSlot* ExecWindowAgg(PlanState* state);
 static void initialize_windowaggregate(
     WindowAggState* winstate, WindowStatePerFunc perfuncstate, WindowStatePerAgg peraggstate);
 static void advance_windowaggregate(
@@ -627,7 +628,7 @@ static void spool_tuples(WindowAggState* winstate, int64 pos)
         if (node->partNumCols > 0) {
             /* Check if this tuple still belongs to the current partition */
             if (!execTuplesMatch(winstate->first_part_slot, outer_slot, node->partNumCols, node->partColIdx,
-                winstate->partEqfunctions, winstate->tmpcontext->ecxt_per_tuple_memory)) {
+                winstate->partEqfunctions, winstate->tmpcontext->ecxt_per_tuple_memory, node->part_collations)) {
                 /*
                  * end of partition; copy the tuple for the next cycle.
                  */
@@ -951,14 +952,17 @@ static void update_frametailpos(WindowObject winobj, TupleTableSlot* slot)
  *	(ignoring the case of SRFs in the targetlist, that is).
  * -----------------
  */
-TupleTableSlot* ExecWindowAgg(WindowAggState* winstate)
+static TupleTableSlot* ExecWindowAgg(PlanState* state)
 {
+    WindowAggState* winstate = castNode(WindowAggState, state);
     TupleTableSlot* result = NULL;
     ExprDoneCond is_done;
     ExprContext* econtext = NULL;
     int i;
     int numfuncs;
 
+    CHECK_FOR_INTERRUPTS();
+    
     if (winstate->all_done)
         return NULL;
 
@@ -1157,6 +1161,7 @@ WindowAggState* ExecInitWindowAgg(WindowAgg* node, EState* estate, int eflags)
     WindowAggState* winstate = makeNode(WindowAggState);
     winstate->ss.ps.plan = (Plan*)node;
     winstate->ss.ps.state = estate;
+    winstate->ss.ps.ExecProcNode = ExecWindowAgg;
 
     int64 operator_mem = SET_NODEMEM(((Plan*)node)->operatorMemKB[0], ((Plan*)node)->dop);
     AllocSetContext* set = (AllocSetContext*)(estate->es_query_cxt);
@@ -1226,7 +1231,7 @@ WindowAggState* ExecInitWindowAgg(WindowAgg* node, EState* estate, int eflags)
      * Initialize result tuple type and projection info.
      * result Tuple Table Slot contains virtual tuple, default tableAm type is set to HEAP.
      */
-    ExecAssignResultTypeFromTL(&winstate->ss.ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&winstate->ss.ps);
 
     ExecAssignProjectionInfo(&winstate->ss.ps, NULL);
 
@@ -1586,7 +1591,8 @@ static bool are_peers(WindowAggState* winstate, TupleTableSlot* slot1, TupleTabl
         node->ordNumCols,
         node->ordColIdx,
         winstate->ordEqfunctions,
-        winstate->tmpcontext->ecxt_per_tuple_memory);
+        winstate->tmpcontext->ecxt_per_tuple_memory,
+        node->ord_collations);
 }
 
 /*

@@ -81,6 +81,51 @@ typedef struct knl_instance_attr_dcf {
     int dcf_mec_batch_size;
 } knl_instance_attr_dcf;
 
+typedef struct knl_instance_attr_nvm {
+    bool enable_nvm;
+    char* nvm_file_path;
+    char *nvmBlocks;
+    double bypassDram;
+    double bypassNvm;
+} knl_instance_attr_nvm;
+
+typedef struct knl_instance_attr_dss {
+    bool ss_enable_dss;
+    char* ss_dss_vg_name;
+    char* ss_dss_conn_path;
+} knl_instance_attr_dss;
+
+typedef struct knl_instance_attr_dms {
+    bool enable_dms;
+    bool enable_catalog_centralized;
+    bool enable_dss_aio;
+    bool enable_verify_page;
+    bool enable_ondemand_recovery;
+    int ondemand_recovery_mem_size;
+    int instance_id;
+    int recv_msg_pool_size;
+    char* interconnect_url;
+    char* interconnect_type;
+    char* rdma_work_config;
+    char* ock_log_path;
+    int channel_count;
+    int work_thread_count;
+    bool enable_reform;
+    bool enable_ssl;
+    int inst_count;
+    bool enable_log_level;
+    bool enable_scrlock;
+    bool enable_scrlock_sleep_mode;
+    char* scrlock_server_bind_core_config;
+    char* scrlock_worker_bind_core_config;
+    int scrlock_server_port;
+    int scrlock_worker_count;
+    int32 sslog_level;
+    int32 sslog_backup_file_count;
+    int32 sslog_max_file_size; //Unit:KB
+    int parallel_thread_num;
+} knl_instance_attr_dms;
+
 typedef struct knl_instance_attr_storage {
     bool wal_log_hints;
     bool EnableHotStandby;
@@ -89,7 +134,6 @@ typedef struct knl_instance_attr_storage {
     bool enable_gtm_free;
     bool comm_cn_dn_logic_conn;
     bool enable_adio_function;
-    bool enable_access_server_directory;
     bool enableIncrementalCheckpoint;
     bool enable_double_write;
     bool enable_delta_store;
@@ -97,10 +141,13 @@ typedef struct knl_instance_attr_storage {
     bool gucMostAvailableSync;
     bool enable_ustore;
     bool auto_csn_barrier;
+    bool enable_availablezone;
     bool enable_wal_shipping_compression;
     int WalReceiverBufSize;
     int DataQueueBufSize;
     int NBuffers;
+    int NNvmBuffers;
+    int NPcaBuffers;
     int NSegBuffers;
     int cstore_buffers;
     int MaxSendSize;
@@ -144,6 +191,9 @@ typedef struct knl_instance_attr_storage {
     int max_concurrent_autonomous_transactions;
     char* available_zone;
     knl_instance_attr_dcf dcf_attr;
+    knl_instance_attr_nvm nvm_attr;
+    knl_instance_attr_dss dss_attr;
+    knl_instance_attr_dms dms_attr;
     int num_internal_lock_partitions[LWLOCK_PART_KIND];
     char* num_internal_lock_partitions_str;
     int wal_insert_status_entries_power;
@@ -157,6 +207,12 @@ typedef struct knl_instance_attr_storage {
     char *redo_bind_cpu_attr;
     bool enable_backend_flush_dirty_page;
     int64 adapt_period;
+    int max_active_gtt;
+#ifndef ENABLE_MULTIPLE_NODES
+    bool enable_save_confirmed_lsn;
+#endif
+    bool enable_huge_pages;
+    int huge_page_size;
 } knl_instance_attr_storage;
 
 #endif /* SRC_INCLUDE_KNL_KNL_INSTANCE_ATTR_STORAGE_H_ */

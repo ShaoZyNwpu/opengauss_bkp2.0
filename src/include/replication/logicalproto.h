@@ -21,25 +21,38 @@
  * Protocol capabilities
  *
  * LOGICALREP_PROTO_VERSION_NUM is our native protocol.
- * LOGICALREP_PROTO_MAX_VERSION_NUM is the greatest version we can support.
+ * LOGICALREP_CONNINFO_PROTO_VERSION_NUM is the version that need to handle changed conninfo.
+ * LOGICALREP_PROTO_MAX_VERSION_NUM is the greatest version we can support + 1.
  * LOGICALREP_PROTO_MIN_VERSION_NUM is the oldest version we
- * have backwards compatibility for. The client requests protocol version at
+ * have backwards compatibility for - 1. The client requests protocol version at
  * connect time.
  */
-#define LOGICALREP_PROTO_MIN_VERSION_NUM 1
-#define LOGICALREP_PROTO_VERSION_NUM 1
-#define LOGICALREP_PROTO_MAX_VERSION_NUM LOGICALREP_PROTO_VERSION_NUM
+typedef enum {
+    LOGICALREP_PROTO_MIN_VERSION_NUM = 0,
+    LOGICALREP_PROTO_VERSION_NUM,
+    LOGICALREP_CONNINFO_PROTO_VERSION_NUM,
+    LOGICALREP_PROTO_MAX_VERSION_NUM
+} LOGICALREP_VERSION_NUM;
 
 /*
  * This struct stores a tuple received via logical replication.
  * Keep in mind that the columns correspond to the *remote* table.
  */
 typedef struct LogicalRepTupleData {
-    char *values[MaxTupleAttributeNumber]; /* value in out function format or NULL if values is NULL */
-    bool changed[MaxTupleAttributeNumber]; /* marker for changed/unchanged values */
+    /* Array of StringInfos, one per column; some may be unused */
+    StringInfoData *colvalues;
+    /* Array of markers for null/unchanged/text/binary, one per column */
+    char       *colstatus;
     /* Length of above arrays */
     int ncols;
 } LogicalRepTupleData;
+
+/* Possible values for LogicalRepTupleData.colstatus[colnum] */
+/* These values are also used in the on-the-wire protocol */
+#define LOGICALREP_COLUMN_NULL        'n'
+#define LOGICALREP_COLUMN_UNCHANGED    'u'
+#define LOGICALREP_COLUMN_TEXT        't'
+#define LOGICALREP_COLUMN_BINARY    'b' /* added in PG14 */
 
 typedef uint32 LogicalRepRelId;
 
@@ -68,6 +81,7 @@ typedef struct LogicalRepBeginData {
     XLogRecPtr final_lsn;
     TimestampTz committime;
     TransactionId xid;
+    CommitSeqNo csn;
 } LogicalRepBeginData;
 
 typedef struct LogicalRepCommitData {
@@ -81,16 +95,18 @@ extern void logicalrep_read_begin(StringInfo in, LogicalRepBeginData *begin_data
 extern void logicalrep_write_commit(StringInfo out, ReorderBufferTXN *txn, XLogRecPtr commit_lsn);
 extern void logicalrep_read_commit(StringInfo in, LogicalRepCommitData *commit_data);
 extern void logicalrep_write_origin(StringInfo out, const char *origin, XLogRecPtr origin_lsn);
-extern void logicalrep_write_insert(StringInfo out, Relation rel, HeapTuple newtuple);
+extern void logicalrep_write_insert(StringInfo out, Relation rel, HeapTuple newtuple, bool binary);
 extern LogicalRepRelId logicalrep_read_insert(StringInfo in, LogicalRepTupleData *newtup);
-extern void logicalrep_write_update(StringInfo out, Relation rel, HeapTuple oldtuple, HeapTuple newtuple);
+extern void logicalrep_write_update(StringInfo out, Relation rel, HeapTuple oldtuple, HeapTuple newtuple, bool binary);
 extern LogicalRepRelId logicalrep_read_update(StringInfo in, bool *has_oldtuple, LogicalRepTupleData *oldtup,
     LogicalRepTupleData *newtup);
-extern void logicalrep_write_delete(StringInfo out, Relation rel, HeapTuple oldtuple);
+extern void logicalrep_write_delete(StringInfo out, Relation rel, HeapTuple oldtuple, bool binary);
 extern LogicalRepRelId logicalrep_read_delete(StringInfo in, LogicalRepTupleData *oldtup);
 extern void logicalrep_write_rel(StringInfo out, Relation rel);
 extern LogicalRepRelation *logicalrep_read_rel(StringInfo in);
 extern void logicalrep_write_typ(StringInfo out, Oid typoid);
 extern void logicalrep_read_typ(StringInfo out, LogicalRepTyp *ltyp);
+extern void logicalrep_write_conninfo(StringInfo out, char* conninfo);
+extern void logicalrep_read_conninfo(StringInfo in, char** conninfo);
 
 #endif /* LOGICALREP_PROTO_H */

@@ -39,7 +39,7 @@
  * The definition of buffer state components is below.
  */
 #define BUF_REFCOUNT_ONE 1
-#define BUF_REFCOUNT_MASK ((1U << 17) - 1)
+#define BUF_REFCOUNT_MASK ((1U << 16) - 1)
 #define BUF_USAGECOUNT_MASK 0x003C0000U
 #define BUF_USAGECOUNT_ONE (1U << 18)
 #define BUF_USAGECOUNT_SHIFT 18
@@ -55,6 +55,7 @@
  * Note: TAG_VALID essentially means that there is a buffer hashtable
  * entry associated with the buffer's tag.
  */
+#define BM_IN_MIGRATE (1U << 16)        /* buffer is migrating */
 #define BM_IS_META (1U << 17)
 #define BM_LOCKED (1U << 22)            /* buffer header is locked */
 #define BM_DIRTY (1U << 23)             /* data needs writing */
@@ -109,12 +110,18 @@ typedef struct buftagnohbkt {
     BlockNumber blockNum; /* blknum relative to begin of reln */
 } BufferTagFirstVer;
 
+/* entry for buffer lookup hashtable */
+typedef struct {
+    BufferTag key; /* Tag of a disk page */
+    int id;        /* Associated buffer ID */
+} BufferLookupEnt;
 
 #define CLEAR_BUFFERTAG(a)               \
     ((a).rnode.spcNode = InvalidOid,     \
         (a).rnode.dbNode = InvalidOid,   \
         (a).rnode.relNode = InvalidOid,  \
         (a).rnode.bucketNode = -1,\
+        (a).rnode.opt = DefaultFileNodeOpt, \
         (a).forkNum = InvalidForkNumber, \
         (a).blockNum = InvalidBlockNumber)
 
@@ -132,6 +139,7 @@ typedef struct buftagnohbkt {
         (a)->rnode.dbNode = (b)->rnode.dbNode,   \
         (a)->rnode.relNode = (b)->rnode.relNode, \
         (a)->rnode.bucketNode = (b)->rnode.bucketNode,\
+        (a)->rnode.opt = (b)->rnode.opt,             \
         (a)->forkNum = (b)->forkNum,             \
         (a)->blockNum = (b)->blockNum)
 
@@ -183,28 +191,35 @@ typedef struct buftagnohbkt {
  * We use this same struct for local buffer headers, but the lock fields
  * are not used and not all of the flag bits are useful either.
  */
-typedef struct BufferDesc {
-    BufferTag tag; /* ID of page contained in buffer */
-    /* state of the tag, containing flags, refcount and usagecount */
-    pg_atomic_uint32 state;
-
+typedef struct BufferDescExtra {
     /* Cached physical location for segment-page storage, used for xlog */
     uint8 seg_fileno;
     BlockNumber seg_blockno;
 
+    /* below fields are used for incremental checkpoint */
+    pg_atomic_uint64 rec_lsn;        /* recovery LSN */
+    volatile uint64 dirty_queue_loc; /* actual loc of dirty page queue */
+    bool encrypt; /* enable table's level data encryption */
+
+    volatile uint64 lsn_on_disk;
+
+    volatile bool aio_in_progress; /* indicate aio is in progress */
+} BufferDescExtra;
+
+typedef struct BufferDesc {
+    BufferTag tag; /* ID of page contained in buffer */
     int buf_id;    /* buffer's index number (from 0) */
+
+    /* state of the tag, containing flags, refcount and usagecount */
+    pg_atomic_uint32 state;
 
     ThreadId wait_backend_pid; /* backend PID of pin-count waiter */
 
     LWLock* io_in_progress_lock; /* to wait for I/O to complete */
     LWLock* content_lock;        /* to lock access to buffer contents */
 
-    /* below fields are used for incremental checkpoint */
-    pg_atomic_uint64 rec_lsn;        /* recovery LSN */
-    volatile uint64 dirty_queue_loc; /* actual loc of dirty page queue */
-    bool encrypt; /* enable table's level data encryption */
-    
-    volatile uint64 lsn_on_disk;
+    BufferDescExtra *extra;
+
 #ifdef USE_ASSERT_CHECKING
     volatile uint64 lsn_dirty;
 #endif
@@ -230,7 +245,7 @@ typedef struct BufferDesc {
  * platform with either 32 or 128 byte line sizes, it's good to align to
  * boundaries and avoid false sharing.
  */
-#define BUFFERDESC_PAD_TO_SIZE (SIZEOF_VOID_P == 8 ? 128 : 1)
+#define BUFFERDESC_PAD_TO_SIZE (SIZEOF_VOID_P == 8 ? 64 : 1)
 
 typedef union BufferDescPadded {
     BufferDesc bufferdesc;
@@ -238,12 +253,12 @@ typedef union BufferDescPadded {
 } BufferDescPadded;
 
 #define GetBufferDescriptor(id) (&t_thrd.storage_cxt.BufferDescriptors[(id)].bufferdesc)
-#define GetLocalBufferDescriptor(id) (&t_thrd.storage_cxt.LocalBufferDescriptors[(id)])
+#define GetLocalBufferDescriptor(id) ((BufferDesc *)&u_sess->storage_cxt.LocalBufferDescriptors[(id)].bufferdesc)
 #define BufferDescriptorGetBuffer(bdesc) ((bdesc)->buf_id + 1)
 
 #define BufferGetBufferDescriptor(buffer)                          \
     (AssertMacro(BufferIsValid(buffer)), BufferIsLocal(buffer) ?   \
-        &u_sess->storage_cxt.LocalBufferDescriptors[-(buffer)-1] : \
+        (BufferDesc *)&u_sess->storage_cxt.LocalBufferDescriptors[-(buffer)-1].bufferdesc : \
         &t_thrd.storage_cxt.BufferDescriptors[(buffer)-1].bufferdesc)
 
 #define BufferDescriptorGetContentLock(bdesc) (((bdesc)->content_lock))

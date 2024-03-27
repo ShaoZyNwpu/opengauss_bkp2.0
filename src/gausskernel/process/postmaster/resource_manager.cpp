@@ -66,7 +66,7 @@ void shutdown_resource_manager(){
 }
 void adapt_create_dirty_page_rate(){
     uint64 curr_dirty_page_queue_capacity = g_instance.ckpt_cxt_ctl->dirty_page_queue_size * PAGE_QUEUE_SLOT_USED_MAX_PERCENTAGE - get_dirty_page_num();
-    uint64 curr_candidate_slot_capacity = get_curr_candidate_nums(false);
+    uint64 curr_candidate_slot_capacity = get_curr_candidate_nums(CAND_LIST_NORMAL);
     uint64 curr_timestamp = get_time_ms();
 
     int64 dirty_page_queue_capacity_change_num = (int64)g_instance.resource_manager_cxt.last_dirty_page_queue_capacity - (int64)curr_dirty_page_queue_capacity;
@@ -333,7 +333,7 @@ Datum gs_stat_resource_manager(PG_FUNCTION_ARGS)
         ((double)g_instance.ckpt_cxt_ctl->dirty_page_queue_size * PAGE_QUEUE_SLOT_USED_MAX_PERCENTAGE);
 
     uint32 max_candidate_slots = g_instance.attr.attr_storage.NBuffers;
-    uint32 curr_candidate_slots = get_curr_candidate_nums(false);
+    uint32 curr_candidate_slots = get_curr_candidate_nums(CAND_LIST_NORMAL);
     double candidate_slot_ratio = (double)curr_candidate_slots / (double)max_candidate_slots;
 
     // dirty page queue stat
@@ -361,5 +361,3 @@ Datum gs_stat_resource_manager(PG_FUNCTION_ARGS)
     tuplestore_donestoring(tupstore);
     PG_RETURN_VOID();
 }
-
-

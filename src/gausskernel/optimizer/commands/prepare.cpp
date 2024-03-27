@@ -48,6 +48,10 @@
 #include "catalog/pgxc_node.h"
 #endif
 #include "replication/walreceiver.h"
+#include "optimizer/gplanmgr.h"
+#ifdef ENABLE_MOT
+#include "storage/mot/jit_exec.h"
+#endif
 
 #define CLUSTER_EXPANSION_BASE 2
 
@@ -65,6 +69,69 @@ static void CopyPlanForGPCIfNecessary(CachedPlanSource* psrc, Portal portal)
         portal->stmts = CopyLocalStmt(portal->cplan->stmt_list, u_sess->temp_mem_cxt, &tmpCxt);
     }
 }
+
+#ifdef ENABLE_MOT
+void TryMotJitCodegenQuery(const char* queryString, CachedPlanSource* psrc, Query* query)
+{
+    // Try to generate LLVM jitted code - first cleanup jit of previous run.
+    if (psrc->mot_jit_context != NULL) {
+        if (JitExec::IsJitContextPendingCompile(psrc->mot_jit_context) ||
+            JitExec::IsJitContextDoneCompile(psrc->mot_jit_context)) {
+            return;
+        }
+
+        // NOTE: context is cleaned up during end of session, this should not happen,
+        // maybe a warning should be issued
+        Assert(false);
+        ereport(WARNING, (errmsg("Cached Plan Source already has a MOT JIT Context, destroying the residual context")));
+        JitExec::DestroyJitContext(psrc->mot_jit_context, true);
+        psrc->mot_jit_context = NULL;
+        Assert(psrc->opFusionObj == NULL);
+    }
+
+    if (query == NULL) {
+        if (list_length(psrc->query_list) != 1) {
+            elog(DEBUG2, "Plan source does not have exactly one query");
+            return;
+        }
+        query = (Query*)linitial(psrc->query_list);
+        if (query == NULL) {
+            elog(DEBUG2, "No query object present for MOT JIT");
+            return;
+        }
+    }
+
+    if ((query->commandType != CMD_SELECT) && (query->commandType != CMD_INSERT) &&
+        (query->commandType != CMD_UPDATE) && (query->commandType != CMD_DELETE)) {
+        elog(DEBUG2, "Query is not SELECT|INSERT|UPDATE|DELETE");
+        return;
+    }
+
+    if (JitExec::IsMotCodegenPrintEnabled()) {
+        elog(LOG, "Attempting to generate MOT jitted code for query: %s\n", queryString);
+    }
+
+    Assert(psrc->opFusionObj == NULL && psrc->mot_jit_context == NULL);
+    u_sess->mot_cxt.jit_codegen_error = 0;
+    psrc->mot_jit_context = JitExec::TryJitCodegenQuery(query, queryString);
+    if (psrc->mot_jit_context != NULL) {
+        if (JitExec::IsJitContextValid(psrc->mot_jit_context)) {
+            psrc->is_checked_opfusion = false;
+        }
+    } else {
+        if (JitExec::IsMotCodegenPrintEnabled()) {
+            elog(LOG, "Failed to generate jitted MOT function for query %s\n", queryString);
+        }
+        if (u_sess->mot_cxt.jit_codegen_error == ERRCODE_QUERY_CANCELED) {
+            // If JIT compilation failed due to cancel request, we need to ereport. JIT source will be in error state,
+            // but checkedMotJitCodegen will still be false so that the JIT compilation will be triggered on next
+            // attempt.
+            Assert(!psrc->checkedMotJitCodegen);
+            ereport(ERROR, (errcode(ERRCODE_QUERY_CANCELED), errmsg("canceling statement due to user request")));
+        }
+    }
+}
+#endif
 
 /*
  * Implements the 'PREPARE' utility statement.
@@ -96,6 +163,7 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
         stmt->name,
 #endif
         CreateCommandTag(stmt->query));
+    t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(stmt->query);
 
     /* Transform list of TypeNames to array of type OIDs */
     nargs = list_length(stmt->argtypes);
@@ -126,12 +194,24 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
      * Analyze the statement using these parameter types (any parameters
      * passed in from above us will not be visible to it), allowing
      * information about unknown parameters to be deduced from context.
-     *
-     * Because parse analysis scribbles on the raw querytree, we must make a
-     * copy to ensure we don't modify the passed-in tree.
      */
 
-    query = parse_analyze_varparams((Node*)copyObject(stmt->query), queryString, &argtypes, &nargs);
+    query = parse_analyze_varparams(stmt->query, queryString, &argtypes, &nargs);
+
+#ifdef ENABLE_MOT
+    /* check cross engine queries  */
+    StorageEngineType storageEngineType = SE_TYPE_UNSPECIFIED;
+    CheckTablesStorageEngine(query, &storageEngineType);
+    SetCurrentTransactionStorageEngine(storageEngineType);
+    /* set the plan's storage engine */
+    plansource->storageEngineType = storageEngineType;
+
+    /* gpc does not support MOT engine */
+    if (ENABLE_CN_GPC && plansource->gpc.status.IsSharePlan() &&
+        (storageEngineType == SE_TYPE_MOT || storageEngineType == SE_TYPE_MIXED)) {
+        plansource->gpc.status.SetKind(GPC_UNSHARED);
+    }
+#endif
 
     if (ENABLE_CN_GPC && plansource->gpc.status.IsSharePlan() && contains_temp_tables(query->rtable)) {
         /* temp table unsupport shared */
@@ -161,6 +241,11 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
         case CMD_MERGE:
             /* OK */
             break;
+        case CMD_UTILITY:
+            if (IsA(query->utilityStmt, VariableMultiSetStmt) ||
+                IsA(query->utilityStmt, CopyStmt)) {
+                break;
+            }
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_INVALID_PSTATEMENT_DEFINITION), errmsg("utility statements cannot be prepared")));
@@ -187,6 +272,15 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
      * Save the results.
      */
     StorePreparedStatement(stmt->name, plansource, true);
+
+#ifdef ENABLE_MOT
+    // Try MOT JIT code generation only after the plan source is saved.
+    if ((plansource->storageEngineType == SE_TYPE_MOT || plansource->storageEngineType == SE_TYPE_UNSPECIFIED) &&
+        !IS_PGXC_COORDINATOR && JitExec::IsMotCodegenEnabled()) {
+        // MOT JIT code generation
+        TryMotJitCodegenQuery(queryString, plansource, query);
+    }
+#endif
 }
 
 /*
@@ -220,6 +314,7 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
     /* Look it up in the hash table */
     entry = FetchPreparedStatement(stmt->name, true, true);
     psrc = entry->plansource;
+    t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(psrc->raw_parse_tree);
 
     /* Shouldn't find a non-fixed-result cached plan */
     if (!entry->plansource->fixed_result)
@@ -240,6 +335,19 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
     }
 
     OpFusion::clearForCplan((OpFusion*)psrc->opFusionObj, psrc);
+
+#ifdef ENABLE_MOT
+    /*
+     * MOT JIT Execution:
+     * Assist in distinguishing query boundaries in case of range query when client uses batches. This allows us to
+     * know a new query started, and in case a previous execution did not fetch all records (since user is working in
+     * batch-mode, and can decide to quit fetching in the middle), using this information we can infer this is a new
+     * scan, and old scan state should be discarded.
+     */
+    if (psrc->mot_jit_context != NULL) {
+        JitResetScan(psrc->mot_jit_context);
+    }
+#endif
 
     if (psrc->opFusionObj != NULL) {
         Assert(psrc->cplan == NULL);
@@ -278,7 +386,12 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
     query_string = MemoryContextStrdup(PortalGetHeapMemory(portal), entry->plansource->query_string);
 
     /* Replan if needed, and increment plan refcount for portal */
-    cplan = GetCachedPlan(entry->plansource, paramLI, false);
+    if (ENABLE_CACHEDPLAN_MGR) {
+        cplan = GetWiseCachedPlan(psrc, paramLI, false);
+    } else {
+        cplan = GetCachedPlan(psrc, paramLI, false);
+    }
+
     plan_list = cplan->stmt_list;
 
     /* 
@@ -288,6 +401,7 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
     * above GetCachedPlan call and here.
     */
     PortalDefineQuery(portal, NULL, query_string, entry->plansource->commandTag, plan_list, cplan);
+    portal->nextval_default_expr_type = psrc->nextval_default_expr_type;
 
     /* incase change shared plan in execute stage */
     CopyPlanForGPCIfNecessary(entry->plansource, portal);
@@ -327,9 +441,8 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
         eflags = 0;
         count = FETCH_ALL;
     }
-    bool checkSQLBypass = IS_PGXC_DATANODE && !psrc->gpc.status.InShareTable() &&
-                          (psrc->cplan == NULL) && (psrc->is_checked_opfusion == false);
-    if (checkSQLBypass) {
+
+    if (OpFusion::IsSqlBypass(psrc, plan_list)) {
         psrc->opFusionObj =
             OpFusion::FusionFactory(OpFusion::getFusionType(cplan, paramLI, NULL),
                                     u_sess->cache_mem_cxt, psrc, NULL, paramLI);
@@ -409,7 +522,7 @@ static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const 
         Oid expected_type_id = param_types[i];
         Oid given_type_id;
 
-        expr = transformExpr(pstate, expr);
+        expr = transformExpr(pstate, expr, EXPR_KIND_EXECUTE_PARAMETER);
 
         /* Cannot contain subselects or aggregates */
         if (pstate->p_hasSubLinks)
@@ -454,6 +567,8 @@ static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const 
     paramLI->parserSetupArg = NULL;
     paramLI->params_need_process = false;
     paramLI->numParams = num_params;
+    paramLI->uParamInfo = DEFUALT_INFO;
+    paramLI->params_lazy_bind = false;
 
     i = 0;
     foreach (l, exprstates) {
@@ -675,7 +790,7 @@ void StorePreparedStatementCNGPC(const char *stmt_name, CachedPlanSource *planso
 
     /* Now it's safe to move the CachedPlanSource to permanent memory */
     if (!is_share) {
-        Assert(IsA((plansource)->raw_parse_tree, TransactionStmt) ||
+        Assert((plansource->raw_parse_tree && IsA(plansource->raw_parse_tree, TransactionStmt)) ||
                !plansource->is_support_gplan || plansource->gpc.status.IsSharePlan());
         plansource->gpc.status.SetLoc(GPC_SHARE_IN_LOCAL_SAVE_PLAN_LIST);
         SaveCachedPlan(plansource);
@@ -1212,7 +1327,11 @@ void ExplainExecuteQuery(
 
     u_sess->attr.attr_sql.explain_allow_multinode = true;
 
-    cplan = GetCachedPlan(psrc, paramLI, true);
+    if (ENABLE_CACHEDPLAN_MGR) {
+        cplan = GetWiseCachedPlan(psrc, paramLI, true);
+    } else {
+        cplan = GetCachedPlan(psrc, paramLI, true);
+    }
 
     /* use shared plan here, add refcount */
     if (cplan->isShared())
@@ -1293,7 +1412,7 @@ Datum pg_prepared_statement(PG_FUNCTION_ARGS)
      * build tupdesc for result tuples. This must match the definition of the
      * pg_prepared_statements view in system_views.sql
      */
-    tupdesc = CreateTemplateTupleDesc(5, false, TAM_HEAP);
+    tupdesc = CreateTemplateTupleDesc(5, false);
     TupleDescInitEntry(tupdesc, (AttrNumber)1, "name", TEXTOID, -1, 0);
     TupleDescInitEntry(tupdesc, (AttrNumber)2, "statement", TEXTOID, -1, 0);
     TupleDescInitEntry(tupdesc, (AttrNumber)3, "prepare_time", TIMESTAMPTZOID, -1, 0);
@@ -1611,6 +1730,7 @@ void RePrepareQuery(ExecuteStmt* stmt)
      */
     foreach (parsetree_item, parseTree_list) {
         Node* parsetree = (Node*)lfirst(parsetree_item);
+        t_thrd.postgres_cxt.cur_command_tag = transform_node_tag(parsetree);
         List* planTree_list = NIL;
 
         queryTree_list = pg_analyze_and_rewrite(parsetree, query_string, NULL, 0);

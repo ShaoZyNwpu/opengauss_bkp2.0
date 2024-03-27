@@ -44,6 +44,8 @@ static HTAB* g_extensible_plan_methods = NULL;
 const int HASHTABLE_LENGTH = 100;
 const char* EXTENSIBLE_PLAN_METHODS_LABEL = "Extensible Plan Methods";
 
+static TupleTableSlot* ExecExtensiblePlan(PlanState* state);
+
 typedef struct {
     char extnodename[EXTNODENAME_MAX_LEN];
     void* extnodemethods;
@@ -109,6 +111,7 @@ ExtensiblePlanState* ExecInitExtensiblePlan(ExtensiblePlan* eplan, EState* estat
     /* fill up fields of ScanState */
     extensionPlanState->ss.ps.plan = &eplan->scan.plan;
     extensionPlanState->ss.ps.state = estate;
+    extensionPlanState->ss.ps.ExecProcNode = ExecExtensiblePlan;
 
     /* create expression context for node */
     ExecAssignExprContext(estate, &extensionPlanState->ss.ps);
@@ -140,7 +143,7 @@ ExtensiblePlanState* ExecInitExtensiblePlan(ExtensiblePlan* eplan, EState* estat
     if (eplan->extensible_plan_tlist != NIL || scan_rel == NULL) {
         TupleDesc scan_tupdesc;
 
-        scan_tupdesc = ExecTypeFromTL(eplan->extensible_plan_tlist, false, false, TAM_HEAP);
+        scan_tupdesc = ExecTypeFromTL(eplan->extensible_plan_tlist, false, false);
         ExecAssignScanType(&extensionPlanState->ss, scan_tupdesc);
         /* Node's targetlist will contain Vars with varno = INDEX_VAR */
         tlistvarno = INDEX_VAR;
@@ -155,9 +158,9 @@ ExtensiblePlanState* ExecInitExtensiblePlan(ExtensiblePlan* eplan, EState* estat
      */
     ExecAssignResultTypeFromTL(
             &extensionPlanState->ss.ps,
-            extensionPlanState->ss.ss_ScanTupleSlot->tts_tupleDescriptor->tdTableAmType);
+            extensionPlanState->ss.ss_ScanTupleSlot->tts_tupleDescriptor->td_tam_ops);
     ExecAssignScanProjectionInfoWithVarno(&extensionPlanState->ss, tlistvarno);
-    Assert(extensionPlanState->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->tdTableAmType != TAM_INVALID);
+    Assert(extensionPlanState->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     /*
      * The callback of extensible-scan provider applies the final initialization
@@ -168,8 +171,9 @@ ExtensiblePlanState* ExecInitExtensiblePlan(ExtensiblePlan* eplan, EState* estat
     return extensionPlanState;
 }
 
-TupleTableSlot* ExecExtensiblePlan(ExtensiblePlanState* node)
+static TupleTableSlot* ExecExtensiblePlan(PlanState* state)
 {
+    ExtensiblePlanState* node = castNode(ExtensiblePlanState, state);
     Assert(node->methods->ExecExtensiblePlan != NULL);
     return node->methods->ExecExtensiblePlan(node);
 }

@@ -54,6 +54,7 @@
 #include "utils/elog.h"
 #include "utils/palloc.h"
 #include "storage/spin.h"
+#include "lib/stringinfo.h"
 
 #ifndef WIN32
 #include <cxxabi.h>
@@ -134,6 +135,7 @@ typedef enum { OM_ONLINE_EXPANSION, OM_ONLINE_NODE_REPLACE } OM_ONLINE_STATE;
 
 extern void reload_configfile(void);
 extern void reload_online_pooler(void);
+extern void ReloadPoolerWithoutTransaction();
 extern OM_ONLINE_STATE get_om_online_state(void);
 
 /* ----------------------------------------------------------------
@@ -323,7 +325,7 @@ typedef enum {
 #define VARATT_IS_1B_E(PTR) ((((varattrib_1b*)(PTR))->va_header) == 0x80)
 #define VARATT_IS_HUGE_TOAST_POINTER(PTR) ((((varattrib_1b*)(PTR))->va_header) == 0x80 && \
     ((((varattrib_1b_e*)(PTR))->va_tag) & 0x01) == 0x01)
-
+#ifndef ENABLE_MULTIPLE_NODES
 #define FUNC_CHECK_HUGE_POINTER(is_null, ptr, funcName)                                                      \
     do {                                                                                                     \
         if (!is_null && unlikely(VARATT_IS_HUGE_TOAST_POINTER((varlena *)ptr))) {                                      \
@@ -332,7 +334,9 @@ typedef enum {
                     errcause("parameter larger than 1GB"), erraction("parameter must less than 1GB")));      \
         }                                                                                                    \
     } while (0)
-
+#else
+#define FUNC_CHECK_HUGE_POINTER(is_null, ptr, funcName)
+#endif
 #define VARATT_NOT_PAD_BYTE(PTR) (*((uint8*)(PTR)) != 0)
 
 /* VARSIZE_4B() should only be used on known-aligned data */
@@ -955,6 +959,7 @@ extern size_t mmap_threshold;
 void HandlePoolerReload(void);
 void HandleMemoryContextDump(void);
 void HandleExecutorFlag(void);
+void handle_terminate_active_sess_socket();
 
 extern void start_xact_command(void);
 extern void finish_xact_command(void);
@@ -966,6 +971,9 @@ extern void InitVecFuncMap(void);
 extern long codegenIRloadProcessCount;
 
 extern pthread_mutex_t nodeDefCopyLock;
+
+/* 	Returns the message type code, and loads message body data into inBuf */
+extern int SocketBackend(StringInfo inBuf);
 
 /* Job worker Process, execute procedure */
 extern void execute_simple_query(const char* query_string);
@@ -993,6 +1001,7 @@ extern void RemoveTempNamespace();
 #endif 
 #define CacheIsProcOid(cc_id) ((cc_id) == PROCOID)
 #define IsBootingPgProc(rel) IsProcRelation(rel)
+#define IsBootingPgClass(rel) (RelationGetRelid(rel) == RelationRelationId)
 #define BootUsingBuiltinFunc true
 
 extern int errdetail_abort(void);
@@ -1001,6 +1010,9 @@ void log_disconnections(int code, Datum arg);
 void cleanGPCPlanProcExit(int code, Datum arg);
 
 void ResetInterruptCxt();
+#ifndef ENABLE_MULTIPLE_NODES
+void LoadSqlPlugin();
+#endif
 
 #define MSG_A_REPEAT_NUM_MAX 1024
 #define OVERRIDE_STACK_LENGTH_MAX 1024
@@ -1011,7 +1023,6 @@ typedef enum {
 } ClusterRunMode;
 
 #ifdef ENABLE_UT
-#include "lib/stringinfo.h"
 extern void exec_describe_statement_message(const char* stmt_name);
 extern void exec_get_ddl_params(StringInfo input_message);
 #endif

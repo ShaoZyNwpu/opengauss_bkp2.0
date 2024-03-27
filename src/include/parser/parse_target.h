@@ -16,15 +16,15 @@
 
 #include "parser/parse_node.h"
 
-extern List* transformTargetList(ParseState* pstate, List* targetlist);
-extern List* transformExpressionList(ParseState* pstate, List* exprlist);
+extern List* transformTargetList(ParseState* pstate, List* targetlist, ParseExprKind exprKind);
+extern List* transformExpressionList(ParseState* pstate, List* exprlist, ParseExprKind exprKind);
 extern void markTargetListOrigins(ParseState* pstate, List* targetlist);
 extern void resolveTargetListUnknowns(ParseState* pstate, List* targetlist);
-extern TargetEntry* transformTargetEntry(ParseState* pstate, Node* node, Node* expr, char* colname, bool resjunk);
-extern Expr* transformAssignedExpr(
-    ParseState* pstate, Expr* expr, char* colname, int attrno, List* indirection, int location);
-extern void updateTargetListEntry(
-    ParseState* pstate, TargetEntry* tle, char* colname, int attrno, List* indirection, int location);
+extern TargetEntry* transformTargetEntry(ParseState* pstate, Node* node, Node* expr, ParseExprKind exprKind, char* colname, bool resjunk);
+extern Expr* transformAssignedExpr(ParseState* pstate, Expr* expr, ParseExprKind exprKind, char* colname, int attrno,
+    List* indirection, int location, Relation rd, RangeTblEntry* rte);
+extern void updateTargetListEntry(ParseState* pstate, TargetEntry* tle, char* colname, int attrno,
+    List* indirection, int location, Relation rd, RangeTblEntry* rte);
 extern List* checkInsertTargets(ParseState* pstate, List* cols, List** attrnos);
 extern TupleDesc expandRecordVariable(ParseState* pstate, Var* var, int levelsup);
 extern char* FigureColname(Node* node);

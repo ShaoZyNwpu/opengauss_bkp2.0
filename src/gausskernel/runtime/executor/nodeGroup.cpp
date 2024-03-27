@@ -26,18 +26,24 @@
 #include "executor/executor.h"
 #include "executor/node/nodeGroup.h"
 
+static TupleTableSlot* ExecGroup(PlanState* state);
+
 /*
  *	 ExecGroup -
  *
  *		Return one tuple for each group of matching input tuples.
  */
-TupleTableSlot* ExecGroup(GroupState* node)
+static TupleTableSlot* ExecGroup(PlanState* state)
 {
+    GroupState* node = castNode(GroupState, state);
     ExprContext* econtext = NULL;
     int numCols;
     AttrNumber* grpColIdx = NULL;
     TupleTableSlot* firsttupleslot = NULL;
     TupleTableSlot* outerslot = NULL;
+    Oid* grpCollations = NULL;
+
+    CHECK_FOR_INTERRUPTS();
 
     /*
      * get state info from node
@@ -47,6 +53,7 @@ TupleTableSlot* ExecGroup(GroupState* node)
     econtext = node->ss.ps.ps_ExprContext;
     numCols = ((Group*)node->ss.ps.plan)->numCols;
     grpColIdx = ((Group*)node->ss.ps.plan)->grpColIdx;
+    grpCollations = ((Group*)node->ss.ps.plan)->grp_collations;
 
     /*
      * Check to see if we're still projecting out tuples from a previous group
@@ -135,9 +142,10 @@ TupleTableSlot* ExecGroup(GroupState* node)
              * Compare with first tuple and see if this tuple is of the same
              * group.  If so, ignore it and keep scanning.
              */
-            if (!execTuplesMatch(
-                    firsttupleslot, outerslot, numCols, grpColIdx, node->eqfunctions, econtext->ecxt_per_tuple_memory))
+            if (!execTuplesMatch(firsttupleslot, outerslot, numCols, grpColIdx, node->eqfunctions,
+                                 econtext->ecxt_per_tuple_memory, grpCollations)) {
                 break;
+            }
         }
 
         /*
@@ -194,6 +202,7 @@ GroupState* ExecInitGroup(Group* node, EState* estate, int eflags)
     grpstate->ss.ps.plan = (Plan*)node;
     grpstate->ss.ps.state = estate;
     grpstate->grp_done = FALSE;
+    grpstate->ss.ps.ExecProcNode = ExecGroup;
 
     /*
      * create expression context
@@ -227,7 +236,7 @@ GroupState* ExecInitGroup(Group* node, EState* estate, int eflags)
      * Group node result tuple slot always holds virtual tuple, so
      * default tableAm type is set to HEAP.
      */
-    ExecAssignResultTypeFromTL(&grpstate->ss.ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&grpstate->ss.ps);
 
     ExecAssignProjectionInfo(&grpstate->ss.ps, NULL);
 

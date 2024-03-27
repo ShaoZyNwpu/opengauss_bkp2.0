@@ -37,9 +37,16 @@
 /*****************************************************************************
  *	  Backend version and inplace upgrade staffs
  *****************************************************************************/
-
+extern const uint32 SRF_FUSION_VERSION_NUM;
+extern const uint32 INNER_UNIQUE_VERSION_NUM;
+extern const uint32 PARTITION_ENHANCE_VERSION_NUM;
+extern const uint32 SELECT_INTO_FILE_VERSION_NUM;
+extern const uint32 CHARACTER_SET_VERSION_NUM;
+extern const uint32 SELECT_INTO_VAR_VERSION_NUM;
+extern const uint32 LARGE_SEQUENCE_VERSION_NUM;
 extern const uint32 GRAND_VERSION_NUM;
-
+extern const uint32 DOLPHIN_ENABLE_DROP_NUM;
+extern const uint32 SQL_PATCH_VERSION_NUM;
 extern const uint32 PREDPUSH_SAME_LEVEL_VERSION_NUM;
 extern const uint32 UPSERT_WHERE_VERSION_NUM;
 extern const uint32 FUNC_PARAM_COL_VERSION_NUM;
@@ -47,6 +54,7 @@ extern const uint32 SUBPARTITION_VERSION_NUM;
 extern const uint32 PBESINGLEPARTITION_VERSION_NUM;
 extern const uint32 COMMENT_PROC_VERSION_NUM;
 extern const uint32 COMMENT_ROWTYPE_TABLEOF_VERSION_NUM;
+extern const uint32 COMMENT_ROWTYPE_NEST_TABLEOF_VERSION_NUM;
 extern const uint32 COMMENT_PCT_TYPE_VERSION_NUM;
 extern const uint32 HINT_ENHANCEMENT_VERSION_NUM;
 extern const uint32 MATERIALIZED_CTE_NUM;
@@ -86,18 +94,65 @@ extern const uint32 HASUID_VERSION_NUM;
 extern const uint32 CREATE_INDEX_CONCURRENTLY_DIST_VERSION_NUM;
 extern const uint32 WAIT_N_TUPLE_LOCK_VERSION_NUM;
 extern const uint32 DISASTER_READ_VERSION_NUM;
+extern const uint32 SKIP_LOCKED_VERSION_NUM;
 extern const uint32 SUPPORT_DATA_REPAIR;
 extern const uint32 SCAN_BATCH_MODE_VERSION_NUM;
 extern const uint32 RELMAP_4K_VERSION_NUM;
 extern const uint32 PUBLICATION_VERSION_NUM;
+extern const uint32 SUBSCRIPTION_BINARY_VERSION_NUM;
 extern const uint32 ANALYZER_HOOK_VERSION_NUM;
 extern const uint32 SUPPORT_HASH_XLOG_VERSION_NUM;
 extern const uint32 PITR_INIT_VERSION_NUM;
+extern const uint32 PUBLICATION_INITIAL_DATA_VERSION_NAME;
+extern const uint32 REPLACE_INTO_VERSION_NUM;
+extern const uint32 CREATE_FUNCTION_DEFINER_VERSION;
+extern const uint32 KEYWORD_IGNORE_COMPART_VERSION_NUM;
+extern const uint32 CSN_TIME_BARRIER_VERSION;
+extern const uint32 ADVANCE_CATALOG_XMIN_VERSION_NUM;
+extern const uint32 V5R2C00_ADVANCE_CATALOG_XMIN_VERSION_NUM;
+extern const uint32 LOGICAL_DECODE_FLATTEN_TOAST_VERSION_NUM;
+extern const uint32 SWITCH_ROLE_VERSION_NUM;
+extern const uint32 MULTI_PARTITIONS_VERSION_NUM;
+extern const uint32 MULTI_MODIFY_VERSION_NUM;
+extern const uint32 COMMENT_SUPPORT_VERSION_NUM;
+extern const uint32 PLAN_SELECT_VERSION_NUM;
+extern const uint32 ON_UPDATE_TIMESTAMP_VERSION_NUM;
+extern const uint32 STANDBY_STMTHIST_VERSION_NUM;
+extern const uint32 PG_AUTHID_PASSWORDEXT_VERSION_NUM;
+extern const uint32 MAT_VIEW_RECURSIVE_VERSION_NUM;
+extern const uint32 SUPPORT_VIEW_AUTO_UPDATABLE;
+extern const uint32 FDW_SUPPORT_JOIN_AGG_VERSION_NUM;
+extern const uint32 UNION_NULL_VERSION_NUM;
+extern const uint32 INSERT_RIGHT_REF_VERSION_NUM;
+extern const uint32 CREATE_INDEX_IF_NOT_EXISTS_VERSION_NUM;
+extern const uint32 SLOW_SQL_VERSION_NUM;
+extern const uint32 INDEX_HINT_VERSION_NUM;
+extern const uint32 CREATE_TABLE_AS_VERSION_NUM;
 
 extern void register_backend_version(uint32 backend_version);
 extern bool contain_backend_version(uint32 version_number);
 
 #define INPLACE_UPGRADE_PRECOMMIT_VERSION 1
+
+// b_format_behavior_compat_options params
+#define B_FORMAT_OPT_ENABLE_SET_SESSION_TRANSACTION 1
+#define B_FORMAT_OPT_ENABLE_SET_VARIABLES 2
+#define B_FORMAT_OPT_ENABLE_MODIFY_COLUMN 4
+#define B_FORMAT_OPT_DEFAULT_COLLATION 8
+#define B_FORMAT_OPT_FETCH 16
+#define B_FORMAT_OPT_MAX 5
+
+#define ENABLE_SET_SESSION_TRANSACTION                                                                   \
+    ((u_sess->utils_cxt.b_format_behavior_compat_flags & B_FORMAT_OPT_ENABLE_SET_SESSION_TRANSACTION) && \
+     u_sess->attr.attr_sql.sql_compatibility == B_FORMAT)
+#define ENABLE_SET_VARIABLES (u_sess->utils_cxt.b_format_behavior_compat_flags & B_FORMAT_OPT_ENABLE_SET_VARIABLES)
+#define USE_DEFAULT_COLLATION (u_sess->utils_cxt.b_format_behavior_compat_flags & B_FORMAT_OPT_DEFAULT_COLLATION && \
+    t_thrd.proc->workingVersionNum >= CHARACTER_SET_VERSION_NUM && u_sess->attr.attr_common.upgrade_mode == 0)
+#define ENABLE_MODIFY_COLUMN \
+        ((u_sess->utils_cxt.b_format_behavior_compat_flags & B_FORMAT_OPT_ENABLE_MODIFY_COLUMN) && \
+        u_sess->attr.attr_sql.sql_compatibility == B_FORMAT)
+#define B_FETCH ((u_sess->utils_cxt.b_format_behavior_compat_flags & B_FORMAT_OPT_FETCH) && \
+        u_sess->attr.attr_sql.sql_compatibility == B_FORMAT)
 
 #define OPT_DISPLAY_LEADING_ZERO 1
 #define OPT_END_MONTH_CALCULATE 2
@@ -122,8 +177,16 @@ extern bool contain_backend_version(uint32 version_number);
 #define OPT_ROWNUM_TYPE_COMPAT 1048576
 #define OPT_COMPAT_CURSOR 2097152
 #define OPT_CHAR_COERCE_COMPAT 4194304
-#define OPT_MAX 23
+#define OPT_PGFORMAT_SUBSTR 8388608
+#define OPT_TRUNC_NUMERIC_TAIL_ZERO 16777216
+#define OPT_ALLOW_ORDERBY_UNDISTINCT_COLUMN 33554432
+#define OPT_SELECT_INTO_RETURN_NULL 67108864
+#define OPT_ACCEPT_EMPTY_STR 134217728
+#define OPT_MAX 28
 
+#define PLPSQL_OPT_FOR_LOOP 1
+#define PLPSQL_OPT_OUTPARAM 2
+#define PLPSQL_OPT_MAX 2
 
 #define DISPLAY_LEADING_ZERO (u_sess->utils_cxt.behavior_compat_flags & OPT_DISPLAY_LEADING_ZERO)
 #define END_MONTH_CALCULATE (u_sess->utils_cxt.behavior_compat_flags & OPT_END_MONTH_CALCULATE)
@@ -133,6 +196,7 @@ extern bool contain_backend_version(uint32 version_number);
 #define RETURN_NS (u_sess->utils_cxt.behavior_compat_flags & OPT_RETURN_NS_OR_NULL)
 #define CORRECT_TO_NUMBER (u_sess->utils_cxt.behavior_compat_flags & OPT_CORRECT_TO_NUMBER)
 #define SUPPORT_BIND_SEARCHPATH (u_sess->utils_cxt.behavior_compat_flags & OPT_BIND_SEARCHPATH)
+#define ACCEPT_EMPTY_STR (u_sess->utils_cxt.behavior_compat_flags & OPT_ACCEPT_EMPTY_STR)
 /*CONCAT_VARIADIC controls 1.the variadic type process, and 2. td mode null return process in concat. By default, the
  * option is blank and the behavior is new and compatible with current A and C mode, if the option is set, the
  * behavior is old and the same as previous GAUSSDB kernel. */
@@ -145,12 +209,21 @@ extern bool contain_backend_version(uint32 version_number);
 #define SKIP_GS_SOURCE (u_sess->utils_cxt.behavior_compat_flags & OPT_SKIP_GS_SOURCE)
 #define PROC_OUTPARAM_OVERRIDE (u_sess->utils_cxt.behavior_compat_flags & OPT_PROC_OUTPARAM_OVERRIDE)
 #define ALLOW_PROCEDURE_COMPILE_CHECK (u_sess->utils_cxt.behavior_compat_flags & OPT_ALLOW_PROCEDURE_COMPILE_CHECK)
-#define IMPLICIT_FOR_LOOP_VARIABLE (u_sess->utils_cxt.behavior_compat_flags & OPT_IMPLICIT_FOR_LOOP_VARIABLE)
+#define IMPLICIT_FOR_LOOP_VARIABLE (u_sess->utils_cxt.behavior_compat_flags & OPT_IMPLICIT_FOR_LOOP_VARIABLE \
+    || (u_sess->utils_cxt.plsql_compile_behavior_compat_flags & PLPSQL_OPT_FOR_LOOP))
 #define AFORMAT_NULL_TEST (u_sess->utils_cxt.behavior_compat_flags & OPT_AFORMAT_NULL_TEST)
 #define AFORMAT_REGEX_MATCH (u_sess->utils_cxt.behavior_compat_flags & OPT_AFORMAT_REGEX_MATCH)
 #define ROWNUM_TYPE_COMPAT (u_sess->utils_cxt.behavior_compat_flags & OPT_ROWNUM_TYPE_COMPAT)
 #define COMPAT_CURSOR (u_sess->utils_cxt.behavior_compat_flags & OPT_COMPAT_CURSOR)
 #define CHAR_COERCE_COMPAT (u_sess->utils_cxt.behavior_compat_flags & OPT_CHAR_COERCE_COMPAT)
+#define PGFORMAT_SUBSTR (u_sess->utils_cxt.behavior_compat_flags & OPT_PGFORMAT_SUBSTR)
+#define TRUNC_NUMERIC_TAIL_ZERO (u_sess->utils_cxt.behavior_compat_flags & OPT_TRUNC_NUMERIC_TAIL_ZERO)
+#define ALLOW_ORDERBY_UNDISTINCT_COLUMN (u_sess->utils_cxt.behavior_compat_flags & OPT_ALLOW_ORDERBY_UNDISTINCT_COLUMN)
+
+#define PLSQL_COMPILE_FOR_LOOP (u_sess->utils_cxt.plsql_compile_behavior_compat_flags & PLPSQL_OPT_FOR_LOOP)
+#define PLSQL_COMPILE_OUTPARAM (u_sess->utils_cxt.plsql_compile_behavior_compat_flags & PLPSQL_OPT_OUTPARAM)
+
+#define SELECT_INTO_RETURN_NULL (u_sess->utils_cxt.behavior_compat_flags & OPT_SELECT_INTO_RETURN_NULL)
 
 /* define database compatibility Attribute */
 typedef struct {
@@ -308,6 +381,7 @@ extern const uint32 BACKUP_SLOT_VERSION_NUM;
 #ifdef PGXC
 extern bool useLocalXid;
 #endif
+extern bool EnableInitDBSegment;
 
 #define DEFUALT_STACK_SIZE 16384
 
@@ -330,6 +404,7 @@ extern bool stack_is_too_deep(void);
 /* in tcop/utility.c */
 extern void PreventCommandIfReadOnly(const char* cmdname);
 extern void PreventCommandDuringRecovery(const char* cmdname);
+extern void PreventCommandDuringSSOndemandRedo(Node* parseTree);
 
 extern int trace_recovery(int trace_level);
 
@@ -341,6 +416,8 @@ extern int trace_recovery(int trace_level);
 /* flags to be OR'd to form sec_context */
 #define SECURITY_LOCAL_USERID_CHANGE 0x0001
 #define SECURITY_RESTRICTED_OPERATION 0x0002
+#define SENDER_LOCAL_USERID_CHANGE 0x0004
+#define RECEIVER_LOCAL_USERID_CHANGE 0x0008
 
 /* now in utils/init/miscinit.c */
 extern char* GetUserNameFromId(Oid roleid);
@@ -349,12 +426,16 @@ extern Oid GetAuthenticatedUserId(void);
 extern Oid GetUserId(void);
 extern Oid getCurrentNamespace();
 extern Oid GetCurrentUserId(void);
+extern Oid GetOldUserId(bool isReceive);
+extern void SetOldUserId(Oid userId, bool isReceive);
 extern Oid GetOuterUserId(void);
 extern Oid GetSessionUserId(void);
 extern void GetUserIdAndSecContext(Oid* userid, int* sec_context);
 extern void SetUserIdAndSecContext(Oid userid, int sec_context);
 extern bool InLocalUserIdChange(void);
 extern bool InSecurityRestrictedOperation(void);
+extern bool InReceivingLocalUserIdChange();
+extern bool InSendingLocalUserIdChange();
 extern void GetUserIdAndContext(Oid* userid, bool* sec_def_context);
 extern void SetUserIdAndContext(Oid userid, bool sec_def_context);
 extern void InitializeSessionUserId(const char* rolename, bool flagresue = false, Oid useroid = InvalidOid);
@@ -362,6 +443,8 @@ extern void InitializeSessionUserIdStandalone(void);
 extern void SetSessionAuthorization(Oid userid, bool is_superuser);
 extern Oid GetCurrentRoleId(void);
 extern void SetCurrentRoleId(Oid roleid, bool is_superuser);
+void ss_initdwsubdir(char *dssdir, int instance_id);
+extern void initDSSConf(void);
 
 extern Oid get_current_lcgroup_oid();
 extern const char* get_current_lcgroup_name();
@@ -421,6 +504,13 @@ extern bool CheckExecDirectPrivilege(const char* query); /* check user have priv
         u_sess->misc_cxt.Mode = (mode);                                                                      \
     } while (0)
 
+#ifdef ENABLE_LITE_MODE
+#define ENABLE_DSS false
+#define ENABLE_DSS_AIO false
+#else
+#define ENABLE_DSS (g_instance.attr.attr_storage.dss_attr.ss_enable_dss)
+#define ENABLE_DSS_AIO (ENABLE_DSS && g_instance.attr.attr_storage.dms_attr.enable_dss_aio && !IsInitdb)
+#endif
 
 /*
  * Auxiliary-process type identifiers.
@@ -459,6 +549,7 @@ typedef enum {
     TsCompactionAuxiliaryProcess,
     XlogCopyBackendProcess,
     BarrierPreParseBackendProcess,
+    DmsAuxiliaryProcess,
     NUM_SINGLE_AUX_PROC, /* Sentry for auxiliary type with single thread. */
 
     /*
@@ -472,7 +563,8 @@ typedef enum {
     TsCompactionConsumerProcess,
     CsnMinSyncProcess,
     ParallelDecodeProcess,
-    LogicalReadRecord,    
+    LogicalReadRecord,
+
     NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
 
@@ -501,6 +593,7 @@ typedef enum {
 #define AmTsCompactionConsumerProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == TsCompactionConsumerProcess)
 #define AmTsCompactionAuxiliaryProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == TsCompactionAuxiliaryProcess)
 #define AmPageRedoWorker() (t_thrd.bootstrap_cxt.MyAuxProcType == PageRedoProcess)
+#define AmDmsReformProcProcess() (t_thrd.role == DMS_WORKER && t_thrd.dms_cxt.is_reform_proc)
 
 
 

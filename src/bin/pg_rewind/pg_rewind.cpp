@@ -22,6 +22,7 @@
 #include "fetch.h"
 #include "file_ops.h"
 #include "logging.h"
+#include "storage/file/fio_device.h"
 
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
@@ -34,6 +35,8 @@
 #include "common/build_query/build_query.h"
 #include "bin/elog.h"
 #include "pg_build.h"
+#include "tool_common.h"
+
 
 #define FORMATTED_TS_LEN 128
 #define BUILD_PID "gs_build.pid"
@@ -44,6 +47,7 @@ static BuildErrorCode updateControlFile(ControlFileData* ControlFile);
 static BuildErrorCode sanityChecks(void);
 static void rewind_dw_file();
 static BuildErrorCode MoveOldXlogFiles(uint32 checkSeg, const char* newPath);
+static BuildErrorCode TruncateAndRemoveXLog(XLogRecPtr endPtr, uint32 timeLine);
 
 static ControlFileData ControlFile_target;
 static ControlFileData ControlFile_source;
@@ -237,6 +241,16 @@ BuildErrorCode gs_increment_build(const char* pgdata, const char* connstr, char*
     rv = findCommonCheckpoint(datadir_target, lastcommontli, startrec, &chkptrec, &chkpttli, &chkptredo, term);
     PG_CHECKRETURN_AND_RETURN(rv);
     pg_log(PG_PROGRESS, "find diverge point success\n");
+
+    /* Read pg_replslot and get the largest confirmed LSN across all the synced replslots */
+    if(CheckIfEanbedSaveSlots()) {
+        XLogRecPtr confirmedLsn = InvalidXLogRecPtr;
+        if(FindConfirmedLSN(datadir_target, &confirmedLsn) &&
+           CheckConfirmedLSNOnTarget(datadir_target, lastcommontli, chkptredo, confirmedLsn, term) == BUILD_FATAL) {
+            pg_log(PG_PROGRESS, "Can't find quorum confirmed LSN at source, build will exit!\n");
+            exit(1);
+        }
+    }
 
     /* Checkpoint redo should exist. Otherwise, fatal and change to full build. */
     (void)readOneRecord(datadir_target, chkptredo, chkpttli);
@@ -447,6 +461,12 @@ BuildErrorCode gs_increment_build(const char* pgdata, const char* connstr, char*
         /* Exited normally, we're happy! */
     }
 
+    /* truncate XLOG after xlog end */
+    pg_log(PG_PROGRESS, "truncating and removing old xlog files\n");
+    rv = TruncateAndRemoveXLog(endrec, timeline);
+    PG_CHECKRETURN_AND_RETURN(rv);
+    pg_log(PG_PROGRESS, "truncate and remove old xlog files success\n");
+
     /* Create backup lable file */
     pg_log(PG_PROGRESS, "creating backup label and updating control file\n");
     rv = createBackupLabel(chkptredo, chkpttli, chkptrec);
@@ -472,6 +492,11 @@ BuildErrorCode gs_increment_build(const char* pgdata, const char* connstr, char*
     if (access(bkup_file, F_OK) == 0) {
         delete_all_file(bkup_file, true);
         PG_CHECKBUILD_AND_RETURN();
+    }
+
+    if (IS_CROSS_CLUSTER_BUILD && !RenameTblspcDir(datadir_target)) {
+        pg_fatal("failed to rename tablespace dir for cross cluster build.\n");
+        return BUILD_FATAL;
     }
 
     if (datadir_target != NULL) {
@@ -696,7 +721,7 @@ static void rewind_dw_file()
     char* unaligned_buf = NULL;
 
     /* Delete the dw file, if it exists. */
-    rc = snprintf_s(dw_file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", datadir_target, OLD_DW_FILE_NAME);
+    rc = snprintf_s(dw_file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", datadir_target, T_OLD_DW_FILE_NAME);
     securec_check_ss_c(rc, "\0", "\0");
     if (realpath(dw_file_path, real_file_path) == NULL) {
         if (real_file_path[0] == '\0') {
@@ -712,7 +737,7 @@ static void rewind_dw_file()
     securec_check_c(rc, "\0", "\0");
 
     /* Delete the dw build file, if it exists. */
-    rc = snprintf_s(dw_file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", datadir_target, DW_BUILD_FILE_NAME);
+    rc = snprintf_s(dw_file_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", datadir_target, T_DW_BUILD_FILE_NAME);
     securec_check_ss_c(rc, "\0", "\0");
     if (realpath(dw_file_path, real_file_path) == NULL) {
         if (real_file_path[0] == '\0') {
@@ -816,3 +841,221 @@ static BuildErrorCode MoveOldXlogFiles(uint32 checkSeg, const char* newPath)
     return BUILD_SUCCESS;
 }
 
+static BuildErrorCode TruncateAndRemoveXLog(XLogRecPtr endPtr, uint32 timeLine)
+{
+    uint32 endOff;
+    XLogSegNo segNo;
+    char xlogFileName[MAXFNAMELEN] = {0};
+    char xlogFilePath[MAXPGPATH] = {0};
+    char xlogLocation[MAXPGPATH] = {0};
+    char realXlogPath[PATH_MAX] = {0};
+    DIR *xlogDir = NULL;
+    struct dirent *dirEnt = NULL;
+    char *writeContent = NULL;
+    uint32 truncateLength = 0;
+    int fd = -1;
+    int rc = 0;
+
+    /* truncate xlog file */
+    XLByteToSeg(endPtr, segNo);
+    XLogFileName(xlogFileName, MAXFNAMELEN, timeLine, segNo);
+    endOff = (uint32)(endPtr) % XLogSegSize;
+
+    if (endOff > 0) {
+        rc = snprintf_s(xlogFilePath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog/%s", datadir_target, xlogFileName);
+        securec_check_ss_c(rc, "\0", "\0");
+
+        fd = open(xlogFilePath, O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
+        if (fd < 0) {
+            pg_log(PG_ERROR, "open xlog file %s failed when truncate old xlog file.\n", xlogFilePath);
+            return BUILD_ERROR;
+        }
+
+        if (lseek(fd, (off_t)endOff, SEEK_SET) < 0) {
+            close(fd);
+            pg_log(PG_ERROR, "lseek xlog file %s failed when truncate old xlog file.\n", xlogFilePath);
+            return BUILD_ERROR;
+        }
+
+        truncateLength = XLogSegSize - endOff;
+        writeContent = (char *)pg_malloc0(truncateLength);
+        if (write(fd, writeContent, truncateLength) != truncateLength) {
+            close(fd);
+            pg_free(writeContent);
+            pg_log(PG_ERROR, "write file %s failed when truncate old xlog file.\n", xlogFilePath);
+            return BUILD_ERROR;
+        }
+        if (fsync(fd) != 0) {
+            close(fd);
+            pg_free(writeContent);
+            pg_log(PG_ERROR, "fsync file %s failed when truncate old xlog file.\n", xlogFilePath);
+            return BUILD_ERROR;
+        }
+        if (close(fd) != 0) {
+            pg_free(writeContent);
+            pg_log(PG_ERROR, "close file %s failed when truncate old xlog file.\n", xlogFilePath);
+            return BUILD_ERROR;
+        }
+        pg_free(writeContent);
+    }
+
+    /* remove xlog files */
+    rc = snprintf_s(xlogLocation, MAXPGPATH, MAXPGPATH - 1, "%s/%s", datadir_target, "pg_xlog");
+    securec_check_ss_c(rc, "\0", "\0");
+    if (realpath(xlogLocation, realXlogPath) == NULL && realXlogPath[0] == '\0') {
+        pg_log(PG_FATAL, "could not get canonical path for file \"%s\": %s in truncate\n", xlogLocation,
+            gs_strerror(errno));
+        return BUILD_FATAL;
+    }
+
+    xlogDir = opendir(realXlogPath);
+    if (!xlogDir) {
+        pg_log(PG_ERROR, "open xlog dir %s failed when remove old xlog files.\n", realXlogPath);
+        return BUILD_ERROR;
+    }
+    while ((dirEnt = readdir(xlogDir)) != NULL) {
+        if (strlen(dirEnt->d_name) != 24 || strspn(dirEnt->d_name, "0123456789ABCDEF") != 24) {
+            continue;
+        }
+        if (strcmp(dirEnt->d_name, xlogFileName) > 0 || (endOff == 0 && strcmp(dirEnt->d_name, xlogFileName) == 0)) {
+            rc = snprintf_s(xlogFilePath, MAXPGPATH, MAXPGPATH - 1, "%s/pg_xlog/%s", datadir_target, dirEnt->d_name);
+            securec_check_ss_c(rc, "\0", "\0");
+            rc = unlink(xlogFilePath);
+            if (rc != 0) {
+                pg_log(PG_ERROR, "remove %s failed when truncate old xlog file.\n", xlogFilePath);
+                (void)closedir(xlogDir);
+                return BUILD_ERROR;
+            }
+        }
+    }
+    (void)closedir(xlogDir);
+    return BUILD_SUCCESS;
+}
+
+BuildErrorCode do_build_check(const char* pgdata, const char* connstr, char* sysidentifier, uint32 timeline, uint32 term)
+{
+    TimeLineID lastcommontli;
+    XLogRecPtr chkptrec = InvalidXLogRecPtr;
+    TimeLineID chkpttli;
+    XLogRecPtr chkptredo = InvalidXLogRecPtr;
+    size_t size = 0;
+    char* buffer = NULL;
+    XLogRecPtr startrec;
+    errno_t errorno = EOK;
+    BuildErrorCode rv = BUILD_SUCCESS;
+
+    datadir_target = pg_strdup(pgdata);
+    if (connstr_source == NULL) {
+        connstr_source = pg_strdup(connstr);
+    }
+
+    if (connstr_source == NULL) {
+        pg_log(PG_WARNING, "%s: no source specified (--source-server)\n", progname);
+        pg_log(PG_WARNING, "Try \"%s --help\" for more information.\n", progname);
+        return BUILD_ERROR;
+    }
+
+    if (datadir_target == NULL) {
+        pg_log(PG_WARNING, "%s: no target data directory specified (--target-pgdata)\n", progname);
+        pg_log(PG_WARNING, "Try \"%s --help\" for more information.\n", progname);
+        return BUILD_ERROR;
+    }
+
+    if (term > PG_UINT32_MAX) {
+        pg_log(PG_PROGRESS, "%s: unexpected term specified\n", progname);
+        pg_log(PG_PROGRESS, "Try \"%s --help\" for more information.\n", progname);
+        return BUILD_ERROR;
+    }
+
+    /*
+     * Don't allow pg_rewind to be run as root, to avoid overwriting the
+     * ownership of files in the data directory. We need only check for root
+     * -- any other user won't have sufficient permissions to modify files in
+     * the data directory.
+     */
+    if (geteuid() == 0) {
+        pg_log(PG_PROGRESS, "cannot be executed by \"root\"\n");
+        pg_log(PG_PROGRESS, "You must run %s as the PostgreSQL superuser.\n", progname);
+        exit(1);
+    }
+
+    /* Can't start new building until restore process success. */
+    if (is_in_restore_process(datadir_target)) {
+        pg_log(PG_PROGRESS,
+            "%s: last restore process hasn't completed, "
+            "can't start new building.\n",
+            progname);
+        return BUILD_ERROR;
+    }
+
+    /* Connect to remote server */
+    rv = libpqConnect(connstr_source);
+    PG_CHECKRETURN_AND_RETURN(rv);
+    rv = libpqGetParameters();
+    PG_CHECKRETURN_AND_RETURN(rv);
+    pg_log(PG_PROGRESS, "connect to primary success\n");
+
+    /*
+     * Ok, we have all the options and we're ready to start. Read in all the
+     * information we need from both clusters.
+     */
+    buffer = slurpFile(ss_instance_config.dss.vgname, "pg_control", &size);
+    PG_CHECKBUILD_AND_RETURN();
+    digestControlFile(&ControlFile_target, (const char*)buffer);
+    pg_free(buffer);
+    buffer = NULL;
+    PG_CHECKBUILD_AND_RETURN();
+
+    pg_log(PG_PROGRESS,
+        "find last checkpoint at %X/%X and checkpoint redo at %X/%X from target control file\n",
+        (uint32)(ControlFile_target.checkPoint >> 32),
+        (uint32)(ControlFile_target.checkPoint),
+        (uint32)(ControlFile_target.checkPointCopy.redo >> 32),
+        (uint32)(ControlFile_target.checkPointCopy.redo));
+
+    buffer = fetchFile("+data/pg_control", &size);
+    PG_CHECKBUILD_AND_RETURN();
+    digestControlFile(&ControlFile_source, buffer);
+    pg_free(buffer);
+    buffer = NULL;
+    PG_CHECKBUILD_AND_RETURN();
+    pg_log(PG_PROGRESS, "get primary pg_control success\n");
+
+    /* Check if rewind can be performed */
+    rv = sanityChecks();
+    PG_CHECKRETURN_AND_RETURN(rv);
+    pg_log(PG_PROGRESS, "sanityChecks success\n");
+
+    lastcommontli = ControlFile_target.checkPointCopy.ThisTimeLineID;
+
+    pg_log(PG_PROGRESS,
+        "find last checkpoint at %X/%X and checkpoint redo at %X/%X from source control file\n",
+        (uint32)(ControlFile_source.checkPoint >> 32),
+        (uint32)(ControlFile_source.checkPoint),
+        (uint32)(ControlFile_source.checkPointCopy.redo >> 32),
+        (uint32)(ControlFile_source.checkPointCopy.redo));
+
+    /* Find the common checkpoint locaiton */
+    startrec = ControlFile_source.checkPoint <= ControlFile_target.checkPoint ?
+        ControlFile_source.checkPoint : ControlFile_target.checkPoint;
+    rv = findCommonCheckpoint(datadir_target, lastcommontli, startrec, &chkptrec, &chkpttli, &chkptredo, term);
+    PG_CHECKRETURN_AND_RETURN(rv);
+    pg_log(PG_PROGRESS, "find diverge point success\n");
+
+    if (chkptrec == ControlFile_target.checkPoint) {
+        pg_log(PG_PROGRESS, "do not need to build\n");
+    } else {
+        pg_log(PG_PROGRESS, "need to do incremental build\n");
+    }
+    /* Disconnect from remote server */
+    if (connstr_source != NULL) {
+        libpqDisconnect();
+    }
+
+    if (datadir_target != NULL) {
+        free(datadir_target);
+        datadir_target = NULL;
+    }
+
+    return BUILD_SUCCESS;
+}

@@ -26,6 +26,8 @@
  *		for the PQfn() call.  (This probably ought to go somewhere else...)
  * ----------------
  */
+#if 0
+// PQArgBlock struct already defined in libpq-fe.h, and struct both include in postgres.cpp, so disable there!
 typedef struct {
     int len;
     int isint;
@@ -34,6 +36,9 @@ typedef struct {
         int integer;
     } u;
 } PQArgBlock;
+#endif
+
+extern ProtocolExtensionConfig default_protocol_config;
 
 /*
  * External functions.
@@ -44,18 +49,21 @@ typedef struct {
  */
 extern int StreamServerPort(int family, char* hostName, unsigned short portNumber, const char* unixSocketName,
     pgsocket ListenSocket[], int MaxListen, bool add_localaddr_flag,
-    bool is_create_psql_sock, bool is_create_libcomm_sock);
+    bool is_create_psql_sock, bool is_create_libcomm_sock, ListenChanelType listen_channel,
+    ProtocolExtensionConfig* protocol_config = &default_protocol_config);
 extern int StreamConnection(pgsocket server_fd, Port* port);
 extern void StreamClose(pgsocket sock);
 extern void TouchSocketFile(void);
 extern void pq_init(void);
 extern void pq_comm_reset(void);
 extern int pq_getbytes(char* s, size_t len);
+extern int pq_discardbytes(size_t len);
 extern int pq_getstring(StringInfo s);
 extern int pq_getmessage(StringInfo s, int maxlen);
 extern int pq_getbyte(void);
 extern int pq_peekbyte(void);
 extern int pq_getbyte_if_available(unsigned char* c);
+extern bool pq_buffer_has_data(void);
 extern int pq_putbytes(const char* s, size_t len);
 extern int pq_flush(void);
 extern int pq_flush_if_writable(void);

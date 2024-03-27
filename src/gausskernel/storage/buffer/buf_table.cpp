@@ -30,11 +30,6 @@
 #include "gstrace/storage_gstrace.h"
 
 extern uint32 hashquickany(uint32 seed, register const unsigned char *data, register int len);
-/* entry for buffer lookup hashtable */
-typedef struct {
-    BufferTag key; /* Tag of a disk page */
-    int id;        /* Associated buffer ID */
-} BufferLookupEnt;
 
 /*
  * Estimate space needed for mapping hashtable
@@ -77,7 +72,9 @@ void InitBufTable(int size)
  */
 uint32 BufTableHashCode(BufferTag *tagPtr)
 {
-    return hashquickany(0xFFFFFFFF, (unsigned char *)tagPtr, sizeof(BufferTag));
+    BufferTag tag = *tagPtr;
+    tag.rnode.opt = DefaultFileNodeOpt;
+    return hashquickany(0xFFFFFFFF, (unsigned char *)&tag, sizeof(BufferTag));
 }
 
 /*

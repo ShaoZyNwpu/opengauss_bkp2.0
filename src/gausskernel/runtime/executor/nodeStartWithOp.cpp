@@ -32,8 +32,7 @@ typedef enum StartWithOpExecStatus {
     SWOP_UNKNOWN = 0,
     SWOP_BUILD = 1,
     SWOP_EXECUTE,
-    SWOP_FINISH,
-    SWOP_ESCAPE
+    SWOP_FINISH
 } StartWithOpExecStatus;
 
 #define KEY_START_TAG "{"
@@ -47,6 +46,7 @@ typedef enum StartWithOpExecStatus {
 
 char* get_typename(Oid typid);
 
+static TupleTableSlot* ExecStartWithOp(PlanState* state);
 static void ProcessPseudoReturnColumns(StartWithOpState *state);
 static AttrNumber FetchRUItrTargetEntryResno(StartWithOpState *state);
 
@@ -230,6 +230,7 @@ static bool unsupported_filter_walker(Node *node, Node *context_node)
  *   - ExecStartWithOp()
  *   - ExecEndStartWithOp()
  *   - ExecReScanStartWithOp()
+ *   - ResetRecursiveInner()
  */
 StartWithOpState* ExecInitStartWithOp(StartWithOp* node, EState* estate, int eflags)
 {
@@ -252,6 +253,8 @@ StartWithOpState* ExecInitStartWithOp(StartWithOp* node, EState* estate, int efl
         ALLOCSET_DEFAULT_MINSIZE,
         ALLOCSET_DEFAULT_INITSIZE,
         ALLOCSET_DEFAULT_MAXSIZE);
+
+    state->ps.ExecProcNode = ExecStartWithOp;
 
     /*
      * Miscellaneous initialization
@@ -289,7 +292,7 @@ StartWithOpState* ExecInitStartWithOp(StartWithOp* node, EState* estate, int efl
      * no relations are involved in nodeResult, set the default
      * tableAm type to HEAP
      */
-    ExecAssignResultTypeFromTL(&state->ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&state->ps);
 
     ExecAssignProjectionInfo(&state->ps, NULL);
 
@@ -336,7 +339,7 @@ StartWithOpState* ExecInitStartWithOp(StartWithOp* node, EState* estate, int efl
                             false, false, u_sess->attr.attr_memory.work_mem);
 
     /* create the working TupleTableslot */
-    state->sw_workingSlot = ExecAllocTableSlot(&estate->es_tupleTable, TAM_HEAP);
+    state->sw_workingSlot = ExecAllocTableSlot(&estate->es_tupleTable, TableAmHeap);
     ExecSetSlotDescriptor(state->sw_workingSlot, ExecTypeFromTL(targetlist, false));
 
     int natts = list_length(node->plan.targetlist);
@@ -372,6 +375,7 @@ bool CheckCycleExeception(StartWithOpState *node, TupleTableSlot *slot)
 {
     RecursiveUnionState *rustate = NULL;
     StartWithOp *swplan = (StartWithOp *)node->ps.plan;
+    bool nocycle = swplan->swoptions->nocycle;
     bool   incycle = false;
 
     if (swplan->swoptions->siblings_orderby_clause != NULL) {
@@ -383,7 +387,7 @@ bool CheckCycleExeception(StartWithOpState *node, TupleTableSlot *slot)
 
     Assert (IsA(rustate, RecursiveUnionState));
 
-    if (IsConnectByLevelStartWithPlan(swplan) || node->sw_keyAttnum == 0) {
+    if ((!nocycle && IsConnectByLevelStartWithPlan(swplan)) || node->sw_keyAttnum == 0) {
         /* for connect by level case, we do not do cycle check */
         return false;
     }
@@ -397,7 +401,7 @@ bool CheckCycleExeception(StartWithOpState *node, TupleTableSlot *slot)
     CheckIsCycle(node, &incycle);
 
     /* compatible with ORA behavior, if NOCYCLE is not set, we report error */
-    if (!swplan->swoptions->nocycle && incycle) {
+    if (!nocycle && incycle) {
         ereport(ERROR,
                 (errmodule(MOD_EXECUTOR),
                 errmsg("START WITH .. CONNECT BY statement runs into cycle exception")));
@@ -415,6 +419,30 @@ bool CheckCycleExeception(StartWithOpState *node, TupleTableSlot *slot)
     return incycle;
 }
 
+/*
+ * This function is called during executing recursive part(inner plan) of recursive union,
+ * so it would be enough to rescan(reset) only inner_plan of RecursiveUnionState to refresh
+ * last working state including working table.
+ */
+void ResetRecursiveInner(RecursiveUnionState *node)
+{
+    PlanState *outerPlanState = outerPlanState(node);
+    PlanState *innerPlanState = innerPlanState(node);
+    RecursiveUnion *ruPlan = (RecursiveUnion*)node->ps.plan;
+
+    /*
+     * Set recursive term's chgParam to tell it that we'll modify the working
+     * table and therefore it has to rescan.
+     */
+    innerPlanState->chgParam = bms_add_member(innerPlanState->chgParam, ruPlan->wtParam);
+    if (outerPlanState->chgParam == NULL) {
+        ExecReScan(innerPlanState);
+    }
+
+    node->intermediate_empty = true;
+    tuplestore_clear(node->working_table);
+    tuplestore_clear(node->intermediate_table);
+}
 
 /*
  * Peeking a tuple's connectable descendants for exactly one level.
@@ -432,8 +460,8 @@ static List* peekNextLevel(TupleTableSlot* startSlot, PlanState* outerNode, int 
     List* queue = NULL;
     RecursiveUnionState* rus = (RecursiveUnionState*) outerNode;
     StartWithOpState *swnode = rus->swstate;
-    /* clean up RU's old working table */
-    ExecReScan(outerNode);
+    /* ReSet RU's inner plan, inlcuding re-scan inner and free its working table */
+    ResetRecursiveInner(rus);
     /* pushing the depth-first tuple into RU's working table */
     rus->recursing = true;
     tuplestore_puttupleslot(rus->working_table, startSlot);
@@ -473,7 +501,7 @@ static bool depth_first_connect(int currentLevel, StartWithOpState *node, List* 
 
     /* loop until all siblings' DFS are done */
     for (;;) {
-        if (queue->head == NULL || node->swop_status == SWOP_ESCAPE) {
+        if (queue->head == NULL) {
             return isCycle;
         }
         TupleTableSlot* leader = (TupleTableSlot*) lfirst(queue->head);
@@ -558,7 +586,7 @@ void markSWLevelEnd(StartWithOpState *node, int64 rowCount)
  * @Function: ExecStartWithRowLevelQual()
  *
  * @Brief:
- *         Check if LEVEL/ROWNUM conditions still hold for the recursion to
+ *         Check if SWCB's conditions still hold for the recursion to
  *         continue. Level and rownum should have been made available
  *         in dstSlot by ConvertStartWithOpOutputSlot() already.
  *
@@ -570,11 +598,10 @@ void markSWLevelEnd(StartWithOpState *node, int64 rowCount)
 bool ExecStartWithRowLevelQual(RecursiveUnionState* node, TupleTableSlot* dstSlot)
 {
     StartWithOp* swplan = (StartWithOp*)node->swstate->ps.plan;
+    ExprContext* expr = node->swstate->ps.ps_ExprContext;
     if (!IsConnectByLevelStartWithPlan(swplan)) {
         return true;
     }
-
-    ExprContext* expr = node->swstate->ps.ps_ExprContext;
 
     /*
      * Level and rownum pseudo attributes are extracted from StartWithOpPlan
@@ -587,52 +614,28 @@ bool ExecStartWithRowLevelQual(RecursiveUnionState* node, TupleTableSlot* dstSlo
     return true;
 }
 
-static bool isStoppedByRowNum(RecursiveUnionState* node, TupleTableSlot* slot)
+static void DiscardSWLastTuple(StartWithOpState *node)
 {
-    TupleTableSlot* dstSlot = node->swstate->ps.ps_ResultTupleSlot;
-    bool ret = false;
-
-    /* 1. roll back to the converted result row */
-    node->swstate->sw_rownum--;
-    /* 2. roll back to one row before execution to check rownum stop condition */
-    node->swstate->sw_rownum--;
-    dstSlot = ConvertStartWithOpOutputSlot(node->swstate, slot, dstSlot);
-    if (ExecStartWithRowLevelQual(node, dstSlot)) {
-        ret = true;
-    }
-    /* undo the rollback after conversion (yes, just one line) */
-    node->swstate->sw_rownum++;
-    return ret;
+    node->sw_rownum--;
+    node->sw_numtuples--;
 }
 
-TupleTableSlot* GetStartWithSlot(RecursiveUnionState* node, TupleTableSlot* slot)
+TupleTableSlot* GetStartWithSlot(RecursiveUnionState* node, TupleTableSlot* slot, bool isRecursive)
 {
     TupleTableSlot* dstSlot = node->swstate->ps.ps_ResultTupleSlot;
     dstSlot = ConvertStartWithOpOutputSlot(node->swstate, slot, dstSlot);
 
-    if (!ExecStartWithRowLevelQual(node, dstSlot)) {
-        StartWithOpState *swnode = node->swstate;
-        StartWithOp *swplan = (StartWithOp *)swnode->ps.plan;
-        PlanState      *outerNode = outerPlanState(swnode);
-        bool isDfsEnabled = swplan->swoptions->nocycle && !IsA(outerNode, SortState);
-        /*
-         * ROWNUM/LEVEL limit reached:
-         * Tell ExecRecursiveUnion to terminate the recursion by returning NULL
-         *
-         * Specifically for ROWNUM limit reached:
-         * Tell DFS routine to stop immediately by setting SW status to ESCAPE.
-         */
-        node->swstate->swop_status = isDfsEnabled && isStoppedByRowNum(node, slot) ?
-                                     SWOP_ESCAPE :
-                                     node->swstate->swop_status;
+    if (isRecursive && !ExecStartWithRowLevelQual(node, dstSlot)) {
+        DiscardSWLastTuple(node->swstate);
         return NULL;
     }
 
     return dstSlot;
 }
 
-TupleTableSlot* ExecStartWithOp(StartWithOpState *node)
+static TupleTableSlot* ExecStartWithOp(PlanState* state)
 {
+    StartWithOpState *node = castNode(StartWithOpState, state);
     TupleTableSlot *dstSlot = node->ps.ps_ResultTupleSlot;
     PlanState      *outerNode = outerPlanState(node);
     StartWithOp    *swplan = (StartWithOp *)node->ps.plan;
@@ -674,16 +677,16 @@ TupleTableSlot* ExecStartWithOp(StartWithOpState *node)
                     break;
                 }
 
-                tuplestore_puttupleslot(node->sw_workingTable, dstSlot);
-
                 /*
                  * check we need stop infinit recursive iteration if NOCYCLE is specified in
                  * ConnectByExpr, then return. Also, in case of cycle-report-error the ereport
                  * is processed inside of CheckCycleException()
                  */
                 if (CheckCycleExeception(node, dstSlot)) {
-                    break;
+                    continue;
                 }
+
+                tuplestore_puttupleslot(node->sw_workingTable, dstSlot);
             }
 
             /* report we have done material step for current StartWithOp node */
@@ -963,12 +966,15 @@ Datum sys_connect_by_path(PG_FUNCTION_ARGS)
     List *token_list = GetCurrentArrayColArray(fcinfo, value, &raw_array_str, &constArrayList);
 
     ListCell *token = NULL;
-
-    if (!constArrayList) {
+    char *trimValue = TrimStr(value);
+    if (trimValue != NULL && !constArrayList) {
         bool valid = false;
         foreach (token, token_list) {
-            const char *curValue = (const char *)lfirst(token);
-            if (strcmp(TrimStr(value), TrimStr(curValue)) == 0) {
+            char *curValue = TrimStr((const char *)lfirst(token));
+            if (curValue == NULL) {
+                continue;
+            }
+            if (strcmp(trimValue, curValue) == 0) {
                 valid = true;
                 break;
             }
@@ -1017,17 +1023,23 @@ Datum connect_by_root(PG_FUNCTION_ARGS)
     char *raw_array_str = NULL;
     List *token_list = GetCurrentArrayColArray(fcinfo, value, &raw_array_str, &constArrayList);
     ListCell *lc = NULL;
-    bool valid = false;
-    foreach (lc, token_list) {
-        const char *curValue = (const char *)lfirst(lc);
-        if (strcmp(TrimStr(value), TrimStr(curValue)) == 0) {
-            valid = true;
-            break;
+    char *trimValue = TrimStr(value);
+    if (trimValue != NULL && !constArrayList) {
+        bool valid = false;
+        foreach (lc, token_list) {
+            char *curValue = TrimStr((const char *)lfirst(lc));
+            if (curValue == NULL) {
+                continue;
+            }
+            if (strcmp(trimValue, curValue) == 0) {
+                valid = true;
+                break;
+            }
         }
-    }
 
-    if (!valid) {
-        elog(ERROR, "node value is not in path (value:%s path:%s)", value, raw_array_str);
+        if (!valid) {
+            elog(ERROR, "node value is not in path (value:%s path:%s)", value, raw_array_str);
+        }
     }
 
     /*
@@ -1857,7 +1869,7 @@ static const char *GetKeyEntryArrayStr(RecursiveUnionState *state, TupleTableSlo
                  */
                 elog(WARNING, "The internal key column[%d]:%s with NULL value.",
                             te->resno,
-                            scanSlot->tts_tupleDescriptor->attrs[i]->attname.data);
+                            scanSlot->tts_tupleDescriptor->attrs[i].attname.data);
             }
 
             if (i == 0) {
@@ -1886,7 +1898,7 @@ static const char *GetCurrentValue(TupleTableSlot *slot, AttrNumber attnum)
     TupleDesc tupDesc = slot->tts_tupleDescriptor;
     HeapTuple tup = ExecFetchSlotTuple(slot);
     bool isnull = true;
-    Oid atttypid = tupDesc->attrs[attnum - 1]->atttypid;
+    Oid atttypid = tupDesc->attrs[attnum - 1].atttypid;
     Datum d = heap_getattr(tup, attnum, tupDesc, &isnull);
     char *value_str = NULL;
 
@@ -1996,7 +2008,7 @@ static const char *GetCurrentValue(TupleTableSlot *slot, AttrNumber attnum)
             break;
         default: {
             elog(ERROR, "unspported type for attname:%s (typid:%u typname:%s)",
-                tupDesc->attrs[attnum - 1]->attname.data,
+                tupDesc->attrs[attnum - 1].attname.data,
                 atttypid, get_typename(atttypid));
         }
     }

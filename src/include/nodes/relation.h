@@ -86,6 +86,23 @@ typedef struct AggClauseCosts {
 } AggClauseCosts;
 
 /*
+ * This enum identifies the different types of "upper" (post-scan/join)
+ * relations that we might deal with during planning.
+ */
+typedef enum UpperRelationKind {
+    UPPERREL_INIT,              /* is a base rel */
+    UPPERREL_SETOP,             /* result of UNION/INTERSECT/EXCEPT, if any */
+    UPPERREL_GROUP_AGG,         /* result of grouping/aggregation, if any */
+    UPPERREL_WINDOW,            /* result of window functions, if any */
+    UPPERREL_DISTINCT,          /* result of "SELECT DISTINCT", if any */
+    UPPERREL_ORDERED,           /* result of ORDER BY, if any */
+    UPPERREL_ROWMARKS,          /* result of ROMARKS, if any */
+    UPPERREL_LIMIT,             /* result of limit offset, if any */
+    UPPERREL_FINAL              /* result of any remaining top-level actions */
+                                /* NB: UPPERREL_FINAL must be last enum entry; it's used to size arrays */
+} UpperRelationKind;
+
+/*
  * For global path optimization, we should keep all paths with interesting distribute
  * keys. There are two kinds of such keys: super set (taking effect for intermediate
  * relation and before agg) and exact match (taking effect for intermediate resultset
@@ -136,7 +153,6 @@ typedef struct OpMemInfo {
 
 /* the min memory for sort is 16MB,  the unit is kb. Don't sort in memory when we don't have engough memory. */
 #define SORT_MIM_MEM 16 * 1024
-#define DFSSCAN_MIN_MEM 12 * 1024 /* the min memory for dfsscan is 12MB,  the unit is kb. */
 #define MEM_KB 1024L              /* 1024kb for caculating mem info */
 
 /* PSORT_SPREAD_MAXMEM_RATIO can increase 20% for partition table's one part on extended limit. */
@@ -226,6 +242,8 @@ typedef struct PlannerGlobal {
 
 #define WITHIN_SUBQUERY(root, rte) (IS_STREAM_PLAN && root->is_correlated && \
             (GetLocatorType(rte->relid) != LOCATOR_TYPE_REPLICATED || ng_is_multiple_nodegroup_scenario()))
+
+struct PlannerTargets;
 
 /* ----------
  * PlannerInfo
@@ -404,6 +422,11 @@ typedef struct PlannerInfo {
 
     /* For count_distinct, save null info for group by clause */
     List* join_null_info;
+    /*
+     * grouping_planner passes back its final processed targetlist here, for
+     * use in relabeling the topmost tlist of the finished Plan.
+     */
+    List *processed_tlist;
     /* for GroupingFunc fixup in setrefs */
     AttrNumber* grouping_map;
 
@@ -438,6 +461,7 @@ typedef struct PlannerInfo {
 	
 	bool hasRownumQual;
     List *origin_tlist;
+    struct PlannerTargets *planner_targets;
 } PlannerInfo;
 
 /*
@@ -466,9 +490,14 @@ typedef struct PlannerInfo {
  *
  * We also have "other rels", which are like base rels in that they refer to
  * single RT indexes; but they are not part of the join tree, and are given
- * a different RelOptKind to identify them.  Lastly, there is a RelOptKind
- * for "dead" relations, which are base rels that we have proven we don't
- * need to join after all.
+ * a different RelOptKind to identify them.  
+ * There is also a RelOptKind for "upper" relations, which are RelOptInfos
+ * that describe post-scan/join processing steps, such as aggregation.
+ * Many of the fields in these RelOptInfos are meaningless, but their Path
+ * fields always hold Paths showing ways to do that processing step, currently
+ * this kind is only used for fdw to search path.
+ * Lastly, there is a RelOptKind for "dead" relations, which are base rels
+ * that we have proven we don't need to join after all.
  *
  * Currently the only kind of otherrels are those made for member relations
  * of an "append relation", that is an inheritance set or UNION ALL subquery.
@@ -491,14 +520,13 @@ typedef struct PlannerInfo {
  *				if there is just one, a join relation if more than one
  *		rows - estimated number of tuples in the relation after restriction
  *			   clauses have been applied (ie, output rows of a plan for it)
- *		width - avg. number of bytes per tuple in the relation after the
- *				appropriate projections have been done (ie, output width)
- *		reltargetlist - List of Var and PlaceHolderVar nodes for the values
- *						we need to output from this relation.
- *						List is in no particular order, but all rels of an
- *						appendrel set must use corresponding orders.
- *						NOTE: in a child relation, may contain RowExpr or
- *						ConvertRowtypeExpr representing a whole-row Var.
+ *		reltarget - Default Path output tlist for this rel; normally contains
+ *					Var and PlaceHolderVar nodes for the values we need to
+ *					output from this relation.
+ *					List is in no particular order, but all rels of an
+ *					appendrel set must use corresponding orders.
+ *					NOTE: in an appendrel child relation, may contain
+ *					arbitrary expressions pulled up from a subquery!
  *		pathlist - List of Path nodes, one for each potentially useful
  *				   method of generating the relation
  *		ppilist - ParamPathInfo nodes for parameterized Paths, if any
@@ -532,8 +560,6 @@ typedef struct PlannerInfo {
  *		allvisfrac - fraction of disk pages that are marked all-visible
  *		subplan - plan for subquery (NULL if it's not a subquery)
  *		subroot - PlannerInfo for subquery (NULL if it's not a subquery)
- *		fdwroutine - function hooks for FDW, if foreign table (else NULL)
- *		fdw_private - private state for FDW, if foreign table (else NULL)
  *
  *		Note: for a subquery, tuples, subplan, subroot are not set immediately
  *		upon creation of the RelOptInfo object; they are filled in when
@@ -542,6 +568,15 @@ typedef struct PlannerInfo {
  *
  *		For otherrels that are appendrel members, these fields are filled
  *		in just as for a baserel.
+ * If the relation is either a foreign table or a join of foreign tables that
+ * all belong to the same foreign server and are assigned to the same user to
+ * check access permissions as (cf checkAsUser), these fields will be set:
+ *
+ *		serverid - OID of foreign server, if foreign table (else InvalidOid)
+ *		userid - OID of user to check access as (InvalidOid means current user)
+ *		useridiscurrent - we've assumed that userid equals current user
+ *		fdwroutine - function hooks for FDW, if foreign table (else NULL)
+ *		fdw_private - private state for FDW, if foreign table (else NULL)
  *
  * The presence of the remaining fields depends on the restrictions
  * and joins that the relation participates in:
@@ -576,7 +611,7 @@ typedef struct PlannerInfo {
  * and may need it multiple times to price index scans.
  * ----------
  */
-typedef enum RelOptKind { RELOPT_BASEREL, RELOPT_JOINREL, RELOPT_OTHER_MEMBER_REL, RELOPT_DEADREL } RelOptKind;
+typedef enum RelOptKind { RELOPT_BASEREL, RELOPT_JOINREL, RELOPT_OTHER_MEMBER_REL, RELOPT_UPPER_REL, RELOPT_DEADREL } RelOptKind;
 
 typedef enum PartitionFlag { PARTITION_NONE, PARTITION_REQURIED, PARTITION_ANCESOR } PartitionFlag;
 
@@ -588,6 +623,72 @@ typedef enum PartitionFlag { PARTITION_NONE, PARTITION_REQURIED, PARTITION_ANCES
 
 /* Is the given relation a join relation? */
 #define IS_JOIN_REL(rel) ((rel)->reloptkind == RELOPT_JOINREL)
+
+/* Is the given relation an upper relation? */
+#define IS_UPPER_REL(rel) ((rel)->reloptkind == RELOPT_UPPER_REL)
+
+/*
+ * PathTarget
+ *
+ * This struct contains what we need to know during planning about the
+ * targetlist (output columns) that a Path will compute.  Each RelOptInfo
+ * includes a default PathTarget, which its individual Paths may simply
+ * reference.  However, in some cases a Path may compute outputs different
+ * from other Paths, and in that case we make a custom PathTarget for it.
+ * For example, an indexscan might return index expressions that would
+ * otherwise need to be explicitly calculated.  (Note also that "upper"
+ * relations generally don't have useful default PathTargets.)
+ *
+ * exprs contains bare expressions; they do not have TargetEntry nodes on top,
+ * though those will appear in finished Plans.
+ *
+ * sortgrouprefs[] is an array of the same length as exprs, containing the
+ * corresponding sort/group refnos, or zeroes for expressions not referenced
+ * by sort/group clauses.  If sortgrouprefs is NULL (which it generally is in
+ * RelOptInfo.reltarget targets; only upper-level Paths contain this info),
+ * we have not identified sort/group columns in this tlist.  This allows us to
+ * deal with sort/group refnos when needed with less expense than including
+ * TargetEntry nodes in the exprs list.
+ */
+typedef struct PathTarget {
+    NodeTag type;
+    List *exprs;          /* list of expressions to be computed */
+    Index *sortgrouprefs; /* corresponding sort/group refnos, or 0 */
+    QualCost cost;        /* cost of evaluating the expressions */
+    int width;            /* estimated avg width of result tuples */
+} PathTarget;
+
+
+typedef struct PlannerTargets {
+    /*final*/
+    bool final_contains_srfs;
+    PathTarget *final_target;
+    List *final_targets;
+    List *final_targets_contain_srfs;
+
+    /*sort input*/
+    bool sort_input_contains_srfs;
+    PathTarget *sort_input_target;
+    List *sort_input_targets;
+    List *sort_input_targets_contain_srfs;
+    bool have_postponed_srfs = false;
+
+    /*grouping*/
+    bool grouping_contains_srfs;
+    PathTarget *grouping_target;
+    List *grouping_targets;
+    List *grouping_targets_contain_srfs;
+
+    /*scan join*/
+    bool scanjoin_contains_srfs;
+    PathTarget *scanjoin_target;
+    List *scanjoin_targets;
+    List *scanjoin_targets_contain_srfs;
+    
+} PlannerTargets;
+
+/* Convenience macro to get a sort/group refno from a PathTarget */
+#define get_pathtarget_sortgroupref(target, colno) ((target)->sortgrouprefs ? (target)->sortgrouprefs[colno] : (Index)0)
 
 typedef struct RelOptInfo {
     NodeTag type;
@@ -603,12 +704,13 @@ typedef struct RelOptInfo {
 
     /* size estimates generated by planner */
     double rows;           /* estimated number of global result tuples */
-    int width;             /* estimated avg width of result tuples */
     int encodedwidth;      /* estimated avg width of encoded columns in result tuples */
     AttrNumber encodednum; /* number of encoded column */
 
+    /* default result targetlist for Paths scanning this relation */
+    struct PathTarget *reltarget; /* list of Vars/Exprs, cost, width */
+
     /* materialization information */
-    List* reltargetlist;   /* Vars to be output by scan of relation */
     List* distribute_keys; /* distribute key */
     List* pathlist;        /* Path structures */
     List* ppilist;         /* ParamPathInfos used in pathlist */
@@ -629,6 +731,11 @@ typedef struct RelOptInfo {
     List* lateral_vars;  /* LATERAL Vars and PHVs referenced by rel */
     Relids lateral_relids; /* minimum parameterization of rel */
     List* indexlist;     /* list of IndexOptInfo */
+
+#ifndef ENABLE_MULTIPLE_NODES
+    List* statlist;      /* list of ExtendedStats */
+#endif
+
     RelPageType pages;   /* local size estimates derived from pg_class */
     double tuples;       /* global size estimates derived from pg_class */
     double multiple;     /* how many dn skewed and biased be influenced by distinct. */
@@ -649,9 +756,18 @@ typedef struct RelOptInfo {
     struct Plan* subplan; /* if subquery */
     PlannerInfo* subroot; /* if subquery */
     List *subplan_params; /* if subquery */
+
+    /* Information about foreign tables and foreign joins */
+    Oid serverid;         /* identifies server for the table or join */
+    Oid userid;           /* identifies user to check access as */
+    bool useridiscurrent; /* join is only valid for current user */
     /* use "struct FdwRoutine" to avoid including fdwapi.h here */
     struct FdwRoutine* fdwroutine; /* if foreign table */
     void* fdw_private;             /* if foreign table */
+
+    /* cache space for remembering if we have proven this relation unique */
+    List *unique_for_rels;	/* known unique for these other relid set(s) */
+    List *non_unique_for_rels;	/* known not unique for these set(s) */
 
     /* used by various scans and joins: */
     List* baserestrictinfo;          /* RestrictInfo structures (if base
@@ -926,6 +1042,11 @@ typedef struct ParamPathInfo {
  * the same Path type for multiple Plan types when there is no need to
  * distinguish the Plan type during path processing.
  *
+ * "parent" identifies the relation this Path scans, and "pathtarget"
+ * describes the precise set of output columns the Path would compute.
+ * In simple cases all Paths for a given rel share the same targetlist,
+ * which we represent by having path->pathtarget point to parent->reltarget.
+ *
  * "param_info", if not NULL, links to a ParamPathInfo that identifies outer
  * relation(s) that provide parameter values to each scan of this path.
  * That means this path can only be joined to those rels by means of nestloop
@@ -946,6 +1067,7 @@ typedef struct Path {
     NodeTag pathtype; /* tag identifying scan/join method */
 
     RelOptInfo* parent;        /* the relation this path can build */
+    PathTarget *pathtarget;    /* list of Vars/Exprs, cost, width */
     ParamPathInfo* param_info; /* parameterization info, or NULL if none */
 
     /* estimated size/costs for path (see costsize.c for more info) */
@@ -1054,6 +1176,7 @@ typedef struct PartIteratorPath {
     List* upperboundary;
     /* the lower boundary list for the partitions in pruning_result, it is meanless unless it is a partitionwise join */
     List* lowerboundary;
+    bool needSortNode; /* for min/max Optimization, need to add sort node. */
 } PartIteratorPath;
 
 /*
@@ -1278,6 +1401,8 @@ typedef struct JoinPath {
     Path path;
 
     JoinType jointype;
+    bool inner_unique; /* each outer tuple provably matches no more
+                               * than one inner tuple */
 
     Path* outerjoinpath; /* path for the outer side of the join */
     Path* innerjoinpath; /* path for the inner side of the join */
@@ -1296,6 +1421,36 @@ typedef struct JoinPath {
  * A nested-loop path needs no special fields.
  */
 typedef JoinPath NestPath;
+
+/*
+ * ProjectionPath represents a projection (that is, targetlist computation)
+ *
+ * Nominally, this path node represents using a Result plan node to do a
+ * projection step.  However, if the input plan node supports projection,
+ * we can just modify its output targetlist to do the required calculations
+ * directly, and not need a Result.  In some places in the planner we can just
+ * jam the desired PathTarget into the input path node (and adjust its cost
+ * accordingly), so we don't need a ProjectionPath.  But in other places
+ * it's necessary to not modify the input path node, so we need a separate
+ * ProjectionPath node, which is marked dummy to indicate that we intend to
+ * assign the work to the input plan node.  The estimated cost for the
+ * ProjectionPath node will account for whether a Result will be used or not.
+ */
+typedef struct ProjectionPath {
+    Path path;
+    Path *subpath; /* path representing input source */
+    bool dummypp;  /* true if no separate Result is needed */
+} ProjectionPath;
+
+/*
+ * ProjectSetPath represents evaluation of a targetlist that includes
+ * set-returning function(s), which will need to be implemented by a
+ * ProjectSet plan node.
+ */
+typedef struct ProjectSetPath {
+    Path path;
+    Path *subpath; /* path representing input source */
+} ProjectSetPath;
 
 /*
  * A mergejoin path has these fields.
@@ -1329,6 +1484,7 @@ typedef struct MergePath {
     List* path_mergeclauses;  /* join clauses to be used for merge */
     List* outersortkeys;      /* keys for explicit sort, if any */
     List* innersortkeys;      /* keys for explicit sort, if any */
+    bool skip_mark_restore;		/* can executor skip mark/restore? */
     bool materialize_inner;   /* add Materialize to inner? */
     OpMemInfo outer_mem_info; /* Mem info for outer explicit sort */
     OpMemInfo inner_mem_info; /* Mem info for inner explicit sort */
@@ -1952,8 +2108,8 @@ typedef struct PlannerParamItem {
 } PlannerParamItem;
 
 /*
- * When making cost estimates for a SEMI or ANTI join, there are some
- * correction factors that are needed in both nestloop and hash joins
+ * When making cost estimates for a SEMI/ANTI/inner_unique join, there are
+ * some correction factors that are needed in both nestloop and hash joins
  * to account for the fact that the executor can stop scanning inner rows
  * as soon as it finds a match to the current outer row.  These numbers
  * depend only on the selected outer and inner join relations, not on the
@@ -1974,6 +2130,13 @@ typedef struct SemiAntiJoinFactors {
     Selectivity outer_match_frac;
     Selectivity match_count;
 } SemiAntiJoinFactors;
+
+typedef struct JoinPathExtraData
+{
+    bool inner_unique;
+    SpecialJoinInfo *sjinfo;
+    SemiAntiJoinFactors semifactors;
+} JoinPathExtraData;
 
 /*
  * For speed reasons, cost estimation for join paths is performed in two

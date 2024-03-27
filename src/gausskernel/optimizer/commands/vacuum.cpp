@@ -21,14 +21,11 @@
  *
  * -------------------------------------------------------------------------
  */
-#include "access/dfs/dfs_query.h" /* stay here, otherwise compile errors */
 #include "postgres.h"
 #include "knl/knl_variable.h"
-
 #include <math.h>
 
 #include "access/clog.h"
-#include "access/dfs/dfs_insert.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/reloptions.h"
@@ -36,7 +33,6 @@
 #include "access/xact.h"
 #include "access/tableam.h"
 #include "access/multixact.h"
-#include "catalog/dfsstore_ctlg.h"
 #include "catalog/namespace.h"
 #include "catalog/gs_matview.h"
 #include "catalog/pg_database.h"
@@ -118,13 +114,10 @@ typedef struct {
     oidvector* bucketList;
 } VacStates;
 
-extern void exec_query_for_merge(const char* query_string);
-
 extern void do_delta_merge(List* infos, VacuumStmt* stmt);
 
 /* release all memory in infos */
 static void free_merge_info(List* infos);
-static void DropEmptyPartitionDirectories(Oid relid);
 
 /* A few variables that don't seem worth passing around as parameters */
 static THR_LOCAL BufferAccessStrategy vac_strategy;
@@ -268,6 +261,9 @@ void vacuum(
      * build one, we put it in vac_context for safekeeping.)
      */
     relations = get_rel_oids(relid, vacstmt);
+    if (relations == NIL) {
+        return;
+    }
 
     /*
      * Decide whether we need to start/commit our own transactions.
@@ -575,14 +571,6 @@ static vacuum_object *GetVacuumObjectOfSubpartition(VacuumStmt* vacstmt, Oid rel
 {
     Assert(PointerIsValid(vacstmt->relation->subpartitionname));
 
-    /*
-    * for dfs table, there is no partition table now so just return
-    * for dfs special vacuum.
-    */
-    if (hdfsVcuumAction(vacstmt->options)) {
-        return NULL;
-    }
-
     Oid partitionid = InvalidOid;
     Oid subpartitionid = InvalidOid;
     Form_pg_partition subpartitionForm;
@@ -590,9 +578,9 @@ static vacuum_object *GetVacuumObjectOfSubpartition(VacuumStmt* vacstmt, Oid rel
     MemoryContext oldcontext = NULL;
     vacuum_object* vacObj = NULL;
 
-    subpartitionid = partitionNameGetPartitionOid(relationid,
+    subpartitionid = SubPartitionNameGetSubPartitionOid(relationid,
         vacstmt->relation->subpartitionname,
-        PART_OBJ_TYPE_TABLE_SUB_PARTITION,
+        AccessShareLock,
         AccessShareLock,
         true,
         false,
@@ -679,6 +667,7 @@ List* get_rel_oids(Oid relid, VacuumStmt* vacstmt)
         vacObj = (vacuum_object*)palloc0(sizeof(vacuum_object));
         vacObj->tab_oid = relid;
         vacObj->flags = vacstmt->flags;
+        vacObj->gpi_vacuumed = vacstmt->gpi_vacuumed;
         oid_list = lappend(oid_list, vacObj);
 
         if (!IsAutoVacuumWorkerProcess()) {
@@ -707,7 +696,10 @@ List* get_rel_oids(Oid relid, VacuumStmt* vacstmt)
          * we're going to commit this transaction and begin a new one between
          * now and then.
          */
-        relationid = RangeVarGetRelidExtended(vacstmt->relation, NoLock, false, false, false, true, NULL, NULL);
+        relationid = RangeVarGetRelidExtended(vacstmt->relation, NoLock, true, false, false, true, NULL, NULL);
+        if (!OidIsValid(relationid)) {
+            return NIL;
+        }
 
         if (is_incremental_matview(relationid) && (vacstmt->options & VACOPT_FULL)) {
             ereport(ERROR,
@@ -739,15 +731,8 @@ List* get_rel_oids(Oid relid, VacuumStmt* vacstmt)
 
         /* 1.a partition */
         if (PointerIsValid(vacstmt->relation->partitionname)) {
-            /*
-             * for dfs table, there is no partition table now so just return
-             * for dfs special vacuum.
-             */
-            if (hdfsVcuumAction(vacstmt->options)) {
-                return NIL;
-            }
 
-            partitionid = partitionNameGetPartitionOid(relationid,
+            partitionid = PartitionNameGetPartitionOid(relationid,
                 vacstmt->relation->partitionname,
                 PART_OBJ_TYPE_TABLE_PARTITION,
                 AccessShareLock,
@@ -783,6 +768,7 @@ List* get_rel_oids(Oid relid, VacuumStmt* vacstmt)
                     vacObj = (vacuum_object *)palloc0(sizeof(vacuum_object));
                     vacObj->tab_oid = partitionid;
                     vacObj->parent_oid = relationid;
+                    vacObj->gpi_vacuumed = vacstmt->gpi_vacuumed;
                     vacObj->flags = VACFLG_SUB_PARTITION;
                     oid_list = lappend(oid_list, vacObj);
 
@@ -812,6 +798,7 @@ List* get_rel_oids(Oid relid, VacuumStmt* vacstmt)
                         vacObj = (vacuum_object *)palloc0(sizeof(vacuum_object));
                         vacObj->tab_oid = HeapTupleGetOid(subPartTuple);
                         vacObj->parent_oid = HeapTupleGetOid(partitionTup);
+                        vacObj->gpi_vacuumed = vacstmt->gpi_vacuumed;
                         vacObj->flags = VACFLG_SUB_PARTITION;
                         oid_list = lappend(oid_list, vacObj);
 
@@ -1097,6 +1084,9 @@ void vacuum_set_xid_limits(Relation rel, int64 freeze_min_age, int64 freeze_tabl
     TransactionId safeLimit;
     TransactionId nextXid;
 
+    /* Recompute replication_slot_xmin before GetOldestXmin */
+    ReplicationSlotsComputeRequiredXmin(false);
+
     /*
      * We can always ignore processes running lazy vacuum.	This is because we
      * use these values only for deciding which tuples we must keep in the
@@ -1318,11 +1308,12 @@ void vac_update_relstats(Relation relation, Relation classRel, RelPageType num_p
     HeapTuple nctup = NULL;
     Form_pg_class pgcform;
     bool dirty = false;
-    bool isNull = false;
+    bool frozenxid64IsNull = false;
+    bool relminmxidIsNull = false;
     TransactionId relfrozenxid;
     Datum xid64datum;
     bool isGtt = false;
-    MultiXactId relminmxid;
+    MultiXactId relminmxid = MaxMultiXactId;
 
     /* global temp table remember relstats to localhash and rel->rd_rel, not catalog */
     if (RELATION_IS_GLOBAL_TEMP(relation)) {
@@ -1398,30 +1389,23 @@ void vac_update_relstats(Relation relation, Relation classRel, RelPageType num_p
      * backend.
      * Caller can pass InvalidTransactionId if it has no new data.
      */
-    xid64datum = tableam_tops_tuple_getattr(ctup, Anum_pg_class_relfrozenxid64, RelationGetDescr(classRel), &isNull);
-
-    if (isNull) {
-        relfrozenxid = pgcform->relfrozenxid;
-
-        if (TransactionIdPrecedes(t_thrd.xact_cxt.ShmemVariableCache->nextXid, relfrozenxid) ||
-            !TransactionIdIsNormal(relfrozenxid))
-            relfrozenxid = FirstNormalTransactionId;
-    } else {
-        relfrozenxid = DatumGetTransactionId(xid64datum);
-    }
+    xid64datum = tableam_tops_tuple_getattr(ctup, Anum_pg_class_relfrozenxid64, RelationGetDescr(classRel),
+        &frozenxid64IsNull);
+    Assert(!frozenxid64IsNull);
+    relfrozenxid = DatumGetTransactionId(xid64datum);
 
 #ifndef ENABLE_MULTIPLE_NODES
     Datum minmxidDatum = tableam_tops_tuple_getattr(ctup,
         Anum_pg_class_relminmxid,
         RelationGetDescr(classRel),
-        &isNull);
-    relminmxid = isNull ? InvalidMultiXactId : DatumGetTransactionId(minmxidDatum);
+        &relminmxidIsNull);
+    relminmxid = relminmxidIsNull ? InvalidMultiXactId : DatumGetTransactionId(minmxidDatum);
 #endif
 
     if ((TransactionIdIsNormal(frozenxid) && (TransactionIdPrecedes(relfrozenxid, frozenxid)
                                                 || !IsPostmasterEnvironment)) ||
         (MultiXactIdIsValid(minmulti) && (MultiXactIdPrecedes(relminmxid, minmulti)
-                                                || !IsPostmasterEnvironment)) || isNull
+                                                || !IsPostmasterEnvironment)) || relminmxidIsNull
     ) {
 
         Datum values[Natts_pg_class];
@@ -1444,7 +1428,7 @@ void vac_update_relstats(Relation relation, Relation classRel, RelPageType num_p
         }
 
 #ifndef ENABLE_MULTIPLE_NODES
-        if ((MultiXactIdIsValid(minmulti) && MultiXactIdPrecedes(relminmxid, minmulti)) || isNull) {
+        if ((MultiXactIdIsValid(minmulti) && MultiXactIdPrecedes(relminmxid, minmulti)) || relminmxidIsNull) {
             replaces[Anum_pg_class_relminmxid - 1] = true;
             values[Anum_pg_class_relminmxid - 1] = TransactionIdGetDatum(minmulti);
         }
@@ -1457,7 +1441,7 @@ void vac_update_relstats(Relation relation, Relation classRel, RelPageType num_p
 
     /* If anything changed, write out the tuple. */
     if (dirty) {
-        if (isNull && nctup) {
+        if (relminmxidIsNull && nctup) {
             simple_heap_update(classRel, &ctup->t_self, ctup);
             CatalogUpdateIndexes(classRel, ctup);
         } else
@@ -1498,7 +1482,8 @@ void vac_update_datfrozenxid(void)
     TransactionId lastSaneFrozenXid;
     bool dirty = false;
     bool bogus = false;
-    bool isNull = false;
+    bool fronzenxid64IsNull = false;
+    bool datminmxidIsNull = false;
     TransactionId datfrozenxid;
     TransactionId relfrozenxid;
     Datum xid64datum;
@@ -1541,6 +1526,7 @@ void vac_update_datfrozenxid(void)
 
     while ((classTup = systable_getnext(scan)) != NULL) {
         Form_pg_class classForm = (Form_pg_class)GETSTRUCT(classTup);
+        bool tmpIsNullInPgClass = false;
 
         /*
          * Only consider heap and TOAST tables (anything else should have
@@ -1556,17 +1542,10 @@ void vac_update_datfrozenxid(void)
             continue;
         }
 
-        xid64datum = tableam_tops_tuple_getattr(classTup, Anum_pg_class_relfrozenxid64, RelationGetDescr(relation), &isNull);
-
-        if (isNull) {
-            relfrozenxid = classForm->relfrozenxid;
-
-            if (TransactionIdPrecedes(t_thrd.xact_cxt.ShmemVariableCache->nextXid, relfrozenxid) ||
-                !TransactionIdIsNormal(relfrozenxid))
-                relfrozenxid = FirstNormalTransactionId;
-        } else
-            relfrozenxid = DatumGetTransactionId(xid64datum);
-
+        xid64datum = tableam_tops_tuple_getattr(classTup, Anum_pg_class_relfrozenxid64, RelationGetDescr(relation),
+            &tmpIsNullInPgClass);
+        Assert(!tmpIsNullInPgClass);
+        relfrozenxid = DatumGetTransactionId(xid64datum);
         Assert(TransactionIdIsNormal(relfrozenxid));
 
         /*
@@ -1600,9 +1579,10 @@ void vac_update_datfrozenxid(void)
             newFrozenXid = relfrozenxid;
 
 #ifndef ENABLE_MULTIPLE_NODES
+        tmpIsNullInPgClass = false;
         minmxidDatum = tableam_tops_tuple_getattr(
-            classTup, Anum_pg_class_relminmxid, RelationGetDescr(relation), &isNull);
-        relminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(minmxidDatum);
+            classTup, Anum_pg_class_relminmxid, RelationGetDescr(relation), &tmpIsNullInPgClass);
+        relminmxid = tmpIsNullInPgClass ? FirstMultiXactId : DatumGetTransactionId(minmxidDatum);
 
         if (MultiXactIdIsValid(relminmxid) && MultiXactIdPrecedes(relminmxid, newFrozenMulti))
             newFrozenMulti = relminmxid;
@@ -1623,7 +1603,7 @@ void vac_update_datfrozenxid(void)
     * Global temp table get frozenxid from MyProc
     * to avoid the vacuum truncate clog that gtt need.
     */
-    if (u_sess->attr.attr_storage.max_active_gtt > 0) {
+    if (g_instance.attr.attr_storage.max_active_gtt > 0) {
         TransactionId safeAge;
         TransactionId oldestGttFrozenxid = InvalidTransactionId;
         if (ENABLE_THREAD_POOL) {
@@ -1676,26 +1656,22 @@ void vac_update_datfrozenxid(void)
      * standalone backend and we want to bring the datfrozenxid in sync with gxid.
      * Also detect the common case where it doesn't go forward either.
      */
-    xid64datum = tableam_tops_tuple_getattr(tuple, Anum_pg_database_datfrozenxid64, RelationGetDescr(relation), &isNull);
-
-    if (isNull) {
-        datfrozenxid = dbform->datfrozenxid;
-
-        if (TransactionIdPrecedes(t_thrd.xact_cxt.ShmemVariableCache->nextXid, datfrozenxid))
-            datfrozenxid = FirstNormalTransactionId;
-    } else {
-        datfrozenxid = DatumGetTransactionId(xid64datum);
-    }
+    xid64datum = tableam_tops_tuple_getattr(tuple, Anum_pg_database_datfrozenxid64, RelationGetDescr(relation),
+        &fronzenxid64IsNull);
+    Assert(!fronzenxid64IsNull);
+    datfrozenxid = DatumGetTransactionId(xid64datum);
 
     /* Consider frozenxid of objects in recyclebin. */
     TrAdjustFrozenXid64(u_sess->proc_cxt.MyDatabaseId, &newFrozenXid);
 
 #ifndef ENABLE_MULTIPLE_NODES
-    minmxidDatum = tableam_tops_tuple_getattr(tuple, Anum_pg_database_datminmxid, RelationGetDescr(relation), &isNull);
-    datminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(minmxidDatum);
+    minmxidDatum = tableam_tops_tuple_getattr(tuple, Anum_pg_database_datminmxid, RelationGetDescr(relation),
+        &datminmxidIsNull);
+    datminmxid = datminmxidIsNull ? FirstMultiXactId : DatumGetTransactionId(minmxidDatum);
 #endif
 
-    if ((TransactionIdPrecedes(datfrozenxid, newFrozenXid)) || (MultiXactIdPrecedes(datminmxid, newFrozenMulti))
+    if ((TransactionIdPrecedes(datfrozenxid, newFrozenXid)) || (MultiXactIdPrecedes(datminmxid, newFrozenMulti)
+        || datminmxidIsNull)
 #ifdef PGXC
         || !IsPostmasterEnvironment
 #endif
@@ -1719,7 +1695,7 @@ void vac_update_datfrozenxid(void)
             values[Anum_pg_database_datfrozenxid64 - 1] = TransactionIdGetDatum(newFrozenXid);
         }
 #ifndef ENABLE_MULTIPLE_NODES
-        if (MultiXactIdPrecedes(datminmxid, newFrozenMulti)) {
+        if (MultiXactIdPrecedes(datminmxid, newFrozenMulti) || datminmxidIsNull) {
             replaces[Anum_pg_database_datminmxid - 1] = true;
             values[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(newFrozenMulti);
         }
@@ -1729,7 +1705,7 @@ void vac_update_datfrozenxid(void)
     }
 
     if (dirty) {
-        if (isNull) {
+        if (datminmxidIsNull) {
             simple_heap_update(relation, &newtuple->t_self, newtuple);
             CatalogUpdateIndexes(relation, newtuple);
         } else
@@ -1743,10 +1719,9 @@ void vac_update_datfrozenxid(void)
 
     /*
      * If we were able to advance datfrozenxid, see if we can truncate
-     * pg_clog. Also do it if the shared XID-wrap-limit info is stale, since
-     * this action will update that too.
+     * pg_clog.
      */
-    if (dirty || ForceTransactionIdLimitUpdate()) {
+    if (dirty) {
         vac_truncate_clog(newFrozenXid, newFrozenMulti);
     }
 }
@@ -2481,6 +2456,12 @@ static bool vacuum_rel(Oid relid, VacuumStmt* vacstmt, bool do_toast)
      * warning here; it would just lead to chatter during a database-wide
      * VACUUM.)
      */
+    if (ENABLE_DSS && RELATION_IS_TEMP(onerel)) {
+        CloseAllRelationsBeforeReturnFalse();
+        proc_snapshot_and_transaction();
+        return false;
+    }
+
     if (RELATION_IS_OTHER_TEMP(onerel)) {
         CloseAllRelationsBeforeReturnFalse();
 
@@ -2675,10 +2656,14 @@ static bool vacuum_rel(Oid relid, VacuumStmt* vacstmt, bool do_toast)
             ereport(messageLevel, (errmsg("skipping \"%s\" --- foreign table does not support vacuum",
                     RelationGetRelationName(onerel))));
         }
-    } else if ((vacstmt->options & VACOPT_FULL) && (vacstmt->flags & VACFLG_SIMPLE_HEAP)) {
+    } else if ((vacstmt->options & VACOPT_FULL) && RelationIsUstoreFormat(onerel)) {
 #else
-    if ((vacstmt->options & VACOPT_FULL) && (vacstmt->flags & VACFLG_SIMPLE_HEAP)) {
+    if ((vacstmt->options & VACOPT_FULL) && RelationIsUstoreFormat(onerel)) {
 #endif
+        ereport(INFO, (errmsg("skipping \"%s\" --- Don't vacuum full ustore table,"
+            "this feature to be released in the future.",
+            RelationGetRelationName(onerel))));
+    } else if ((vacstmt->options & VACOPT_FULL) && (vacstmt->flags & VACFLG_SIMPLE_HEAP)) {
         bool is_hdfs_rel = RelationIsPAXFormat(onerel);
         if (is_hdfs_rel) {
             ereport(LOG, (errmsg("vacuum full for DFS table: %s", onerel->rd_rel->relname.data)));
@@ -2697,24 +2682,20 @@ static bool vacuum_rel(Oid relid, VacuumStmt* vacstmt, bool do_toast)
         onerel = NULL;
         pgstat_report_waitstatus_relname(STATE_VACUUM_FULL, get_nsp_relname(relid));
 
-        if (is_hdfs_rel) {
-            DfsVacuumFull(relid, vacstmt);
-        } else {
-            /* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
-            cluster_rel(relid,
-                InvalidOid,
-                InvalidOid,
-                false,
-                (vacstmt->options & VACOPT_VERBOSE) != 0,
-                vacstmt->freeze_min_age,
-                vacstmt->freeze_table_age,
-                &vacstmt->memUsage,
-                vacstmt->relation != NULL);
-            /* Record changecsn when VACUUM FULL occur */
-            Relation rel = RelationIdGetRelation(relid);
-            UpdatePgObjectChangecsn(relid, rel->rd_rel->relkind);
-            RelationClose(rel);
-        }
+        /* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
+        cluster_rel(relid,
+            InvalidOid,
+            InvalidOid,
+            false,
+            (vacstmt->options & VACOPT_VERBOSE) != 0,
+            vacstmt->freeze_min_age,
+            vacstmt->freeze_table_age,
+            &vacstmt->memUsage,
+            vacstmt->relation != NULL);
+        /* Record changecsn when VACUUM FULL occur */
+        Relation rel = RelationIdGetRelation(relid);
+        UpdatePgObjectChangecsn(relid, rel->rd_rel->relkind);
+        RelationClose(rel);
     } else if ((vacstmt->options & VACOPT_FULL) && (vacstmt->flags & VACFLG_SUB_PARTITION)) {
         if (OidIsValid(subparentid)) {
             releaseDummyRelation(&onerel);
@@ -2745,6 +2726,11 @@ static bool vacuum_rel(Oid relid, VacuumStmt* vacstmt, bool do_toast)
         /* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
         pgstat_report_waitstatus_relname(STATE_VACUUM_FULL, get_nsp_relname(relid));
         vacuumFullPart(relid, vacstmt, vacstmt->freeze_min_age, vacstmt->freeze_table_age);
+
+        /* Record changecsn when VACUUM FULL occur */
+        Relation rel = RelationIdGetRelation(relationid);
+        UpdatePgObjectChangecsn(relationid, rel->rd_rel->relkind);
+        RelationClose(rel);
     } else if ((vacstmt->options & VACOPT_FULL) && (vacstmt->flags & VACFLG_MAIN_PARTITION)) {
         if (cudescrel != NULL) {
             relation_close(cudescrel, NoLock);
@@ -2760,14 +2746,15 @@ static bool vacuum_rel(Oid relid, VacuumStmt* vacstmt, bool do_toast)
         pgstat_report_waitstatus_relname(STATE_VACUUM_FULL, get_nsp_relname(relid));
         GpiVacuumFullMainPartiton(relid);
         CBIVacuumFullMainPartiton(relid);
+        RelationResetPartitionno(relid, AccessExclusiveLock);
         pgstat_report_vacuum(relid, InvalidOid, false, 0);
+
+        /* Record changecsn when VACUUM FULL occur */
+        Relation rel = RelationIdGetRelation(relid);
+        UpdatePgObjectChangecsn(relid, rel->rd_rel->relkind);
+        RelationClose(rel);
     } else if (!(vacstmt->options & VACOPT_FULL)) {
-        /* clean hdfs empty directories of value partition just on main CN */
-        if (vacstmt->options & VACOPT_HDFSDIRECTORY) {
-            if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
-                DropEmptyPartitionDirectories(relid);
-            }
-        } else if (vacuumMainPartition((uint32)(vacstmt->flags))) {
+        if (vacuumMainPartition((uint32)(vacstmt->flags))) {
             pgstat_report_waitstatus_relname(STATE_VACUUM, get_nsp_relname(relid));
             if (isPartitionedUHeap) {
                 UstoreVacuumMainPartitionGPIs(onerel, vacstmt, lmode, vac_strategy);
@@ -2984,7 +2971,8 @@ void vac_update_partstats(Partition part, BlockNumber num_pages, double num_tupl
     HeapTuple nparttup = NULL;
     Form_pg_partition partform;
     bool dirty = false;
-    bool isNull = false;
+    bool frozenxid64IsNull = false;
+    bool relminmxidIsNull = false;
     TransactionId relfrozenxid;
     Datum xid64datum;
     MultiXactId relminmxid = MaxMultiXactId;
@@ -3025,26 +3013,19 @@ void vac_update_partstats(Partition part, BlockNumber num_pages, double num_tupl
      * relfrozenxid should never go backward.  Caller can pass
      * InvalidTransactionId if it has no new data.
      */
-    xid64datum = tableam_tops_tuple_getattr(parttup, Anum_pg_partition_relfrozenxid64, RelationGetDescr(rd), &isNull);
-
-    if (isNull) {
-        relfrozenxid = partform->relfrozenxid;
-
-        if (TransactionIdPrecedes(t_thrd.xact_cxt.ShmemVariableCache->nextXid, relfrozenxid) ||
-            !TransactionIdIsNormal(relfrozenxid))
-            relfrozenxid = FirstNormalTransactionId;
-    } else {
-        relfrozenxid = DatumGetTransactionId(xid64datum);
-    }
+    xid64datum = tableam_tops_tuple_getattr(parttup, Anum_pg_partition_relfrozenxid64, RelationGetDescr(rd),
+        &frozenxid64IsNull);
+    Assert(!frozenxid64IsNull);
+    relfrozenxid = DatumGetTransactionId(xid64datum);
 
 #ifndef ENABLE_MULTIPLE_NODES
     Datum minmxidDatum = tableam_tops_tuple_getattr(parttup, Anum_pg_partition_relminmxid,
-        RelationGetDescr(rd), &isNull);
-    relminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(minmxidDatum);
+        RelationGetDescr(rd), &relminmxidIsNull);
+    relminmxid = relminmxidIsNull ? FirstMultiXactId : DatumGetTransactionId(minmxidDatum);
 #endif
 
     if ((TransactionIdIsNormal(frozenxid) && TransactionIdPrecedes(relfrozenxid, frozenxid)) ||
-        (MultiXactIdIsValid(minmulti) && MultiXactIdPrecedes(relminmxid, minmulti))) {
+        (MultiXactIdIsValid(minmulti) && MultiXactIdPrecedes(relminmxid, minmulti)) || relminmxidIsNull) {
         Datum values[Natts_pg_partition];
         bool nulls[Natts_pg_partition];
         bool replaces[Natts_pg_partition];
@@ -3065,7 +3046,7 @@ void vac_update_partstats(Partition part, BlockNumber num_pages, double num_tupl
         }
 
 #ifndef ENABLE_MULTIPLE_NODES
-        if (MultiXactIdIsValid(minmulti) && MultiXactIdPrecedes(relminmxid, minmulti)) {
+        if ((MultiXactIdIsValid(minmulti) && MultiXactIdPrecedes(relminmxid, minmulti)) || relminmxidIsNull) {
             replaces[Anum_pg_partition_relminmxid - 1] = true;
             values[Anum_pg_partition_relminmxid - 1] = TransactionIdGetDatum(minmulti);
         }
@@ -3078,7 +3059,7 @@ void vac_update_partstats(Partition part, BlockNumber num_pages, double num_tupl
 
     /* If anything changed, write out the tuple. */
     if (dirty) {
-        if (isNull && nparttup) {
+        if (relminmxidIsNull && nparttup) {
             simple_heap_update(rd, &parttup->t_self, parttup);
             CatalogUpdateIndexes(rd, parttup);
         } else
@@ -3222,6 +3203,101 @@ void vac_close_part_indexes(
     pfree_ext(Irel);
 }
 
+static void CalculateSubPartitionedRelStats(_in_ Relation partitionRel, _in_ Relation partRel,
+    _out_ BlockNumber *totalPages, _out_ BlockNumber *totalVisiblePages, _out_ double *totalTuples,
+    _out_ TransactionId *minFrozenXid, _out_ MultiXactId *minMultiXid)
+{
+    Assert(RelationIsSubPartitioned(partitionRel));
+
+    BlockNumber pages = 0;
+    BlockNumber allVisiblePages = 0;
+    double tuples = 0;
+    ScanKeyData partKey[2];
+    SysScanDesc partScan = NULL;
+    HeapTuple partTuple = NULL;
+    ScanKeyData subpartKey[2];
+    SysScanDesc subpartScan = NULL;
+    HeapTuple subpartTuple = NULL;
+    Form_pg_partition partForm;
+    /* we set xid to max as an initial value, then we find the min xid in all subpartitions */
+    TransactionId frozenXid = MaxTransactionId;
+    MultiXactId multiXid = MaxMultiXactId;
+    bool isNull = false;
+
+    ScanKeyInit(&partKey[0], Anum_pg_partition_parttype, BTEqualStrategyNumber, F_CHAREQ,
+        CharGetDatum(PART_OBJ_TYPE_TABLE_PARTITION));
+    ScanKeyInit(&partKey[1], Anum_pg_partition_parentid, BTEqualStrategyNumber, F_OIDEQ,
+        ObjectIdGetDatum(RelationGetRelid(partitionRel)));
+    partScan = systable_beginscan(partRel, PartitionParentOidIndexId, true, NULL, 2, partKey);
+
+    while (HeapTupleIsValid(partTuple = systable_getnext(partScan))) {
+        ScanKeyInit(&subpartKey[0], Anum_pg_partition_parttype, BTEqualStrategyNumber, F_CHAREQ,
+            CharGetDatum(PART_OBJ_TYPE_TABLE_SUB_PARTITION));
+        ScanKeyInit(&subpartKey[1], Anum_pg_partition_parentid, BTEqualStrategyNumber, F_OIDEQ,
+            ObjectIdGetDatum(HeapTupleGetOid(partTuple)));
+        subpartScan = systable_beginscan(partRel, PartitionParentOidIndexId, true, NULL, 2, subpartKey);
+
+        while (HeapTupleIsValid(subpartTuple = systable_getnext(subpartScan))) {
+            partForm = (Form_pg_partition)GETSTRUCT(subpartTuple);
+            Datum xid64datum = tableam_tops_tuple_getattr(subpartTuple, Anum_pg_partition_relfrozenxid64,
+                RelationGetDescr(partRel), &isNull);
+            TransactionId relfrozenxid;
+            if (isNull) {
+                relfrozenxid = partForm->relfrozenxid;
+                if (TransactionIdPrecedes(t_thrd.xact_cxt.ShmemVariableCache->nextXid, relfrozenxid) ||
+                    !TransactionIdIsNormal(relfrozenxid))
+                    relfrozenxid = FirstNormalTransactionId;
+            } else {
+                relfrozenxid = DatumGetTransactionId(xid64datum);
+            }
+            if (TransactionIdPrecedes(relfrozenxid, frozenXid)) {
+                frozenXid = relfrozenxid;
+            }
+
+#ifndef ENABLE_MULTIPLE_NODES
+            Datum mxid64datum = tableam_tops_tuple_getattr(subpartTuple, Anum_pg_partition_relminmxid,
+                RelationGetDescr(partRel), &isNull);
+            MultiXactId relminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(mxid64datum);
+            if (TransactionIdPrecedes(relminmxid, multiXid)) {
+                multiXid = relminmxid;
+            }
+#endif
+
+            /* calculate pages and tuples from all the subpartitioned. */
+            pages += (uint32) partForm->relpages;
+            allVisiblePages += partForm->relallvisible;
+            tuples += partForm->reltuples;
+
+        }
+        systable_endscan(subpartScan);
+    }
+    systable_endscan(partScan);
+
+    /* if xid is maxvalue, means no subpartitions found, then we set it invalid */
+    if (frozenXid == MaxTransactionId) {
+        frozenXid = InvalidTransactionId;
+    }
+    if (multiXid == MaxMultiXactId) {
+        multiXid = InvalidMultiXactId;
+    }
+
+    if (totalPages != NULL) {
+        *totalPages = pages;
+    }
+    if (totalVisiblePages != NULL) {
+        *totalVisiblePages = allVisiblePages;
+    }
+    if (totalTuples != NULL) {
+        *totalTuples = tuples;
+    }
+    if (minFrozenXid != NULL) {
+        *minFrozenXid = frozenXid;
+    }
+    if (minMultiXid != NULL) {
+        *minMultiXid = multiXid;
+    }
+}
+
 /* Scan pg_partition to get all the partitions of the partitioned table,
  * calculate all the pages, tuples, and the min frozenXid, multiXid
  */
@@ -3240,13 +3316,13 @@ void CalculatePartitionedRelStats(_in_ Relation partitionRel, _in_ Relation part
     Assert(partitionRel->rd_rel->parttype == PARTTYPE_PARTITIONED_RELATION ||
            partitionRel->rd_rel->parttype == PARTTYPE_SUBPARTITIONED_RELATION);
 
-    if (partitionRel->rd_rel->parttype == PARTTYPE_SUBPARTITIONED_RELATION) {
-        ScanKeyInit(&partKey[0],
-            Anum_pg_partition_parttype,
-            BTEqualStrategyNumber,
-            F_CHAREQ,
-            CharGetDatum(PART_OBJ_TYPE_TABLE_SUB_PARTITION));
-    } else if (partitionRel->rd_rel->relkind == RELKIND_RELATION) {
+    if (RelationIsSubPartitioned(partitionRel)) {
+        CalculateSubPartitionedRelStats(partitionRel, partRel, totalPages, totalVisiblePages, totalTuples, minFrozenXid,
+            minMultiXid);
+        return;
+    }
+
+    if (partitionRel->rd_rel->relkind == RELKIND_RELATION) {
         ScanKeyInit(&partKey[0],
             Anum_pg_partition_parttype,
             BTEqualStrategyNumber,
@@ -3742,55 +3818,6 @@ static uint64 get_max_row(Oid relid)
 }
 
 /*
- * "vacuum deltamerge t1" will be splited into three SQLs in DN.
- */
-static void make_real_queries(MergeInfo* info)
-{
-    StringInfo deltaName = makeStringInfo();
-    Relation rel;
-    Oid deltaOid;
-
-    Assert(info);
-
-    ereport(DEBUG1, (errmsg("deltamerge: %s()", __FUNCTION__)));
-
-    rel = heap_open(info->oid, AccessShareLock);
-    deltaOid = RelationGetDeltaRelId(rel);
-    Relation deltaRel = relation_open(deltaOid, AccessShareLock);
-    appendStringInfo(deltaName, "%s", RelationGetRelationName(deltaRel));
-
-    relation_close(deltaRel, NoLock);
-    heap_close(rel, NoLock);
-
-    info->row_count_sql = makeStringInfo();
-    info->merge_sql = makeStringInfo();
-    info->vacuum_sql = makeStringInfo();
-
-    appendStringInfo(info->row_count_sql, sql_templates[ROW_COUNT_SQL_TEMPLATE], deltaName->data);
-    appendStringInfo(info->vacuum_sql, sql_templates[VACUUM_SQL_TEMPLATE], deltaName->data);
-
-    if (info->schemaname == NULL)
-        appendStringInfo(info->merge_sql,
-            sql_templates[MERGE_SQL_TEMPLATE],
-            info->relname->data,
-            info->relname->data,
-            deltaName->data,
-            deltaName->data);
-    else
-        appendStringInfo(info->merge_sql,
-            sql_templates[VACUUM_SQL_TEMPLATE_WITH_SCHEMA],
-            info->schemaname->data,
-            info->relname->data,
-            info->schemaname->data,
-            info->relname->data,
-            deltaName->data,
-            deltaName->data);
-
-    pfree_ext(deltaName->data);
-    pfree_ext(deltaName);
-}
-
-/*
  * Scan pg_class to determine which tables to merge.
  */
 static List* get_tables_to_merge()
@@ -3840,10 +3867,7 @@ static List* get_tables_to_merge()
             info->schemaname = makeStringInfo();
             appendStringInfo(info->schemaname, "%s", schema_name);
             pfree_ext(schema_name);
-
-            if (info->is_hdfs) {
-                make_real_queries(info);
-            }
+            Assert(!info->is_hdfs);
             infos = lappend(infos, info);
 
             ereport(DEBUG1,
@@ -3860,58 +3884,6 @@ static List* get_tables_to_merge()
     heap_close(classRel, AccessShareLock);
 
     return infos;
-}
-
-/*
- * merge_one_relation() will call exec_query_for_merge() for delta merge sql,
- */
-void merge_one_relation(void* _info)
-{
-    uint64 row_count;
-    CommandDest old_dest = (CommandDest)t_thrd.postgres_cxt.whereToSendOutput;
-
-    MergeInfo* info = (MergeInfo*)_info;
-
-    /*
-     * select count(*) from pg_delta_xxx
-     */
-    PG_TRY();
-    {
-        t_thrd.postgres_cxt.whereToSendOutput = DestNone;
-        exec_query_for_merge(info->row_count_sql->data);
-    }
-    PG_CATCH();
-    {
-        /* recover to old output config as early as possible */
-        t_thrd.postgres_cxt.whereToSendOutput = old_dest;
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    /* recover to old output config as early as possible */
-    t_thrd.postgres_cxt.whereToSendOutput = old_dest;
-
-    row_count = (uint64)DatumGetInt64(t_thrd.postgres_cxt.query_result);
-
-    ereport(DEBUG1,
-        (errmsg("deltamerge, count sql: %s, result: %lu, max_row: %lu",
-            info->row_count_sql->data,
-            row_count,
-            info->max_row)));
-
-    /*
-     * if data size of delta table is less than 60000 and cstore_insert_mode is
-     * not main, ignore delta merge.
-     */
-    if (row_count == 0 || (row_count < info->max_row && u_sess->attr.attr_storage.cstore_insert_mode != TO_MAIN))
-        return;
-
-    ereport(DEBUG1, (errmsg("deltamerge, merge sql: %s", info->merge_sql->data)));
-
-    /*
-     * do real merge, move data from delta table to main table
-     */
-    exec_query_for_merge(info->merge_sql->data);
 }
 
 /*
@@ -3968,12 +3940,8 @@ void begin_delta_merge(VacuumStmt* stmt)
             info->schemaname = makeStringInfo();
             appendStringInfo(info->schemaname, "%s", var->schemaname);
         }
-
-        if (info->is_hdfs)
-            make_real_queries(info);
-
+        Assert(!info->is_hdfs);
         infos = lappend(infos, info);
-
     } else {
         /*
          * get all merge sqls
@@ -4022,269 +3990,6 @@ static void free_merge_info(List* infos)
 
         pfree_ext(info);
     }
-}
-
-bool equal_string(const void* _str1, const void* _str2)
-{
-    StringInfo str1 = (StringInfo)_str1;
-    StringInfo str2 = (StringInfo)_str2;
-    if (pg_strcasecmp(str1->data, str2->data))
-        return false;
-    else
-        return true;
-}
-
-bool IsMember(const List* list, const void* datum, EqualFunc fn)
-{
-    const ListCell* cell = NULL;
-
-    foreach (cell, list) {
-        if ((*fn)(lfirst(cell), datum))
-            return true;
-    }
-
-    return false;
-}
-
-/*
- * get all items which is in list1 and not in list2
- */
-List* GetDifference(const List* list1, const List* list2, EqualFunc fn)
-{
-    List* result = NIL;
-
-    if (list2 == NIL)
-        return list_copy(list1);
-
-    const ListCell* cell = NULL;
-    foreach (cell, list1) {
-        if (!IsMember(list2, lfirst(cell), fn))
-            result = lappend(result, lfirst(cell));
-    }
-
-    return result;
-}
-
-/*
- * remove garbase files in the directory of the relation on hdfs, the garbase
- * files can be made because of other operation, such as the interrupt of insert.
- */
-void RemoveGarbageFiles(Relation rel, DFSDescHandler* handler)
-{
-    ListCell* lc = NULL;
-
-    /*
-     * get connection object and will be used in doPendingDfsDelete()
-     */
-    StringInfo store_path = getDfsStorePath(rel);
-    DfsSrvOptions* dfsoptions = GetDfsSrvOptions(rel->rd_rel->reltablespace);
-    dfs::DFSConnector* conn = dfs::createConnector(
-        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), dfsoptions, rel->rd_rel->reltablespace);
-
-    /*
-     * get files in desc table
-     */
-    List* descs = handler->GetAllDescs(SnapshotNow);
-    List* files_in_desc = NIL;
-    foreach (lc, descs) {
-        DFSDesc* desc = (DFSDesc*)lfirst(lc);
-
-        StringInfo fpath = makeStringInfo();
-        appendStringInfo(fpath, "%s", desc->GetFileName());
-
-        files_in_desc = lappend(files_in_desc, fpath);
-        desc->Destroy();
-        pfree_ext(desc);
-    }
-    list_free(descs);
-
-    /*
-     * get files in dir and remove garbage files
-     */
-    StringInfo fullpath = makeStringInfo();
-    List* files_in_dir = getDataFiles(rel->rd_id);
-
-    List* deleted = GetDifference(files_in_dir, files_in_desc, equal_string);
-    foreach (lc, deleted) {
-        resetStringInfo(fullpath);
-
-        StringInfo file = (StringInfo)lfirst(lc);
-        appendStringInfo(fullpath, "%s/%s", store_path->data, file->data);
-
-        ereport(DEBUG1,
-            (errmsg("remove_garbage_file: nodename: %s, delete file: %s",
-                g_instance.attr.attr_common.PGXCNodeName ? g_instance.attr.attr_common.PGXCNodeName : "",
-                fullpath->data)));
-
-        conn->deleteFile(fullpath->data, false);
-    }
-
-    foreach (lc, files_in_desc) {
-        StringInfo file = (StringInfo)lfirst(lc);
-        pfree_ext(file->data);
-        pfree_ext(file);
-    }
-    list_free(files_in_desc);
-
-    delete (conn);
-}
-
-/*
- * main entry of "VACUUM FULL" for DFS table
- *
- * @_in_param relid: Oid of DFS table
- * @_in_param vacstmt: statment for the DFS table with relid
- */
-void DfsVacuumFull(Oid relid, VacuumStmt* vacstmt)
-{
-    /*
-     * vacuum full just run on DN
-     */
-    if (IS_PGXC_COORDINATOR)
-        return;
-
-    /*
-     * "vacuum full" is default behavior, not "vacuum full compact"
-     */
-    t_thrd.vacuum_cxt.vacuum_full_compact = false;
-    if ((uint32)(vacstmt->options) & VACOPT_COMPACT)
-        t_thrd.vacuum_cxt.vacuum_full_compact = true;
-
-    /*
-     * reset pendingDfsDelete
-     */
-    ResetPendingDfsDelete();
-
-    /*
-     * block INSERT, DELETE and UPDATE operation, just SELECT can be run
-     * with "VACUUM FULL [ COMPACT ]" parallel.
-     */
-    Relation rel = heap_open(relid, ExclusiveLock);
-
-    /*
-     * create handler for desc table
-     */
-    DFSDescHandler* handler = New(CurrentMemoryContext) DFSDescHandler(MAX_LOADED_DFSDESC, rel->rd_att->natts, rel);
-
-    /*
-     * remove garbage files in store path
-     */
-    RemoveGarbageFiles(rel, handler);
-    delete (handler);
-
-    heap_close(rel, NoLock);
-
-    /*
-     * do all the dirty work
-     */
-    cluster_rel(relid,
-        InvalidOid,
-        InvalidOid,
-        false,
-        false,
-        vacstmt->freeze_min_age,
-        vacstmt->freeze_table_age,
-        &vacstmt->memUsage,
-        vacstmt->relation != NULL);
-}
-
-/*
- * drop all empty directories including root_path itself.
- *
- * @_in_param root_path: starting point
- */
-static void RemoveEmptyDir(char* root_path, dfs::DFSConnector* conn)
-{
-    bool file_exist = false;
-    List* sub_paths = conn->listDirectory(root_path, false);
-
-    ListCell* lc = NULL;
-    foreach (lc, sub_paths) {
-        char* sub_path = (char*)lfirst(lc);
-
-        if (!conn->isDfsFile(sub_path, false)) {
-            RemoveEmptyDir(sub_path, conn);
-        } else {
-            file_exist = true;
-        }
-    }
-
-    list_free(sub_paths);
-
-    if (file_exist) {
-        return;
-    }
-
-    /*
-     * drop the empty directory if no any staff in the root_path.
-     */
-    sub_paths = conn->listDirectory(root_path, false);
-    if (sub_paths == NIL) {
-        ereport(DEBUG1, (errmsg("vacuum_hdfsdir: remove hdfs dir: %s", root_path)));
-
-        if (conn->pathExists(root_path) && conn->deleteFile(root_path, 0) == -1) {
-            ereport(DEBUG1, (errmsg("vacuum_hdfsdir: Failed to remove hdfs dir: %s", root_path)));
-        }
-    }
-
-    list_free(sub_paths);
-}
-
-/*
- * drop all empty value partition directories which are belong to dfs table with
- * relid.
- *
- * @_in_param relid: Oid of dfs table
- */
-static void DropEmptyPartitionDirectories(Oid relid)
-{
-    Assert(relid);
-
-    /*
-     * vacuum full just run on main CN
-     */
-    if (IS_PGXC_DATANODE)
-        return;
-
-    /*
-     * open with ExclusiveLock, only select can be run on this relation
-     */
-    Relation rel = heap_open(relid, ExclusiveLock);
-    StringInfo store_path = getDfsStorePath(rel);
-
-    ereport(DEBUG1,
-        (errmsg("vacuum_hdfsdir: relname: %s, relid: %u, schemaid: %u, root_path: %s",
-            rel->rd_rel->relname.data,
-            relid,
-            rel->rd_rel->relnamespace,
-            store_path->data)));
-
-    /*
-     * get connection object and will be used in RemoveEmptyDir()
-     */
-    DfsSrvOptions* options = GetDfsSrvOptions(rel->rd_rel->reltablespace);
-    dfs::DFSConnector* conn = dfs::createConnector(
-        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), options, rel->rd_rel->reltablespace);
-
-    /*
-     * walk the root path of dfs table recursively
-     */
-    ListCell* lc = NULL;
-    List* sub_paths = conn->listDirectory(store_path->data, false);
-
-    foreach (lc, sub_paths) {
-        char* sub_path = (char*)lfirst(lc);
-
-        if (!conn->isDfsFile(sub_path, false)) {
-            RemoveEmptyDir(sub_path, conn);
-        }
-    }
-
-    list_free(sub_paths);
-
-    delete (conn);
-
-    heap_close(rel, NoLock);
 }
 
 void updateTotalRows(Oid relid, double num_tuples)
@@ -4425,6 +4130,7 @@ static void UstoreVacuumMainPartitionGPIs(Relation onerel, const VacuumStmt* vac
 {
     OidRBTree* invisibleParts = CreateOidRBTree();
     Oid parentOid = RelationGetRelid(onerel);
+    bool lockInterval = false;
 
     if (vacstmt->options & VACOPT_VERBOSE) {
         elevel = VERBOSEMESSAGE;
@@ -4433,11 +4139,13 @@ static void UstoreVacuumMainPartitionGPIs(Relation onerel, const VacuumStmt* vac
     }
 
     /* Get invisable parts */
-    if (ConditionalLockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK)) {
+    if (!RELATION_IS_INTERVAL_PARTITIONED(onerel)) {
         PartitionGetAllInvisibleParts(parentOid, &invisibleParts);
-        UnlockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK);
+    } else if (ConditionalLockPartitionObject(onerel->rd_id, INTERVAL_PARTITION_LOCK_SDEQUENCE, PARTITION_SHARE_LOCK)) {
+        PartitionGetAllInvisibleParts(parentOid, &invisibleParts);
+        lockInterval = true;
     }
-    
+
     /* In rbtree, rb_leftmost will return NULL if rbtree is empty. */
     if (rb_leftmost(invisibleParts) == NULL) {
         DestroyOidRBTree(&invisibleParts);
@@ -4470,17 +4178,19 @@ static void UstoreVacuumMainPartitionGPIs(Relation onerel, const VacuumStmt* vac
     heap_close(classRel, RowExclusiveLock);
 
     /*
-     * Before clearing the global partition index of a partition table,
-     * acquire a AccessShareLock on ADD_PARTITION_ACTION, and make sure that the interval partition
-     * creation process will not be performed concurrently.
+     * Before clearing the global partition index of a partition table, acquire a AccessShareLock on
+     * INTERVAL_PARTITION_LOCK_SDEQUENCE, and make sure that the interval partition creation process will not be
+     * performed concurrently.
      */
     OidRBTree* cleanedParts = CreateOidRBTree();
     OidRBTreeUnionOids(cleanedParts, invisibleParts);
-    if (ConditionalLockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK)) {
+    if (!RELATION_IS_INTERVAL_PARTITIONED(onerel)) {
         PartitionSetEnabledClean(parentOid, cleanedParts, invisibleParts, true);
-        UnlockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK);
+    } else if (lockInterval) {
+        PartitionSetEnabledClean(parentOid, cleanedParts, invisibleParts, true);
+        UnlockPartitionObject(onerel->rd_id, INTERVAL_PARTITION_LOCK_SDEQUENCE, PARTITION_SHARE_LOCK);
     } else {
-        /* Updates reloptions of cleanedParts in pg_partition after GPI vacuum is executed */
+        /* Updates reloptions of cleanedParts in pg_partition after gpi lazy_vacuum is executed */
         PartitionSetEnabledClean(parentOid, cleanedParts, invisibleParts, false);
     }
 
@@ -4498,6 +4208,7 @@ static void GPIVacuumMainPartition(
     OidRBTree* cleanedParts = CreateOidRBTree();
     OidRBTree* invisibleParts = CreateOidRBTree();
     Oid parentOid = RelationGetRelid(onerel);
+    bool lockInterval = false;
 
     if (vacstmt->options & VACOPT_VERBOSE) {
         elevel = VERBOSEMESSAGE;
@@ -4506,13 +4217,15 @@ static void GPIVacuumMainPartition(
     }
 
     /*
-     * Before clearing the global partition index of a partition table,
-     * acquire a AccessShareLock on ADD_PARTITION_ACTION, and make sure that the interval partition
-     * creation process will not be performed concurrently.
+     * Before clearing the global partition index of a partition table, acquire a AccessShareLock on
+     * INTERVAL_PARTITION_LOCK_SDEQUENCE, and make sure that the interval partition creation process will not be
+     * performed concurrently.
      */
-    if (ConditionalLockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK)) {
+    if (!RELATION_IS_INTERVAL_PARTITIONED(onerel)) {
         PartitionGetAllInvisibleParts(parentOid, &invisibleParts);
-        UnlockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK);
+    } else if (ConditionalLockPartitionObject(onerel->rd_id, INTERVAL_PARTITION_LOCK_SDEQUENCE, PARTITION_SHARE_LOCK)) {
+        PartitionGetAllInvisibleParts(parentOid, &invisibleParts);
+        lockInterval = true;
     }
 
     vac_strategy = bstrategy;
@@ -4538,9 +4251,11 @@ static void GPIVacuumMainPartition(
      * acquire a AccessShareLock on ADD_PARTITION_ACTION, and make sure that the interval partition
      * creation process will not be performed concurrently.
      */
-    if (ConditionalLockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK)) {
+    if (!RELATION_IS_INTERVAL_PARTITIONED(onerel)) {
         PartitionSetEnabledClean(parentOid, cleanedParts, invisibleParts, true);
-        UnlockPartition(parentOid, ADD_PARTITION_ACTION, AccessShareLock, PARTITION_SEQUENCE_LOCK);
+    } else if (lockInterval) {
+        PartitionSetEnabledClean(parentOid, cleanedParts, invisibleParts, true);
+        UnlockPartitionObject(onerel->rd_id, INTERVAL_PARTITION_LOCK_SDEQUENCE, PARTITION_SHARE_LOCK);
     } else {
         /* Updates reloptions of cleanedParts in pg_partition after gpi lazy_vacuum is executed */
         PartitionSetEnabledClean(parentOid, cleanedParts, invisibleParts, false);
@@ -4601,5 +4316,17 @@ static void CBIVacuumMainPartition(
     }
 
     pfree_ext(iRel);
+}
+
+int GetVacuumLogLevel(void)
+{
+#ifndef ENABLE_LITE_MODE
+    return LOG;
+#else
+    if (module_logging_is_on(MOD_VACUUM)) {
+        return LOG;
+    }
+    return DEBUG2;
+#endif
 }
 

@@ -155,7 +155,7 @@ void CSNLogSetCommitSeqNo(TransactionId xid, int nsubxids, TransactionId *subxid
         pageno = TransactionIdToCSNPage(subxids[offset]);
         xid = InvalidTransactionId;
     }
-    if (IS_DISASTER_RECOVER_MODE && COMMITSEQNO_IS_COMMITTED(csn)) {
+    if (IS_MULTI_DISASTER_RECOVER_MODE && COMMITSEQNO_IS_COMMITTED(csn)) {
         UpdateXLogMaxCSN(csn);
     }
 }
@@ -176,6 +176,11 @@ void CSNLogSetCommitSeqNo(TransactionId xid, int nsubxids, TransactionId *subxid
 static void CSNLogSetPageStatus(TransactionId xid, int nsubxids, TransactionId *subxids, CommitSeqNo csn, int64 pageno,
                                 TransactionId topxid)
 {
+    if (SS_STANDBY_MODE) {
+        ereport(WARNING, (errmodule(MOD_DMS), errmsg("DMS standby can't set csnlog status")));
+        return;
+    }
+
     int slotno;
     int i;
     bool modified = false;
@@ -250,6 +255,11 @@ restart:
  */
 void SubTransSetParent(TransactionId xid, TransactionId parent)
 {
+    if (SS_STANDBY_MODE) {
+        ereport(WARNING, (errmodule(MOD_DMS), errmsg("DMS standby can't set csnlog status")));
+        return;
+    }
+
     int64 pageno = TransactionIdToCSNPage(xid);
     int entryno = TransactionIdToCSNPgIndex(xid);
     int slotno;
@@ -466,6 +476,8 @@ CommitSeqNo CSNLogGetNestCommitSeqNo(TransactionId xid)
 CommitSeqNo CSNLogGetDRCommitSeqNo(TransactionId xid)
 {
     CommitSeqNo csn = InvalidCommitSeqNo;
+    uint32 saveInterruptHoldoffCount = t_thrd.int_cxt.InterruptHoldoffCount;
+    MemoryContext old = CurrentMemoryContext;
     PG_TRY();
     {
         csn = CSNLogGetCommitSeqNo(xid);
@@ -473,6 +485,9 @@ CommitSeqNo CSNLogGetDRCommitSeqNo(TransactionId xid)
     PG_CATCH();
     {
         if (t_thrd.xact_cxt.slru_errcause == SLRU_OPEN_FAILED) {
+            MemoryContextSwitchTo(old);
+            FlushErrorState();
+            t_thrd.int_cxt.InterruptHoldoffCount = saveInterruptHoldoffCount;
             csn = InvalidCommitSeqNo;
         } else {
             PG_RE_THROW();
@@ -558,7 +573,7 @@ void CSNLOGShmemInit(void)
         rc = sprintf_s(name, SLRU_MAX_NAME_LENGTH, "%s%d", "CSNLOG Ctl", i);
         securec_check_ss(rc, "\0", "\0");
         SimpleLruInit(CsnlogCtl(i), name, LWTRANCHE_CSNLOG_CTL, CSNLOGShmemBuffers(), 0,
-                      CSNBufMappingPartitionLockByIndex(i), "pg_csnlog", i);
+                      CSNBufMappingPartitionLockByIndex(i), CSNLOGDIR, i);
     }
 }
 
@@ -810,4 +825,18 @@ void TruncateCSNLOG(TransactionId oldestXact)
     SimpleLruTruncate(CsnlogCtl(0), cutoffPage, NUM_CSNLOG_PARTITIONS);
 
     elog(LOG, "truncate CSN log oldestXact %lu, next xid %lu", oldestXact, t_thrd.xact_cxt.ShmemVariableCache->nextXid);
+}
+
+void SSCSNLOGShmemClear(void)
+{
+    int i;
+    int rc = 0;
+    char name[SLRU_MAX_NAME_LENGTH];
+
+    for (i = 0; i < NUM_CSNLOG_PARTITIONS; i++) {
+        rc = sprintf_s(name, SLRU_MAX_NAME_LENGTH, "%s%d", "CSNLOG Ctl", i);
+        securec_check_ss(rc, "\0", "\0");
+        SimpleLruSetPageEmpty(CsnlogCtl(i), name, (int)LWTRANCHE_CSNLOG_CTL, (int)CSNLOGShmemBuffers(), 0,
+            CSNBufMappingPartitionLockByIndex(i), CSNLOGDIR, i);
+    }
 }

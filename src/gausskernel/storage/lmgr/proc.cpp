@@ -51,6 +51,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/snapcapturer.h"
+#include "postmaster/cfs_shrinker.h"
 #include "postmaster/rbcleaner.h"
 #include "replication/slot.h"
 #ifdef PGXC
@@ -62,7 +63,6 @@
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
-#include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/spin.h"
 #include "utils/timestamp.h"
@@ -81,6 +81,7 @@
 #endif   /* ENABLE_MULTIPLE_NODES */
 
 #define MAX_NUMA_NODE 16
+#define BACKEND_TYPE_CMAGENT 0x0020
 
 extern THR_LOCAL uint32 *g_workingVersionNum;
 
@@ -89,6 +90,9 @@ static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
 static bool CheckStatementTimeout(void);
 static void CheckSessionTimeout(void);
+#ifndef ENABLE_MULTIPLE_NODES
+static void CheckIdleInTransactionSessionTimeout(void);
+#endif
 
 static bool CheckStandbyTimeout(void);
 static void FiniNuma(int code, Datum arg);
@@ -129,7 +133,8 @@ int ProcGlobalSemas(void)
      * We need a sema per backend (including autovacuum), plus one for each
      * auxiliary process.
      */
-    return g_instance.shmem_cxt.MaxBackends + NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS;
+    return (g_instance.shmem_cxt.MaxBackends + NUM_CMAGENT_PROCS + \
+            NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS + NUM_DMS_CALLBACK_PROCS);
 }
 
 /*
@@ -246,7 +251,7 @@ int GetThreadPoolStreamProcNum()
 void InitProcGlobal(void)
 {
     PGPROC **procs = NULL;
-    int i, j;
+    int i, j, cmaProcCount;
     uint32 TotalProcs = (uint32)(GLOBAL_ALL_PROCS);
     bool needPalloc = false;
 
@@ -283,7 +288,9 @@ void InitProcGlobal(void)
     g_instance.proc_base->bgworkerFreeProcs  = NULL;	
     g_instance.proc_base->cbmwriterLatch = NULL;
     g_instance.proc_base->ShareStoragexlogCopyerLatch = NULL;
+    g_instance.proc_base->BarrierPreParseLatch = NULL;
     pg_atomic_init_u32(&g_instance.proc_base->procArrayGroupFirst, INVALID_PGPROCNO);
+    pg_atomic_init_u32(&g_instance.proc_base->snapshotGroupFirst, INVALID_PGPROCNO);
     pg_atomic_init_u32(&g_instance.proc_base->clogGroupFirst, INVALID_PGPROCNO);
 
     /*
@@ -347,7 +354,7 @@ void InitProcGlobal(void)
     g_instance.proc_base->allProcCount = TotalProcs;
     g_instance.proc_base->allNonPreparedProcCount = g_instance.shmem_cxt.MaxBackends +
                                                     NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + 
-                                                    NUM_DCF_CALLBACK_PROCS;
+                                                    NUM_DCF_CALLBACK_PROCS + NUM_DMS_CALLBACK_PROCS;
     if (procs == NULL)
         ereport(FATAL, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of shared memory")));
 
@@ -378,7 +385,7 @@ void InitProcGlobal(void)
         ereport(LOG, (errmsg("Get stream thread proc num [%d].", thread_pool_stream_proc_num)));
     }
 
-    for (i = 0; (unsigned int)(i) < TotalProcs; i++) {
+    for (i = 0, cmaProcCount = 0; (unsigned int)(i) < TotalProcs; i++) {
         /* Common initialization for all PGPROCs, regardless of type.
          *
          * Set up per-PGPROC semaphore, latch, and backendLock. Prepared xact
@@ -386,7 +393,7 @@ void InitProcGlobal(void)
          * with a real process
          */
         if (i < g_instance.shmem_cxt.MaxBackends + NUM_CMAGENT_PROCS +
-            NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS) {
+            NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS + NUM_DMS_CALLBACK_PROCS) {
             PGSemaphoreCreate(&(procs[i]->sem));
             InitSharedLatch(&(procs[i]->procLatch));
             procs[i]->backendLock = LWLockAssign(LWTRANCHE_PROC);
@@ -418,12 +425,17 @@ void InitProcGlobal(void)
             procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->pgjobfreeProcs;
             g_instance.proc_base->pgjobfreeProcs = procs[i];
         } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
-                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS) {
+                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS + \
+                   NUM_DMS_CALLBACK_PROCS) {
             /* PGPROC for external thread, add to externalFreeProcs list */
             procs[i]->links.next = (SHM_QUEUE *)g_instance.proc_base->externalFreeProcs;
             g_instance.proc_base->externalFreeProcs = procs[i];
+            if (!pg_atomic_read_u32(&g_instance.dms_cxt.dmsProcSid)) {
+                pg_atomic_write_u32(&g_instance.dms_cxt.dmsProcSid, (uint32)(i + NUM_DCF_CALLBACK_PROCS));
+            }
         } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
-                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS + NUM_CMAGENT_PROCS) {
+                   g_instance.attr.attr_sql.job_queue_processes + 1 + NUM_DCF_CALLBACK_PROCS + NUM_CMAGENT_PROCS + \
+                   NUM_DMS_CALLBACK_PROCS) {
             /*
              * This pointer indicates the first position of cm anget's procs.
              * In the first time, cmAgentFreeProcs is NULL, so procs[LAST]->links.next is NULL.
@@ -431,12 +443,17 @@ void InitProcGlobal(void)
              */
             procs[i]->links.next = (SHM_QUEUE*)g_instance.proc_base->cmAgentFreeProcs;
             g_instance.proc_base->cmAgentFreeProcs = procs[i];
+            /* Record all cma proc, just print information if necessary */
+            Assert(cmaProcCount < NUM_CMAGENT_PROCS);
+            g_instance.proc_base->cmAgentAllProcs[cmaProcCount] = procs[i];
+            cmaProcCount++;
         } else if (i < g_instance.shmem_cxt.MaxConnections + thread_pool_stream_proc_num + AUXILIARY_BACKENDS +
                    g_instance.attr.attr_sql.job_queue_processes + 1 +
-                   NUM_CMAGENT_PROCS + g_max_worker_processes + NUM_DCF_CALLBACK_PROCS) {
+                   NUM_CMAGENT_PROCS + g_max_worker_processes + NUM_DCF_CALLBACK_PROCS + NUM_DMS_CALLBACK_PROCS) {
             procs[i]->links.next = (SHM_QUEUE*)g_instance.proc_base->bgworkerFreeProcs;
             g_instance.proc_base->bgworkerFreeProcs = procs[i];
-        } else if (i < g_instance.shmem_cxt.MaxBackends + NUM_CMAGENT_PROCS + NUM_DCF_CALLBACK_PROCS) {
+        } else if (i < g_instance.shmem_cxt.MaxBackends + NUM_CMAGENT_PROCS + NUM_DCF_CALLBACK_PROCS + \
+                   NUM_DMS_CALLBACK_PROCS) {
             /*
              * PGPROC for AV launcher/worker, add to autovacFreeProcs list
              * list size is autovacuum_max_workers + AUTOVACUUM_LAUNCHERS
@@ -463,12 +480,13 @@ void InitProcGlobal(void)
      * processes and prepared transactions.
      */
     g_instance.proc_aux_base = &procs[g_instance.shmem_cxt.MaxBackends +
-                                      NUM_CMAGENT_PROCS + NUM_DCF_CALLBACK_PROCS];
+                                      NUM_CMAGENT_PROCS + NUM_DCF_CALLBACK_PROCS + NUM_DMS_CALLBACK_PROCS];
     g_instance.proc_preparexact_base = &procs[g_instance.shmem_cxt.MaxBackends +
-                                              NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS];
+                                              NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS + \
+                                              NUM_DMS_CALLBACK_PROCS];
 
-    /* Create &g_instance.proc_base_lock mutexlock, too */
-    pthread_mutex_init(&g_instance.proc_base_lock, NULL);
+    /* Create &g_instance.proc_base_mutex_lock mutexlock, too */
+    pthread_mutex_init(&g_instance.proc_base_mutex_lock, NULL);
 
     MemoryContextSwitchTo(oldContext);
 }
@@ -513,46 +531,19 @@ PGPROC *GetFreeProc()
  */
 void PgStatCMAThreadStatus()
 {
-    const char* appName = "cm_agent";
-    MemoryContext oldContext = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
-    /* get all threads from global status entries which name is 'cm_agent' */
-    PgBackendStatusNode* result = pgstat_get_backend_status_by_appname(appName, NULL);
-
-    if (result == NULL) {
-        (void)MemoryContextSwitchTo(oldContext);
-        return;
-    }
-
-    PgBackendStatusNode* tempNode = result;
-    tempNode = tempNode->next;
-
-    while (tempNode != NULL) {
-        PgBackendStatus* beentry = tempNode->data;
-        tempNode = tempNode->next;
-        if (beentry == NULL) {
-            continue;
+    StringInfoData callStack;
+    initStringInfo(&callStack);
+    for (int i = 0; i < NUM_CMAGENT_PROCS; i++) {
+        ThreadId pid = g_instance.proc_base->cmAgentAllProcs[i]->pid;
+        if (pid != 0) {
+            resetStringInfo(&callStack);
+            get_stack_according_to_tid(pid, &callStack);
+            ereport(LOG, (errmsg("Print cm_agent thread stack when proc is going to be not available, pid is %lu, "
+                "stack is \n%s",
+                pid, callStack.data)));
         }
-
-        char* wait_status = getThreadWaitStatusDesc(beentry);
-        ereport(LOG, (errmsg("Print cm_agent thread information when proc is going to be not available, node_name<%s>,"
-            " datid<%u>, app_name<%s>, query_id<%lu>, tid<%lu>, lwtid<%d>, parent_sessionid<%lu>, "
-            "thread_level<%d>, wait_status<%s>",
-            g_instance.attr.attr_common.PGXCNodeName,
-            beentry->st_databaseid,
-            beentry->st_appname ? beentry->st_appname : "unnamed thread",
-            beentry->st_queryid,
-            beentry->st_procpid,
-            beentry->st_tid,
-            beentry->st_parent_sessionid,
-            beentry->st_thread_level,
-            wait_status)));
-
-        pfree_ext(wait_status);
     }
-
-    /* Free node list memory */
-    FreeBackendStatusNodeMemory(result);
-    (void)MemoryContextSwitchTo(oldContext);
+    FreeStringInfo(&callStack);
 }
 
 /*
@@ -563,54 +554,68 @@ PGPROC* GetFreeCMAgentProc()
     /* sleep 100ms every time while proc has not init */
     const int sleepTime = 100000;
     const int maxRepeatTimes = 10;
+
+    int times = 0;
+    PG_TRY();
+    {
+        while ((g_instance.conn_cxt.CurCMAProcCount == 0) && (g_instance.proc_base->cmAgentFreeProcs == NULL)) {
+            times++;
+            pg_usleep(sleepTime);
+            /* Check interrupt in order to reveive cancel signal and break loop */
+            CHECK_FOR_INTERRUPTS();
+            ereport(WARNING, (errmsg("CMA-proc list has not init completely, current %d times, total %d us period",
+                times, times * sleepTime)));
+            if (times >= maxRepeatTimes) {
+                break;
+            }
+        }
+    }
+    PG_CATCH();
+    {
+        ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    return g_instance.proc_base->cmAgentFreeProcs;
+}
+
+static void CheckCMAReservedProc()
+{
     /* Set threshold value. If proc consumed number is more than threshold, send single to print thread stack */
     const float procThreshold = 0.8;
     uint32 procWarningCount = NUM_CMAGENT_PROCS * procThreshold;
-    int times = 0;
-    while ((g_instance.conn_cxt.CurCMAProcCount == 0) && (g_instance.proc_base->cmAgentFreeProcs == NULL)) {
-        times++;
-        pg_usleep(sleepTime);
-        /* Check interrupt in order to reveive cancel signal and break loop */
-        CHECK_FOR_INTERRUPTS();
-        ereport(WARNING, (errmsg("CMA-proc list has not init completely, current %d times, total %d us period",
-            times, times * sleepTime)));
-        if (times >= maxRepeatTimes) {
-            break;
-        }
-    }
 
-    PGPROC* cmaProc = g_instance.proc_base->cmAgentFreeProcs;
+    PGPROC* cmaProc = t_thrd.proc;
 
     if (cmaProc != NULL) {
         (void)pg_atomic_add_fetch_u32(&g_instance.conn_cxt.CurCMAProcCount, 1);
-        SpinLockRelease(&g_instance.conn_cxt.ConnCountLock);
-        ereport(DEBUG5, (errmsg("Get free proc from CMA-proc list, proc location is %p. Current proc count %d",
-            cmaProc, g_instance.conn_cxt.CurCMAProcCount)));
     }
+    int curCMAProcCount = g_instance.conn_cxt.CurCMAProcCount;
+    ereport(DEBUG5, (errmsg("Get free proc from CMA-proc list, proc location is %p. Current proc count %d",
+        cmaProc, curCMAProcCount)));
 
     /*
      * If proc consumed number for cm_agent is more than threshold, print all threads wait status which appname
      * equals to 'cm_agent'
      */
-    if (g_instance.conn_cxt.CurCMAProcCount >= procWarningCount) {
+    if (curCMAProcCount >= (int)procWarningCount) {
         ereport(WARNING, (errmsg("Get free proc from CMA-proc list, proc location is %p."
-            " Current proc count %d is more than threshold %d. Ready to print thread wait status",
-            cmaProc, g_instance.conn_cxt.CurCMAProcCount, procWarningCount)));
+            " Current proc count %d is more than threshold %u. Ready to print thread stack",
+            cmaProc, curCMAProcCount, procWarningCount)));
         PgStatCMAThreadStatus();
     }
-
-    return cmaProc;
 }
 
 /* Relase child slot in some cases, other role will release slot in CleanupBackend */
 static inline void ReleaseChildSlot(void)
 {
-    if (IsUnderPostmaster && ((t_thrd.role == WLM_WORKER || t_thrd.role == WLM_MONITOR || t_thrd.role == WLM_ARBITER ||
-        t_thrd.role == WLM_CPMONITOR) ||
-        IsJobAspProcess() || t_thrd.role == STREAMING_BACKEND || IsStatementFlushProcess() || IsJobSnapshotProcess() ||
+    if (IsUnderPostmaster && (WLMThreadAmI() || IsJobAspProcess() ||
+        t_thrd.role == STREAMING_BACKEND || IsStatementFlushProcess() || IsJobSnapshotProcess() ||
         t_thrd.postmaster_cxt.IsRPCWorkerThread || IsJobPercentileProcess() || t_thrd.role == ARCH ||
         IsTxnSnapCapturerProcess() || IsRbCleanerProcess() || t_thrd.role == GLOBALSTATS_THREAD ||
-        t_thrd.role == BARRIER_ARCH || t_thrd.role == BARRIER_CREATOR || t_thrd.role == APPLY_LAUNCHER)) {
+        t_thrd.role == BARRIER_ARCH || t_thrd.role == BARRIER_CREATOR || t_thrd.role == APPLY_LAUNCHER ||
+        t_thrd.role == STACK_PERF_WORKER || ParallelLogicalWorkerThreadAmI())) {
         (void)ReleasePostmasterChildSlot(t_thrd.proc_cxt.MyPMChildSlot);
     }
 }
@@ -623,7 +628,7 @@ static void GetProcFromFreeList()
         t_thrd.proc = g_instance.proc_base->pgjobfreeProcs;
     } else if (IsBgWorkerProcess()) {
         t_thrd.proc = g_instance.proc_base->bgworkerFreeProcs;
-    } else if (t_thrd.dcf_cxt.is_dcf_thread) {
+    } else if (t_thrd.dcf_cxt.is_dcf_thread || t_thrd.role == DMS_WORKER) {
         t_thrd.proc = g_instance.proc_base->externalFreeProcs;
     } else if (u_sess->libpq_cxt.IsConnFromCmAgent) {
         t_thrd.proc = GetFreeCMAgentProc();
@@ -634,6 +639,54 @@ static void GetProcFromFreeList()
         t_thrd.proc = GetFreeProc();
 #endif
     }
+}
+
+/*
+ * Provide two helper functions lock/unlock for proc_base_mutex_lock, ideally we need have
+ * ResourceOwner to do so, however in ProcInit stage ResourceOwner is not setup yet,
+ * provide a more privmitive method to avoid leak of lock
+ *
+ * Basically, any lock that do not coverd by ResourceOwner should have suck kind of
+ * protection mechanism
+ */
+void ProcBaseLockAccquire(pthread_mutex_t *procBaseLock)
+{
+    if (unlikely(procBaseLock != &g_instance.proc_base_mutex_lock)) {
+        return;
+    }
+
+    if (unlikely(t_thrd.utils_cxt.holdProcBaseLock)) {
+        return;
+    }
+
+    /* mark proc_bas_lock is held by current thread */
+    t_thrd.utils_cxt.holdProcBaseLock = true;
+
+    pthread_mutex_lock(&g_instance.proc_base_mutex_lock);
+}
+
+void ProcBaseLockRelease(pthread_mutex_t *procBaseLock)
+{
+    if (unlikely(procBaseLock != &g_instance.proc_base_mutex_lock)) {
+        return;
+    }
+
+    /*
+     * we have to check if mutex lock is held by current thread, normally it is not safe
+     * to handle lock/unlock on pthread_mutex_t in different threads (OS' design)
+     */
+    if (unlikely(!t_thrd.utils_cxt.holdProcBaseLock)) {
+        return;
+    }
+    /*
+     * do check holdProcBaseLock flag in release, as pthread_mutex_unlock() fucntion
+     * can ReEntrancy
+     */
+
+    pthread_mutex_unlock(&g_instance.proc_base_mutex_lock);
+
+    /* mark proc_base_mutex_lock is released from current thread */
+    t_thrd.utils_cxt.holdProcBaseLock = false;
 }
 
 /*
@@ -665,26 +718,34 @@ void InitProcess(void)
      * Try to get a proc struct from the free list.  If this fails, we must be
      * out of PGPROC structures (not to mention semaphores).
      *
-     * While we are holding the &g_instance.proc_base_lock, also copy the current shared
+     * While we are holding the &g_instance.proc_base_mutex_lock, also copy the current shared
      * estimate of spins_per_delay to local storage.
      */
-    pthread_mutex_lock(&g_instance.proc_base_lock);
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
+
 #ifndef ENABLE_THREAD_CHECK
     set_spins_per_delay(g_instance.proc_base->spins_per_delay);
 #endif
 
+    /*
+     * Allocate a per thread level proc object and store its poiter as t_thrd.proc
+     *
+     * Normally, once the needed proc is not available to be allocated, we FATAL this
+     * thread and do DFX info as much as possible
+     */
     GetProcFromFreeList();
 
     if (t_thrd.proc != NULL) {
         t_thrd.myLogicTid = t_thrd.proc->logictid;
 
+        /* write back to its entry handler in proc_base */
         if (IsAnyAutoVacuumProcess()) {
             g_instance.proc_base->autovacFreeProcs = (PGPROC*)t_thrd.proc->links.next;
         } else if (IsJobSchedulerProcess() || IsJobWorkerProcess()) {
             g_instance.proc_base->pgjobfreeProcs = (PGPROC*)t_thrd.proc->links.next;
         } else if (IsBgWorkerProcess()) {
             g_instance.proc_base->bgworkerFreeProcs = (PGPROC*)t_thrd.proc->links.next;
-        } else if (t_thrd.dcf_cxt.is_dcf_thread) {
+        } else if (t_thrd.dcf_cxt.is_dcf_thread || t_thrd.role == DMS_WORKER) {
             g_instance.proc_base->externalFreeProcs = (PGPROC*)t_thrd.proc->links.next;
         } else if (u_sess->libpq_cxt.IsConnFromCmAgent) {
             g_instance.proc_base->cmAgentFreeProcs = (PGPROC *)t_thrd.proc->links.next;
@@ -694,7 +755,7 @@ void InitProcess(void)
 #endif
         }
 
-        pthread_mutex_unlock(&g_instance.proc_base_lock);
+        ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
     } else {
         /*
          * If we reach here, all the PGPROCs are in use.  This is one of the
@@ -702,7 +763,7 @@ void InitProcess(void)
          * error message.  XXX do we need to give a different failure message
          * in the autovacuum case?
          */
-        pthread_mutex_unlock(&g_instance.proc_base_lock);
+        ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 
         if (IsUnderPostmaster && StreamThreadAmI())
             MarkPostmasterChildUnuseForStreamWorker();
@@ -747,6 +808,9 @@ void InitProcess(void)
         ereport(ERROR,
                 (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("failed to acquire mutex lock for deleMemContextMutex.")));
     t_thrd.proc->topmcxt = t_thrd.top_mem_cxt;
+    if (t_thrd.role == WORKER || t_thrd.role == THREADPOOL_WORKER) {
+        t_thrd.proc->usedMemory = &t_thrd.utils_cxt.trackedBytes;
+    }
     if (syscalllockRelease(&t_thrd.proc->deleMemContextMutex) != 0)
         ereport(ERROR,
                 (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("failed to release mutex lock for deleMemContextMutex.")));
@@ -759,7 +823,7 @@ void InitProcess(void)
      */
     if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess() && !IsJobSchedulerProcess() &&
         !IsJobWorkerProcess() && !t_thrd.dcf_cxt.is_dcf_thread && !IsBgWorkerProcess() &&
-        !IsFencedProcessingMode())
+        !IsFencedProcessingMode() && (t_thrd.role != DMS_WORKER))
         MarkPostmasterChildActive();
 
     /*
@@ -777,6 +841,8 @@ void InitProcess(void)
     t_thrd.pgxact->xid = InvalidTransactionId;
     t_thrd.pgxact->next_xid = InvalidTransactionId;
     t_thrd.pgxact->xmin = InvalidTransactionId;
+    t_thrd.proc->snapXmax = InvalidTransactionId;
+    t_thrd.proc->snapCSN = InvalidCommitSeqNo;
     t_thrd.pgxact->csn_min = InvalidCommitSeqNo;
     t_thrd.pgxact->csn_dr = InvalidCommitSeqNo;
     t_thrd.pgxact->prepare_xid = InvalidTransactionId;
@@ -806,7 +872,6 @@ void InitProcess(void)
     t_thrd.proc->waitProcLock = NULL;
     t_thrd.proc->blockProcLock = NULL;
     t_thrd.proc->waitLockThrd = &t_thrd;
-    init_proc_dw_buf();
 #ifdef USE_ASSERT_CHECKING
     if (assert_enabled) {
         int i;
@@ -822,6 +887,7 @@ void InitProcess(void)
     t_thrd.proc->waitLSN = 0;
     t_thrd.proc->syncRepState = SYNC_REP_NOT_WAITING;
     t_thrd.proc->syncRepInCompleteQueue = false;
+    t_thrd.proc->syncSetConfirmedLSN = 0;
     SHMQueueElemInit(&(t_thrd.proc->syncRepLinks));
 
     /* Initialize fields for data sync rep */
@@ -839,6 +905,16 @@ void InitProcess(void)
     t_thrd.proc->procArrayGroupMember = false;
     t_thrd.proc->procArrayGroupMemberXid = InvalidTransactionId;
     pg_atomic_init_u32(&t_thrd.proc->procArrayGroupNext, INVALID_PGPROCNO);
+
+    /* Initialize fields for group snapshot getting. */
+    t_thrd.proc->snapshotGroupMember = false;
+    pg_atomic_init_u32(&t_thrd.proc->snapshotGroupNext, INVALID_PGPROCNO);
+    t_thrd.proc->snapshotGroup = NULL;
+    t_thrd.proc->xminGroup = InvalidTransactionId;
+    t_thrd.proc->xmaxGroup = InvalidTransactionId;
+    t_thrd.proc->globalxminGroup = InvalidTransactionId;
+    t_thrd.proc->replicationSlotXminGroup = InvalidTransactionId;
+    t_thrd.proc->replicationSlotCatalogXminGroup = InvalidTransactionId;
 
     /* Initialize fields for group transaction status update. */
     t_thrd.proc->clogGroupMember = false;
@@ -891,6 +967,18 @@ void InitProcess(void)
      * Arrange to clean up at backend exit.
      */
     on_shmem_exit(ProcKill, 0);
+
+    /*
+     * We call this function to check reserved proc and print stack.
+     * Must after register ProcKill, so that ProcKill will release all lwlock and put back proc to
+     * g_instance.proc_base->cmAgentFreeProcs if proc_ext happend.
+     */
+    if (u_sess->libpq_cxt.IsConnFromCmAgent) {
+        t_thrd.bn->backend_type = BACKEND_TYPE_CMAGENT;
+        CheckCMAReservedProc();
+    }
+
+    init_proc_dw_buf();
 
     /*
      * Now that we have a PGPROC, we could try to acquire locks, so initialize
@@ -963,13 +1051,13 @@ void InitAuxiliaryProcess(void)
     InitializeLatchSupport();
 
     /*
-     * We use the &g_instance.proc_base_lock to protect assignment and releasing of
+     * We use the &g_instance.proc_base_mutex_lock to protect assignment and releasing of
      * &g_instance.proc_aux_base entries.
      *
-     * While we are holding the &g_instance.proc_base_lock, also copy the current shared
+     * While we are holding the &g_instance.proc_base_mutex_lock, also copy the current shared
      * estimate of spins_per_delay to local storage.
      */
-    pthread_mutex_lock(&g_instance.proc_base_lock);
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 #ifndef ENABLE_THREAD_CHECK
     set_spins_per_delay(g_instance.proc_base->spins_per_delay);
 #endif
@@ -983,7 +1071,7 @@ void InitAuxiliaryProcess(void)
             break;
     }
     if (proctype >= NUM_AUXILIARY_PROCS) {
-        pthread_mutex_unlock(&g_instance.proc_base_lock);
+        ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
         ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("all &g_instance.proc_aux_base are in use")));
     }
 
@@ -994,7 +1082,7 @@ void InitAuxiliaryProcess(void)
     t_thrd.proc = auxproc;
     t_thrd.pgxact = &g_instance.proc_base_all_xacts[auxproc->pgprocno];
 
-    pthread_mutex_unlock(&g_instance.proc_base_lock);
+    ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 
     /*
      * Initialize all fields of t_thrd.proc, except for those previously
@@ -1015,6 +1103,8 @@ void InitAuxiliaryProcess(void)
     t_thrd.pgxact->xid = InvalidTransactionId;
     t_thrd.pgxact->next_xid = InvalidTransactionId;
     t_thrd.pgxact->xmin = InvalidTransactionId;
+    t_thrd.proc->snapXmax = InvalidTransactionId;
+    t_thrd.proc->snapCSN = InvalidCommitSeqNo;
     t_thrd.pgxact->csn_min = InvalidCommitSeqNo;
     t_thrd.pgxact->csn_dr = InvalidCommitSeqNo;
     t_thrd.proc->backendId = InvalidBackendId;
@@ -1117,12 +1207,12 @@ int GetAuxProcEntryIndex(int baseIdx)
  */
 void PublishStartupProcessInformation(void)
 {
-    pthread_mutex_lock(&g_instance.proc_base_lock);
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 
     g_instance.proc_base->startupProc = t_thrd.proc;
     g_instance.proc_base->startupProcPid = t_thrd.proc_cxt.MyProcPid;
 
-    pthread_mutex_unlock(&g_instance.proc_base_lock);
+    ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 }
 
 
@@ -1135,7 +1225,7 @@ bool HaveNFreeProcs(int n)
 {
     PGPROC* proc = NULL;
 
-    pthread_mutex_lock(&g_instance.proc_base_lock);
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 
     if (u_sess->libpq_cxt.IsConnFromCmAgent) {
         proc = g_instance.proc_base->cmAgentFreeProcs;
@@ -1148,7 +1238,7 @@ bool HaveNFreeProcs(int n)
         n--;
     }
 
-    pthread_mutex_unlock(&g_instance.proc_base_lock);
+    ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 
     return (n <= 0);
 }
@@ -1266,7 +1356,7 @@ static void ProcPutBackToFreeList()
     } else if (IsJobSchedulerProcess() || IsJobWorkerProcess()) {
         t_thrd.proc->links.next = (SHM_QUEUE*)g_instance.proc_base->pgjobfreeProcs;
         g_instance.proc_base->pgjobfreeProcs = t_thrd.proc;
-    } else if (t_thrd.dcf_cxt.is_dcf_thread) {
+    } else if (t_thrd.dcf_cxt.is_dcf_thread || t_thrd.role == DMS_WORKER) {
         t_thrd.proc->links.next = (SHM_QUEUE *)g_instance.proc_base->externalFreeProcs;
         g_instance.proc_base->externalFreeProcs = t_thrd.proc;
     } else if (u_sess->libpq_cxt.IsConnFromCmAgent) {
@@ -1331,8 +1421,8 @@ static void ProcKill(int code, Datum arg)
     LWLockReleaseAll();
 
     /* Make sure active replication slots are released */
-    if (t_thrd.slot_cxt.MyReplicationSlot != NULL)
-        ReplicationSlotRelease();
+    CleanMyReplicationSlot();
+
     /*
      * Detach from any lock group of which we are a member.  If the leader
      * exist before all other group members, it's PGPROC will remain allocated
@@ -1372,6 +1462,7 @@ static void ProcKill(int code, Datum arg)
         ereport(ERROR,
                 (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("failed to acquire mutex lock for deleMemContextMutex.")));
     t_thrd.proc->topmcxt = NULL;
+    t_thrd.proc->usedMemory = NULL;
     if (syscalllockRelease(&t_thrd.proc->deleMemContextMutex) != 0)
         ereport(ERROR,
                 (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("failed to release mutex lock for deleMemContextMutex.")));
@@ -1379,7 +1470,7 @@ static void ProcKill(int code, Datum arg)
     clean_proc_dw_buf();
     /* Clean subxid cache if needed. */
     ProcSubXidCacheClean();
-    pthread_mutex_lock(&g_instance.proc_base_lock);
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 
     /*
      * If we're still a member of a locking group, that means we're a leader
@@ -1407,15 +1498,16 @@ static void ProcKill(int code, Datum arg)
     g_instance.proc_base->spins_per_delay = update_spins_per_delay(g_instance.proc_base->spins_per_delay);
 #endif
 
-    pthread_mutex_unlock(&g_instance.proc_base_lock);
+    ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 
     /*
      * This process is no longer present in shared memory in any meaningful
      * way, so tell the postmaster we've cleaned up acceptably well. (XXX
      * autovac launcher should be included here someday)
+     * DMS worker threads does not have shmem resources to clean.
      */
     if (IsUnderPostmaster && !IsAutoVacuumLauncherProcess() && !StreamThreadAmI() && !IsJobSchedulerProcess() &&
-        !IsJobWorkerProcess() && !IsBgWorkerProcess())
+        !IsJobWorkerProcess() && !IsBgWorkerProcess() && !IsDMSWorkerProcess())
         MarkPostmasterChildInactive();
 
     /*
@@ -1468,7 +1560,7 @@ static void AuxiliaryProcKill(int code, Datum arg)
 
     clean_proc_dw_buf();
 
-    pthread_mutex_lock(&g_instance.proc_base_lock);
+    ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 
     /* Mark auxiliary proc no longer in use */
     t_thrd.proc->pid = 0;
@@ -1484,7 +1576,7 @@ static void AuxiliaryProcKill(int code, Datum arg)
     g_instance.proc_base->spins_per_delay = update_spins_per_delay(g_instance.proc_base->spins_per_delay);
 #endif
 
-    pthread_mutex_unlock(&g_instance.proc_base_lock);
+    ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
 }
 
 /*
@@ -1993,6 +2085,10 @@ int ProcSleep(LOCALLOCK* locallock, LockMethod lockMethodTable, bool allow_con_u
                     ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
                         errmsg("could not obtain lock on row in relation,waitSec = %d", waitSec)));
                 } else {
+                    StringInfoData callStack;
+                    initStringInfo(&callStack);
+                    get_stack_according_to_tid(t_thrd.storage_cxt.conflicting_lock_thread_id, &callStack);
+                    FreeStringInfo(&callStack);
                     ereport(ERROR, (errcode(ERRCODE_LOCK_WAIT_TIMEOUT),
                                 (errmsg("Lock wait timeout: thread %lu on node %s waiting for %s on %s after %ld.%03d ms",
                                         t_thrd.proc_cxt.MyProcPid, g_instance.attr.attr_common.PGXCNodeName, modename, buf.data, msecs,
@@ -2356,8 +2452,8 @@ void ProcSendSignal(ThreadId pid)
 {
     PGPROC* proc = NULL;
 
-    if (RecoveryInProgress()) {
-        pthread_mutex_lock(&g_instance.proc_base_lock);
+    if (RecoveryInProgress() || SS_IN_ONDEMAND_RECOVERY) {
+        ProcBaseLockAccquire(&g_instance.proc_base_mutex_lock);
 
         /*
          * Check to see whether it is the Startup process we wish to signal.
@@ -2369,7 +2465,7 @@ void ProcSendSignal(ThreadId pid)
          */
         proc = MultiRedoThreadPidGetProc(pid);
 
-        pthread_mutex_unlock(&g_instance.proc_base_lock);
+        ProcBaseLockRelease(&g_instance.proc_base_mutex_lock);
     }
 
     if (proc == NULL)
@@ -2547,6 +2643,54 @@ bool enable_session_sig_alarm(int delayms)
     return true;
 }
 
+#ifndef ENABLE_MULTIPLE_NODES
+/* Enable the idle_in_transaction_session_timeout timer. */
+bool enable_idle_in_transaction_session_sig_alarm(int delayms)
+{
+    TimestampTz fin_time;
+    struct itimerval timeval;
+    errno_t rc = EOK;
+
+    /* Session timer only work when connect form app, not work for inner conncection. */
+    if (!IsConnFromApp() || IS_THREAD_POOL_STREAM) {
+        return true;
+    }
+    /* disable idle_in_transaction session timeout */
+    if (u_sess->attr.attr_common.IdleInTransactionSessionTimeout == 0) {
+        return true;
+    }
+    int delay_time_ms = delayms;
+    /* Set idle_in_transaction_session_timeout flag true. */
+    u_sess->storage_cxt.idle_in_transaction_session_timeout_active = true;
+
+    /* Calculate idle_in_transaction session timeout finish time. */
+    fin_time = GetCurrentTimestamp();
+    fin_time = TimestampTzPlusMilliseconds(fin_time, delay_time_ms);
+    u_sess->storage_cxt.idle_in_transaction_session_fin_time = fin_time;
+
+    /*
+     * threadpool session status must be UNINIT,ATTACH,DEATCH...
+     * KNL_SESS_FAKE only use in thread preinit
+     * if a new session is UNINIT
+     * 		if attached, t_thrd is valid.
+     * 		if not attach, t_thrd is invalid
+     * so we user USESS_STATUS to check again
+     * */
+    if (IS_THREAD_POOL_WORKER || u_sess->status != KNL_SESS_FAKE) {
+        return true;
+    }
+    /* Now we set the timer to interrupt. */
+    rc = memset_s(&timeval, sizeof(struct itimerval), 0, sizeof(struct itimerval));
+    securec_check(rc, "\0", "\0");
+    timeval.it_value.tv_sec = delay_time_ms / 1000;
+    timeval.it_value.tv_usec = (delay_time_ms % 1000) * 1000;
+    if (gs_signal_settimer(&timeval))
+        return false;
+
+    return true;
+}
+#endif
+
 /* Disable the session timeout timer. */
 bool disable_session_sig_alarm(void)
 {
@@ -2575,6 +2719,37 @@ bool disable_session_sig_alarm(void)
         return false;
     }
 }
+
+#ifndef ENABLE_MULTIPLE_NODES
+/* Disable the idle_in_transaction_session_timeout timer. */
+bool disable_idle_in_transaction_session_sig_alarm(void)
+{
+    if (IS_THREAD_POOL_WORKER) {
+        u_sess->storage_cxt.idle_in_transaction_session_timeout_active = false;
+        return true;
+    }
+    /* idle_in_transaction_session_timeout timer only work when connect from app, not work for inner conncection. */
+    if (!IsConnFromApp()) {
+        return true;
+    }
+
+    /* already disable */
+    if (!u_sess->attr.attr_common.IdleInTransactionSessionTimeout && \
+        (!u_sess->storage_cxt.idle_in_transaction_session_timeout_active)) {
+        return true;
+    }
+    /*
+     * Always disable the timer if it is active; this is for guarantee the
+     * atomicity of idle_in_transaction_session_timeout timer.
+     */
+    if (u_sess->storage_cxt.idle_in_transaction_session_timeout_active && !gs_signal_canceltimer()) {
+        u_sess->storage_cxt.idle_in_transaction_session_timeout_active = false;
+        return true;
+    } else {
+        return false;
+    }
+}
+#endif
 
 /*
  * Cancel the SIGALRM timer, either for a deadlock timeout or a statement
@@ -2655,10 +2830,11 @@ bool pause_sig_alarm(bool is_statement_timeout)
 bool resume_sig_alarm(bool is_statement_timeout)
 {
     /*
-     * The time counter was not paused before if t_thrd.utils_cxt.timeIsPausing is false.
-     * You should not invoke resume_sig_alarm here.
+     * In case of network error or unchanged statistics, pause_sig_alarm may never be called.
      */
-    Assert(t_thrd.storage_cxt.timeIsPausing == true);
+    if (!t_thrd.storage_cxt.timeIsPausing) {
+        return true;
+    }
 
     if (enable_sig_alarm(t_thrd.storage_cxt.restimems, is_statement_timeout)) {
         t_thrd.storage_cxt.timeIsPausing = false;
@@ -2721,6 +2897,28 @@ static bool CheckStatementTimeout(void)
 
     return true;
 }
+
+#ifndef ENABLE_MULTIPLE_NODES
+/*
+ * Check for idle_in_transaction timeout.  If the timeout time has come,
+ * trigger a session-cancel interrupt;
+ */
+static void CheckIdleInTransactionSessionTimeout(void)
+{
+    if (IS_THREAD_POOL_WORKER) {
+        return;
+    }
+    TimestampTz now = GetCurrentTimestamp();
+    if (now >= u_sess->storage_cxt.idle_in_transaction_session_fin_time) {
+        u_sess->storage_cxt.idle_in_transaction_session_timeout_active = false;
+        if (u_sess->attr.attr_common.IdleInTransactionSessionTimeout > 0) {
+            ereport(WARNING, (errmsg("Idle in transaction session unused timeout.")));
+            (void)gs_signal_canceltimer();
+            (void)gs_signal_send(t_thrd.proc_cxt.MyProcPid, SIGTERM);
+        }
+    }
+}
+#endif
 
 /*
  * Check for session timeout.  If the timeout time has come,
@@ -2786,6 +2984,12 @@ void handle_sig_alarm(SIGNAL_ARGS)
     if (t_thrd.proc) {
         SetLatch(&t_thrd.proc->procLatch);
     }
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (u_sess->storage_cxt.idle_in_transaction_session_timeout_active) {
+        CheckIdleInTransactionSessionTimeout();
+    }
+#endif
 
     if (u_sess->storage_cxt.session_timeout_active) {
         CheckSessionTimeout();

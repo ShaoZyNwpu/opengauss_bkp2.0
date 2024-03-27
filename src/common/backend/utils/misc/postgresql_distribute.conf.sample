@@ -1,4 +1,4 @@
-# -----------------------------------------------------------------------------
+﻿# -----------------------------------------------------------------------------
 #
 # postgresql_distribute.conf.sample
 #      Configuration file for distributed environment
@@ -79,7 +79,7 @@ max_connections = 200			# (change requires restart)
 #unix_socket_group = ''			# (change requires restart)
 #unix_socket_permissions = 0700		# begin with 0 to use octal notation
 					# (change requires restart)
-
+#light_comm = off			# whether use light commnucation with nonblock mode or latch
 # - Security and Authentication -
 
 #authentication_timeout = 1min		# 1s-600s
@@ -266,9 +266,8 @@ max_wal_senders = 4		# max number of walsender processes
 wal_keep_segments = 16		# in logfile segments, 16MB each; 0 disables
 #wal_sender_timeout = 6s	# in milliseconds; 0 disables
 enable_slot_log = off
-max_replication_slots = 8	# max number of replication slots.i
-				# The value belongs to [1,7].
-				# (change requires restart)
+max_replication_slots = 8
+
 #max_changes_in_memory = 4096
 #max_cached_tuplebufs = 8192
 
@@ -614,10 +613,27 @@ use_workload_manager = on		# Enables workload manager in the system.
 #vacuum_freeze_min_age = 50000000
 #vacuum_freeze_table_age = 150000000
 #bytea_output = 'hex'			# hex, escape
+#block_encryption_mode = 'aes-128-cbc'     #  values in order of decreasing detail:
+    #  aes-128-cbc
+    #  aes-192-cbc
+    #  aes-256-cbc
+    #  aes-128-cfb1
+    #  aes-192-cfb1
+    #  aes-256-cfb1
+    #  aes-128-cfb8
+    #  aes-192-cfb8
+    #  aes-256-cfb8
+    #  aes-128-cfb128
+    #  aes-192-cfb128
+    #  aes-256-cfb128
+    #  aes-128-ofb
+    #  aes-192-ofb
+    #  aes-256-ofb
 #xmlbinary = 'base64'
 #xmloption = 'content'
 #max_compile_functions = 1000
 #gin_pending_list_limit = 4MB
+#group_concat_max_len=1024
 # - Locale and Formatting -
 
 #datestyle = 'iso, mdy'
@@ -804,6 +820,9 @@ audit_enabled = on
 #audit_set_parameter = 1		# whether audit set parameter operation
 #audit_xid_info = 0 			# whether record xid info in audit log
 #audit_thread_num = 1
+#no_audit_client = ""
+#full_audit_users = ""
+#audit_system_function_exec = 0
 
 #Choose which style to print the explain info, normal,pretty,summary,run
 #explain_perf_mode = normal

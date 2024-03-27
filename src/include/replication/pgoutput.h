@@ -13,17 +13,18 @@
 #ifndef PGOUTPUT_H
 #define PGOUTPUT_H
 
+#include "replication/logical.h"
 #include "utils/palloc.h"
 
 typedef struct PGOutputData {
-    MemoryContext context; /* private memory context for transient
-                            * allocations */
+    PluginTestDecodingData common;
 
     /* client info */
     uint32 protocol_version;
 
     List *publication_names;
     List *publications;
+    bool binary;
 } PGOutputData;
 
 #endif /* PGOUTPUT_H */

@@ -56,6 +56,7 @@
 #include "executor/executor.h"
 
 #include "communication/commproxy_interface.h"
+#include "utils/mem_snapshot.h"
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
@@ -70,6 +71,7 @@ ThreadPoolControler* g_threadPoolControler = NULL;
     ereport(FATAL, (errcode(ERRCODE_OPERATE_INVALID_PARAM), errmsg("Invalid attribute for thread pool."), detail))
 
 static const long one_hundred_micro_sec = 100;
+static const long max_dms_wait_time = 30000000L; //30s
 
 ThreadPoolControler::ThreadPoolControler()
 {
@@ -115,6 +117,7 @@ void ThreadPoolControler::Init(bool enableNumaDistribute)
     int expectThreadNum = 0;
     int maxStreamNum = 0;
     int numaId = 0;
+    int tmpNumaId = 0;
     int cpuNum = 0;
     int *cpuArr = NULL;
 
@@ -143,16 +146,18 @@ void ThreadPoolControler::Init(bool enableNumaDistribute)
             cpuNum = m_cpuInfo.cpuArrSize[numaId];
             cpuArr = m_cpuInfo.cpuArr[numaId];
 
+            tmpNumaId = numaId;
             numaId++;
         } else {
             expectThreadNum = m_threadNum / m_groupNum;
             maxThreadNum = m_maxPoolSize / m_groupNum;
             maxStreamNum = m_maxPoolSize / m_groupNum;
             numaId = -1;
+            tmpNumaId = numaId;
         }
 
         m_groups[i] = New(CurrentMemoryContext)ThreadPoolGroup(maxThreadNum, expectThreadNum,
-                                                    maxStreamNum, i, numaId, cpuNum, cpuArr, bindCpuNuma);
+                                                    maxStreamNum, i, tmpNumaId, cpuNum, cpuArr, bindCpuNuma);
         m_groups[i]->Init(enableNumaDistribute);
     }
 
@@ -740,10 +745,18 @@ void ThreadPoolControler::CloseAllSessions()
         }
 
         allclose = true;
+        int waitTime = 0;
         for (int i = 0; i < m_groupNum; i++) {
             allclose = (m_groups[i]->AllSessionClosed() && allclose);
         }
         pg_usleep(one_hundred_micro_sec);
+        if (SS_STANDBY_FAILOVER) {
+            waitTime += one_hundred_micro_sec;
+            if (waitTime > max_dms_wait_time) {
+                t_thrd.dms_cxt.CloseAllSessionsFailed = true;
+                break;
+            }
+        }
     }
 
     ereport(LOG, (errmodule(MOD_THREAD_POOL),
@@ -797,6 +810,7 @@ void ThreadPoolControler::ShutDownScheduler(bool forceWait, bool noAdjust)
     if (noAdjust) {
         pg_memory_barrier();
         m_scheduler->m_canAdjustPool = false;
+        pg_memory_barrier();
     }
 
     m_scheduler->ShutDown();
@@ -877,7 +891,7 @@ int ThreadPoolControler::DispatchSession(Port* port)
         return STATUS_ERROR;
     }
     /* if this group is hanged, we don't accept new session */
-    if (grp->IsGroupHanged()) {
+    if (grp->isGroupAlreadyTooBusy()) {
         ereport(WARNING, 
                 (errmodule(MOD_THREAD_POOL), 
                     errmsg("Group[%d] is too busy to add new session for now.", grp->GetGroupId())));

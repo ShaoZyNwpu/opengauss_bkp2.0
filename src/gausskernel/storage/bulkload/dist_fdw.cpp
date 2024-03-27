@@ -233,8 +233,6 @@ static void assignTaskToDataNodeInNormalMode(List *urllist, List **totalTask, Li
 
 extern void decryptOBSForeignTableOption(List **options);
 
-extern BlockNumber getPageCountForFt(void *additionalData);
-
 List *getOBSFileList(List *urllist, bool encrypt, const char *access_key, const char *secret_access_key,
                      bool isAnalyze);
 #ifndef ENABLE_LITE_MODE
@@ -528,7 +526,7 @@ ForeignScanState *buildRelatedStateInfo(Relation relation, DistFdwFileSegment *s
     ;
 
     /* setup tuple slot */
-    scanTupleSlot = MakeTupleTableSlot(true, tupleDescriptor->tdTableAmType);
+    scanTupleSlot = MakeTupleTableSlot(true, tupleDescriptor->td_tam_ops);
     scanTupleSlot->tts_tupleDescriptor = tupleDescriptor;
     scanTupleSlot->tts_values = columnValues;
     scanTupleSlot->tts_isnull = columnNulls;
@@ -643,7 +641,7 @@ static int distAcquireSampleRows(Relation relation, int logLevel, HeapTuple *sam
             (void)MemoryContextSwitchTo(oldContext);
 
             /* if there are no more records to read, break */
-            if (scanTupleSlot->tts_isempty) {
+            if (TTS_EMPTY(scanTupleSlot)) {
                 break;
             }
 
@@ -655,7 +653,7 @@ static int distAcquireSampleRows(Relation relation, int logLevel, HeapTuple *sam
              * reach the end of the relation.
              */
             if (sampleRowCount < targetRowCount) {
-                sampleRows[sampleRowCount++] = (HeapTuple)tableam_tops_form_tuple(tupleDescriptor, columnValues, columnNulls, HEAP_TUPLE);
+                sampleRows[sampleRowCount++] = (HeapTuple)tableam_tops_form_tuple(tupleDescriptor, columnValues, columnNulls);
             } else {
                 /*
                  * If we need to compute a new S value, we must use the "not yet
@@ -675,7 +673,7 @@ static int distAcquireSampleRows(Relation relation, int logLevel, HeapTuple *sam
                     Assert(rowIndex < targetRowCount);
 
                     heap_freetuple(sampleRows[rowIndex]);
-                    sampleRows[rowIndex] = (HeapTuple)tableam_tops_form_tuple(tupleDescriptor, columnValues, columnNulls, HEAP_TUPLE);
+                    sampleRows[rowIndex] = (HeapTuple)tableam_tops_form_tuple(tupleDescriptor, columnValues, columnNulls);
                 }
                 rowCountToSkip -= 1;
             }
@@ -751,7 +749,7 @@ bool check_selective_binary_conversion(RelOptInfo *baserel, Oid foreigntableid, 
     }
 
     /* Collect all the attributes needed for joins or final output. */
-    pull_varattnos((Node *)baserel->reltargetlist, baserel->relid, &attrs_used);
+    pull_varattnos((Node *)baserel->reltarget->exprs, baserel->relid, &attrs_used);
 
     /* Add all the attributes used by restriction clauses. */
     foreach (lc, baserel->baserestrictinfo) {
@@ -779,7 +777,7 @@ bool check_selective_binary_conversion(RelOptInfo *baserel, Oid foreigntableid, 
 
         /* Get user attributes. */
         if (attnum > 0) {
-            Form_pg_attribute attr = tupleDesc->attrs[attnum - 1];
+            Form_pg_attribute attr = &tupleDesc->attrs[attnum - 1];
             char *attname = NameStr(attr->attname);
 
             /* Skip dropped attributes (probably shouldn't see any here). */
@@ -792,7 +790,7 @@ bool check_selective_binary_conversion(RelOptInfo *baserel, Oid foreigntableid, 
     /* Count non-dropped user attributes while we have the tupdesc. */
     numattrs = 0;
     for (i = 0; i < tupleDesc->natts; i++) {
-        Form_pg_attribute attr = tupleDesc->attrs[i];
+        Form_pg_attribute attr = &tupleDesc->attrs[i];
 
         if (attr->attisdropped)
             continue;
@@ -1414,7 +1412,7 @@ static void DistBegin(CopyState cstate, bool isImport, Relation rel, Node *raw_q
             if (!list_member_int(cstate->attnumlist, attnum))
                 ereport(ERROR, (errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
                                 errmsg("FORCE QUOTE column \"%s\" not referenced by COPY",
-                                       NameStr(tupDesc->attrs[attnum - 1]->attname))));
+                                       NameStr(tupDesc->attrs[attnum - 1].attname))));
             cstate->force_quote_flags[attnum - 1] = true;
         }
     }
@@ -1429,7 +1427,7 @@ static void DistBegin(CopyState cstate, bool isImport, Relation rel, Node *raw_q
             if (!list_member_int(cstate->attnumlist, attnum))
                 ereport(ERROR, (errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
                                 errmsg("FORCE NOT NULL column \"%s\" not referenced by COPY",
-                                       NameStr(tupDesc->attrs[attnum - 1]->attname))));
+                                       NameStr(tupDesc->attrs[attnum - 1].attname))));
             cstate->force_notnull_flags[attnum - 1] = true;
         }
     }
@@ -1441,14 +1439,14 @@ static void DistBegin(CopyState cstate, bool isImport, Relation rel, Node *raw_q
         /* find last valid column */
         int i = num_phys_attrs - 1;
         for (; i >= 0; i--) {
-            if (!tupDesc->attrs[i]->attisdropped)
+            if (!tupDesc->attrs[i].attisdropped)
                 break;
         }
 
         if (cstate->force_notnull_flags[i])
             ereport(ERROR,
                     (errcode(ERRCODE_SYNTAX_ERROR), errmsg("fill_missing_fields can't be set while \"%s\" is NOT NULL",
-                                                           NameStr(tupDesc->attrs[i]->attname))));
+                                                           NameStr(tupDesc->attrs[i].attname))));
     }
 
     /* Use client encoding when ENCODING option is not specified. */
@@ -1475,7 +1473,7 @@ void InitDistImport(DistImportExecutionState *importstate, Relation rel, const c
                     List *options, List *totalTask)
 {
     TupleDesc tupDesc;
-    Form_pg_attribute *attr = NULL;
+    FormData_pg_attribute *attr = NULL;
     AttrNumber num_phys_attrs, num_defaults;
     FmgrInfo *in_functions = NULL;
     Oid *typioparams = NULL;
@@ -1504,6 +1502,7 @@ void InitDistImport(DistImportExecutionState *importstate, Relation rel, const c
     initStringInfo(&importstate->attribute_buf);
     initStringInfo(&importstate->sequence_buf);
     initStringInfo(&importstate->line_buf);
+    initStringInfo(&importstate->fieldBuf);
     importstate->line_buf_converted = false;
     importstate->raw_buf = (char *)palloc(RAW_BUF_SIZE + 1);
     importstate->raw_buf_index = importstate->raw_buf_len = 0;
@@ -1541,15 +1540,15 @@ void InitDistImport(DistImportExecutionState *importstate, Relation rel, const c
 
     for (attnum = 1; attnum <= num_phys_attrs; attnum++) {
         /* We don't need info for dropped attributes */
-        if (attr[attnum - 1]->attisdropped)
+        if (attr[attnum - 1].attisdropped)
             continue;
 
-        accept_empty_str[attnum - 1] = IsTypeAcceptEmptyStr(attr[attnum - 1]->atttypid);
+        accept_empty_str[attnum - 1] = IsTypeAcceptEmptyStr(attr[attnum - 1].atttypid);
         /* Fetch the input function and typioparam info */
         if (IS_BINARY(importstate))
-            getTypeBinaryInputInfo(attr[attnum - 1]->atttypid, &in_func_oid, &typioparams[attnum - 1]);
+            getTypeBinaryInputInfo(attr[attnum - 1].atttypid, &in_func_oid, &typioparams[attnum - 1]);
         else
-            getTypeInputInfo(attr[attnum - 1]->atttypid, &in_func_oid, &typioparams[attnum - 1]);
+            getTypeInputInfo(attr[attnum - 1].atttypid, &in_func_oid, &typioparams[attnum - 1]);
         fmgr_info(in_func_oid, &in_functions[attnum - 1]);
 
         /* Get default info if needed */
@@ -1580,9 +1579,9 @@ void InitDistImport(DistImportExecutionState *importstate, Relation rel, const c
                          * values into output form before appending to data row.
                          */
                         if (IS_BINARY(importstate))
-                            getTypeBinaryOutputInfo(attr[attnum - 1]->atttypid, &out_func_oid, &isvarlena);
+                            getTypeBinaryOutputInfo(attr[attnum - 1].atttypid, &out_func_oid, &isvarlena);
                         else
-                            getTypeOutputInfo(attr[attnum - 1]->atttypid, &out_func_oid, &isvarlena);
+                            getTypeOutputInfo(attr[attnum - 1].atttypid, &out_func_oid, &isvarlena);
                         fmgr_info(out_func_oid, &importstate->out_functions[attnum - 1]);
                     }
                 } else {
@@ -2150,3 +2149,64 @@ bool is_obs_protocol(const char *locations)
 
     return result;
 }
+
+/*
+ * @dist_fdw
+ * brief: Calculate the foreign table size.
+ * input param @fileName: the file names of the foreign table;
+ */
+int64 GetForeignTableTotalSize(List *const fileName)
+{
+    int64 totalSize = 0;
+    ListCell *fileCell = NULL;
+
+    Assert(fileName != NULL);
+
+    /* Iterate the fileName list to get each file size and add them one by one. */
+    foreach (fileCell, fileName) {
+        int64 size = 0;
+        void *data = lfirst(fileCell);
+        if (IsA(data, SplitInfo)) {
+            SplitInfo *fileInfo = (SplitInfo *)data;
+            size = fileInfo->ObjectSize;
+        } else {
+            /* for txt/csv format obs foreign table. */
+            DistFdwFileSegment *fileSegment = (DistFdwFileSegment *)data;
+            size = fileSegment->ObjectSize;
+        }
+
+        totalSize += size < 0 ? 0 : size;
+    }
+    return totalSize;
+}
+
+BlockNumber getPageCountForFt(void *additionalData)
+{
+    BlockNumber totalPageCount = 0;
+
+    /*
+     * Get table total size. The table may have many files. We add each file size together. File list in additionalData
+     * comes from CN scheduler.
+     */
+    List *fileList = NIL;
+    if (IsA(additionalData, SplitMap)) {
+        SplitMap *splitMap = (SplitMap *)additionalData;
+        fileList = splitMap->splits;
+    } else {
+        /* for dist obs foreign table. */
+        DistFdwDataNodeTask *dnTask = (DistFdwDataNodeTask *)additionalData;
+        fileList = dnTask->task;
+    }
+    double totalSize = GetForeignTableTotalSize(fileList);
+
+    /*
+     * description: BLSCKZ value may change
+     */
+    totalPageCount = (uint32)(totalSize + (BLCKSZ - 1)) / BLCKSZ;
+    if (totalPageCount < 1) {
+        totalPageCount = 1;
+    }
+
+    return totalPageCount;
+}
+

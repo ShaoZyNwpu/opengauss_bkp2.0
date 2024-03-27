@@ -100,6 +100,8 @@
 #include "catalog/pg_hashbucket_fn.h"
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/access_gstrace.h"
+#include "ddes/dms/ss_transaction.h"
+
 #ifdef ENABLE_MULTIPLE_NODES
 #include "tsdb/storage/ts_store_insert.h"
 #endif /* ENABLE_MULTIPLE_NODES */
@@ -133,8 +135,6 @@ static void SkipToNewPage(
     HeapScanDesc scan, ScanDirection dir, BlockNumber page, bool* finished, bool* isValidRelationPage);
 static bool VerifyHeapGetTup(HeapScanDesc scan, ScanDirection dir);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
-static HeapScanDesc heap_beginscan_internal(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
-    uint32 flags, ParallelHeapScanDesc parallel_scan, RangeScanInRedis rangeScanInRedis = {false, 0, 0});
 extern void vacuum_set_xid_limits(Relation rel, int64 freeze_min_age, int64 freeze_table_age, TransactionId *oldestXmin,
                                   TransactionId *freezeLimit, TransactionId *freezeTableLimit,
                                   MultiXactId* multiXactFrzLimit);
@@ -147,7 +147,6 @@ static void ComputeNewXmaxInfomask(TransactionId xmax, uint16 old_infomask, uint
     uint16 *result_infomask, uint16 *result_infomask2);
 
 static void GetMultiXactIdHintBits(MultiXactId multi, uint16 *new_infomask, uint16 *new_infomask2);
-static TransactionId MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask, uint16 t_infomask2);
 static bool DoesMultiXactIdConflict(MultiXactId multi, LockTupleMode lockmode);
 
 /* ----------------
@@ -302,7 +301,7 @@ static void initscan(HeapScanDesc scan, ScanKey key, bool is_rescan)
  * In page-at-a-time mode it performs additional work, namely determining
  * which tuples on the page are visible.
  */
-void heapgetpage(TableScanDesc sscan, BlockNumber page)
+void heapgetpage(TableScanDesc sscan, BlockNumber page, bool* has_cur_xact_write)
 {
     Buffer buffer;
     Snapshot snapshot;
@@ -384,6 +383,11 @@ void heapgetpage(TableScanDesc sscan, BlockNumber page)
             HeapTupleData loctup;
             bool valid = false;
 
+            if (likely(all_visible && (!IsSerializableXact()))) {
+                scan->rs_base.rs_vistuples[ntup++] = line_off;
+                continue;
+            }
+
             loctup.t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
             loctup.t_bucketId = RelationGetBktid(scan->rs_base.rs_rd);
             loctup.t_data = (HeapTupleHeader)PageGetItem((Page)dp, lpp);
@@ -394,7 +398,7 @@ void heapgetpage(TableScanDesc sscan, BlockNumber page)
             if (all_visible)
                 valid = true;
             else
-                valid = HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer);
+                valid = HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer, has_cur_xact_write);
 
             CheckForSerializableConflictOut(valid, scan->rs_base.rs_rd, (void*)&loctup, buffer, snapshot);
 
@@ -1001,7 +1005,8 @@ static void heapgettup(HeapScanDesc scan, ScanDirection dir, int nkeys, ScanKey 
  * heapgettup is 1-based.
  * ----------------
  */
-static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys, ScanKey key)
+static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys, ScanKey key,
+                                bool* has_cur_xact_write = NULL)
 {
     HeapTuple tuple = &(scan->rs_ctup);
     bool backward = ScanDirectionIsBackward(dir);
@@ -1050,7 +1055,7 @@ static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys,
             } else {
                 page = scan->rs_base.rs_startblock; /* first page */
             }
-            heapgetpage((TableScanDesc)scan, page);
+            heapgetpage((TableScanDesc)scan, page, has_cur_xact_write);
             line_index = 0;
             scan->rs_base.rs_inited = true;
         } else {
@@ -1087,7 +1092,7 @@ static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys,
             } else {
                 page = scan->rs_base.rs_nblocks - 1;
             }
-            heapgetpage((TableScanDesc)scan, page);
+            heapgetpage((TableScanDesc)scan, page, has_cur_xact_write);
         } else {
             /* continue from previously returned page/tuple */
             page = scan->rs_base.rs_cblock; /* current page */
@@ -1114,7 +1119,7 @@ static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys,
 
         page = ItemPointerGetBlockNumber(&(tuple->t_self));
         if (page != scan->rs_base.rs_cblock) {
-            heapgetpage((TableScanDesc)scan, page);
+            heapgetpage((TableScanDesc)scan, page, has_cur_xact_write);
         }
 
         /* Since the tuple was previously fetched, needn't lock page here */
@@ -1208,7 +1213,7 @@ static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys,
             return;
         }
 
-        heapgetpage((TableScanDesc)scan, page);
+        heapgetpage((TableScanDesc)scan, page, has_cur_xact_write);
 
         dp = (Page)BufferGetPage(scan->rs_base.rs_cbuf);
         lines = scan->rs_base.rs_ntuples;
@@ -1374,9 +1379,9 @@ Datum fastgetattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool* isnull)
 
     *isnull = false;
     if (HeapTupleNoNulls(tup)) {
-        if (tupleDesc->attrs[attnum - 1]->attcacheoff >= 0) {
-            return fetchatt(tupleDesc->attrs[attnum - 1],
-                (char *)tup->t_data + tup->t_data->t_hoff + tupleDesc->attrs[attnum - 1]->attcacheoff);
+        if (tupleDesc->attrs[attnum - 1].attcacheoff >= 0) {
+            return fetchatt(&tupleDesc->attrs[attnum - 1],
+                (char *)tup->t_data + tup->t_data->t_hoff + tupleDesc->attrs[attnum - 1].attcacheoff);
         }
         return nocachegetattr(tup, attnum, tupleDesc);
     } else {
@@ -1448,7 +1453,7 @@ Relation relation_open(Oid relationId, LOCKMODE lockmode, int2 bucketId)
             ERROR, (errcode(ERRCODE_RELATION_OPEN_ERROR), errmsg("could not open relation with OID %u", relationId)));
     }
 
-    if (r->xmin_csn != InvalidCommitSeqNo) {
+    if (r->xmin_csn != InvalidCommitSeqNo && ActiveSnapshotSet()) {
         Snapshot snapshot = GetActiveSnapshot();
         if (snapshot == NULL || r->xmin_csn > snapshot->snapshotcsn) {
             ereport(ERROR, (errcode(ERRCODE_SNAPSHOT_INVALID), errmsg(
@@ -1800,7 +1805,7 @@ TableScanDesc heap_beginscan_sampling(Relation relation, Snapshot snapshot, int 
         relation, snapshot, nkeys, key, flags, NULL, rangeScanInRedis);
 }
 
-static HeapScanDesc heap_beginscan_internal(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
+TableScanDesc heap_beginscan_internal(Relation relation, Snapshot snapshot, int nkeys, ScanKey key,
     uint32 flags, ParallelHeapScanDesc parallel_scan, RangeScanInRedis rangeScanInRedis)
 {
     HeapScanDesc scan;
@@ -1880,7 +1885,7 @@ static HeapScanDesc heap_beginscan_internal(Relation relation, Snapshot snapshot
 
     initscan(scan, key, false);
 
-    return scan;
+    return (TableScanDesc)scan;
 }
 
 /* ----------------
@@ -2030,22 +2035,8 @@ void HeapParallelscanInitialize(ParallelHeapScanDesc target, Relation relation)
         target->phs_nblocks > (uint32)g_instance.attr.attr_storage.NBuffers / 4;
     SpinLockInit(&target->phs_mutex);
     target->phs_startblock = InvalidBlockNumber;
+    target->isplain = true;
     pg_atomic_init_u64(&target->phs_nallocated, 0);
-}
-
-/* ----------------
- * 		HeapBeginscanParallel - join a parallel scan
- *
- * 		Caller must hold a suitable lock on the correct relation.
- * ----------------
- */
-HeapScanDesc HeapBeginscanParallel(Relation relation, ParallelHeapScanDesc parallel_scan)
-{
-    uint32 flags = SO_ALLOW_STRAT | SO_ALLOW_SYNC;
-
-    Assert(RelationGetRelid(relation) == parallel_scan->phs_relid);
-
-    return heap_beginscan_internal(relation, SnapshotAny, 0, NULL, flags, parallel_scan);
 }
 
 /* ----------------
@@ -2148,14 +2139,14 @@ static BlockNumber HeapParallelscanNextpage(HeapScanDesc scan)
     return page;
 }
 
-HeapTuple heap_getnext(TableScanDesc sscan, ScanDirection direction)
+HeapTuple heap_getnext(TableScanDesc sscan, ScanDirection direction, bool* has_cur_xact_write)
 {
     HeapScanDesc scan = (HeapScanDesc) sscan;
     /* Note: no locking manipulations needed */
     HEAPDEBUG_1; /* heap_getnext( info ) */
 
     if (scan->rs_base.rs_pageatatime) {
-        heapgettup_pagemode(scan, direction, scan->rs_base.rs_nkeys, scan->rs_base.rs_key);
+        heapgettup_pagemode(scan, direction, scan->rs_base.rs_nkeys, scan->rs_base.rs_key, has_cur_xact_write);
     } else {
         heapgettup(scan, direction, scan->rs_base.rs_nkeys, scan->rs_base.rs_key);
     }
@@ -2243,7 +2234,8 @@ bool HeapamGetNextBatchMode(TableScanDesc sscan, ScanDirection direction)
  * tuple first), but the item number might well not be good.
  */
 bool heap_fetch(
-    Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer* userbuf, bool keepBuf, Relation statsRelation)
+    Relation relation, Snapshot snapshot, HeapTuple tuple, Buffer* userbuf, bool keepBuf, Relation statsRelation,
+    bool* has_cur_xact_write)
 {
     ItemPointer tid = &(tuple->t_self);
     ItemId lp;
@@ -2323,7 +2315,7 @@ bool heap_fetch(
     /*
      * check time qualification of tuple, then release lock
      */
-    valid = HeapTupleSatisfiesVisibility(private_tuple, snapshot, buffer);
+    valid = HeapTupleSatisfiesVisibility(private_tuple, snapshot, buffer, has_cur_xact_write);
     if (valid) {
         PredicateLockTuple(relation, private_tuple, snapshot);
 
@@ -2373,7 +2365,7 @@ bool heap_fetch(
     return false;
 }
 
-static TransactionId inline GetOldestXminForHot(Relation relation)
+static inline TransactionId GetOldestXminForHot(Relation relation)
 {
     if (IsCatalogRelation(relation) || RelationIsAccessibleInLogicalDecoding(relation)) {
         return u_sess->utils_cxt.RecentGlobalCatalogXmin;
@@ -2404,7 +2396,7 @@ static TransactionId inline GetOldestXminForHot(Relation relation)
  * heap_fetch, we do not report any pgstats count; caller may do so if wanted.
  */
 bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, Snapshot snapshot, HeapTuple heap_tuple,
-    HeapTupleHeaderData* uncompress_tup, bool* all_dead, bool first_call)
+    HeapTupleHeaderData* uncompress_tup, bool* all_dead, bool first_call, bool* has_cur_xact_write)
 {
     Page dp = (Page)BufferGetPage(buffer);
     TransactionId prev_xmax = InvalidTransactionId;
@@ -2496,12 +2488,12 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
              */
             ItemPointerSet(&(heap_tuple->t_self), BufferGetBlockNumber(buffer), offnum);
             /* If it's visible per the snapshot, we must return it */
-            valid = HeapTupleSatisfiesVisibility(heap_tuple, snapshot, buffer);
+            valid = HeapTupleSatisfiesVisibility(heap_tuple, snapshot, buffer, has_cur_xact_write);
             /* We unlock buffer if sync xid to finish and xid base may change, so copy base again */
             HeapTupleCopyBaseFromPage(heap_tuple, dp);
             CheckForSerializableConflictOut(valid, relation, (void*)heap_tuple, buffer, snapshot);
 
-            if (SHOW_DEBUG_MESSAGE()) {
+            if (unlikely(SHOW_DEBUG_MESSAGE())) {
                 ereport(DEBUG1,
                     (errmsg("heap_hot_search_buffer xid %lu self(%u,%hu) ctid(%u,%hu) valid %d "
                             "pointer(%u,%hu)",
@@ -3476,7 +3468,7 @@ void heap_invalid_invisible_tuple(HeapTuple tuple)
 
     Assert(!HeapTupleIsHotUpdated(tuple));
 
-    ereport(LOG, (errmsg("Dead and invisible tuple: t_ctid = { ip_blkid = { bi_hi = %hu, bi_lo = %hu }, "
+    ereport(DEBUG2, (errmsg("Dead and invisible tuple: t_ctid = { ip_blkid = { bi_hi = %hu, bi_lo = %hu }, "
         "ip_posid = %hu }, t_xmin = %u, xmax = %u, infomask = %hu",
         tuple->t_data->t_ctid.ip_blkid.bi_hi,
         tuple->t_data->t_ctid.ip_blkid.bi_lo,
@@ -4142,7 +4134,7 @@ int heap_multi_insert(Relation relation, Relation parent, HeapTuple* tuples, int
             /* try to insert tuple into mlog-table. */
             if (relation != NULL && relation->rd_mlogoid != InvalidOid) {
                 /* judge whether need to insert into mlog-table */
-                if (relation->rd_tam_type == TAM_USTORE) {
+                if (relation->rd_tam_ops == TableAmUstore) {
                     heaptup = UHeapToHeap(relation->rd_att, (UHeapTuple)heaptup);
                 }
                 insert_into_mlog_table(relation, relation->rd_mlogoid,
@@ -4891,6 +4883,7 @@ void simple_heap_delete(Relation relation, ItemPointer tid, int options, bool al
 {
     TM_Result result;
     TM_FailureData tmfd;
+    bool allow_delete_self = (options & HEAP_INSERT_SPECULATIVE) ? true : false;
 
     result = tableam_tuple_delete(relation,
         tid,
@@ -4900,7 +4893,7 @@ void simple_heap_delete(Relation relation, ItemPointer tid, int options, bool al
         true, /* wait for commit */
         NULL,
         &tmfd,
-        allow_update_self);
+        allow_delete_self || allow_update_self);
     switch (result) {
         case TM_SelfModified:
             /* Tuple was already updated in current command? */
@@ -5549,7 +5542,8 @@ l2:
          */
         if (need_toast) {
             /* Note we always use WAL and FSM during updates */
-            heaptup = toast_insert_or_update(relation, newtup, &oldtup, 0, page, allow_update_self);
+            heaptup = toast_insert_or_update(relation, newtup, &oldtup, allow_update_self ? HEAP_INSERT_SPECULATIVE : 0,
+                                             page, allow_update_self);
             new_tup_size = MAXALIGN(heaptup->t_len);
         } else {
             heaptup = newtup;
@@ -5958,7 +5952,7 @@ static bool heap_tuple_attr_equals(TupleDesc tupdesc, int attrnum, HeapTuple tup
         return (DatumGetObjectId(value1) == DatumGetObjectId(value2));
     } else {
         Assert(attrnum <= tupdesc->natts);
-        att = tupdesc->attrs[attrnum - 1];
+        att = &tupdesc->attrs[attrnum - 1];
         return datumIsEqual(value1, value2, att->attbyval, att->attlen);
     }
 }
@@ -6081,6 +6075,15 @@ void simple_heap_update(Relation relation, ItemPointer otid, HeapTuple tup)
         IsSystemObjOid(HeapTupleGetOid(tup))) {
         ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                 errmsg("All built-in functions are hard coded, and they should not be updated.")));
+    }
+
+    /* All attribute of system table columns are hard coded, and thus they should not be updated */
+    if (u_sess->attr.attr_common.IsInplaceUpgrade == false && IsAttributeRelation(relation)) {
+        Oid attrelid = ((Form_pg_attribute)GETSTRUCT(tup))->attrelid;
+        if (IsSystemObjOid(attrelid)) {
+            ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                    errmsg("All attribute of system table columns are hard coded, and they should not be updated.")));
+        }
     }
 
     result = heap_update(relation,
@@ -6217,7 +6220,7 @@ static void CheckInfomaskCompatilibilty(TransactionId xid, uint16 infomask)
  * See README.tuplock for a thorough explanation of this mechanism.
  */
 TM_Result heap_lock_tuple(Relation relation, HeapTuple tuple, Buffer* buffer, 
-    CommandId cid, LockTupleMode mode, bool nowait, bool follow_updates, TM_FailureData *tmfd, bool allow_lock_self,
+    CommandId cid, LockTupleMode mode, LockWaitPolicy waitPolicy, bool follow_updates, TM_FailureData *tmfd, bool allow_lock_self,
     int waitSec)
 {
     TM_Result result;
@@ -6239,7 +6242,7 @@ TM_Result heap_lock_tuple(Relation relation, HeapTuple tuple, Buffer* buffer,
 
     /* Not support tuple concurrent update to avoid distributed deadlock. */
     if (!u_sess->attr.attr_common.allow_concurrent_tuple_update) {
-        nowait = true;
+        waitPolicy = LockWaitError;
     }
 
     if (t_thrd.proc->workingVersionNum < ENHANCED_TUPLE_LOCK_VERSION_NUM) {
@@ -6285,7 +6288,7 @@ TM_Result heap_lock_tuple(Relation relation, HeapTuple tuple, Buffer* buffer,
     if (RELATION_HAS_UIDS(relation) && HeapTupleHeaderHasUid(tuple->t_data)) {
         uint64 tupleUid = HeapTupleGetUid(tuple);
         LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
-        LockTupleUid(relation, tupleUid, TupleLockExtraInfo[mode].hwlock, !nowait, true);
+        LockTupleUid(relation, tupleUid, TupleLockExtraInfo[mode].hwlock, waitPolicy == LockWaitBlock, true);
         LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
     }
 l3:
@@ -6554,14 +6557,26 @@ l3:
              * tuple state.
              */
             if (!have_tuple_lock) {
-                if (nowait) {
-                    if (!ConditionalLockTupleTuplock(relation, tid, mode)) {
-                        ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-                                        errmsg("could not obtain lock on row in relation \"%s\"",
+                switch (waitPolicy) {
+                    case LockWaitBlock:
+                        LockTuple(relation, tid, TupleLockExtraInfo[mode].hwlock, true, waitSec);
+                        break;
+                    case LockWaitSkip:
+                        if (!ConditionalLockTupleTuplock(relation, tid, mode))
+                        {
+                            result = TM_WouldBlock;
+                            /* recovery code expects to have buffer lock held */
+                            LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+                            goto failed;
+                        }
+                        break;
+                    case LockWaitError:
+                        if (!ConditionalLockTupleTuplock(relation, tid, mode))
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                                     errmsg("could not obtain lock on row in relation \"%s\"",
                                             RelationGetRelationName(relation))));
-                    }
-                } else {
-                    LockTuple(relation, tid, TupleLockExtraInfo[mode].hwlock, true, waitSec);
+                        break;
                 }
                 have_tuple_lock = true;
             }
@@ -6572,13 +6587,27 @@ l3:
                 if (status >= MultiXactStatusNoKeyUpdate)
                     ereport(ERROR, (errmsg("invalid lock mode in heap_lock_tuple")));
 
-                /* wait for multixact to end */
-                if (nowait) {
-                    if (!ConditionalMultiXactIdWait((MultiXactId)xwait, status, NULL))
-                        ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg(
-                            "could not obtain lock on row in relation \"%s\"", RelationGetRelationName(relation))));
-                } else {
-                    MultiXactIdWait((MultiXactId)xwait, status, NULL, waitSec);
+                /* wait for multixact to end, or die trying */
+                switch (waitPolicy) {
+                    case LockWaitBlock:
+                        MultiXactIdWait((MultiXactId) xwait, status, NULL, waitSec);
+                        break;
+                    case LockWaitSkip:
+                        if (!ConditionalMultiXactIdWait((MultiXactId)xwait, status, NULL)) {
+                            result = TM_WouldBlock;
+                            /* recovery code expects to have buffer lock held */
+                            LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+                            goto failed;
+                        }
+                        break;
+                    case LockWaitError:
+                        if (!ConditionalMultiXactIdWait((MultiXactId)xwait, status, NULL))
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                                     errmsg("could not obtain lock on row in relation \"%s\"",
+                                            RelationGetRelationName(relation))));
+                        break;
+                    
                 }
 
                 /*
@@ -6591,13 +6620,27 @@ l3:
                  * is simpler.
                  */
             } else {
-                /* wait for regular transaction to end */
-                if (nowait) {
-                    if (!ConditionalXactLockTableWait(xwait))
-                        ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg(
-                            "could not obtain lock on row in relation \"%s\"", RelationGetRelationName(relation))));
-                } else {
-                    XactLockTableWait(xwait, true, waitSec);
+                /* wait for regular transaction to end, or die trying */
+                switch (waitPolicy) {
+                    case LockWaitBlock:
+                        XactLockTableWait(xwait, true, waitSec);
+                        break;
+                    case LockWaitSkip:
+                        if (!ConditionalXactLockTableWait(xwait))
+                        {
+                            result = TM_WouldBlock;
+                            /* recovery code expects to have buffer lock held */
+                            LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+                            goto failed;
+                        }
+                        break;
+                    case LockWaitError:
+                        if (!ConditionalXactLockTableWait(xwait))
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                                     errmsg("could not obtain lock on row in relation \"%s\"",
+                                            RelationGetRelationName(relation))));
+                        break;
                 }
             }
 
@@ -6657,7 +6700,7 @@ l3:
 
 failed:
     if (result != TM_Ok) {
-        Assert(result == TM_SelfModified || result == TM_Updated || result == TM_Deleted);
+        Assert(result == TM_SelfModified || result == TM_Updated || result == TM_Deleted || result == TM_WouldBlock);
         Assert(!(tuple->t_data->t_infomask & HEAP_XMAX_INVALID));
         Assert(result != TM_Updated ||
             !ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid));
@@ -7139,6 +7182,7 @@ static TM_Result heap_lock_updated_tuple_rec(Relation rel, ItemPointer tid, Tran
     uint16 old_infomask2;
     TransactionId xmax;
     TransactionId new_xmax;
+    TransactionId priorXmax = InvalidTransactionId;
     Buffer vmbuffer = InvalidBuffer;
     BlockNumber block;
     TM_Result result;
@@ -7167,16 +7211,36 @@ l4:
         CHECK_FOR_INTERRUPTS();
 
         /*
-		 * Before locking the buffer, pin the visibility map page if it
-		 * appears to be necessary.  Since we haven't got the lock yet,
-		 * someone else might be in the middle of changing this, so we'll need
-		 * to recheck after we have the lock.
-		 */
+         * Before locking the buffer, pin the visibility map page if it
+         * appears to be necessary.  Since we haven't got the lock yet,
+         * someone else might be in the middle of changing this, so we'll need
+         * to recheck after we have the lock.
+         */
         if (PageIsAllVisible(BufferGetPage(buf))) {
             visibilitymap_pin(rel, block, &vmbuffer);
         }
 
         LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+        /*
+         * Check the tuple XMIN against prior XMAX, if any. If we reached the
+         * end of the chain, we're done, so return success.
+         */
+        if (TransactionIdIsValid(priorXmax) &&
+            !TransactionIdEquals(HeapTupleGetRawXmin(&mytup), priorXmax)) {
+            result = TM_Ok;
+            goto out_locked;
+        }
+
+        /*
+         * Also check Xmin: if this tuple was created by an aborted
+         * (sub)transaction, then we already locked the last live one in the
+         * chain, thus we're done, so return success.
+         */
+        if (TransactionIdDidAbort(HeapTupleGetRawXmin(&mytup))) {
+            result = TM_Ok;
+            goto out_locked;
+        }
 
         old_infomask = mytup.t_data->t_infomask;
         old_infomask2 = mytup.t_data->t_infomask2;
@@ -7341,6 +7405,7 @@ next:
         }
 
         /* tail recursion */
+        priorXmax = HeapTupleGetUpdateXid(&mytup);
         ItemPointerCopy(&(mytup.t_data->t_ctid), &tupid);
         UnlockReleaseBuffer(buf);
         if (vmbuffer != InvalidBuffer)
@@ -7741,8 +7806,16 @@ static void GetMultiXactIdHintBits(MultiXactId multi, uint16 *new_infomask, uint
  * Caller is expected to check the status of the updating transaction, if
  * necessary.
  */
-static TransactionId MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask, uint16 t_infomask2)
+TransactionId MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask, uint16 t_infomask2)
 {
+    if (ENABLE_DMS) {
+        /* fetch TXN info locally if either reformer, original primary, or normal primary */
+        bool local_fetch = SS_PRIMARY_MODE || SS_OFFICIAL_PRIMARY;
+        if (!local_fetch) {
+            return SSMultiXactIdGetUpdateXid(xmax, t_infomask, t_infomask2);
+        }
+    }
+
     TransactionId updateXact = InvalidTransactionId;
     MultiXactMember *members = NULL;
     int nmembers;
@@ -9177,9 +9250,6 @@ static void heap_xlog_update(XLogReaderState* record, bool hot_update)
     if (isinit) {
         rec_data += sizeof(TransactionId);
     }
-    if ((record->decoded_record->xl_term & XLOG_CONTAIN_CSN) == XLOG_CONTAIN_CSN) {
-        rec_data += sizeof(CommitSeqNo);
-    }
 
     xlrec = (xl_heap_update*)rec_data;
 
@@ -9512,8 +9582,8 @@ void heap_sync(Relation rel, LOCKMODE lockmode)
     bool heapIsPartitioned = RELATION_IS_PARTITIONED(rel);
     LOCKMODE toastLockmode = (lockmode == NoLock) ? NoLock : AccessShareLock;
     
-    /* non-WAL-logged tables or dfs tables never need fsync */
-    if (!RelationNeedsWAL(rel) || RelationIsDfsStore(rel)) {
+    /* non-WAL-logged tables never need fsync */
+    if (!RelationNeedsWAL(rel)) {
         return;
     }
     
@@ -9539,8 +9609,8 @@ void partition_sync(Relation rel, Oid partition_id, LOCKMODE partition_lockmode)
 {
     LOCKMODE toastLockmode = (partition_lockmode == NoLock) ? NoLock : AccessShareLock;
 
-    /* non-WAL-logged tables or dfs tables never need fsync */
-    if (!RelationNeedsWAL(rel) || RelationIsDfsStore(rel)) {
+    /* non-WAL-logged tables never need fsync */
+    if (!RelationNeedsWAL(rel)) {
         return;
     }
 
@@ -9555,18 +9625,6 @@ void partition_sync(Relation rel, Oid partition_id, LOCKMODE partition_lockmode)
 
     releaseDummyRelation(&partionRel);
     partitionClose(rel, partition, NoLock);
-}
-
-static void ReportPartitionOpenError(Relation relation, Oid partition_id)
-{
-    ereport(
-        ERROR,
-        (errcode(ERRCODE_RELATION_OPEN_ERROR), errmsg("could not open partition with OID %u", partition_id),
-         errdetail("Check whether DDL operations exist on the current partition in the table %s, like "
-                   "drop/exchange/split/merge partition",
-                   RelationGetRelationName(relation)),
-         errcause("If there is a DDL operation, the cause is incorrect operation. Otherwise, it is a system error."),
-         erraction("Wait for DDL operation to complete or Contact engineer to support.")));
 }
 
 /*
@@ -9610,7 +9668,15 @@ Partition partitionOpenWithRetry(Relation relation, Oid partition_id, LOCKMODE l
     Assert(PointerIsValid(relation));
     Assert(OidIsValid(partition_id));
 
-    if (RelationIsSubPartitioned(relation) && relation->rd_id != partid_get_parentid(partition_id)) {
+    Oid parentid = partid_get_parentid(partition_id);
+    if (!OidIsValid(parentid)) {
+        ereport(ERROR, (errcode(ERRCODE_PARTITION_ERROR),
+                        errmsg("partition %u does not exist on relation \"%s\" when find parent oid with retry mod",
+                               partition_id, RelationGetRelationName(relation)),
+                        errdetail("this partition may have already been dropped")));
+    }
+
+    if (RelationIsSubPartitioned(relation) && relation->rd_id != parentid) {
         /* partition_id is subpartition oid */
         p = SubPartitionOidGetPartitionWithRetry(relation, partition_id, lockmode, stmt);
         Assert(relation->rd_id == partid_get_parentid(p->pd_part->parentid));
@@ -9657,7 +9723,10 @@ Partition partitionOpenWithRetry(Relation relation, Oid partition_id, LOCKMODE l
     p = PartitionIdGetPartition(partition_id, RelationGetStorageType(relation));
 
     if (!PartitionIsValid(p)) {
-        ReportPartitionOpenError(relation, partition_id);
+        ereport(ERROR,
+            (errcode(ERRCODE_RELATION_OPEN_ERROR),
+            errmsg("partition %u does not exist", partition_id),
+            errdetail("this partition may have already been dropped")));
     }
     Assert(relation->rd_id == p->pd_part->parentid);
 
@@ -9689,24 +9758,42 @@ Partition partitionOpenWithRetry(Relation relation, Oid partition_id, LOCKMODE l
  *			: on the partiiton already.)
  * Notes		:
  */
-Partition partitionOpen(Relation relation, Oid partition_id, LOCKMODE lockmode, int2 bucket_id)
+Partition partitionOpen(Relation relation, Oid partitionOid, LOCKMODE lockmode, int2 bucket_id)
 {
     Partition p;
 
-    if (!OidIsValid(partition_id)) {
-        ereport(ERROR, (errcode(ERRCODE_RELATION_OPEN_ERROR), errmsg("partition %u is invalid", partition_id)));
+    if (!OidIsValid(partitionOid)) {
+        ereport(ERROR, (errcode(ERRCODE_PARTITION_ERROR),
+                        errmsg("Partition oid %u is invalid when opening partition", partitionOid),
+                        errdetail("There is a partition may have already been dropped on relation/partition \"%s\"",
+                                  RelationGetRelationName(relation))));
     }
 
     Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
     Assert(PointerIsValid(relation));
     Assert(bucket_id < SegmentBktId);
 
-    if (RelationIsSubPartitioned(relation) && relation->rd_id != partid_get_parentid(partition_id)) {
-        /* partition_id is subpartition oid */
-        p = SubPartitionOidGetPartition(relation, partition_id, lockmode);
+    Oid parentOid = partid_get_parentid(partitionOid);
+    if (!OidIsValid(parentOid)) {
+        ereport(ERROR, (errcode(ERRCODE_PARTITION_ERROR),
+                        errmsg("partition %u does not exist on relation \"%s\" when find parent oid", partitionOid,
+                               RelationGetRelationName(relation)),
+                        errdetail("this partition may have already been dropped")));
+    }
+
+    Assert(RelationIsPartitioned(relation));
+    /* subpartition table open subpartition, which is judged by partitionOpen() */
+    if (RelationIsSubPartitioned(relation) && relation->rd_id != parentOid) {
+        /* partitionOid is subpartition oid */
+        p = SubPartitionOidGetPartition(relation, partitionOid, lockmode);
         Assert(relation->rd_id == partid_get_parentid(p->pd_part->parentid));
         return p;
     }
+    if (relation->rd_id != parentOid)
+        ereport(ERROR,
+                (errcode(ERRCODE_PARTITION_ERROR),
+                 errmsg("partition %u does not exist on relation \"%s\"", partitionOid,
+                         RelationGetRelationName(relation))));
 
     /*
      * If we are executing select for update/share operation,
@@ -9721,32 +9808,35 @@ Partition partitionOpen(Relation relation, Oid partition_id, LOCKMODE lockmode, 
              * assume the partition is in PART_AREA_RANGE, if we support interval partition,
              * we have to find a quick way to find the area it belongs to.
              */
-            LockPartition(relation->rd_id, partition_id, lockmode, PARTITION_LOCK);
+            LockPartition(relation->rd_id, partitionOid, lockmode, PARTITION_LOCK);
         } else if (relation->rd_rel->relkind == RELKIND_INDEX) {
-            LockPartition(relation->rd_id, partition_id, lockmode, PARTITION_LOCK);
+            LockPartition(relation->rd_id, partitionOid, lockmode, PARTITION_LOCK);
         } else {
             ereport(ERROR,
                 (errcode(ERRCODE_RELATION_OPEN_ERROR),
                     errmsg("openning partition %u, but relation %s %u is neither table nor index",
-                        partition_id,
+                        partitionOid,
                         RelationGetRelationName(relation),
                         RelationGetRelid(relation))));
         }
     }
 
     /* The partcache does all the real work... */
-    p = PartitionIdGetPartition(partition_id, RelationGetStorageType(relation));
+    p = PartitionIdGetPartition(partitionOid, RelationGetStorageType(relation));
 
     if (!PartitionIsValid(p)) {
-        ReportPartitionOpenError(relation, partition_id);
+        ereport(ERROR, (errcode(ERRCODE_PARTITION_ERROR),
+                        errmsg("partition %u does not exist on relation \"%s\" when get the partcache", partitionOid,
+                               RelationGetRelationName(relation)),
+                        errdetail("this partition may have already been dropped")));
     }
 
-    if (p->xmin_csn != InvalidCommitSeqNo) {
+    if (p->xmin_csn != InvalidCommitSeqNo && ActiveSnapshotSet()) {
         Snapshot snapshot = GetActiveSnapshot();
         if (p->xmin_csn > snapshot->snapshotcsn) {
             ereport(ERROR,
             (errcode(ERRCODE_SNAPSHOT_INVALID),
-                    errmsg("current snapshot is invalid for this partition : %u.", partition_id)));
+                    errmsg("current snapshot is invalid for this partition : %u.", partitionOid)));
         }
 
     }
@@ -9836,12 +9926,24 @@ Partition tryPartitionOpen(Relation relation, Oid partition_id, LOCKMODE lockmod
     Assert(PointerIsValid(relation));
     Assert(OidIsValid(partition_id));
 
-    if (RelationIsSubPartitioned(relation) && relation->rd_id != partid_get_parentid(partition_id)) {
+    Oid parentid = partid_get_parentid(partition_id);
+    if (!OidIsValid(parentid)) {
+        return NULL;
+    }
+
+    Assert(RelationIsPartitioned(relation));
+    /* subpartition table open subpartition, which is judged by tryPartitionOpen() */
+    if (RelationIsSubPartitioned(relation) && relation->rd_id != parentid) {
+        if (!SearchSysCacheExists1(PARTRELID, ObjectIdGetDatum(partition_id))) {
+            return NULL;
+        }
         /* partition_id is subpartition oid */
         p = TrySubPartitionOidGetPartition(relation, partition_id, lockmode);
         Assert(relation->rd_id == partid_get_parentid(p->pd_part->parentid));
         return p;
     }
+    if (relation->rd_id != parentid)
+        return NULL;
 
     /*
      * If we are executing select for update/share operation,
@@ -9891,7 +9993,7 @@ Partition tryPartitionOpen(Relation relation, Oid partition_id, LOCKMODE lockmod
     p = PartitionIdGetPartition(partition_id, RelationGetStorageType(relation));
 
     if (!PartitionIsValid(p)) {
-        ReportPartitionOpenError(relation, partition_id);
+        return NULL;
     }
     Assert(relation->rd_id == p->pd_part->parentid);
 
@@ -9913,6 +10015,41 @@ Partition tryPartitionOpen(Relation relation, Oid partition_id, LOCKMODE lockmod
 #endif
 
     return p;
+}
+
+/*
+ * Search the partition with partitionno retry.
+ * If the partition entry has already been removed by DDL operations, we use partitionno to research the new entry.
+ * Must make sure the partitionno is of the old partition entry, otherwise a wrong entry may be found!
+ * If the partitionno is invalid, this function is degenerated into partitionOpen.
+ */
+Partition PartitionOpenWithPartitionno(Relation relation, Oid partition_id, int partitionno, LOCKMODE lockmode)
+{
+    Partition part = NULL;
+    bool issubpartition = false;
+    char parttype;
+    Oid newpartOid = InvalidOid;
+
+    /* first try open the partition */
+    part = tryPartitionOpen(relation, partition_id, lockmode);
+    if (likely(PartitionIsValid(part))) {
+        return part;
+    }
+
+    if (!PARTITIONNO_IS_VALID(partitionno)) {
+        ReportPartitionOpenError(relation, partition_id);
+    }
+
+    PARTITION_LOG(
+        "partition %u does not exist on relation \"%s\", we will try to use partitionno %d to search the new partition",
+        partition_id, RelationGetRelationName(relation), partitionno);
+
+    /* if not found, search the new partition with partitionno */
+    issubpartition = RelationIsPartitionOfSubPartitionTable(relation);
+    parttype = issubpartition ? PART_OBJ_TYPE_TABLE_SUB_PARTITION : PART_OBJ_TYPE_TABLE_PARTITION;
+    newpartOid = GetPartOidWithPartitionno(RelationGetRelid(relation), partitionno, parttype);
+
+    return partitionOpen(relation, newpartOid, lockmode);
 }
 
 /*
@@ -10079,7 +10216,13 @@ void heapam_index_fetch_end(IndexFetchTableData *scan)
     pfree(hscan);
 }
 
-HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead)
+static bool BufferExclusiveLockHeldByMe(Buffer cbuf)
+{
+    volatile BufferDesc *buf = GetBufferDescriptor(cbuf - 1);
+    return LWLockHeldByMeInMode(buf->content_lock, LW_EXCLUSIVE);
+}
+
+HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has_cur_xact_write)
 {
     ItemPointer tid = &scan->xs_ctup.t_self;
     bool got_heap_tuple = false;
@@ -10109,11 +10252,17 @@ HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead)
     
     page = BufferGetPage(scan->xs_cbuf);
 
+    /* Report error if it holds the lock on pg_partition page. */
+    if (RelationGetRelid(scan->heapRelation) == PartitionRelationId && BufferExclusiveLockHeldByMe(scan->xs_cbuf)) {
+        ereport(ERROR, (errmsg("deadlock detected: requesting lock on pg_partition page while already holding it."),
+                        errhint("retry this operation after other DDL operation finished.")));
+    }
+
     /* Obtain share-lock on the buffer so we can examine visibility */
     LockBuffer(scan->xs_cbuf, BUFFER_LOCK_SHARE);
     got_heap_tuple = heap_hot_search_buffer(tid, scan->heapRelation,
         scan->xs_cbuf, scan->xs_snapshot, &scan->xs_ctup,
-        &scan->xs_ctbuf_hdr, all_dead, !scan->xs_continue_hot);
+        &scan->xs_ctbuf_hdr, all_dead, !scan->xs_continue_hot, has_cur_xact_write);
 
     LockBuffer(scan->xs_cbuf, BUFFER_LOCK_UNLOCK);
 

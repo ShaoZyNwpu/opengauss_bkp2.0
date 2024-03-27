@@ -45,7 +45,7 @@ typedef struct _FuncCandidateList
 	int			ndargs;			/* number of defaulted args */
 	int		   *argnumbers;		/* args' positional indexes, if named call */
 	Oid			refSynOid;		/* referenced synonym's OID if mapping successfully, and drop it when view decoupling */
-        int 		allArgNum;      /* all param num including in/out/inout */
+    int 		allArgNum;      /* all param num including in/out/inout */
 	Oid			args[FLEXIBLE_ARRAY_MEMBER];		/* arg types --- VARIABLE LENGTH ARRAY */
 }	*FuncCandidateList;	/* VARIABLE LENGTH STRUCT */
 
@@ -208,6 +208,7 @@ extern void RemoveTmpNspFromSearchPath(Oid tmpnspId);
 extern Oid	get_collation_oid(List *collname, bool missing_ok);
 extern Oid	get_conversion_oid(List *conname, bool missing_ok);
 extern Oid	FindDefaultConversionProc(int4 for_encoding, int4 to_encoding);
+extern Oid get_collation_oid_with_lower_name(const char* collation_name, int charset);
 
 /* initialization & transaction cleanup code */
 extern void InitializeSearchPath(void);

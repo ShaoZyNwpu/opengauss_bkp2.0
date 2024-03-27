@@ -101,8 +101,6 @@
 extern uint64 pg_relation_perm_table_size(Relation rel);
 extern uint64 pg_relation_table_size(Relation rel);
 
-extern int64 MetaCacheGetCurrentUsedSize();
-
 extern bool is_searchserver_api_load();
 extern void* get_searchlet_resource_info(int* used_mem, int* peak_mem);
 extern void ExplainOneQueryForStatistics(QueryDesc* queryDesc);
@@ -127,9 +125,9 @@ void updateIOFlowData4GroupUserOnCN(UserData* userdata);
 bool IsQidInvalid(const Qid* qid)
 {
 #ifdef ENABLE_MULTIPLE_NODES
-    return (qid == NULL || qid->queryId <= 0 || qid->procId > KBYTES || qid->procId <= 0 || qid->stamp < 0);
+    return (qid == NULL || qid->queryId == 0 || qid->procId > KBYTES || qid->procId == 0 || qid->stamp < 0);
 #else
-    return (qid == NULL || qid->queryId <= 0 || qid->stamp < 0);
+    return (qid == NULL || qid->queryId == 0 || qid->stamp < 0);
 #endif
 }
 
@@ -1091,7 +1089,7 @@ void WLMAdjustCGroup4EachThreadOnDN(WLMDNodeInfo* info)
     }
 
     /* Check the thread id whether is valid, and get the next group. */
-    if (info->tid <= 0 || gscgroup_get_next_group(ng, info->cgroup) <= 0) {
+    if (info->tid == 0 || gscgroup_get_next_group(ng, info->cgroup) <= 0) {
         return;
     }
 
@@ -1882,8 +1880,12 @@ void WLMReadjustUserSpaceByQuery(const char* username, List* database_name_list)
             isFirstDb ? "true" : "false");
         securec_check_ss(rc, "\0", "\0");
         isFirstDb = false;
-
+        bool old = t_thrd.int_cxt.ImmediateInterruptOK;
+        /*Allow cancel/die interrupts because the connection might be stucked forever*/
+        t_thrd.int_cxt.ImmediateInterruptOK = true;
+        CHECK_FOR_INTERRUPTS();
         pgConn = PQconnectdb(conninfo);
+        t_thrd.int_cxt.ImmediateInterruptOK = old;
         if (PQstatus(pgConn) != CONNECTION_OK) {
             ereport(WARNING,
                 (errcode(ERRCODE_CONNECTION_TIMED_OUT),
@@ -7474,7 +7476,7 @@ bool WLMUpdateMemoryInfo(bool need_adjust)
     unsigned long lib = 0;
     unsigned long data = 0;
     unsigned long dt = 0;
-    uint32 cu_size = (uint32)((uint64)(CUCache->GetCurrentMemSize() + MetaCacheGetCurrentUsedSize()) >> BITS_IN_MB);
+    uint32 cu_size = (uint32)((uint64)(CUCache->GetCurrentMemSize()) >> BITS_IN_MB);
     int gpu_used = 0;
 
 #ifdef ENABLE_MULTIPLE_NODES
@@ -7795,6 +7797,7 @@ int WLMProcessThreadMain(void)
      * SIGINT is used to signal canceling; SIGTERM
      * means abort and exit cleanly, and SIGQUIT means abandon ship.
      */
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGINT, SIG_IGN);
     (void)gspqsignal(SIGTERM, die);
     (void)gspqsignal(SIGQUIT, quickdie);

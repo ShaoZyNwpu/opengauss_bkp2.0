@@ -80,7 +80,7 @@ static uint64 ledger_copytable(CopyState cstate)
 {
     Relation cur_rel;
     TupleDesc tuple_desc;
-    Form_pg_attribute *attr = NULL;
+    FormData_pg_attribute *attr = NULL;
     ListCell *cur = NULL;
     int num_phys_attrs;
     uint64 processed = 0;
@@ -106,7 +106,7 @@ static uint64 ledger_copytable(CopyState cstate)
         int attnum = lfirst_int(cur);
         Oid out_func_oid;
         bool isvarlena = false;
-        getTypeOutputInfo(attr[attnum - 1]->atttypid, &out_func_oid, &isvarlena);
+        getTypeOutputInfo(attr[attnum - 1].atttypid, &out_func_oid, &isvarlena);
         fmgr_info(out_func_oid, &cstate->out_functions[attnum - 1]);
     }
 
@@ -482,6 +482,7 @@ Datum ledger_hist_archive(PG_FUNCTION_ARGS)
 
         /* Do insertion for unified row. */
         simple_heap_insert(histRel, tuple);
+        CatalogUpdateIndexes(histRel,tuple);
         heap_freetuple(tuple);
 
         /*

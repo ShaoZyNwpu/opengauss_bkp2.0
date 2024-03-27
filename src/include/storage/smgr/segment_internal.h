@@ -33,7 +33,9 @@
 #include "storage/buf/bufpage.h"
 #include "storage/lock/lwlock.h"
 #include "storage/smgr/smgr.h"
+#include "storage/file/fio_device_com.h"
 #include "utils/segment_test.h"
+#include "libaio.h"
 
 const int DF_MAP_GROUP_RESERVED = 3;
 const int DF_MAX_MAP_GROUP_CNT = 33;
@@ -100,6 +102,8 @@ void df_unlink(SegLogicFile *sf);
 void df_create_file(SegLogicFile *sf, bool redo);
 void df_shrink(SegLogicFile *sf, BlockNumber target);
 void df_flush_data(SegLogicFile *sf, BlockNumber blocknum, BlockNumber nblocks);
+bool df_ss_update_segfile_size(SegLogicFile *sf, BlockNumber target_block);
+SegPhysicalFile df_get_physical_file(SegLogicFile *sf, int sliceno, BlockNumber target_block);
 
 /*
  * Data files status in the segment space;
@@ -340,6 +344,7 @@ typedef struct IpBlockLocation {
 
 void SetInversePointer(SegExtentGroup *eg, BlockNumber extent, ExtentInversePointer iptr);
 ExtentInversePointer GetInversePointer(SegExtentGroup *eg, BlockNumber extent, Buffer *buf);
+extern ExtentInversePointer RepairGetInversePointer(SegExtentGroup *seg, BlockNumber extent);
 void GetAllInversePointer(SegExtentGroup *seg, uint32 *cnt, ExtentInversePointer **iptrs, BlockNumber **extents);
 const char *GetExtentUsageName(ExtentInversePointer iptr);
 
@@ -392,8 +397,10 @@ SegSpace *spc_open(Oid tablespace_id, Oid database_id, bool create, bool isRedo 
 SegSpace *spc_init_space_node(Oid spcNode, Oid dbNode);
 SpaceDataFileStatus spc_status(SegSpace *spc);
 SegSpace *spc_drop(Oid tablespace_id, Oid database_id, bool redo);
+void spc_drop_space_node(Oid spcNode, Oid dbNode);
 void spc_lock(SegSpace *spc);
 void spc_unlock(SegSpace *spc);
+void SSDrop_seg_space(Oid spcNode, Oid dbNode);
 
 BlockNumber spc_alloc_extent(SegSpace *spc, int extent_size, ForkNumber forknum, BlockNumber designate_block,
                              ExtentInversePointer iptr);
@@ -407,6 +414,8 @@ BlockNumber spc_size(SegSpace *spc, BlockNumber egRelNode, ForkNumber forknum);
 void spc_datafile_create(SegSpace *spc, BlockNumber egRelNode, ForkNumber forknum);
 void spc_extend_file(SegSpace *spc, BlockNumber egRelNode, ForkNumber forknum, BlockNumber blkno);
 bool spc_datafile_exist(SegSpace *spc, BlockNumber egRelNode, ForkNumber forknum);
+int32 spc_aio_prep_pwrite(SegSpace *spc, RelFileNode relNode, ForkNumber forknum, BlockNumber blocknum,
+    const char *buffer, void *iocb_ptr);
 
 extern void spc_shrink_files(SegExtentGroup *seg, BlockNumber target_size, bool redo);
 
@@ -447,7 +456,8 @@ typedef struct SegPageLocation {
     BlockNumber blocknum;
 } SegPageLocation;
 
-SegPageLocation seg_get_physical_location(RelFileNode rnode, ForkNumber forknum, BlockNumber blocknum);
+SegPageLocation seg_get_physical_location(RelFileNode rnode, ForkNumber forknum, BlockNumber blocknum,
+                                          bool check_standby = true);
 void seg_record_new_extent_on_level0_page(SegSpace *spc, Buffer seg_head_buffer, uint32 new_extent_id,
                                           BlockNumber new_extent_first_pageno);
 void seg_head_update_xlog(Buffer head_buffer, SegmentHead *seg_head, int level0_slot,
@@ -497,6 +507,7 @@ typedef struct SegmentDesc {
     BlockNumber head_blocknum; // Segment Head block number
     uint32 timeline;
 } SegmentDesc;
+
 
 #define IsNormalForknum(forknum)                                                                                       \
     ((forknum) == MAIN_FORKNUM || (forknum) == FSM_FORKNUM || (forknum) == VISIBILITYMAP_FORKNUM)

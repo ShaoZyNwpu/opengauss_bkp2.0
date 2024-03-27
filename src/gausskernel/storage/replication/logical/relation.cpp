@@ -24,6 +24,7 @@
 #include "replication/logicalrelation.h"
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
+#include "catalog/pg_subscription_rel.h"
 
 static const int DEFAULT_LOGICAL_RELMAP_HASH_ELEM = 128;
 /*
@@ -270,11 +271,11 @@ LogicalRepRelMapEntry *logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lo
 
         found = 0;
         for (i = 0; i < desc->natts; i++) {
-            if (desc->attrs[i]->attisdropped || GetGeneratedCol(desc, i)) {
+            if (desc->attrs[i].attisdropped || GetGeneratedCol(desc, i)) {
                 entry->attrmap[i] = -1;
                 continue;
             }
-            int attnum = logicalrep_rel_att_by_name(remoterel, NameStr(desc->attrs[i]->attname));
+            int attnum = logicalrep_rel_att_by_name(remoterel, NameStr(desc->attrs[i].attname));
             entry->attrmap[i] = attnum;
             if (attnum >= 0)
                 found++;
@@ -315,11 +316,9 @@ LogicalRepRelMapEntry *logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lo
         while ((i = bms_next_member(idkey, i)) >= 0) {
             int attnum = i + FirstLowInvalidHeapAttributeNumber;
 
-            if (!AttrNumberIsForUserDefinedAttr(attnum))
-                ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                    errmsg("logical replication target relation \"%s.%s\" uses "
-                    "system columns in REPLICA IDENTITY index",
-                    remoterel->nspname, remoterel->relname)));
+            if (!AttrNumberIsForUserDefinedAttr(attnum)) {
+                continue;
+            }
 
             attnum = AttrNumberGetAttrOffset(attnum);
             if (entry->attrmap[attnum] < 0 || !bms_is_member(entry->attrmap[attnum], remoterel->attkeys)) {
@@ -330,6 +329,11 @@ LogicalRepRelMapEntry *logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lo
 
         entry->localrelvalid = true;
     }
+
+    if (entry->state != SUBREL_STATE_READY)
+        entry->state = GetSubscriptionRelState(t_thrd.applyworker_cxt.mySubscription->oid,
+                                               entry->localreloid,
+                                               &entry->statelsn);
 
     return entry;
 }

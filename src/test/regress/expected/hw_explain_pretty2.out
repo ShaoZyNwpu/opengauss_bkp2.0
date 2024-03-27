@@ -65,8 +65,8 @@ explain (verbose on, costs off, analyze on, cpu on)
 
 explain (verbose on, costs off, analyze on, cpu on)
 (select col_interval from row_append_table_01 where col_int > 11) union (select col_interval from row_append_table_02 where col_int > 12) order by col_interval;
-                                                 QUERY PLAN                                                  
--------------------------------------------------------------------------------------------------------------
+--?.*
+--?.*
 --? Sort (actual time=.* rows=3 loops=1)
    Output: row_append_table_01.col_interval
    Sort Key: row_append_table_01.col_interval
@@ -100,7 +100,7 @@ explain (analyze on, costs off, timing off) select * from row_append_table_01 jo
    Rows Removed by Join Filter: 9
    ->  Seq Scan on row_append_table_01 (actual rows=12 loops=1)
    ->  Hash (actual rows=5 loops=1)
-          Buckets: 32768  Batches: 1  Memory Usage: 1kB
+--?          Buckets: 32768  Batches: 1  Memory Usage: .*kB
          ->  Seq Scan on row_append_table_02 (actual rows=5 loops=1)
 --? Total runtime: .* ms
 (9 rows)

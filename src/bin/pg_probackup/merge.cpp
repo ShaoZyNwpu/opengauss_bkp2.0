@@ -15,6 +15,7 @@
 
 #include "thread.h"
 #include "common/fe_memutils.h"
+#include "storage/file/fio_device.h"
 
 typedef struct
 {
@@ -1137,9 +1138,9 @@ merge_files(void *arg)
                                                 arguments->full_external_prefix);
 
         done:
-            tmp_file->compressedFile = dest_file->compressedFile;
-            tmp_file->compressedAlgorithm = dest_file->compressedAlgorithm;
-            tmp_file->compressedChunkSize = dest_file->compressedChunkSize;
+            tmp_file->compressed_file = dest_file->compressed_file;
+            tmp_file->compressed_algorithm = dest_file->compressed_algorithm;
+            tmp_file->compressed_chunk_size = dest_file->compressed_chunk_size;
             parray_append(arguments->merge_filelist, tmp_file);
     }
 
@@ -1393,7 +1394,7 @@ merge_data_file(parray *parent_chain, pgBackup *full_backup,
     if (out == NULL)
         elog(ERROR, "Cannot open merge target file \"%s\": %s",
             to_fullpath_tmp1, strerror(errno));
-            setvbuf(out, buffer, _IOFBF, STDIO_BUFSIZE);
+    setvbuf(out, buffer, _IOFBF, STDIO_BUFSIZE);
 
     /* restore file into temp file */
     restore_data_file(parent_chain, dest_file, out, to_fullpath_tmp1,

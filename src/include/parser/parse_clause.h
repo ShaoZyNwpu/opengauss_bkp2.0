@@ -18,23 +18,24 @@
 #include "nodes/relation.h"
 #include "parser/parse_node.h"
 
-extern void transformFromClause(ParseState* pstate, List* frmList, bool isFirstNode = true, bool isCreateView = false);
-extern int setTargetTable(ParseState* pstate, RangeVar* relation, bool inh, bool alsoSource, AclMode requiredPerms);
+extern void transformFromClause(ParseState* pstate, List* frmList, bool isFirstNode = true, bool isCreateView = false,
+    bool isUpdate = false);
+extern List* setTargetTables(ParseState* pstate, List* relation, bool expandInh, bool alsoSource, AclMode requiredPerms);
 extern bool interpretInhOption(InhOption inhOpt);
 extern bool interpretOidsOption(List* defList);
 
 extern Node* transformFromClauseItem(ParseState* pstate, Node* n, RangeTblEntry** top_rte, int* top_rti,
     RangeTblEntry** right_rte, int* right_rti, List** relnamespace, bool isFirstNode = true,
-    bool isCreateView = false, bool isMergeInto = false);
+    bool isCreateView = false, bool isMergeInto = false, bool isUpdate = false);
 
 extern Node* transformJoinOnClause(ParseState* pstate, JoinExpr* j, RangeTblEntry* l_rte, RangeTblEntry* r_rte,
     List* relnamespace);
-extern Node* transformWhereClause(ParseState* pstate, Node* clause, const char* constructName);
-extern Node* transformLimitClause(ParseState* pstate, Node* clause, const char* constructName);
+extern Node* transformWhereClause(ParseState* pstate, Node* clause, ParseExprKind exprKind, const char* constructName);
+extern Node* transformLimitClause(ParseState* pstate, Node* clause, ParseExprKind exprKind, const char* constructName);
 extern List* transformGroupClause(
-    ParseState* pstate, List* grouplist, List** groupingSets, List** targetlist, List* sortClause, bool useSQL99);
+    ParseState* pstate, List* grouplist, List** groupingSets, List** targetlist, List* sortClause, ParseExprKind exprKind, bool useSQL99);
 extern List* transformSortClause(
-    ParseState* pstate, List* orderlist, List** targetlist, bool resolveUnknown, bool useSQL99);
+    ParseState* pstate, List* orderlist, List** targetlist, ParseExprKind exprKind, bool resolveUnknown, bool useSQL99);
 
 extern List* transformWindowDefinitions(ParseState* pstate, List* windowdefs, List** targetlist);
 

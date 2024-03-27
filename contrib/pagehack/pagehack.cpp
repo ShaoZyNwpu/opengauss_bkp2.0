@@ -46,6 +46,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <new>
 
 #include "access/heapam.h"
 #include "access/htup.h"
@@ -79,6 +80,8 @@
 #include "storage/smgr/relfilenode.h"
 #include "storage/sinval.h"
 #include "storage/smgr/segment.h"
+#include "storage/dss/dss_adaptor.h"
+#include "storage/file/fio_device.h"
 #include "replication/bcm.h"
 #include "utils/datetime.h"
 #include "utils/memutils.h"
@@ -87,6 +90,7 @@
 #include "cstore.h"
 #include "common/build_query/build_query.h"
 #include <libgen.h>
+#include "tool_common.h"
 #ifdef ENABLE_MULTIPLE_NODES
 #include "tsdb/utils/constant_def.h"
 #endif
@@ -98,6 +102,7 @@
 /* Number of pg_class types */
 #define CLASS_TYPE_NUM 512
 #define TEN 10
+
 
 typedef unsigned char* binary;
 static const char* indents[] = {  // 10 tab is enough to used.
@@ -141,7 +146,15 @@ static const char* PgHeapRelName[] = {"pg_class",
     "pg_am",
     "pg_statistic",
     "pg_toast"};
-typedef enum SegmentType { SEG_HEAP, SEG_FSM, SEG_UHEAP, SEG_INDEX_BTREE, SEG_UNDO, SEG_UNKNOWN } SegmentType;
+
+typedef enum SegmentType {
+    SEG_HEAP,
+    SEG_FSM,
+    SEG_UHEAP,
+    SEG_INDEX_BTREE,
+    SEG_UNDO,
+    SEG_UNKNOWN
+} SegmentType;
 
 static void ParsePgClassTupleData(binary tupdata, int len, binary nullBitmap, int natrrs);
 static void ParsePgIndexTupleData(binary tupdata, int len, binary nullBitmap, int nattrs);
@@ -183,14 +196,20 @@ static ParseHeapTupleData PgIndexRelTupleParser[] = {ParseToastIndexTupleData};
 static int PgHeapRelTupleParserCursor = -1;
 static int PgIndexRelTupleParserCursor = -1;
 
+
 /* For Assert(...) macros. */
+#ifdef USE_ASSERT_CHECKING
 THR_LOCAL bool assert_enabled = true;
+#else
+THR_LOCAL bool assert_enabled = false;
+#endif
 
 /* Options */
 bool only_vm = false;
 bool only_bcm = false;
 bool write_back = false;
 bool dirty_page = false;
+bool enable_dss = false;
 int start_item = 1;
 int num_item = 0;
 int SegNo = 0;
@@ -1005,6 +1024,9 @@ static void usage(const char* progname)
            "  -d only for test, use 0xFF to fill the last half page[4k]\n"
            "  -z only for undo space/group meta, dump the specified space/group\n"
            "  -S heap file segment number\n"
+           "\nDss options:\n"
+           "  -D enable shared storage mode\n"
+           "  -c SOCKETPATH  dss connect socket file path\n"
            "\nCommon options:\n"
            "  --help, -h       show this help, then exit\n"
            "  --version, -V    output version information, then exit\n");
@@ -1055,7 +1077,8 @@ static void ParsePgCudescXXTupleData(binary tupdata, int len, binary nullBitmap,
     char* nextAttr = (char*)tupdata;
 
     bool isnulls[nattrs];
-    memset(isnulls, false, nattrs);
+    errno_t rc = memset_s(isnulls, nattrs, false, nattrs);
+    securec_check_c(rc, "\0", "\0");
     if (NULL != nullBitmap) {
         datlen = (nattrs + 7) / 8;
         int j = 0;
@@ -2360,12 +2383,14 @@ static void parse_uheap_item(const Item item, unsigned len, int blkno, int linen
 
     indentLevel = 3;
 
-    errno_t rc = snprintf_s(buffer, 128, 127, "\t\t\txid:%d, td:%d locker_td:%d\n",
-                            utuple->xid, utuple->td_id, utuple->locker_td_id);
+    errno_t rc = snprintf_s(buffer, 128, 127, "\t\t\txid:%u, td:%d locker_td:%d\n",
+        utuple->xid, utuple->td_id, utuple->reserved);
     securec_check(rc, "\0", "\0");
     fprintf(stdout, "%s", buffer);
     fprintf(stdout, "\t\t\tNumber of columns: %d\n", UHeapTupleHeaderGetNatts(utuple));
     fprintf(stdout, "\t\t\tFlag: %d\n", utuple->flag);
+    fprintf(stdout, "\t\t\tFlag2: %d\n", utuple->flag2);
+    fprintf(stdout, "\t\t\tt_hoff: %d\n", utuple->t_hoff);
 
     if (utuple->flag & UHEAP_HAS_NULL) {
         fprintf(stdout, "\t\t\tFlag: %s\n", "UHEAP_HASNULL ");
@@ -2705,7 +2730,7 @@ static void ParseUHeapPageHeader(const PageHeader page, int blkno, int blknum)
     fprintf(stdout, "\tpd_xid_base: %lu, pd_multi_base: %lu\n",
         upage->pd_xid_base, upage->pd_multi_base);
     if (upage->pd_upper < upage->pd_lower) {
-        fprintf(stdout, "WARNING: INVALID PAGE!");
+        fprintf(stdout, "WARNING: INVALID PAGE!\n");
     } else {
         freeSpace = upage->pd_upper - upage->pd_lower;
         g_freeMax = freeSpace > g_freeMax ? freeSpace : g_freeMax;
@@ -2890,7 +2915,7 @@ static void parse_heap_or_index_page(const char* buffer, int blkno, SegmentType 
         }
         fprintf(stdout, "\n\tUHeap tuple information on this page\n");
         for (i = FirstOffsetNumber; i <= nline; i++) {
-            rowptr = UPageGetRowPtr(buffer, i);
+            rowptr = UPageGenerateRowPtr(buffer, i);
             if (RowPtrIsUsed(rowptr)) {
                 if (RowPtrHasStorage(rowptr))
                     nstorage++;
@@ -3058,7 +3083,7 @@ static int parse_a_page(const char* buffer, int blkno, int blknum, SegmentType t
 
     if (PageIsNew(page)) {
         fprintf(stdout, "Page information of block %d/%d : new page\n\n", blkno, blknum);
-        ParseHeapPageHeader(page, blkno, blknum);
+        ParsePageHeader(page, blkno, blknum, type);
         return true;
     }
 
@@ -3088,10 +3113,10 @@ static BlockNumber CalculateMaxBlockNumber(BlockNumber blknum, BlockNumber start
 {
     /* parse */
     if (start >= blknum) {
-        fprintf(stderr, "start point exceeds the total block number of relation.\n");
+        (void)fprintf(stderr, "start point exceeds the total block number of relation.\n");
         return InvalidBlockNumber;
     } else if ((start + number) > blknum) {
-        fprintf(stderr, "don't have %d blocks from block %d in the relation, only %d blocks\n", number, start,
+        (void)fprintf(stderr, "don't have %u blocks from block %u in the relation, only %u blocks\n", number, start,
                 (blknum - start));
         number = blknum;
     } else if (number == 0) {
@@ -3104,22 +3129,26 @@ static BlockNumber CalculateMaxBlockNumber(BlockNumber blknum, BlockNumber start
 
 static void MarkBufferDirty(char *buffer, size_t len)
 {
-    int writeLen = len / 2;
+    size_t writeLen = len / 2;
     unsigned char fill_byte[writeLen] = {0xFF};
-    for (int i = 0; i < writeLen; i++)
+    for (size_t i = 0; i < writeLen; i++)
         fill_byte[i] = 0xFF;
-    auto rc = memcpy_s(buffer + writeLen, BLCKSZ - writeLen, fill_byte, writeLen);
+    auto rc = memcpy_s(buffer + writeLen, len - writeLen, fill_byte, writeLen);
     securec_check(rc, "", "");
 }
 
 static int parse_page_file(const char *filename, SegmentType type, const uint32 start_point, const uint32 number_read)
 {
-    if (type != SEG_HEAP && type != SEG_INDEX_BTREE) {
+    if (!IsCompressedFile(filename, strlen(filename))) {
         return parse_uncompressed_page_file(filename, type, start_point, number_read);
     }
-    
-    auto pageCompression = new PageCompression();
-    if (pageCompression->Init(filename, MAXPGPATH, SegNo) != SUCCESS) {
+
+    PageCompression *pageCompression = new(std::nothrow) PageCompression();
+    if (pageCompression == NULL) {
+        fprintf(stderr, "compression page new failed\n");
+        return false;
+    }
+    if (pageCompression->Init(filename, (BlockNumber)SegNo) != SUCCESS) {
         delete pageCompression;
         return parse_uncompressed_page_file(filename, type, start_point, number_read);
     }
@@ -3134,15 +3163,16 @@ static int parse_page_file(const char *filename, SegmentType type, const uint32 
     char compressed[BLCKSZ];
     char decompressed[BLCKSZ];
     while (start < number) {
-        auto compressedSize = pageCompression->ReadCompressedBuffer(start, compressed, BLCKSZ);
-        if (compressedSize == 0) {
-            fprintf(stderr, "read block %d failed, filename: %s_pcd: %s\n", start, filename, strerror(errno));
+        size_t compressedSize = pageCompression->ReadCompressedBuffer(start, compressed, BLCKSZ);
+        if (compressedSize > MIN_COMPRESS_ERROR_RT) {
+            fprintf(stderr, "read block %u failed, filename: %s: code: %lu %s\n",
+                    start, filename, compressedSize, strerror(errno));
             delete pageCompression;
             return false;
         }
         char *parseFile = NULL;
         if (compressedSize < BLCKSZ) {
-            pageCompression->DecompressedPage(compressed, decompressed);
+            (void)pageCompression->DecompressedPage(compressed, decompressed);
             parseFile = decompressed;
         } else {
             parseFile = compressed;
@@ -3157,7 +3187,7 @@ static int parse_page_file(const char *filename, SegmentType type, const uint32 
                 MarkBufferDirty(parseFile, BLCKSZ);
             }
             if (!pageCompression->WriteBackUncompressedData(compressed, compressedSize, parseFile, BLCKSZ, start)) {
-                fprintf(stderr, "write back failed, filename: %s_pcd: %s\n", filename, strerror(errno));
+                fprintf(stderr, "write back failed, filename: %s: %s\n", filename, strerror(errno));
                 delete pageCompression;
                 return false;
             }
@@ -3179,7 +3209,8 @@ static int parse_uncompressed_page_file(const char *filename, SegmentType type, 
     BlockNumber number = number_read;
     size_t result;
 
-    if (NULL == (fd = fopen(filename, "rb+"))) {
+    fd = fopen(filename, "rb+");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         return false;
     }
@@ -3236,7 +3267,8 @@ static int parse_uncompressed_page_file(const char *filename, SegmentType type, 
                 unsigned char fill_byte[4096] = {0xFF};
                 for (int i = 0; i < 4096; i++)
                     fill_byte[i] = 0xFF;
-                memcpy(buffer + 4096, fill_byte, 4096);
+                errno_t rc = memcpy_s(buffer + 4096, BLCKSZ - 4096, fill_byte, 4096);
+                securec_check_c(rc, "\0", "\0");
             }
             fseek(fd, (start * BLCKSZ), SEEK_SET);
             fwrite(buffer, 1, BLCKSZ, fd);
@@ -3405,7 +3437,8 @@ static bool parse_internal_init_file(char* filename)
         return false;
     }
 
-    if (NULL == (fp = fopen(filename, "rb"))) {
+    fp = fopen(filename, "rb");
+    if (fp == NULL) {
         result = false;
         fprintf(stderr, "IO error when opening %s: %s\n", filename, strerror(errno));
         goto read_failed;
@@ -3636,7 +3669,8 @@ static int parse_filenodemap_file(char* filename)
     }
     fill_filenode_map(pg_class_map);
 
-    if (NULL == (fd = fopen(filename, "rb"))) {
+    fd = fopen(filename, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         return false;
     }
@@ -3718,9 +3752,11 @@ static int parse_cu_file(char* filename, uint64 offset)
     seg_num = offset / (RELSEG_SIZE * BLCKSZ);
     seg_offset = offset % (RELSEG_SIZE * BLCKSZ);
 
-    sprintf(fullpath, "%s.%d", filename, seg_num);
+    errno_t rc = snprintf_s(fullpath, sizeof(fullpath), sizeof(fullpath) - 1, "%s.%d", filename, seg_num);
+    securec_check_ss_c(rc, "\0", "\0");
 
-    if (NULL == (fd = fopen(fullpath, "rb"))) {
+    fd = fopen(fullpath, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", fullpath, strerror(errno));
         return false;
     }
@@ -3779,7 +3815,8 @@ static int parse_slot_file(char* filename)
     size_t readBytes = 0;
     pg_crc32 checksum = 0;
 
-    if (NULL == (fd = fopen(filename, "rb"))) {
+    fd = fopen(filename, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         return false;
     }
@@ -3876,7 +3913,8 @@ static int parse_gaussdb_state_file(char* filename)
     char* BuildModeStr[] = {"node", "auto", "full", "incremental"};
     XLogRecPtr lsn;
     uint32 term;
-    if (NULL == (fd = fopen(filename, "rb"))) {
+    fd = fopen(filename, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         return false;
     }
@@ -3938,7 +3976,8 @@ static int parse_pg_control_file(char* filename)
     char sysident_str[32];
     const char* strftime_fmt = "%c";
 
-    if (NULL == (fd = fopen(filename, "rb"))) {
+    fd = fopen(filename, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         return false;
     }
@@ -3970,7 +4009,9 @@ static int parse_pg_control_file(char* filename)
      * Format system_identifier separately to keep platform-dependent format
      * code out of the translatable message string.
      */
-    snprintf(sysident_str, sizeof(sysident_str), UINT64_FORMAT, ControlFile.system_identifier);
+    errno_t rc = snprintf_s(sysident_str, sizeof(sysident_str), sizeof(sysident_str) - 1, UINT64_FORMAT,
+        ControlFile.system_identifier);
+    securec_check_ss_c(rc, "\0", "\0");
 
     fprintf(stdout, "pg_control version number:            %u\n", ControlFile.pg_control_version);
 
@@ -4071,7 +4112,8 @@ static int parse_clog_file(char* filename)
 
     xid = (uint64)segnum * segnum_xid;
 
-    if (NULL == (fd = fopen(filename, "rb"))) {
+    fd = fopen(filename, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         return false;
     }
@@ -4126,7 +4168,8 @@ static int parse_csnlog_file(char* filename)
 
     xid = (uint64)segnum * segnum_xid;
 
-    if (NULL == (fd = fopen(filename, "rb"))) {
+    fd = fopen(filename, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", filename, gs_strerror(errno));
         return false;
     }
@@ -4366,26 +4409,36 @@ static bool parse_dw_file(const char* file_name, uint32 start_page, uint32 page_
     size_t result;
     uint32 dw_batch_page_num;
     dw_file_head_t file_head;
-    char meta_path[PATH_MAX];
-    char cur_dir[PATH_MAX];
+    char* meta_name;
+    char meta_full_path[PATH_MAX];
+    char meta_name_tmp[PATH_MAX];
     dw_batch_meta_file* batch_meta_file;
     char* meta_buf = NULL;
     char* dw_buf = NULL;
 
-    rc = strcpy_s(cur_dir, PATH_MAX, file_name);
+    /* copy the full path of dw file to meta_full_path */
+    if (realpath(file_name, meta_full_path) == NULL && file_name[0] == '\0') {
+        fprintf(stderr, "could not get correct path or the absolute path is too long!\n");
+        return false;
+    }
+
+    /* extract the path dir of dw file, which is the dir of meta file */
+    (void)dirname(meta_full_path);
+
+    /* extract the meta name from DW_META_FILE */
+    rc = strcpy_s(meta_name_tmp, PATH_MAX, T_DW_META_FILE);
     securec_check(rc, "", "");
-    (void)dirname(cur_dir);
-    rc = strcpy_s(meta_path, PATH_MAX, cur_dir);
+    meta_name = basename(meta_name_tmp);
+
+    /* fetch the full meta path with above two parts */
+    rc = strcat_s(meta_full_path, PATH_MAX, "/");
     securec_check(rc, "", "");
-    rc = strcat_s(meta_path, PATH_MAX, "\\");
-    securec_check(rc, "", "");
-    rc = strcat_s(meta_path, PATH_MAX, DW_META_FILE);
+    rc = strcat_s(meta_full_path, PATH_MAX, meta_name);
     securec_check(rc, "", "");
 
-    fd = fopen(meta_path, "rb+");
-
+    fd = fopen(meta_full_path, "rb+");
     if (fd == NULL) {
-        fprintf(stderr, "%s: %s\n", meta_path, strerror(errno));
+        fprintf(stderr, "%s: %s\n", meta_full_path, strerror(errno));
         return false;
     }
 
@@ -4400,7 +4453,7 @@ static bool parse_dw_file(const char* file_name, uint32 start_page, uint32 page_
     if (result != 1) {
         free(meta_buf);
         fclose(fd);
-        fprintf(stderr, "read %s: %s\n", meta_path, strerror(errno));
+        fprintf(stderr, "read %s: %s\n", meta_full_path, strerror(errno));
         return false;
     }
 
@@ -4549,8 +4602,7 @@ static bool parse_segment_head(char *filename, uint32 start_page)
     }
 
     bool result;
-
-    int fd = open(filename, O_RDONLY);
+    int fd = open(filename, O_RDONLY, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         fprintf(stderr, "Failed to open %s: %s\n", filename, strerror(errno));
         free(buf);
@@ -4621,7 +4673,8 @@ static bool parse_dw_single_flush_file(const char* file_name)
     char *dw_block = (char *)TYPEALIGN(BLCKSZ, unaligned_buf2);
     PageHeader pghr = NULL;
 
-    if (NULL == (fd = fopen(file_name, "rb"))) {
+    fd = fopen(file_name, "rb");
+    if (fd == NULL) {
         fprintf(stderr, "%s: %s\n", file_name, gs_strerror(errno));
         free(item);
         free(unaligned_buf);
@@ -4822,11 +4875,15 @@ static int ParseUndoZoneMeta(const char *filename, int zid)
             uspMetaInfo = (UndoZoneMetaInfo *) (uspMetaBuffer + offset * sizeof(UndoZoneMetaInfo));
             if ((zid == INVALID_ZONE_ID) || (zid != INVALID_ZONE_ID && zid == zoneId)) {
                 fprintf(stdout,
-                    "zid=%d, insert=%lu, discard=%lu, forcediscard=%lu, allocate=%lu, recycle=%lu, recyclexid=%lu, "
-                    "lsn=%lu.\n",
-                    zoneId, UNDO_PTR_GET_OFFSET(uspMetaInfo->insert), UNDO_PTR_GET_OFFSET(uspMetaInfo->discard),
-                    UNDO_PTR_GET_OFFSET(uspMetaInfo->forceDiscard), UNDO_PTR_GET_OFFSET(uspMetaInfo->allocate),
-                    UNDO_PTR_GET_OFFSET(uspMetaInfo->recycle), uspMetaInfo->recycleXid, uspMetaInfo->lsn);
+                    "zid=%d, insertURecPtr=%lu, discardURecPtr=%lu, forcediscardURecPtr=%lu, allocateTSlotPtr=%lu, "
+                    "recycleTSlotPtr=%lu, recyclexid=%lu, lsn=%lu.\n",
+                    zoneId,
+                    UNDO_PTR_GET_OFFSET(uspMetaInfo->insertURecPtr),
+                    UNDO_PTR_GET_OFFSET(uspMetaInfo->discardURecPtr),
+                    UNDO_PTR_GET_OFFSET(uspMetaInfo->forceDiscardURecPtr),
+                    UNDO_PTR_GET_OFFSET(uspMetaInfo->allocateTSlotPtr),
+                    UNDO_PTR_GET_OFFSET(uspMetaInfo->recycleTSlotPtr),
+                    uspMetaInfo->recycleXid, uspMetaInfo->lsn);
 
                 if (zid != INVALID_ZONE_ID) {
                     break;
@@ -4928,6 +4985,7 @@ static int ParseUndoSlot(const char *filename)
     }
 
     for (uint32 loop = 0; loop < UNDO_META_SEG_SIZE; loop++) {
+        int flag = 0;
         seekpos = (off_t)BLCKSZ * loop;
         lseek(fd, seekpos, SEEK_SET);
         rc = memset_s(buffer, BLCKSZ, 0, BLCKSZ);
@@ -4942,13 +5000,32 @@ static int ParseUndoSlot(const char *filename)
         fprintf(stdout, "Block %u, LSN (%X/%X)\n", loop, (uint32)(PageGetLSN(buffer) >> 32),
             (uint32)PageGetLSN(buffer));
 
+        if (PageIsNew(buffer)) {
+            continue;
+        }
         for (uint32 offset = UNDO_LOG_BLOCK_HEADER_SIZE; offset < BLCKSZ - MAXALIGN(sizeof(TransactionSlot));
             offset += MAXALIGN(sizeof(TransactionSlot))) {
             slot = (TransactionSlot *) (buffer + offset);
             if (slot->XactId() != InvalidTransactionId || slot->StartUndoPtr() != INVALID_UNDO_REC_PTR) {
+                if (flag > 0) {
+                    uint32 tempOffset = offset - (uint32)flag * MAXALIGN(sizeof(TransactionSlot));
+                    TransactionSlot *tempSlot = NULL;
+                    fprintf(stdout, "WARNING: invalid slot num %d.\n", flag);
+                    for (int i = 0; i < flag; i++) {
+                        tempOffset += MAXALIGN(sizeof(TransactionSlot));
+                        tempSlot = (TransactionSlot *) (buffer + tempOffset);
+                        fprintf(stdout,
+                            "offset=%u, xid=%lu, startptr=%lu, endptr=%lu, dbid=%u, rollback finish=%d.\n",
+                            tempOffset, tempSlot->XactId(), tempSlot->StartUndoPtr(), tempSlot->EndUndoPtr(),
+                            tempSlot->DbId(), !(tempSlot->NeedRollback()));
+                    }
+                    flag = 0;
+                }
                 fprintf(stdout, "offset=%u, xid=%lu, startptr=%lu, endptr=%lu, dbid=%u, rollback finish=%d.\n",
                     offset, slot->XactId(), slot->StartUndoPtr(), slot->EndUndoPtr(),
                     slot->DbId(), !(slot->NeedRollback()));
+            } else {
+                flag++;
             }
         }
     }
@@ -4964,26 +5041,40 @@ typedef struct UndoHeader {
     UndoRecordOldTd         wtd_;
     UndoRecordPartition wpart_;
     UndoRecordTablespace wtspc_;
+    StringInfoData rawdata_;
 } UndoHeader;
 
-char g_dir[100] = {0};
+typedef struct UHeapDiskTupleDataHeader {
+    ShortTransactionId xid;
+    uint16 td_id : 8, reserved : 8; /* Locker as well as the last updater, 8 bits each */
+    uint16 flag;                          /* Flag for tuple attributes */
+    uint16 flag2;                         /* Number of attributes for now(11 bits) */
+    uint8 t_hoff;                         /*  header incl. bitmap, padding */
+} UHeapDiskTupleDataHeader;
+
+char g_dir[MAX_PATH_LEN] = {0};
 
 static int OpenUndoBlock(int zoneId, BlockNumber blockno)
 {
-    char fileName[100] = {0};
+    char fileName[MAX_PATH_LEN] = {0};
+    const int idLen = 13;
     errno_t rc = EOK;
     int segno = blockno / UNDOSEG_SIZE;
 
-    rc = snprintf_s(fileName, sizeof(fileName), sizeof(fileName), g_dir);
+    rc = snprintf_s(fileName, sizeof(fileName), sizeof(fileName) - 1, g_dir);
     securec_check(rc, "\0", "\0");
-    rc = snprintf_s(fileName + strlen(fileName), sizeof(fileName), sizeof(fileName), "%05X.%07zX", zoneId, segno);
+    if (strlen(g_dir) + idLen >= MAX_PATH_LEN) {
+        fprintf(stdout, "ERROR: path is too long, MAX_PATH_LEN %d, path len %lu.\n", MAX_PATH_LEN, strlen(g_dir));
+    }
+    rc = snprintf_s(fileName + strlen(fileName), sizeof(fileName) - strlen(fileName),
+        sizeof(fileName) - strlen(fileName) - 1, "%05X.%07zX", zoneId, segno);
     securec_check(rc, "\0", "\0");
 
     int fd = open(fileName, O_RDONLY | PG_BINARY, S_IRUSR | S_IWUSR);
 
     if (fd < 0) {
-        fprintf(stderr, "Open file(%s), return code desc(%s).\n", UNDO_META_FILE, strerror(errno));
-        return-1;
+        fprintf(stderr, "Open file(%s), return code desc(%s).\n", fileName, strerror(errno));
+        return -1;
     }
 
     return fd;
@@ -5057,69 +5148,191 @@ bool ReadUndoRecord(UndoHeader *urec, char *buffer, int startingByte, int *alrea
             &readptr, endptr, &myBytesRead, alreadyRead)) {
             return false;
         }
-    }
 
+        urec->rawdata_.len = urec->wpay_.payloadlen;
+        if (urec->rawdata_.len > 0) {
+            if (urec->rawdata_.data == NULL) {
+                urec->rawdata_.data = (char *)malloc(urec->rawdata_.len);
+                if (NULL == urec->rawdata_.data) {
+                    fprintf(stderr, "out of memory\n");
+                    return false;
+                }
+            }
+            if (!ReadUndoBytes((char *)urec->rawdata_.data, urec->rawdata_.len,
+                &readptr, endptr, &myBytesRead, alreadyRead)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
-static bool ParseUndoRecord(UndoRecPtr urp)
+static bool ParseUndoRecord(UndoRecPtr urp, bool forward = false)
 {
-    char buffer[BLCKSZ] = {'\0'};
-    BlockNumber blockno = UNDO_PTR_GET_BLOCK_NUM(urp);
-    int zoneId = UNDO_PTR_GET_ZONE_ID(urp);
-    int startingByte = UNDO_PTR_GET_PAGE_OFFSET(urp);
-    int fd = -1;
-    int alreadyRead = 0;
-    off_t seekpos;
-    errno_t rc = EOK;
-    uint32 ret = 0;
-    UndoHeader *urec = (UndoHeader *)malloc(sizeof(UndoHeader));
-    UndoRecPtr blkprev = INVALID_UNDO_REC_PTR;
-
-    rc = memset_s(urec, sizeof(UndoHeader), (0), sizeof(UndoHeader));
-    securec_check(rc, "\0", "\0");
-
     do {
-        fd = OpenUndoBlock(zoneId, blockno);
-        if (fd < 0) {
-            free(urec);
-            return false;
-        }
-        seekpos = (off_t)BLCKSZ * (blockno % ((BlockNumber)UNDOSEG_SIZE));
-        lseek(fd, seekpos, SEEK_SET);
-        rc = memset_s(buffer, BLCKSZ, 0, BLCKSZ);
+        char buffer[BLCKSZ] = {'\0'};
+        BlockNumber blockno = UNDO_PTR_GET_BLOCK_NUM(urp);
+        int zoneId = UNDO_PTR_GET_ZONE_ID(urp);
+        int startingByte = UNDO_PTR_GET_PAGE_OFFSET(urp);
+        int fd = -1;
+        int alreadyRead = 0;
+        off_t seekpos;
+        errno_t rc = EOK;
+        uint32 ret = 0;
+        UndoHeader *urec = (UndoHeader *)malloc(sizeof(UndoHeader));
+        UndoRecPtr blkprev = INVALID_UNDO_REC_PTR;
+        const UndoRecordSize UNDO_RECORD_FIX_SIZE = SIZE_OF_UNDO_RECORD_HEADER + SIZE_OF_UNDO_RECORD_BLOCK;
+        uint32 curSize = UNDO_RECORD_FIX_SIZE + sizeof(UndoRecordSize);
+        PageHeader phdr;
+
+        rc = memset_s(urec, sizeof(UndoHeader), (0), sizeof(UndoHeader));
         securec_check(rc, "\0", "\0");
 
-        ret = read(fd, (char *)buffer, BLCKSZ);
-        if (ret != BLCKSZ) {
+        do {
+            fd = OpenUndoBlock(zoneId, blockno);
+            if (fd < 0) {
+                free(urec);
+                return false;
+            }
+            seekpos = (off_t)BLCKSZ * (blockno % ((BlockNumber)UNDOSEG_SIZE));
+            lseek(fd, seekpos, SEEK_SET);
+            rc = memset_s(buffer, BLCKSZ, 0, BLCKSZ);
+            securec_check(rc, "\0", "\0");
+
+            ret = read(fd, (char *)buffer, BLCKSZ);
+            if (ret != BLCKSZ) {
+                close(fd);
+                free(urec);
+                fprintf(stderr, "Read undo meta page failed, expect size(8192), real size(%u).\n", ret);
+                return false;
+            }
+            phdr = (PageHeader)buffer;
+            if (ReadUndoRecord(urec, buffer, startingByte, &alreadyRead)) {
+                break;
+            }
+
+            startingByte = UNDO_LOG_BLOCK_HEADER_SIZE;
+            blockno++;
             close(fd);
+        } while (true);
+
+        if (!TransactionIdIsValid(urec->whdr_.xid)) {
             free(urec);
-            fprintf(stderr, "Read undo meta page failed, expect size(8192), real size(%u).\n", ret);
-            return false;
+            close(fd);
+            return true;
         }
 
-        if (ReadUndoRecord(urec, buffer, startingByte, &alreadyRead)) {
-            break;
+        fprintf(stdout, "DumpPageInfo: lsn:%X/%X, pd_checksum:%u, flags:%u, lower:%u, upper:%u, special:%u, "
+            "pagesize_version:%u.\n",
+            phdr->pd_lsn.xlogid, phdr->pd_lsn.xrecoff, (uint16)(phdr->pd_checksum), (uint16)(phdr->pd_flags),
+            (uint16)(phdr->pd_lower), (uint16)(phdr->pd_upper), (uint16)(phdr->pd_special),
+            (uint16)(phdr->pd_pagesize_version));
+        
+        blkprev = urec->wblk_.blkprev;
+        fprintf(stdout, "UndoRecPtr(%lu):\nwhdr = xid(%lu), cid(%u), reloid(%u), relfilenode(%u), utype(%u), "
+            "uinfo(%u).\n", urp, urec->whdr_.xid, urec->whdr_.cid, urec->whdr_.reloid, urec->whdr_.relfilenode,
+            urec->whdr_.utype, urec->whdr_.uinfo);
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_PAYLOAD) != 0) {
+            fprintf(stdout, "flag_payload, size = %lu.\n", SIZE_OF_UNDO_RECORD_PAYLOAD);
+            curSize += SIZE_OF_UNDO_RECORD_PAYLOAD;
+            curSize += urec->rawdata_.len;
+        }
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_TRANSAC) != 0) {
+            fprintf(stdout, "flag_transac, size = %lu.\n", SIZE_OF_UNDO_RECORD_TRANSACTION);
+            curSize += SIZE_OF_UNDO_RECORD_TRANSACTION;
+        }
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_BLOCK) != 0) {
+            fprintf(stdout, "flag_block, size = %lu.\n", SIZE_OF_UNDO_RECORD_BLOCK);
+        }
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_OLDTD) != 0) {
+            fprintf(stdout, "flag_oldtd, size = %lu.\n", SIZE_OF_UNDO_RECORD_OLDTD);
+            curSize += SIZE_OF_UNDO_RECORD_OLDTD;
+        }
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_CONTAINS_SUBXACT) != 0) {
+            /* subxid is at the end of rawdata */
+            char *end = (char *)(urec->rawdata_.data) + (urec->rawdata_.len - sizeof(SubTransactionId));
+            SubTransactionId *subxid = (SubTransactionId *)end;
+            fprintf(stdout, "flag_subxact, subxid = %lu.\n", *subxid);
+        }
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_HAS_PARTOID) != 0) {
+            fprintf(stdout, "flag_partoid, size = %lu.\n", SIZE_OF_UNDO_RECORD_PARTITION);
+            curSize += SIZE_OF_UNDO_RECORD_PARTITION;
+        }
+        if ((urec->whdr_.uinfo & UNDO_UREC_INFO_HAS_TABLESPACEOID) != 0) {
+            fprintf(stdout, "flag_tablespaceoid, size = %lu.\n", SIZE_OF_UNDO_RECORD_TABLESPACE);
+            curSize += SIZE_OF_UNDO_RECORD_TABLESPACE;
+        }
+        fprintf(stdout, "wblk = blk_prev(%lu), blockno(%u), offset(%u).\n", urec->wblk_.blkprev, urec->wblk_.blkno,
+            urec->wblk_.offset);
+        fprintf(stdout, "wtxn = prevurp(%lu).\n", urec->wtxn_.prevurp);
+        fprintf(stdout, "wpay = payloadlen(%u).\n", urec->wpay_.payloadlen);
+        fprintf(stdout, "wtd = oldxactid(%lu).\n", urec->wtd_.oldxactid);
+        fprintf(stdout, "wpart_ = partitionoid(%u).\n", urec->wpart_.partitionoid);
+        fprintf(stdout, "wtspc_ = tablespace(%u).\n", urec->wtspc_.tablespace);
+        fprintf(stdout, "len = alreadyRead(%u).\n", alreadyRead);
+        
+        char prevLen[2];
+        UndoRecordSize byteToRead = sizeof(UndoRecordSize);
+        char *readptr = buffer + startingByte - byteToRead;
+        for (auto i = 0; i < byteToRead; i++) {
+            prevLen[i] = *readptr;
+            readptr++;
+        }
+        UndoRecordSize prevRecLen = *(UndoRecordSize *)(prevLen);
+        fprintf(stdout, "prevLen = prevLen(%u).\n", prevRecLen);
+
+        if (urec->whdr_.utype != UNDO_INSERT && urec->whdr_.utype != UNDO_MULTI_INSERT &&
+            urec->rawdata_.len > 0 && urec->rawdata_.data != NULL) {
+            UHeapDiskTupleDataHeader diskTuple;
+            if (urec->whdr_.utype == UNDO_INPLACE_UPDATE) {
+                Assert(urec->rawdata_.len >= (int)SizeOfUHeapDiskTupleData);
+                uint8 *t_hoff_ptr = (uint8 *)(urec->rawdata_.data);
+                uint8 t_hoff = *t_hoff_ptr;
+                char *cur_undodata_ptr = NULL;
+                fprintf(stdout, "t_hoff %u ", t_hoff);
+                rc = memcpy_s((char *)&diskTuple + OffsetTdId, SizeOfUHeapDiskTupleHeaderExceptXid,
+                    urec->rawdata_.data + sizeof(uint8), SizeOfUHeapDiskTupleHeaderExceptXid);
+                securec_check(rc, "", "");
+                cur_undodata_ptr = urec->rawdata_.data + sizeof(uint8) + t_hoff - OffsetTdId;
+                uint8* flags_ptr = (uint8 *)cur_undodata_ptr;
+                uint8 flags = *flags_ptr;
+                fprintf(stdout, "flags %u ", flags);
+                cur_undodata_ptr += sizeof(uint8);
+                if (flags & UREC_INPLACE_UPDATE_XOR_PREFIX) {
+                    uint16* prefixlen_ptr = (uint16 *)(cur_undodata_ptr);
+                    cur_undodata_ptr += sizeof(uint16);
+                    uint16 prefixlen = *prefixlen_ptr;
+                    fprintf(stdout, "PREFIXLEN %u ", prefixlen);
+                }
+
+                if (flags & UREC_INPLACE_UPDATE_XOR_SUFFIX) {
+                    uint16* suffixlen_ptr = (uint16 *)(cur_undodata_ptr);
+                    cur_undodata_ptr += sizeof(uint16);
+                    uint16 suffixlen = *suffixlen_ptr;
+                    fprintf(stdout, "SUFFIXLEN %u ", suffixlen);
+                }
+                diskTuple.xid = (ShortTransactionId)InvalidTransactionId;
+            } else {
+                Assert(urec->rawdata_.len >= (int)SizeOfUHeapDiskTupleHeaderExceptXid);
+                rc = memcpy_s(((char *)&diskTuple + OffsetTdId), SizeOfUHeapDiskTupleHeaderExceptXid,
+                    urec->rawdata_.data, SizeOfUHeapDiskTupleHeaderExceptXid);
+                securec_check(rc, "", "");
+                diskTuple.xid = (ShortTransactionId)InvalidTransactionId;
+            }
+            fprintf(stdout, "\ndiskTuple: td_id %u, reserved %u, flag %u, flag2 %u, t_hoff %u.\n",
+                    diskTuple.td_id, diskTuple.reserved, diskTuple.flag, diskTuple.flag2, diskTuple.t_hoff);
+            fprintf(stdout, "current undo record size: %u\n\n", curSize);
         }
 
-        startingByte = UNDO_LOG_BLOCK_HEADER_SIZE;
-        blockno++;
-    } while (true);
+        free(urec);
+        close(fd);
 
-    blkprev = urec->wblk_.blkprev;
-    fprintf(stderr, "UndoRecPtr(%lu):\nwhdr = xid(%lu), cid(%u), reloid(%u), relfilenode(%u), utype(%u).\n",
-        urp, urec->whdr_.xid, urec->whdr_.cid, urec->whdr_.reloid, urec->whdr_.relfilenode, urec->whdr_.utype);
-    fprintf(stderr, "wblk = blk_prev(%lu), blockno(%u), offset(%u).\n", urec->wblk_.blkprev, urec->wblk_.blkno,
-        urec->wblk_.offset);
-    fprintf(stderr, "wtxn = prevurp(%lu).\n", urec->wtxn_.prevurp);
-    fprintf(stderr, "wpay = payloadlen(%u).\n", urec->wpay_.payloadlen);
-
-    free(urec);
-    close(fd);
-
-    if (blkprev != INVALID_UNDO_REC_PTR) {
-        ParseUndoRecord(blkprev);
-    }
+        if (!forward) {
+            urp = blkprev;
+        } else {
+            urp = UNDO_LOG_OFFSET_PLUS_USABLE_BYTES(urp, curSize);
+        }
+    } while (urp != INVALID_UNDO_REC_PTR);
 
     return true;
 }
@@ -5175,6 +5388,7 @@ static void fill_filenode_map(char** class_map)
         {"pg_extension", 3079},
         {"pg_foreign_table", 3118},
         {"pg_enum", 3501},
+        {"pg_set", 3516},
         {"pg_seclabel", 3596},
         {"pg_ts_dict", 3600},
         {"pg_ts_parser", 3601},
@@ -5226,6 +5440,7 @@ static void fill_filenode_map(char** class_map)
         {"pg_cast_source_target_index", 2661},
         {"pg_class_oid_index", 2662},
         {"pg_class_relname_nsp_index", 2663},
+        {"pg_collation_enc_def_index", 3147},
         {"pg_collation_name_enc_nsp_index", 3164},
         {"pg_collation_oid_index", 3085},
         {"pg_constraint_conname_nsp_index", 2664},
@@ -5336,7 +5551,9 @@ static void fill_filenode_map(char** class_map)
             return;
         }
         if (NULL != cmap[i].class_name) {
-            memcpy(name, cmap[i].class_name, strlen(cmap[i].class_name) + 1);
+            errno_t rc = EOK;
+            rc = memcpy_s(name, 64 * sizeof(char), cmap[i].class_name, strlen(cmap[i].class_name) + 1);
+            securec_check_c(rc, "\0", "\0");
             class_map[cmap[i].ralation_id] = name;
             name = NULL;
         } else {
@@ -5375,6 +5592,7 @@ int main(int argc, char** argv)
     char* filename = NULL;
     char* env = NULL;
     const char* progname = NULL;
+    const char* socketpath = NULL;
     uint32 start_point = 0;
     uint32 num_block = 0;
     uint64 cu_offset = 0;
@@ -5399,7 +5617,7 @@ int main(int argc, char** argv)
     setvbuf(stderr, NULL, _IONBF, 0);
 #endif
 
-    while ((c = getopt(argc, argv, "bf:o:t:vs:z:n:r:i:I:N:uwdS:")) != -1) {
+    while ((c = getopt(argc, argv, "bc:Df:o:t:vs:z:n:r:i:I:N:uwdS:")) != -1) {
         switch (c) {
             case 'f':
                 filename = optarg;
@@ -5505,6 +5723,15 @@ int main(int argc, char** argv)
                 SegNo = (unsigned int)strtolSafe(optarg, 0);
                 break;
 
+            case 'D':
+                enable_dss = true;
+                break;
+
+            case 'c':
+                socketpath = optarg;
+                enable_dss = true;
+                break;
+
             default:
                 fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
                 exit(1);
@@ -5524,6 +5751,17 @@ int main(int argc, char** argv)
 
     if (only_bcm && (hackingtype > HACKING_INDEX)) {
         fprintf(stderr, "Only heap file and index file have bcm map info.\n");
+        exit(1);
+    }
+
+    if (enable_dss && (socketpath == NULL || strlen(socketpath) == 0 || strncmp("UDS:", socketpath, 4) != 0)) {
+        fprintf(stderr, "Socketpath must be specific correctly when enable dss, "
+            "format is: '-c UDS:xxx'.\n");
+        exit(1);
+    }
+
+    if (enable_dss && (filename[0] != '+' || strstr(filename, "/") == NULL)) {
+        fprintf(stderr, "Filepath should be absolutely when enable dss.\n");
         exit(1);
     }
 
@@ -5554,6 +5792,13 @@ int main(int argc, char** argv)
         if ((env = getenv("GAUSSDATA")) != NULL && *env != '\0')
             pgdata = env;
     }
+
+    // dss device init
+    if (dss_device_init(socketpath, enable_dss) != DSS_SUCCESS) {
+        exit(1);
+    }
+
+    initDataPathStruct(false);
 
     // if heap relation name is given (-r), force hackingtype to be HACKING_HEAP
     if (PgHeapRelTupleParserCursor >= 0) {
@@ -5695,8 +5940,14 @@ int main(int argc, char** argv)
         case HACKING_UNDO_RECORD:
             ret = snprintf_s(g_dir, sizeof(g_dir), sizeof(g_dir), filename);
             securec_check(ret, "\0", "\0");
-            if (!ParseUndoRecord(cu_offset)) {
-                fprintf(stderr, "Error during parsing undo group meta file %s\n", filename);
+            fprintf(stdout, "Parsing backward, urp %lu:\n", cu_offset);
+            if (!ParseUndoRecord(cu_offset, false)) {
+                fprintf(stderr, "Error during parsing undo group meta file %s backward\n", filename);
+                exit(1);
+            }
+            fprintf(stdout, "Parsing forward, urp %lu:\n", cu_offset);
+            if (!ParseUndoRecord(cu_offset, true)) {
+                fprintf(stderr, "Error during parsing undo group meta file %s forward\n", filename);
                 exit(1);
             }
             break;

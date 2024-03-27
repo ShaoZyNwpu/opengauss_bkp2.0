@@ -60,6 +60,8 @@
 #include "executor/exec/execdebug.h"
 #include "executor/node/nodeAppend.h"
 
+static TupleTableSlot* ExecAppend(PlanState* state);
+
 /* ----------------------------------------------------------------
  *		exec_append_initialize_next
  *
@@ -132,6 +134,7 @@ AppendState* ExecInitAppend(Append* node, EState* estate, int eflags)
     appendstate->ps.state = estate;
     appendstate->appendplans = appendplanstates;
     appendstate->as_nplans = nplans;
+    appendstate->ps.ExecProcNode = ExecAppend;
 
     /*
      * Miscellaneous initialization
@@ -162,7 +165,7 @@ AppendState* ExecInitAppend(Append* node, EState* estate, int eflags)
      * Result tuple slot of Append always contains a virtual tuple,
      * Default tableAMtype for this slot is Heap.
      */
-    ExecAssignResultTypeFromTL(&appendstate->ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&appendstate->ps);
     appendstate->ps.ps_ProjInfo = NULL;
 
     /*
@@ -179,11 +182,14 @@ AppendState* ExecInitAppend(Append* node, EState* estate, int eflags)
  *		Handles iteration over multiple subplans.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecAppend(AppendState* node)
+static TupleTableSlot* ExecAppend(PlanState* state)
 {
+    AppendState* node = castNode(AppendState, state);
     for (;;) {
         PlanState* subnode = NULL;
         TupleTableSlot* result = NULL;
+
+        CHECK_FOR_INTERRUPTS();
 
         /*
          * figure out which subplan we are currently processing

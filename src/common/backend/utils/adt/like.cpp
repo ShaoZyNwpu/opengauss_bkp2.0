@@ -25,6 +25,7 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/pg_locale.h"
+#include "catalog/gs_utf8_collation.h"
 
 static int SB_MatchText(char* t, int tlen, char* p, int plen, pg_locale_t locale, bool locale_is_c);
 static text* SB_do_like_escape(text*, text*);
@@ -153,6 +154,15 @@ int GenericMatchText(char* s, int slen, char* p, int plen)
         return MB_MatchText(s, slen, p, plen, 0, true);
 }
 
+int generic_match_text_with_collation(char* s, int slen, char* p, int plen, Oid collation)
+{
+    if (IS_UTF8_GENERAL_COLLATION(collation)) {
+        return matchtext_utf8mb4((unsigned char*)s, slen, (unsigned char*)p, plen);
+    }
+
+    return GenericMatchText(s, slen, p, plen);
+}
+
 static inline int Generic_Text_IC_like(text* str, text* pat, Oid collation)
 {
     char *s = NULL, *p = NULL;
@@ -172,10 +182,7 @@ static inline int Generic_Text_IC_like(text* str, text* pat, Oid collation)
         str = DatumGetTextP(DirectFunctionCall1Coll(lower, collation, PointerGetDatum(str)));
         s = VARDATA(str);
         slen = (VARSIZE(str) - VARHDRSZ);
-        if (GetDatabaseEncoding() == PG_UTF8)
-            return UTF8_MatchText(s, slen, p, plen, 0, true);
-        else
-            return MB_MatchText(s, slen, p, plen, 0, true);
+        return generic_match_text_with_collation(s, slen, p, plen, collation);
     } else {
         /*
          * Here we need to prepare locale information for SB_lower_char. This
@@ -184,7 +191,7 @@ static inline int Generic_Text_IC_like(text* str, text* pat, Oid collation)
         pg_locale_t locale = 0;
         bool locale_is_c = false;
 
-        if (lc_ctype_is_c(collation))
+        if (lc_ctype_is_c(collation) || COLLATION_IN_B_FORMAT(collation))
             locale_is_c = true;
         else if (collation != DEFAULT_COLLATION_OID) {
             if (!OidIsValid(collation)) {
@@ -263,7 +270,7 @@ Datum textlike(PG_FUNCTION_ARGS)
     p = VARDATA_ANY(pat);
     plen = VARSIZE_ANY_EXHDR(pat);
 
-    result = (GenericMatchText(s, slen, p, plen) == LIKE_TRUE);
+    result = (generic_match_text_with_collation(s, slen, p, plen, PG_GET_COLLATION()) == LIKE_TRUE);
 
     PG_RETURN_BOOL(result);
 }
@@ -283,7 +290,7 @@ Datum textnlike(PG_FUNCTION_ARGS)
     p = VARDATA_ANY(pat);
     plen = VARSIZE_ANY_EXHDR(pat);
 
-    result = (GenericMatchText(s, slen, p, plen) != LIKE_TRUE);
+    result = (generic_match_text_with_collation(s, slen, p, plen, PG_GET_COLLATION()) != LIKE_TRUE);
 
     PG_RETURN_BOOL(result);
 }

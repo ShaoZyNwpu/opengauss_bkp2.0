@@ -127,7 +127,7 @@
 #define MAX_DECIMAL_LEN 50
 
 /* to improve processing speed, (16 ^ m) * n matrix (0<= m <=31, 0<= n <= 15) is defined. */
-/*static variable 'g_HexToDecMatrix' has size '2048'¡ê? */
+/*static variable 'g_HexToDecMatrix' has size '2048'? */
 const char* g_HexToDecMatrix[MAX_POWER + 1][MAX_CHAR_FOR_HEX] = {
     /*16^31*/
     {/*0*/ "0",
@@ -2333,7 +2333,7 @@ char* str_tolower(const char* buff, size_t nbytes, Oid collid)
         return NULL;
 
     /* C/POSIX collations use this path regardless of database encoding */
-    if (lc_ctype_is_c(collid)) {
+    if (lc_ctype_is_c(collid) || COLLATION_IN_B_FORMAT(collid)) {
         char* p = NULL;
 
         result = pnstrdup(buff, nbytes);
@@ -2446,7 +2446,7 @@ char* str_toupper(const char* buff, size_t nbytes, Oid collid)
         return NULL;
 
     /* C/POSIX collations use this path regardless of database encoding */
-    if (lc_ctype_is_c(collid)) {
+    if (lc_ctype_is_c(collid) || COLLATION_IN_B_FORMAT(collid)) {
         result = str_toupper_c_encode(buff, nbytes);
     }
 #ifdef USE_WIDE_UPPER_LOWER
@@ -2471,7 +2471,7 @@ char* str_toupper_for_raw(const char* buff, size_t nbytes, Oid collid)
         return NULL;
 
     /* C/POSIX collations use this path regardless of database encoding */
-    if (lc_ctype_is_c(collid)) {
+    if (lc_ctype_is_c(collid) || COLLATION_IN_B_FORMAT(collid)) {
         result = str_toupper_c_encode(buff, nbytes);
     } else {
         result = str_toupper_locale_encode(buff, nbytes, collid);
@@ -2599,7 +2599,7 @@ char* str_initcap(const char* buff, size_t nbytes, Oid collid)
         return NULL;
 
     /* C/POSIX collations use this path regardless of database encoding */
-    if (lc_ctype_is_c(collid)) {
+    if (lc_ctype_is_c(collid) || COLLATION_IN_B_FORMAT(collid)) {
         char* p = NULL;
 
         result = pnstrdup(buff, nbytes);
@@ -3698,19 +3698,55 @@ static void DCH_to_char(FormatNode* node, bool is_interval, TmToChar* in, char* 
                 s += strlen(s);
                 break;
             case DCH_RM:
-                if (!tm->tm_mon)
-                    break;
-                rc = sprintf_s(s, len, "%*s", S_FM(n->suffix) ? 0 : -4, rm_months_upper[MONTHS_PER_YEAR - tm->tm_mon]);
-                securec_check_ss(rc, "\0", "\0");
-                s += strlen(s);
-                break;
             case DCH_rm:
-                if (!tm->tm_mon)
+                /*
+                * For intervals, values like '12 month' will be reduced to 0
+                * month and some years.  These should be processed.
+                */
+                if (!tm->tm_mon && !tm->tm_year) {
                     break;
-                rc = sprintf_s(s, len, "%*s", S_FM(n->suffix) ? 0 : -4, rm_months_lower[MONTHS_PER_YEAR - tm->tm_mon]);
-                securec_check_ss(rc, "\0", "\0");
-                s += strlen(s);
-                break;
+                } else {
+                    int mon = 0;
+                    char** months = NULL;
+
+                    if (n->key->id == DCH_RM) {
+                        months = rm_months_upper;
+                    } else {
+                        months = rm_months_lower;
+                    }
+
+                    /*
+                    * Compute the position in the roman-numeral array.  Note
+                    * that the contents of the array are reversed, December
+                    * being first and January last.
+                    */
+                    if (tm->tm_mon == 0) {
+                        /*
+                        * This case is special, and tracks the case of full
+                        * interval years.
+                        */
+                        mon = tm->tm_year >= 0 ? 0 : MONTHS_PER_YEAR - 1;
+                    } else if (tm->tm_mon < 0) {
+                        /*
+                        * Negative case.  In this case, the calculation is
+                        * reversed, where -1 means December, -2 November,
+                        * etc.
+                        */
+                        mon = -1 * (tm->tm_mon + 1);
+                    } else {
+                        /*
+                        * Common case, with a strictly positive value.  The
+                        * position in the array matches with the value of
+                        * tm_mon.
+                        */
+                        mon = MONTHS_PER_YEAR - tm->tm_mon;
+                    }
+
+                    rc = sprintf_s(s, len, "%*s", S_FM(n->suffix) ? 0 : -4, months[mon]);
+                    securec_check_ss(rc, "\0", "\0");
+                    s += strlen(s);
+                    break;
+                }
             case DCH_W:
                 rc = sprintf_s(s, len, "%d", (tm->tm_mday - 1) / 7 + 1);
                 securec_check_ss(rc, "\0", "\0");
@@ -6684,7 +6720,7 @@ Datum numeric_to_char(PG_FUNCTION_ARGS)
             }
 
             x = DatumGetNumeric(DirectFunctionCall2(numeric_round, NumericGetDatum(val), Int32GetDatum(Num.post)));
-            orgnum = DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(x)));
+            orgnum = DatumGetCString(DirectFunctionCall1(numeric_out_with_zero, NumericGetDatum(x)));
         }
 
         if (*orgnum == '-') {
@@ -6709,6 +6745,11 @@ Datum numeric_to_char(PG_FUNCTION_ARGS)
     }
 
     NUM_TOCHAR_finish;
+    if (orgnum[0] == '0' && orgnum[1] == '\0' && HIDE_TAILING_ZERO) {
+        SET_VARSIZE(result, strlen(orgnum) + VARHDRSZ);
+        int errorno = memcpy_s(VARDATA(result), strlen(orgnum), orgnum, strlen(orgnum));
+        securec_check(errorno, "\0", "\0");
+    }
     PG_RETURN_TEXT_P(result);
 }
 
@@ -7425,15 +7466,31 @@ static void parse_field_ms(FormatNode* node, TmFormatConstraint* tm_const, char*
     out->ms *= ms_multi_factor[Min(tmp_len, 3)];
 }
 
+template <int accuracy>
+static void parse_field_usffn(FormatNode* node, TmFormatConstraint* tm_const, char** src_str, TmFromChar* out)
+{
+    int tmp_len = optimized_parse_int_len(&out->us, src_str, accuracy, node, tm_const);
+    if (tmp_len != accuracy) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("The raw data length is not match.")));
+    }
+    out->us *= us_multi_factor[tmp_len];
+}
+
 static void parse_field_usff(FormatNode* node, TmFormatConstraint* tm_const, char** src_str, TmFromChar* out)
 {
     int tmp_len = optimized_parse_int_len(&out->us, src_str, 6, node, tm_const);
     /*
      * tmp_len is the real number of digits exluding head spaces.
      * we have checked US value validation and make that
-     *	  tmp_len is between 1 and 6.
+     * tmp_len is between 1 and 6.
      */
-    Assert(tmp_len >= 1 && tmp_len <= 6);
+    if (tmp_len < 1 || tmp_len > 6) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("The raw data length is not match.")));
+    }
     out->us *= us_multi_factor[tmp_len];
 }
 
@@ -7619,12 +7676,12 @@ static const parse_field parse_field_map[] = {
     parse_field_d,     /* DCH_Day   */
     parse_field_d,     /* DCH_Dy    */
     parse_field_d_int, /* DCH_D     */
-    NULL,              /* DCH_FF1   */
-    NULL,              /* DCH_FF2   */
-    NULL,              /* DCH_FF3   */
-    NULL,              /* DCH_FF4   */
-    NULL,              /* DCH_FF5   */
-    NULL,              /* DCH_FF6   */
+    parse_field_usffn<1>,  /* DCH_FF1   */
+    parse_field_usffn<2>,  /* DCH_FF2   */
+    parse_field_usffn<3>,  /* DCH_FF3   */
+    parse_field_usffn<4>,  /* DCH_FF4   */
+    parse_field_usffn<5>,  /* DCH_FF5   */
+    parse_field_usffn<6>,  /* DCH_FF6   */
 
     /* -----  20~29  ----- */
     parse_field_usff,    /* DCH_FF    */
@@ -7688,12 +7745,12 @@ static const parse_field parse_field_map[] = {
 
     /* -----  70~79  ----- */
     parse_field_d_int, /* DCH_d     */
-    NULL,              /* DCH_ff1   */
-    NULL,              /* DCH_ff2   */
-    NULL,              /* DCH_ff3   */
-    NULL,              /* DCH_ff4   */
-    NULL,              /* DCH_ff5   */
-    NULL,              /* DCH_ff6   */
+    parse_field_usffn<1>,  /* DCH_ff1   */
+    parse_field_usffn<2>,  /* DCH_ff2   */
+    parse_field_usffn<3>,  /* DCH_ff3   */
+    parse_field_usffn<4>,  /* DCH_ff4   */
+    parse_field_usffn<5>,  /* DCH_ff5   */
+    parse_field_usffn<6>,  /* DCH_ff6   */
     parse_field_usff,  /* DCH_ff    */
     NULL,              /* DCH_fx    */
     parse_field_hh24,  /* DCH_hh24  */

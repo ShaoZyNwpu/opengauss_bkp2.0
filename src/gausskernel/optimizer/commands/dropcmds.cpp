@@ -19,6 +19,7 @@
 #include "utils/fmgroids.h"
 #include "access/heapam.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_db_privilege.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
 #include "catalog/pg_class.h"
@@ -37,10 +38,12 @@
 #include "utils/syscache.h"
 
 static void does_not_exist_skipping(ObjectType objtype, List* objname, List* objargs, bool missing_ok);
+static bool schema_does_not_exist_skipping(List *object, char **msg, char **name);
 
-static bool CheckObjectDropPrivilege(ObjectType removeType, Oid objectId)
+static bool CheckObjectDropPrivilege(ObjectType removeType, Oid objectId, const Relation relation)
 {
     AclResult aclresult = ACLCHECK_NO_PRIV;
+    bool anyresult = false;
     switch (removeType) {
         case OBJECT_FUNCTION:
             aclresult = pg_proc_aclcheck(objectId, GetUserId(), ACL_DROP);
@@ -57,10 +60,16 @@ static bool CheckObjectDropPrivilege(ObjectType removeType, Oid objectId)
         case OBJECT_FOREIGN_SERVER:
             aclresult = pg_foreign_server_aclcheck(objectId, GetUserId(), ACL_DROP);
             break;
+        case OBJECT_TRIGGER:
+            if (!IsSysSchema(RelationGetNamespace(relation))) {
+                anyresult = HasSpecAnyPriv(GetUserId(), DROP_ANY_TRIGGER, false);
+            }
+            break;
         default:
             break;
     }
-    return (aclresult == ACLCHECK_OK) ? true : false;
+
+    return ((aclresult == ACLCHECK_OK) ? true : false) || anyresult;
 }
 
 static void DropExtensionInListIsSupported(List* objname)
@@ -79,10 +88,32 @@ static void DropExtensionInListIsSupported(List* objname)
         "db_b_parser",
         "db_c_parser",
         "db_pg_parser",
+        "hdfs_fdw",
 #endif
     };
     int len = lengthof(supportList);
     const char* name = strVal(linitial(objname));
+
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+    static const char *unsupportList[] = {
+        "dolphin"
+    };
+    int len_unsupport = lengthof(unsupportList);
+    for (int i = 0; i < len_unsupport; i++) {
+        if (pg_strcasecmp(name, unsupportList[i]) == 0) {
+#ifdef ENABLE_LITE_MODE
+            if (u_sess->attr.attr_common.upgrade_mode != 0 && t_thrd.proc->workingVersionNum < DOLPHIN_ENABLE_DROP_NUM) {
+                return;
+            }
+#else
+            if (u_sess->attr.attr_common.IsInplaceUpgrade && t_thrd.proc->workingVersionNum < DOLPHIN_ENABLE_DROP_NUM) {
+                return;
+            }
+#endif
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("EXTENSION is not yet supported.")));
+        }
+    }
+#endif
 
     for (int i = 0; i < len; i++) {
         if (pg_strcasecmp(name, supportList[i]) == 0) {
@@ -90,7 +121,15 @@ static void DropExtensionInListIsSupported(List* objname)
         }
     }
 
-    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("EXTENSION is not yet supported.")));
+    if (pg_strcasecmp(name, "file_fdw") == 0 && !u_sess->attr.attr_common.IsInplaceUpgrade) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("EXTENSION file_fdw does not allow to drop.")));
+    }
+
+    /* Enable DROP operation of the above objects during inplace upgrade or support_extended_features is true */
+    if (!u_sess->attr.attr_common.IsInplaceUpgrade && !g_instance.attr.attr_common.support_extended_features) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("EXTENSION is not yet supported.")));
+    }
 }
 
 /*
@@ -236,6 +275,14 @@ void RemoveObjects(DropStmt* stmt, bool missing_ok, bool is_securityadmin)
             CacheInvalidateFunction(InvalidOid, pkgOid);
             ReleaseSysCache(tup);
         }
+
+#if (!defined(ENABLE_MULTIPLE_NODES)) && (!defined(ENABLE_PRIVATEGAUSS))
+        if (stmt->removeType == OBJECT_SCHEMA && u_sess->attr.attr_sql.dolphin && strcmp(strVal(linitial(objname)), "public") == 0) {
+            ereport(ERROR,
+                (errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+                    errmsg("cannot drop schema public because dolphin depends on it")));
+        }
+#endif
         // @Temp Table. myTempNamespace and myTempToastNamespace's owner is
         // bootstrap user, so can not be deleted by ordinary user. to ensuer this two
         // schema be deleted on session quiting, we should bypass acl check when
@@ -246,7 +293,7 @@ void RemoveObjects(DropStmt* stmt, bool missing_ok, bool is_securityadmin)
 
         /* Check permissions. */
         if (!skip_check) {
-            skip_check = CheckObjectDropPrivilege(stmt->removeType, address.objectId);
+            skip_check = CheckObjectDropPrivilege(stmt->removeType, address.objectId, relation);
         }
         namespaceId = get_object_namespace(&address);
         if ((!is_securityadmin) && (!skip_check) &&
@@ -267,6 +314,34 @@ void RemoveObjects(DropStmt* stmt, bool missing_ok, bool is_securityadmin)
 }
 
 /*
+ * schema_does_not_exist_skipping
+ *      Subroutine for RemoveObjects
+ *
+ * After determining that a specification for a schema-qualifiable object
+ * refers to an object that does not exist, test whether the specified schema
+ * exists or not.  If no schema was specified, or if the schema does exist,
+ * return false -- the object itself is missing instead.  If the specified
+ * schema does not exist, fill the error message format string and the
+ * specified schema name, and return true.
+ */
+static bool schema_does_not_exist_skipping(List *object, char **msg, char **name)
+{
+    RangeVar   *rel;
+
+    rel = makeRangeVarFromNameList(object);
+
+    if (rel->schemaname != NULL &&
+        !OidIsValid(LookupNamespaceNoError(rel->schemaname))) {
+        *msg = gettext_noop("schema \"%s\" does not exist, skipping");
+        *name = rel->schemaname;
+
+        return true;
+    }
+
+    return false;
+}
+
+/*
  * Generate a NOTICE stating that the named object was not found, and is
  * being skipped.  This is only relevant when "IF EXISTS" is used; otherwise,
  * get_object_address() will throw an ERROR.
@@ -281,9 +356,23 @@ static void does_not_exist_skipping(ObjectType objtype, List* objname, List* obj
     switch (objtype) {
         case OBJECT_TYPE:
         case OBJECT_DOMAIN:
-            msg = gettext_noop("type \"%s\" does not exist");
-            name = TypeNameToString(makeTypeNameFromNameList(objname));
-            break;
+        {
+            /*objname migth be a TypeName list or a String list, check its node type firstly*/
+            Node * ptype = (Node*) linitial(objname);
+            TypeName   *typ = NULL;
+            if (ptype->type == T_String)
+                typ = makeTypeNameFromNameList(objname);
+            else if (ptype->type == T_TypeName)
+                typ = (TypeName*)linitial(objname);
+            else
+                ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), (errmsg("unknown type: %d",(int)ptype->type))));
+ 
+            if (!schema_does_not_exist_skipping(typ->names, &msg, &name)) {
+                msg = gettext_noop("type \"%s\" does not exist");
+                name = TypeNameToString(typ);
+            }
+            
+        }  break;
         case OBJECT_COLLATION:
             msg = gettext_noop("collation \"%s\" does not exist");
             name = NameListToString(objname);
@@ -350,9 +439,19 @@ static void does_not_exist_skipping(ObjectType objtype, List* objname, List* obj
             args = format_type_be(typenameTypeId(NULL, (TypeName*)linitial(objargs)));
             break;
         case OBJECT_TRIGGER:
-            msg = gettext_noop("trigger \"%s\" for table \"%s\" does not exist");
+            if (list_length(objname) == 1) {
+                msg = gettext_noop("trigger \"%s\" does not exist");
+                name = NameListToString(objname);
+                break;
+            } else {
+                msg = gettext_noop("trigger \"%s\" for table \"%s\" does not exist");
+                name = NameListToString(objname);
+                args = NameListToString(list_truncate(list_copy(objname), list_length(objname) - 1));
+                break;
+            }
+        case OBJECT_EVENT_TRIGGER:
+            msg = gettext_noop("event trigger \"%s\" does not exist, skipping");
             name = NameListToString(objname);
-            args = NameListToString(list_truncate(list_copy(objname), list_length(objname) - 1));
             break;
         case OBJECT_RULE:
             msg = gettext_noop("rule \"%s\" for relation \"%s\" does not exist");
@@ -368,15 +467,25 @@ static void does_not_exist_skipping(ObjectType objtype, List* objname, List* obj
             name = NameListToString(objname);
             break;
         case OBJECT_OPCLASS:
-            msg = gettext_noop("operator class \"%s\" does not exist for access method \"%s\"");
-            name = NameListToString(objname);
-            args = strVal(linitial(objargs));
-            break;
+            {
+                List *opcname = list_copy_tail(objname, 1);
+                if (!schema_does_not_exist_skipping(opcname, &msg, &name)) {
+                    msg = gettext_noop("operator class \"%s\" does not exist for access method \"%s\"");
+                    name = NameListToString(opcname);
+                    args = strVal(linitial(objname));
+                }
+                list_free_ext(opcname);
+            } break;
         case OBJECT_OPFAMILY:
-            msg = gettext_noop("operator family \"%s\" does not exist for access method \"%s\"");
-            name = NameListToString(objname);
-            args = strVal(linitial(objargs));
-            break;
+            {
+                List *opfname = list_copy_tail(objname, 1);
+                if (!schema_does_not_exist_skipping(opfname, &msg, &name)) {
+                    msg = gettext_noop("operator family \"%s\" does not exist for access method \"%s\"");
+                    name = NameListToString(opfname);
+                    args = strVal(linitial(objname));
+                }
+                list_free_ext(opfname);
+            } break;
         case OBJECT_DATA_SOURCE:
             msg = gettext_noop("data source \"%s\" does not exist");
             name = NameListToString(objname);

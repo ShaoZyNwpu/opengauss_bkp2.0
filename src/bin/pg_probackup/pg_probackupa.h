@@ -53,11 +53,13 @@ extern const char  *PROGRAM_FULL_PATH;
 
 /* Directory/File names */
 #define DATABASE_DIR                "database"
+#define DSSDATA_DIR                  "dssdata"
 #define BACKUPS_DIR                    "backups"
 #define PG_XLOG_DIR                    "pg_xlog"
 #define PG_LOG_DIR                     "pg_log"
 #define PG_TBLSPC_DIR                "pg_tblspc"
 #define PG_GLOBAL_DIR                "global"
+#define PG_XLOG_CONTROL_FILE          "pg_control"
 #define BACKUP_CONTROL_FILE            "backup.control"
 #define BACKUP_CATALOG_CONF_FILE    "pg_probackup.conf"
 #define BACKUP_CATALOG_PID            "backup.pid"
@@ -69,6 +71,7 @@ extern const char  *PROGRAM_FULL_PATH;
 #define HEADER_MAP                  "page_header_map"
 #define HEADER_MAP_TMP              "page_header_map_tmp"
 #define PG_RELATIVE_TBLSPC_DIR       "pg_location"
+#define PG_REPLSLOT_DIR              "pg_replslot"
 
 /* Timeout defaults */
 #define ARCHIVE_TIMEOUT_DEFAULT        300
@@ -141,6 +144,8 @@ typedef enum CompressAlg
 #ifdef HAVE_LIBZ
     ZLIB_COMPRESS,
 #endif
+    LZ4_COMPRESS,
+    ZSTD_COMPRESS,
 } CompressAlg;
 
 typedef enum ForkName

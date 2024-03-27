@@ -28,7 +28,7 @@ export FIRSTOBJECTID
 # note: we exclude BKI_BOOTSTRAP relations since they are expected to have
 # matching DATA lines in pg_class.h and pg_type.h
 
-cat pgxc_*.h pg_*.h toasting.h indexing.h ../../common/backend/catalog/builtin_funcs.ini | \
+cat gs_*.h pgxc_*.h pg_*.h toasting.h indexing.h ../../common/backend/catalog/builtin_funcs.ini | \
 egrep -v -e '^CATALOG\(.*BKI_BOOTSTRAP' | \
 sed -n	-e 's/^DATA(insert *OID *= *\([0-9][0-9]*\).*$/\1/p' \
 	-e 's/^CATALOG([^,]*, *\([0-9][0-9]*\).*BKI_ROWTYPE_OID(\([0-9][0-9]*\)).*$/\1,\2/p' \
@@ -56,5 +56,9 @@ BEGIN {
 	last = $1;
 }
 END {
-	print last + 1, "-", ENVIRON["FIRSTOBJECTID"]-1;
+	if (last + 1 < ENVIRON["FIRSTOBJECTID"]-1) {
+		print last + 1, "-", ENVIRON["FIRSTOBJECTID"]-1;
+	} else {
+		print last + 1;
+	}
 }'

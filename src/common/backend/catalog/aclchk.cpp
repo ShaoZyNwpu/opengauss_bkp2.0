@@ -35,6 +35,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_directory.h"
+#include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
@@ -61,6 +62,7 @@
 #include "catalog/gs_global_config.h"
 #include "catalog/gs_db_privilege.h"
 #include "commands/dbcommands.h"
+#include "commands/event_trigger.h"
 #include "commands/proclang.h"
 #include "commands/sec_rls_cmds.h"
 #include "commands/tablecmds.h"
@@ -101,19 +103,6 @@
  * represented in col_privs and col_ddl_privs (this is a list of untransformed AccessPriv nodes).
  * Column privileges are only valid for objtype ACL_OBJECT_RELATION.
  */
-typedef struct {
-    bool is_grant;
-    GrantObjectType objtype;
-    List* objects;
-    bool all_privs;
-    AclMode privileges;
-    AclMode ddl_privileges;
-    List* col_privs;
-    List* col_ddl_privs;
-    List* grantees;
-    bool grant_option;
-    DropBehavior behavior;
-} InternalGrant;
 
 /*
  * Internal format used by ALTER DEFAULT PRIVILEGES.
@@ -199,6 +188,7 @@ const struct AclObjKind {
     {ACL_KIND_DIRECTORY, ACL_ALL_RIGHTS_DIRECTORY, ACL_ALL_DDL_RIGHTS_DIRECTORY},
     {ACL_KIND_COLUMN_SETTING, ACL_ALL_RIGHTS_KEY, ACL_ALL_DDL_RIGHTS_KEY},
     {ACL_KIND_GLOBAL_SETTING, ACL_ALL_RIGHTS_KEY, ACL_ALL_DDL_RIGHTS_KEY},
+    {ACL_KIND_EVENT_TRIGGER, ACL_NO_RIGHTS, ACL_NO_DDL_RIGHTS},   
 };
 
 const struct AclClassId {
@@ -224,7 +214,7 @@ const struct AclClassId {
 };
 
 static void ExecGrantStmt_oids(InternalGrant* istmt);
-static void ExecGrant_Relation(InternalGrant* grantStmt);
+void ExecGrant_Relation(InternalGrant* grantStmt);
 static void ExecGrant_Database(InternalGrant* grantStmt);
 static void ExecGrant_Fdw(InternalGrant* grantStmt);
 static void ExecGrant_ForeignServer(InternalGrant* grantStmt);
@@ -388,6 +378,11 @@ static void restrict_and_check_grant(AclMode* this_privileges, bool is_grant,
         whole_ddl_mask = ACL_NO_DDL_RIGHTS;
     }
 
+    if ((whole_mask == ACL_NO_RIGHTS) && (objkind == ACL_KIND_EVENT_TRIGGER)) {
+        elog(ERROR, "grantable rights not supported for event triggers");
+        /* not reached, but keep compiler quiet */
+        return ;
+    }
     /*
      * If we found no grant options, consider whether to issue a hard error.
      * Per spec, having any privilege at all on the object will get you by
@@ -417,49 +412,55 @@ static void restrict_and_check_grant(AclMode* this_privileges, bool is_grant,
     ddl_privileges = REMOVE_DDL_FLAG(ddl_privileges);
     this_privileges[DDL_PRIVS_INDEX] = ddl_privileges & ACL_OPTION_TO_PRIVS(avail_ddl_goptions);
 
+#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
+    int level = WARNING;
+#else
+    int level = ERROR;
+#endif
+
     if (is_grant) {
         if (this_privileges[DML_PRIVS_INDEX] == 0 && this_privileges[DDL_PRIVS_INDEX] == 0) {
             if (objkind == ACL_KIND_COLUMN && colname != NULL)
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
                         errmsg("no privileges were granted for column \"%s\" of relation \"%s\"", colname, objname)));
             else
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
                         errmsg("no privileges were granted for \"%s\"", objname)));
         } else if (!all_privs && ((this_privileges[DML_PRIVS_INDEX] != privileges) ||
             (this_privileges[DDL_PRIVS_INDEX] != ddl_privileges))) {
             if (objkind == ACL_KIND_COLUMN && colname != NULL)
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
                         errmsg(
                             "not all privileges were granted for column \"%s\" of relation \"%s\"", colname, objname)));
             else
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
                         errmsg("not all privileges were granted for \"%s\"", objname)));
         }
     } else {
         if (this_privileges[DML_PRIVS_INDEX] == 0 && this_privileges[DDL_PRIVS_INDEX] == 0) {
             if (objkind == ACL_KIND_COLUMN && colname != NULL)
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_REVOKED),
                         errmsg(
                             "no privileges could be revoked for column \"%s\" of relation \"%s\"", colname, objname)));
             else
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_REVOKED),
                         errmsg("no privileges could be revoked for \"%s\"", objname)));
         } else if (!all_privs && ((this_privileges[DML_PRIVS_INDEX] != privileges) ||
             (this_privileges[DDL_PRIVS_INDEX] != ddl_privileges))) {
             if (objkind == ACL_KIND_COLUMN && colname != NULL)
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_REVOKED),
                         errmsg("not all privileges could be revoked for column \"%s\" of relation \"%s\"",
                             colname,
                             objname)));
             else
-                ereport(WARNING,
+                ereport(level,
                     (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_REVOKED),
                         errmsg("not all privileges could be revoked for \"%s\"", objname)));
         }
@@ -740,6 +741,15 @@ static void ExecGrantStmt_oids(InternalGrant* istmt)
                     errcause("The object type is not supported for GRANT/REVOKE."),
                         erraction("Check GRANT/REVOKE syntax to obtain the supported object types.")));
     }
+
+    /*
+     * Pass the info to event triggers about the just-executed GRANT.  Note
+     * that we prefer to do it after actually executing it, because that gives
+     * the functions a chance to adjust the istmt with privileges actually
+     * granted.
+     */
+    if (EventTriggerSupportsGrantObjectType(istmt->objtype))
+        EventTriggerCollectGrant(istmt);
 }
 
 static void get_global_objects(const List *objnames, List **objects)
@@ -2097,7 +2107,7 @@ static void ExecGrantRelationPrivilegesCheck(Form_pg_class tuple, AclMode* privi
 /*
  *	This processes both sequences and non-sequences.
  */
-static void ExecGrant_Relation(InternalGrant* istmt)
+void ExecGrant_Relation(InternalGrant* istmt)
 {
     Relation relation = NULL;
     Relation attRelation = NULL;
@@ -4702,6 +4712,8 @@ static const char* const no_priv_msg[MAX_ACL_KIND] = {
     gettext_noop("permission denied for client master key %s"),
     /* ACL_KIND_PACKAGE */
     gettext_noop("permission denied for package %s"),
+    /* ACL_KIND_EVENT_TRIGGER */
+    gettext_noop("permission denied for event trigger %s"),
 };
 
 static const char* const not_owner_msg[MAX_ACL_KIND] = {
@@ -4761,6 +4773,8 @@ static const char* const not_owner_msg[MAX_ACL_KIND] = {
     gettext_noop("must be owner of publication %s"),
     /* ACL_KIND_SUBSCRIPTION */
     gettext_noop("must be owner of subscription %s"),
+    /* ACL_KIND_EVENT_TRIGGER */
+    gettext_noop("must be owner of event trigger %s"),
 };
 
 void aclcheck_error(AclResult aclerr, AclObjectKind objectkind, const char* objectname)
@@ -4879,6 +4893,10 @@ static AclMode pg_aclmask(
             return pg_foreign_data_wrapper_aclmask(table_oid, roleid, mask, how);
         case ACL_KIND_FOREIGN_SERVER:
             return pg_foreign_server_aclmask(table_oid, roleid, mask, how);
+        case ACL_KIND_EVENT_TRIGGER:
+            elog(ERROR, "grantable rights not supported for event triggers");
+            /* not reached, but keep compiler quiet */
+            return ACL_NO_RIGHTS;
         case ACL_KIND_TYPE:
             return pg_type_aclmask(table_oid, roleid, mask, how);
         case ACL_KIND_DATA_SOURCE:
@@ -5002,9 +5020,13 @@ static AclMode check_dml_privilege(Form_pg_class classForm, AclMode mask, Oid ro
     switch (classForm->relkind) {
         case RELKIND_INDEX:
         case RELKIND_GLOBAL_INDEX:
+        case RELKIND_COMPOSITE_TYPE:
+            break;
         case RELKIND_SEQUENCE:
         case RELKIND_LARGE_SEQUENCE:
-        case RELKIND_COMPOSITE_TYPE:
+            if (HasSpecAnyPriv(roleid, SELECT_ANY_SEQUENCE, false)) {
+                result |= ACL_USAGE | ACL_SELECT | ACL_UPDATE;
+            }
             break;
         /* table */
         default:
@@ -5039,10 +5061,21 @@ static AclMode check_ddl_privilege(char relkind, AclMode mask, Oid roleid, AclMo
     mask = REMOVE_DDL_FLAG(mask);
     switch (relkind) {
         case RELKIND_COMPOSITE_TYPE:
-        case RELKIND_SEQUENCE:
-        case RELKIND_LARGE_SEQUENCE:
         case RELKIND_INDEX:
         case RELKIND_GLOBAL_INDEX:
+            break;
+        case RELKIND_LARGE_SEQUENCE:
+        case RELKIND_SEQUENCE:
+            if ((mask & ACL_ALTER) && !(result & ACL_ALTER)) {
+                if (HasSpecAnyPriv(roleid, ALTER_ANY_SEQUENCE, false)) {
+                    result |= ACL_ALTER;
+                }
+            }
+            if ((mask & ACL_DROP) && !(result & ACL_DROP)) {
+                if (HasSpecAnyPriv(roleid, DROP_ANY_SEQUENCE, false)) {
+                    result |= ACL_DROP;
+                }
+            }
             break;
         /* table */
         default:
@@ -5307,8 +5340,8 @@ AclMode pg_directory_aclmask(Oid dir_oid, Oid roleid, AclMode mask, AclMaskHow h
      * when enable_access_server_directory is off, only initial user bypass all permission checking
      * otherwise, superuser can bypass all permission checking
      */
-    if ((!g_instance.attr.attr_storage.enable_access_server_directory && superuser_arg_no_seperation(roleid)) ||
-        (g_instance.attr.attr_storage.enable_access_server_directory &&
+    if ((!u_sess->attr.attr_storage.enable_access_server_directory && superuser_arg_no_seperation(roleid)) ||
+        (u_sess->attr.attr_storage.enable_access_server_directory &&
             (superuser_arg(roleid) || systemDBA_arg(roleid))))
         return REMOVE_DDL_FLAG(mask);
 
@@ -6213,6 +6246,24 @@ AclMode pg_type_aclmask(Oid type_oid, Oid roleid, AclMode mask, AclMaskHow how)
     /* if we have a detoasted copy, free it */
     FREE_DETOASTED_ACL(acl, aclDatum);
 
+    if ((how == ACLMASK_ANY && result != 0) || IsSysSchema(typeForm->typnamespace)) {
+        ReleaseSysCache(tuple);
+        return result;
+    }
+    bool is_ddl_privileges = ACLMODE_FOR_DDL(mask);
+    if (is_ddl_privileges) {
+        if ((REMOVE_DDL_FLAG(mask) & ACL_ALTER) && !(result & ACL_ALTER)) {
+            if (HasSpecAnyPriv(roleid, ALTER_ANY_TYPE, false)) {
+                result |= ACL_ALTER;
+            }
+        }
+        if ((REMOVE_DDL_FLAG(mask) & ACL_DROP) && !(result & ACL_DROP)) {
+            if (HasSpecAnyPriv(roleid, DROP_ANY_TYPE, false)) {
+                result |= ACL_DROP;
+            }
+        }
+    }
+
     ReleaseSysCache(tuple);
 
     return result;
@@ -6968,6 +7019,32 @@ bool pg_foreign_server_ownercheck(Oid srv_oid, Oid roleid)
                 errcause("System error."), erraction("Contact engineer to support.")));
 
     ownerId = ((Form_pg_foreign_server)GETSTRUCT(tuple))->srvowner;
+
+    ReleaseSysCache(tuple);
+
+    return has_privs_of_role(roleid, ownerId);
+}
+
+/*
+ * Ownership check for an event trigger (specified by OID).
+ */
+bool pg_event_trigger_ownercheck(Oid et_oid, Oid roleid)
+{
+    HeapTuple   tuple;
+    Oid         ownerId;
+
+    /* Superusers bypass all permission checking. */
+    if (superuser_arg(roleid))
+        return true;
+
+    tuple = SearchSysCache1(EVENTTRIGGEROID, ObjectIdGetDatum(et_oid));
+    if (!HeapTupleIsValid(tuple))
+        ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_OBJECT),
+                    errmsg("event trigger with OID %u does not exist",
+                        et_oid)));
+
+    ownerId = ((Form_pg_event_trigger) GETSTRUCT(tuple))->evtowner;
 
     ReleaseSysCache(tuple);
 

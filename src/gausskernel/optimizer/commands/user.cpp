@@ -113,7 +113,7 @@ static bool CheckPasswordComplexity(
     const char* roleID, char* newPasswd, char* oldPasswd, bool isCreaterole);
 static void AddAuthHistory(Oid roleID, const char* rolename, const char* passwd, int operatType, const char* salt);
 static void DropAuthHistory(Oid roleID);
-
+static inline void check_iteration_count(int iteration_count);
 /* Check weak password */
 static bool is_weak_password(const char* password);
 static void check_weak_password(char *Password);
@@ -148,8 +148,18 @@ void initWaitCountCell(
 void initWaitCount(Oid userid);
 static inline void clean_role_password(const DefElem* dpassword);
 
+static inline void check_iteration_count(int iteration_count)
+{
+    if (iteration_count < ITERATION_COUNT || iteration_count > MAX_ITERATION_COUNT) {
+        ereport(NOTICE,
+            (errcode(ERRCODE_INVALID_PASSWORD),
+                errmsg("The iteration value of password is not recommended."
+                    "Setting the iteration value too small reduces the security of the password, "
+                    "and setting it too large results in performance degradation.")));
+    }
+}
 /* Check if current user has createrole privileges */
-static bool have_createrole_privilege(void)
+bool have_createrole_privilege(void)
 {
     return has_createrole_privilege(GetUserId());
 }
@@ -326,7 +336,7 @@ void initSqlCountUser()
 {
     ResourceOwner currentOwner = t_thrd.utils_cxt.CurrentResourceOwner;
     ResourceOwner tmpOwner;
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "ForSqlCount",
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(currentOwner, "ForSqlCount",
         THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
 
     Relation relation = heap_open(AuthIdRelationId, AccessShareLock);
@@ -533,7 +543,7 @@ static inline void clean_role_password(const DefElem* dpassword)
  * True iff role name starts with the gs_role_ prefix.
  * The prefix gs_role_ is reserverd for the predefined role names.
  */
-static bool IsReservedRoleName(const char* name)
+bool IsReservedRoleName(const char* name)
 {
     if (strncmp(name, "gs_role_", strlen("gs_role_")) == 0) {
         return true;
@@ -545,7 +555,7 @@ static bool IsReservedRoleName(const char* name)
 /*
  * CREATE ROLE
  */
-void CreateRole(CreateRoleStmt* stmt)
+Oid CreateRole(CreateRoleStmt* stmt)
 {
     Datum new_record[Natts_pg_authid];
     bool new_record_nulls[Natts_pg_authid] = {false};
@@ -1174,7 +1184,12 @@ void CreateRole(CreateRoleStmt* stmt)
 
     if (OidIsValid(get_role_oid(stmt->role, true))) {
         str_reset(password);
-        ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("role \"%s\" already exists", stmt->role)));
+        int elevel = stmt->missing_ok ? NOTICE : ERROR;
+        ereport(elevel, (errmsg("role \"%s\" already exists", stmt->role)));
+        if (stmt->missing_ok) {
+            heap_close(pg_authid_rel, NoLock);
+            return InvalidOid;
+        }
     }
 
     /* Convert validBegin to internal form */
@@ -1223,7 +1238,7 @@ void CreateRole(CreateRoleStmt* stmt)
         int pwd_type = PASSWORD_TYPE_PLAINTEXT;
         if (isMD5(password)) {
             pwd_type = PASSWORD_TYPE_MD5;
-        } else if (!isSHA256(password)) {
+        } else if (isSHA256(password)) {
             pwd_type = PASSWORD_TYPE_SHA256;
         }
 
@@ -1303,12 +1318,20 @@ void CreateRole(CreateRoleStmt* stmt)
         }
         sha_bytes_to_hex64((uint8*)salt_bytes, salt_string);
         /* Database Security: Support password complexity */
-        if (u_sess->attr.attr_security.Password_policy == DEFAULT_PASSWORD_POLICY &&
-            !CheckPasswordComplexity(stmt->role, password, NULL, true)) {
+        if (u_sess->attr.attr_security.Password_policy == DEFAULT_PASSWORD_POLICY) {
+            if (!CheckPasswordComplexity(stmt->role, password, NULL, true)) {
+                str_reset(password);
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PASSWORD),
+                        errmsg("The password does not satisfy the complexity requirement")));
+            }
+        } else if (isStrHasInvalidCharacter(password)) {
             str_reset(password);
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PASSWORD),
-                    errmsg("The password does not satisfy the complexity requirement")));
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+                errmsg("Password cannot contain characters except numbers, alphabetic characters and "
+                       "specified special characters."),
+                errcause("Password contain invalid characters."),
+                erraction("Use valid characters in password.")));
         }
 
         new_record[Anum_pg_authid_rolpassword - 1] =
@@ -1368,6 +1391,7 @@ void CreateRole(CreateRoleStmt* stmt)
     }
 
     new_record_nulls[Anum_pg_authid_rolexcpdata - 1] = true;
+    new_record_nulls[Anum_pg_authid_rolpasswordext - 1] = true;
 
     HeapTuple tuple = heap_form_tuple(pg_authid_dsc, new_record, new_record_nulls);
 
@@ -1552,6 +1576,8 @@ void CreateRole(CreateRoleStmt* stmt)
     if (OidIsValid(nodegroup_id)) {
         grant_nodegroup_to_role(nodegroup_id, roleid, true);
     }
+
+    return roleid;
 }
 
 /*
@@ -1612,7 +1638,7 @@ static bool IsPredefinedRole(const char* name)
  * backwards-compatible ALTER GROUP syntax.  Although it will work to say
  * "ALTER ROLE role ROLE rolenames", we don't document it.
  */
-void AlterRole(AlterRoleStmt* stmt)
+Oid AlterRole(AlterRoleStmt* stmt)
 {
     Datum new_record[Natts_pg_authid];
     bool new_record_nulls[Natts_pg_authid] = {false};
@@ -1719,7 +1745,7 @@ void AlterRole(AlterRoleStmt* stmt)
 
     /* Extract options from the statement node tree */
     foreach (option, stmt->options) {
-        DefElem* defel = (DefElem*)lfirst(option);
+        DefElem *defel = (DefElem *)lfirst(option);
 
         if (strcmp(defel->defname, "password") == 0 || strcmp(defel->defname, "encryptedPassword") == 0 ||
             strcmp(defel->defname, "unencryptedPassword") == 0 || strcmp(defel->defname, "expiredPassword") == 0) {
@@ -2070,15 +2096,22 @@ void AlterRole(AlterRoleStmt* stmt)
      */
     Relation pg_authid_rel = heap_open(AuthIdRelationId, RowExclusiveLock);
 
-    HeapTuple tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(stmt->role));
+    HeapTuple tuple = SearchUserHostName(stmt->role, NULL);
     if (!HeapTupleIsValid(tuple)) {
         str_reset(password);
         str_reset(replPasswd);
 
-        if (!have_createrole_privilege())
+        if (!have_createrole_privilege()) {
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
-        else
-            ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" does not exist", stmt->role)));
+        } else {
+            if (stmt->missing_ok) {
+                heap_close(pg_authid_rel, NoLock);
+                ereport(NOTICE, (errmsg("role \"%s\" does not exist, skipping", stmt->role)));
+                return InvalidOid;
+            } else {
+                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" does not exist", stmt->role)));
+            } 
+        }   
     }
     roleid = HeapTupleGetOid(tuple);
 
@@ -2235,13 +2268,13 @@ void AlterRole(AlterRoleStmt* stmt)
         CheckLockPrivilege(roleid, tuple, is_opradmin);
 
         if (stmt->lockstatus == LOCK_ROLE) {
-            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || SS_STANDBY_MODE) {
                 UpdateFailCountToHashTable(roleid, 0, true);
             } else {
                 TryLockAccount(roleid, 0, true);
             }
         } else {
-            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || SS_STANDBY_MODE) {
                 UnlockAccountToHashTable(roleid, true, false);
             } else {
                 TryUnlockAccount(roleid, true, false);
@@ -2252,7 +2285,7 @@ void AlterRole(AlterRoleStmt* stmt)
         heap_close(pg_authid_rel, NoLock);
         str_reset(password);
         str_reset(replPasswd);
-        return;
+        return InvalidOid;
     }
 
     /* Database Security:  Support separation of privilege.*/
@@ -2431,7 +2464,7 @@ void AlterRole(AlterRoleStmt* stmt)
     }
 
     /* If locked, try unlock to see whether lock time is over. */
-    if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+    if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || SS_STANDBY_MODE) {
         if (UNLOCK_STATUS != GetAccountLockedStatusFromHashTable(roleid)) {
             UnlockAccountToHashTable(roleid, false, false);
             rolestatus = GetAccountLockedStatusFromHashTable(roleid);
@@ -2496,7 +2529,7 @@ void AlterRole(AlterRoleStmt* stmt)
         int pwd_type = PASSWORD_TYPE_PLAINTEXT;
         if (isMD5(password)) {
             pwd_type = PASSWORD_TYPE_MD5;
-        } else if (!isSHA256(password)) {
+        } else if (isSHA256(password)) {
             pwd_type = PASSWORD_TYPE_SHA256;
         }
 
@@ -2754,7 +2787,7 @@ void AlterRole(AlterRoleStmt* stmt)
                         /* the password is not right, and try to lock the account */
                         if (u_sess->attr.attr_security.Password_lock_time > 0 &&
                             u_sess->attr.attr_security.Failed_login_attempts > 0) {
-                            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+                            if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || SS_STANDBY_MODE) {
                                 UpdateFailCountToHashTable(roleid, 1, false);
                             } else {
                                 TryLockAccount(roleid, 1, false);
@@ -2765,7 +2798,7 @@ void AlterRole(AlterRoleStmt* stmt)
                         str_reset(oldPasswd);
                         ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("The old password is invalid.")));
                     } else {
-                        if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+                        if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || SS_STANDBY_MODE) {
                             UnlockAccountToHashTable(roleid, false, true);
                         } else {
                             TryUnlockAccount(roleid, false, true);
@@ -2812,14 +2845,24 @@ void AlterRole(AlterRoleStmt* stmt)
         if (!(authidPasswdIsNull || NULL == (void*)authidPasswdDatum)) {
             oldPasswd = TextDatumGetCString(authidPasswdDatum);
         }
-        if (DEFAULT_PASSWORD_POLICY == u_sess->attr.attr_security.Password_policy &&
-            !CheckPasswordComplexity(stmt->role, password, oldPasswd, false)) {
+        if (u_sess->attr.attr_security.Password_policy == DEFAULT_PASSWORD_POLICY) {
+            if (!CheckPasswordComplexity(stmt->role, password, oldPasswd, false)) {
+                str_reset(password);
+                str_reset(replPasswd);
+                str_reset(oldPasswd);
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PASSWORD),
+                        errmsg("The password does not satisfy the complexity requirement")));
+            }
+        } else if (isStrHasInvalidCharacter(password)) {
             str_reset(password);
             str_reset(replPasswd);
             str_reset(oldPasswd);
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PASSWORD),
-                    errmsg("The password does not satisfy the complexity requirement")));
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+                errmsg("Password cannot contain characters except numbers, alphabetic characters and "
+                       "specified special characters."),
+                errcause("Password contain invalid characters."),
+                erraction("Use valid characters in password.")));
         }
         retval = RAND_priv_bytes((unsigned char*)salt_bytes, (GS_UINT32)SALT_LENGTH);
         if (retval != 1) {
@@ -3016,12 +3059,13 @@ void AlterRole(AlterRoleStmt* stmt)
     if (isexpired && GetAccountPasswordExpired(roleid) != EXPIRED_STATUS) {
         SetAccountPasswordExpired(roleid, true);
     }
+    return roleid;
 }
 
 /*
  * ALTER ROLE ... SET
  */
-void AlterRoleSet(AlterRoleSetStmt* stmt)
+Oid AlterRoleSet(AlterRoleSetStmt* stmt)
 {
     Oid databaseid = InvalidOid;
     Oid roleid;
@@ -3041,10 +3085,11 @@ void AlterRoleSet(AlterRoleSetStmt* stmt)
     pg_authid_rel = heap_open(AuthIdRelationId, RowExclusiveLock);
     pg_authid_dsc = RelationGetDescr(pg_authid_rel);
 
-    HeapTuple roletuple = SearchSysCache1(AUTHNAME, PointerGetDatum(stmt->role));
+    HeapTuple roletuple = SearchUserHostName(stmt->role, NULL);
 
-    if (!HeapTupleIsValid(roletuple))
+    if (!HeapTupleIsValid(roletuple)) {
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" does not exist", stmt->role)));
+    }
 
     /*
      * Obtain a lock on the role and make sure it didn't go away in the
@@ -3093,6 +3138,7 @@ void AlterRoleSet(AlterRoleSetStmt* stmt)
 #endif
     heap_close(pg_authid_rel, NoLock);
     ReleaseSysCache(roletuple);
+    return roleid;
 }
 
 /*
@@ -3152,7 +3198,7 @@ void DropRole(DropRoleStmt* stmt)
                 errmsg("Permission denied to drop predefined roles.")));
         }
 
-        HeapTuple tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
+        HeapTuple tuple = SearchUserHostName(role, NULL);
         if (!HeapTupleIsValid(tuple)) {
             if (!stmt->missing_ok) {
                 ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" does not exist", role)));
@@ -3385,7 +3431,7 @@ void DropRole(DropRoleStmt* stmt)
 /*
  * Rename role
  */
-void RenameRole(const char* oldname, const char* newname)
+ObjectAddress RenameRole(const char* oldname, const char* newname)
 {
     Datum datum;
     bool isnull = false;
@@ -3395,6 +3441,7 @@ void RenameRole(const char* oldname, const char* newname)
     int i;
     Oid roleid;
     bool is_opradmin = false;
+    ObjectAddress address;
     Relation pg_job_tbl = NULL;
     TableScanDesc scan = NULL;
     HeapTuple tuple = NULL;
@@ -3402,7 +3449,7 @@ void RenameRole(const char* oldname, const char* newname)
     Relation rel = heap_open(AuthIdRelationId, RowExclusiveLock);
     TupleDesc dsc = RelationGetDescr(rel);
 
-    HeapTuple oldtuple = SearchSysCache1(AUTHNAME, CStringGetDatum(oldname));
+    HeapTuple oldtuple = SearchUserHostName(oldname, NULL);
     if (!HeapTupleIsValid(oldtuple))
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("role \"%s\" does not exist", oldname)));
 
@@ -3507,6 +3554,7 @@ void RenameRole(const char* oldname, const char* newname)
     CatalogUpdateIndexes(rel, newtuple);
     ReleaseSysCache(oldtuple);
 
+    ObjectAddressSet(address, AuthIdRelationId, roleid);
     /*
      * Close pg_authid, but keep lock till commit.
      */
@@ -3528,6 +3576,7 @@ void RenameRole(const char* oldname, const char* newname)
     heap_endscan(scan);
     heap_close(pg_job_tbl, ExclusiveLock);
 
+    return address;
 }
 
 /*
@@ -4235,7 +4284,17 @@ static bool IsSpecialCharacter(char ch)
     return false;
 }
 
-
+bool isStrHasInvalidCharacter(const char* str)
+{
+    while (*str != '\0') {
+        if (isalnum(*str) || IsSpecialCharacter(*str)) {
+            str++;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void CalculateTheNumberOfAllTypesOfCharacters(const char* ptr, int *kinds, bool *include_unusual_character)
 {
@@ -4397,6 +4456,9 @@ static bool CheckPasswordComplexity(const char* roleID, char* newPasswd, char* o
                 (errcode(ERRCODE_INVALID_PASSWORD),
                     errmsg("New password should not be empty.")));
         }
+        int iteration_count = 0;
+        iteration_count = get_iteration_by_password(newPasswd);
+        check_iteration_count(iteration_count);
         ereport(NOTICE,
             (errcode(ERRCODE_INVALID_PASSWORD),
                 errmsg("Using encrypted password directly now and it is not recommended."),
@@ -5113,7 +5175,7 @@ void TryLockAccount(Oid roleID, int extrafails, bool superlock)
     char* rolename = NULL;
 
     /* We could not insert new xlog if recovery in process */
-    if (RecoveryInProgress()) {
+    if (RecoveryInProgress() || SSIsServerModeReadOnly()) {
         return;
     }
 
@@ -5128,7 +5190,7 @@ void TryLockAccount(Oid roleID, int extrafails, bool superlock)
 
     /* if the relation is valid, get the tuple of roleID*/
     if (RelationIsValid(pg_user_status_rel)) {
-        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        LockRelationOid(UserStatusRelationId, ShareUpdateExclusiveLock);
         pgstat_initstats(pg_user_status_rel);
         pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
         tuple = SearchSysCache1(USERSTATUSROLEID, PointerGetDatum(roleID));
@@ -5202,7 +5264,7 @@ void TryLockAccount(Oid roleID, int extrafails, bool superlock)
             ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("The tuple of pg_user_status not found")));
         }
 
-        heap_close(pg_user_status_rel, RowExclusiveLock);
+        heap_close(pg_user_status_rel, ShareUpdateExclusiveLock);
 
     } else {
         ereport(WARNING, (errmsg("the relation pg_user_status is invalid")));
@@ -5264,7 +5326,7 @@ bool TryUnlockAccount(Oid roleID, bool superunlock, bool isreset)
     char* rolename = NULL;
 
     /* We could not insert new xlog if recovery in process */
-    if (RecoveryInProgress()) {
+    if (RecoveryInProgress() || SSIsServerModeReadOnly()) {
         return false;
     }
 
@@ -5287,7 +5349,7 @@ bool TryUnlockAccount(Oid roleID, bool superunlock, bool isreset)
 
     /* if the relation is valid, get the tuple of roleID */
     if (RelationIsValid(pg_user_status_rel)) {
-        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        LockRelationOid(UserStatusRelationId, ShareUpdateExclusiveLock);
         pgstat_initstats(pg_user_status_rel);
         pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
 
@@ -5350,7 +5412,7 @@ bool TryUnlockAccount(Oid roleID, bool superunlock, bool isreset)
         AcceptInvalidationMessages();
         (void)GetCurrentCommandId(true);
         CommandCounterIncrement();
-        heap_close(pg_user_status_rel, RowExclusiveLock);
+        heap_close(pg_user_status_rel, ShareUpdateExclusiveLock);
         if (unlockflag) {
             pgaudit_lock_or_unlock_user(false, rolename);
         }
@@ -5382,7 +5444,7 @@ void TryUnlockAllAccounts(void)
     bool roleIdIsNull = false;
     char* rolename = NULL;
 
-    if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE) {
+    if (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE || SS_STANDBY_MODE) {
         return;
     }
 
@@ -5391,7 +5453,7 @@ void TryUnlockAllAccounts(void)
 
     /* if the relation is valid, get the tuple of roleID */
     if (RelationIsValid(pg_user_status_rel)) {
-        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        LockRelationOid(UserStatusRelationId, ShareUpdateExclusiveLock);
         pgstat_initstats(pg_user_status_rel);
         pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
         scan = tableam_scan_begin(pg_user_status_rel, SnapshotNow, 0, NULL);
@@ -5433,7 +5495,7 @@ void TryUnlockAllAccounts(void)
         AcceptInvalidationMessages();
         (void)GetCurrentCommandId(true);
         CommandCounterIncrement();
-        heap_close(pg_user_status_rel, NoLock);
+        heap_close(pg_user_status_rel, ShareUpdateExclusiveLock);
     } else {
         ereport(WARNING, (errmsg("the relation pg_user_status is invalid")));
     }
@@ -5461,6 +5523,7 @@ static void UpdateUnlockAccountTuples(HeapTuple tuple, Relation rel, TupleDesc t
     new_tuple =
         (HeapTuple) tableam_tops_modify_tuple(tuple, tupledesc, user_status_record, user_status_record_nulls, user_status_record_repl);
     heap_inplace_update(rel, new_tuple);
+    CacheInvalidateHeapTupleInplace(rel, new_tuple);
     tableam_tops_free_tuple(new_tuple);
 }
 
@@ -5604,7 +5667,7 @@ void SetAccountPasswordExpired(Oid roleID, bool expired)
 
     pg_user_status_rel = RelationIdGetRelation(UserStatusRelationId);
     if (RelationIsValid(pg_user_status_rel)) { 
-        LockRelationOid(UserStatusRelationId, RowExclusiveLock);
+        LockRelationOid(UserStatusRelationId, ShareUpdateExclusiveLock);
         pgstat_initstats(pg_user_status_rel);
         pg_user_status_dsc = RelationGetDescr(pg_user_status_rel);
         HeapTuple tuple = SearchSysCache1(USERSTATUSROLEID, PointerGetDatum(roleID));
@@ -5618,13 +5681,14 @@ void SetAccountPasswordExpired(Oid roleID, bool expired)
                 heap_modify_tuple(tuple, pg_user_status_dsc, userStatusRecord,
                                   user_status_record_nulls, user_status_record_repl);
             simple_heap_update(pg_user_status_rel, &new_tuple->t_self, new_tuple);
+            CatalogUpdateIndexes(pg_user_status_rel, new_tuple);
             heap_freetuple_ext(new_tuple);
             ReleaseSysCache(tuple);
         }
         AcceptInvalidationMessages();
         (void)GetCurrentCommandId(true);
         CommandCounterIncrement();
-        heap_close(pg_user_status_rel, RowExclusiveLock);
+        heap_close(pg_user_status_rel, ShareUpdateExclusiveLock);
     } else {
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("the relation pg_user_status is invalid")));
     }
@@ -5669,7 +5733,7 @@ void DropUserStatus(Oid roleID)
  */
 Oid GetRoleOid(const char* username)
 {
-    HeapTuple tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(username));
+    HeapTuple tuple = SearchUserHostName(username, NULL);
     if (!HeapTupleIsValid(tuple)) {
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("Invalid username/password,login denied.")));
     }
@@ -5687,7 +5751,7 @@ bool IsRoleExist(const char* username)
 {
     bool result = false;
     HOLD_INTERRUPTS();
-    HeapTuple tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(username));
+    HeapTuple tuple = SearchUserHostName(username, NULL);
     RESUME_INTERRUPTS();
     CHECK_FOR_INTERRUPTS();
     if (HeapTupleIsValid(tuple)) {
@@ -5910,6 +5974,7 @@ Datum calculate_encrypted_combined_password(const char* password, const char* ro
     Datum datum_value;
     errno_t rc = EOK;
 
+    check_iteration_count(u_sess->attr.attr_security.auth_iteration_count);
     /* For PG ecological compatibility, we stored both sha256 and md5 password. */
     if (!pg_sha256_encrypt(password,
             salt_string,
@@ -5965,6 +6030,7 @@ Datum calculate_encrypted_sha256_password(const char* password, const char* roln
     Datum datum_value;
     errno_t rc = EOK;
 
+    check_iteration_count(u_sess->attr.attr_security.auth_iteration_count);
     if (!pg_sha256_encrypt(password,
         salt_string,
         strlen(salt_string),
@@ -6007,6 +6073,7 @@ static Datum gs_calculate_encrypted_sm3_password(const char* password, const cha
     Datum datum_value;
     errno_t rc = EOK;
 
+    check_iteration_count(u_sess->attr.attr_security.auth_iteration_count);
     if (!GsSm3Encrypt(password,
         salt_string,
         strlen(salt_string),

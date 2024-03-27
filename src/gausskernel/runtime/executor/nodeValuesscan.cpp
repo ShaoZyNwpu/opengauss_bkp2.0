@@ -27,7 +27,9 @@
 #include "executor/executor.h"
 #include "executor/node/nodeValuesscan.h"
 #include "parser/parsetree.h"
+#include "optimizer/clauses.h"
 
+static TupleTableSlot* ExecValuesScan(PlanState* state);
 static TupleTableSlot* ValuesNext(ValuesScanState* node);
 
 /* ----------------------------------------------------------------
@@ -42,7 +44,7 @@ static TupleTableSlot* ValuesNext(ValuesScanState* node);
  */
 static TupleTableSlot* ValuesNext(ValuesScanState* node)
 {
-    List* expr_list = NIL;
+    int curr_idx = 0;
 
     /*
      * get information from the estate and scan state
@@ -58,17 +60,9 @@ static TupleTableSlot* ValuesNext(ValuesScanState* node)
     if (ScanDirectionIsForward(direction)) {
         if (node->curr_idx < node->array_len)
             node->curr_idx++;
-        if (node->curr_idx < node->array_len)
-            expr_list = node->exprlists[node->curr_idx];
-        else
-            expr_list = NIL;
     } else {
         if (node->curr_idx >= 0)
             node->curr_idx--;
-        if (node->curr_idx >= 0)
-            expr_list = node->exprlists[node->curr_idx];
-        else
-            expr_list = NIL;
     }
 
     /*
@@ -79,9 +73,11 @@ static TupleTableSlot* ValuesNext(ValuesScanState* node)
      */
     (void)ExecClearTuple(slot);
 
-    if (expr_list != NULL) {
+    curr_idx = node->curr_idx;
+    if (curr_idx >= 0 && curr_idx < node->array_len) {
         MemoryContext old_context;
-        List* expr_state_list = NIL;
+        List* expr_state_list = node->exprstatelists[curr_idx];
+        List* exprlist = node->exprlists[curr_idx];
         Datum* values = NULL;
         bool* is_null = NULL;
         ListCell* lc = NULL;
@@ -99,6 +95,7 @@ static TupleTableSlot* ValuesNext(ValuesScanState* node)
          * This is a tad unusual, but we want to delete the eval state again
          * when we move to the next row, to avoid growth of memory
          * requirements over a long values list.
+         * Do per-value-row work in the per-tuple context.
          */
         old_context = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 
@@ -108,7 +105,9 @@ static TupleTableSlot* ValuesNext(ValuesScanState* node)
          * is a SubPlan, and there shouldn't be any (any subselects in the
          * VALUES list should be InitPlans).
          */
-        expr_state_list = (List*)ExecInitExpr((Expr*)expr_list, NULL);
+        if (expr_state_list == NIL) {
+            expr_state_list = (List*)ExecInitExpr((Expr*)exprlist, NULL);
+        }
 
         /* parser should have checked all sublists are the same length */
         Assert(list_length(expr_state_list) == slot->tts_tupleDescriptor->natts);
@@ -120,12 +119,32 @@ static TupleTableSlot* ValuesNext(ValuesScanState* node)
         values = slot->tts_values;
         is_null = slot->tts_isnull;
 
+        RightRefState* refState = econtext->rightRefState;
+        int targetCount = list_length(expr_state_list);
+        GenericExprState* targetArr[targetCount];
+
+        int colCnt = (IS_ENABLE_RIGHT_REF(refState) && refState->colCnt > 0) ? refState->colCnt : 1;
+        bool hasExecs[colCnt];
+
+        SortTargetListAsArray(refState, expr_state_list, targetArr);
+
+        InitOutputValues(refState, targetArr, values, is_null, targetCount, hasExecs);
+        
         resind = 0;
         foreach (lc, expr_state_list) {
             ExprState* exprState = (ExprState*)lfirst(lc);
 
             values[resind] = ExecEvalExpr(exprState, econtext, &is_null[resind], NULL);
+            if (IS_ENABLE_RIGHT_REF(refState) && resind < refState->colCnt) {
+                hasExecs[resind] = true;
+            }
             resind++;
+        }
+
+        if (IS_ENABLE_RIGHT_REF(econtext->rightRefState)) {
+            econtext->rightRefState->values = nullptr;
+            econtext->rightRefState->isNulls = nullptr;
+            econtext->rightRefState->hasExecs = nullptr;
         }
 
         MemoryContextSwitchTo(old_context);
@@ -157,8 +176,9 @@ static bool ValuesRecheck(ValuesScanState* node, TupleTableSlot* slot)
  *		access method functions.
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecValuesScan(ValuesScanState* node)
+static TupleTableSlot* ExecValuesScan(PlanState* state)
 {
+    ValuesScanState* node = castNode(ValuesScanState, state);
     return ExecScan(&node->ss, (ExecScanAccessMtd)ValuesNext, (ExecScanRecheckMtd)ValuesRecheck);
 }
 
@@ -186,6 +206,7 @@ ValuesScanState* ExecInitValuesScan(ValuesScan* node, EState* estate, int eflags
 
     scan_state->ss.ps.plan = (Plan*)node;
     scan_state->ss.ps.state = estate;
+    scan_state->ss.ps.ExecProcNode =  ExecValuesScan;
 
     /*
      * Miscellaneous initialization
@@ -199,6 +220,7 @@ ValuesScanState* ExecInitValuesScan(ValuesScan* node, EState* estate, int eflags
      */
     ExecAssignExprContext(estate, plan_state);
     scan_state->rowcontext = plan_state->ps_ExprContext;
+    ATTACH_RIGHT_REF_STATE(plan_state);
     ExecAssignExprContext(estate, plan_state);
 
     /*
@@ -217,7 +239,7 @@ ValuesScanState* ExecInitValuesScan(ValuesScan* node, EState* estate, int eflags
      * get info about values list
      * value lists scan, no relation is  involved, default tableAm type is set to HEAP.
      */
-    tupdesc = ExecTypeFromExprList((List*)linitial(node->values_lists), rte->eref->colnames, TAM_HEAP);
+    tupdesc = ExecTypeFromExprList((List*)linitial(node->values_lists), rte->eref->colnames);
 
     ExecAssignScanType(&scan_state->ss, tupdesc);
 
@@ -228,11 +250,36 @@ ValuesScanState* ExecInitValuesScan(ValuesScan* node, EState* estate, int eflags
     scan_state->curr_idx = -1;
     scan_state->array_len = list_length(node->values_lists);
 
-    /* convert list of sublists into array of sublists for easy addressing */
+    /* Convert the list of expression sublists into an array for easier
+	 * addressing at runtime.  Also, detect whether any sublists contain
+	 * SubPlans; for just those sublists, go ahead and do expression
+	 * initialization.  (This avoids problems with SubPlans wanting to connect
+	 * themselves up to the outer plan tree.  Notably, EXPLAIN won't see the
+	 * subplans otherwise; also we will have troubles with dangling pointers
+	 * and/or leaked resources if we try to handle SubPlans the same as
+	 * simpler expressions.)
+     */
     scan_state->exprlists = (List**)palloc(scan_state->array_len * sizeof(List*));
+    scan_state->exprstatelists = (List**)palloc0(scan_state->array_len * sizeof(List*));
     i = 0;
     foreach (vtl, node->values_lists) {
-        scan_state->exprlists[i++] = (List*)lfirst(vtl);
+        List* exprs = castNode(List, lfirst(vtl));
+        scan_state->exprlists[i] = exprs;
+
+        /*
+         * Avoid the cost of a contain_subplans() scan in the simple
+         * case where there are no SubPlans anywhere.
+         */
+        if (estate->es_subplanstates && contain_subplans((Node*)exprs)) {
+            /*
+             * As these expressions are only used once. This is worthwhile
+             * because it's common to insert significant amounts of data
+             * via VALUES().  Note that's initialized separately;
+             * this just affects the upper-level subexpressions.
+             */
+            scan_state->exprstatelists[i] = ExecInitExprList(exprs, &scan_state->ss.ps);
+        }
+        i++;
     }
 
     scan_state->ss.ps.ps_TupFromTlist = false;
@@ -241,7 +288,7 @@ ValuesScanState* ExecInitValuesScan(ValuesScan* node, EState* estate, int eflags
      * Initialize result tuple type and projection info.
      * value lists result tuple is set to default tableAm type HEAP.
      */
-    ExecAssignResultTypeFromTL(&scan_state->ss.ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&scan_state->ss.ps);
 
     ExecAssignScanProjectionInfo(&scan_state->ss);
 

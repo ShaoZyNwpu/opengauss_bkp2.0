@@ -55,6 +55,7 @@
 
 THR_LOCAL int global_iteration = 0;
 
+static TupleTableSlot* ExecRecursiveUnion(PlanState* state);
 static SyncController* create_stream_synccontroller(Stream* stream_node);
 static SyncController* create_recursiveunion_synccontroller(RecursiveUnion* ru_node);
 static List* getSpecialSubPlanStateNodes(const PlanState* node);
@@ -101,7 +102,8 @@ static void build_hash_table(RecursiveUnionState* rustate)
         sizeof(RUHashEntryData),
         rustate->tableContext,
         rustate->tempContext,
-        u_sess->attr.attr_memory.work_mem);
+        u_sess->attr.attr_memory.work_mem,
+        NULL);
 }
 
 /*
@@ -165,8 +167,9 @@ static void markIterationStats(RecursiveUnionState* node, bool isSW)
  * 2.6 go back to 2.2
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
+static TupleTableSlot* ExecRecursiveUnion(PlanState* state)
 {
+    RecursiveUnionState* node = castNode(RecursiveUnionState, state);
     PlanState* outer_plan = outerPlanState(node);
     PlanState* inner_plan = innerPlanState(node);
     RecursiveUnion* plan = (RecursiveUnion*)node->ps.plan;
@@ -181,6 +184,8 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
             build_hash_table(node);
         }
     }
+
+    CHECK_FOR_INTERRUPTS();
 
     /* 1. Evaluate non-recursive term */
     if (!node->recursing) {
@@ -205,14 +210,10 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
              * For START WITH CONNECT BY, create converted tuple with pseudo columns.
              */
             slot = isSW ? ConvertRuScanOutputSlot(node, slot, false) : slot;
-            swSlot = isSW ? GetStartWithSlot(node, slot) : NULL;
+            swSlot = isSW ? GetStartWithSlot(node, slot, false) : NULL;
             if (isSW && swSlot == NULL) {
-                /*
-                 * SWCB terminal condition met. Time to stop.
-                 * Discarding the last tuple.
-                 */
-                markSWLevelEnd(node->swstate, node->swstate->sw_numtuples - 1);
-                break;
+                /* Not satisfy connect_by_level_qual，skip this tuple */
+                continue;
             }
 
             /* Each non-duplicate tuple goes to the working table ... */
@@ -383,21 +384,27 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
              * avoid order siblings by exist.
              * */
             if (node->iteration > max_times) {
-                ereport(ERROR,
-                        (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-                        errmsg("Current Start With...Connect by has exceeded max iteration times %d", max_times),
-                        errhint("Please check your connect by clause carefully")));
+                /* if connectByLevelQual can't offer a limited results, declare a cycle exception
+                 * and suggest user add NOCYCLE into CONNECT BY clause.
+                 */
+                if (IsConnectByLevelStartWithPlan(swplan)) {
+                    ereport(ERROR,
+                            (errmodule(MOD_EXECUTOR),
+                            errmsg("START WITH .. CONNECT BY statement runs into cycle exception because of bad"
+                                    " condition for evaluation given in CONNECT BY clause")));
+                } else {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+                            errmsg("Current Start With...Connect by has exceeded max iteration times %d", max_times),
+                            errhint("Please check your connect by clause carefully")));
+                }
             }
 
             slot = ConvertRuScanOutputSlot(node, slot, true);
-            swSlot = GetStartWithSlot(node, slot);
+            swSlot = GetStartWithSlot(node, slot, true);
             if (isSW && swSlot == NULL) {
-                /*
-                 * SWCB terminal condition met. Time to stop.
-                 * Discarding the last tuple.
-                 */
-                markSWLevelEnd(node->swstate, node->swstate->sw_numtuples - 1);
-                break;
+                /* Not satisfy connect_by_level_qual，skip this tuple */
+                continue;
             }
 
             /*
@@ -502,6 +509,7 @@ RecursiveUnionState* ExecInitRecursiveUnion(RecursiveUnion* node, EState* estate
     rustate->hashtable = NULL;
     rustate->tempContext = NULL;
     rustate->tableContext = NULL;
+    rustate->ps.ExecProcNode = ExecRecursiveUnion;
 
     /* initialize processing state */
     rustate->recursing = false;
@@ -577,7 +585,7 @@ RecursiveUnionState* ExecInitRecursiveUnion(RecursiveUnion* node, EState* estate
      * set up the result type before initializing child nodes, because
      * nodeWorktablescan.c expects it to be valid.)
      */
-    ExecAssignResultTypeFromTL(&rustate->ps, TAM_HEAP);
+    ExecAssignResultTypeFromTL(&rustate->ps);
     rustate->ps.ps_ProjInfo = NULL;
 
     /*
@@ -2054,13 +2062,13 @@ static void ExecInitRecursiveResultTupleSlot(EState* estate, PlanState* planstat
 {
     TupleTableSlot* slot = makeNode(TupleTableSlot);
 
-    slot->tts_isempty = true;
-    slot->tts_shouldFree = false;
-    slot->tts_shouldFreeMin = false;
+    slot->tts_flags |= TTS_FLAG_EMPTY;
+    slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+    slot->tts_flags &= ~TTS_FLAG_SHOULDFREEMIN;
     slot->tts_tuple = NULL;
     slot->tts_tupleDescriptor = NULL;
 #ifdef PGXC
-    slot->tts_shouldFreeRow = false;
+    slot->tts_flags &= ~TTS_FLAG_SHOULDFREE_ROW;
     slot->tts_dataRow = NULL;
     slot->tts_dataLen = -1;
     slot->tts_attinmeta = NULL;

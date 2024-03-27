@@ -26,10 +26,12 @@
 #include "storage/ipc.h"
 #include "storage/smgr/smgr.h"
 #include "storage/smgr/segment.h"
+#include "storage/cfs/cfs.h"
 #include "threadpool/threadpool.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "postmaster/aiocompleter.h"
+#include "catalog/pg_partition_fn.h"
 
 /*
  * This struct of function pointers defines the API between smgr.c and
@@ -178,6 +180,23 @@ void smgrshutdown(int code, Datum arg)
     }
 }
 
+static uint32 RelFileNodeBackendHashWithoutOpt(const void* key, Size keySize)
+{
+    RelFileNodeBackend relFileNodeBackend = *(const RelFileNodeBackend*)key;
+    relFileNodeBackend.node.opt = 0;
+    return tag_hash((const void*)&relFileNodeBackend, keySize);
+}
+
+static int RelFileNodeBackendCompareWithoutOpt(const void* left, const void* right, Size keySize)
+{
+    Assert(left != NULL && right != NULL);
+    Assert(keySize == sizeof(RelFileNodeBackend));
+    const RelFileNodeBackend* leftRelBackend = (const RelFileNodeBackend*)left;
+    const RelFileNodeBackend* rightRelBackend = (const RelFileNodeBackend*)right;
+    /* we just care whether the result is 0 or not */
+    return RelFileNodeBackendEquals(*leftRelBackend, *rightRelBackend) ? 0 : 1;
+}
+
 /*
  *  smgropen() -- Return an SMgrRelation object, creating it if need be.
  *
@@ -204,16 +223,17 @@ SMgrRelation smgropen(const RelFileNode& rnode, BackendId backend, int col /* = 
         securec_check(rc, "", "");
         hashCtrl.keysize = sizeof(RelFileNodeBackend);
         hashCtrl.entrysize = sizeof(SMgrRelationData);
-        hashCtrl.hash = tag_hash;
+        hashCtrl.hash = RelFileNodeBackendHashWithoutOpt;
+        hashCtrl.match = RelFileNodeBackendCompareWithoutOpt;
         if (EnableLocalSysCache()) {
             hashCtrl.hcxt = t_thrd.lsc_cxt.lsc->lsc_mydb_memcxt;
             t_thrd.lsc_cxt.lsc->SMgrRelationHash = hash_create("smgr relation table", 400,
-                &hashCtrl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+                &hashCtrl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
             dlist_init(&t_thrd.lsc_cxt.lsc->unowned_reln);
         } else {
             hashCtrl.hcxt = u_sess->cache_mem_cxt;
             u_sess->storage_cxt.SMgrRelationHash = hash_create("smgr relation table", 400,
-                &hashCtrl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+                &hashCtrl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
             dlist_init(&u_sess->storage_cxt.unowned_reln);
         }
         
@@ -236,6 +256,7 @@ SMgrRelation smgropen(const RelFileNode& rnode, BackendId backend, int col /* = 
             reln->smgr_prevtargblock = InvalidBlockNumber;
             reln->smgr_fsm_nblocks = InvalidBlockNumber;
             reln->smgr_vm_nblocks = InvalidBlockNumber;
+            reln->smgr_cached_nblocks = InvalidBlockNumber;
             reln->encrypt = false;
             temp = col + 1;
             reln->smgr_bcm_nblocks = (BlockNumber*)MemoryContextAllocZero(
@@ -279,6 +300,7 @@ SMgrRelation smgropen(const RelFileNode& rnode, BackendId backend, int col /* = 
                 dlist_push_tail(&parent_smgr->bucket_smgr_head, &reln->bucket_smgr_node);
             }
         }
+        TryFreshSmgrCache(reln);
 
         if (reln->smgr_bcmarry_size < col + 1) {
             int old_bcmarry_size = reln->smgr_bcmarry_size;
@@ -469,27 +491,7 @@ void smgrcloseall(void)
         }
     }
 }
-static void smgrcleanbolcknum(SMgrRelation reln)
-{
-    reln->smgr_targblock = InvalidBlockNumber;
-}
 
-void smgrcleanblocknumall(void)
-{
-    HASH_SEQ_STATUS status;
-    SMgrRelation reln;
-
-    /* Nothing to do if hashtable not set up */
-    if (GetSMgrRelationHash() == NULL) {
-        return;
-    }
-
-    hash_seq_init(&status, GetSMgrRelationHash());
-
-    while ((reln = (SMgrRelation)hash_seq_search(&status)) != NULL) {
-        smgrcleanbolcknum(reln);
-    }
-}
 /*
  *	smgrclosenode() -- Close SMgrRelation object for given RelFileNode,
  *					   if one exists.
@@ -565,17 +567,17 @@ void smgrdounlink(SMgrRelation reln, bool isRedo, BlockNumber blockNum)
     RelFileNodeBackend rnode = reln->smgr_rnode;
     int which = reln->smgr_which;
     int forknum;
+    HTAB *unlink_rel_hashtbl = g_instance.bgwriter_cxt.unlink_rel_hashtbl;
+    DelFileTag *entry = NULL;
+    bool found = false;
 
     /* Close the forks at smgr level */
     for (forknum = 0; forknum < (int)(reln->md_fdarray_size); forknum++) {
         (*(smgrsw[which].smgr_close))(reln, (ForkNumber)forknum, blockNum);
     }
-
     if (which == UNDO_MANAGER) {
-        /* Drop undo buffer is excuted in ReleaseUndoSpace. */
         goto unlink_file;
     }
-
     /*
      * Get rid of any remaining buffers for the relation.  bufmgr will just
      * drop them without bothering to write the contents.
@@ -607,6 +609,13 @@ void smgrdounlink(SMgrRelation reln, bool isRedo, BlockNumber blockNum)
      */
 unlink_file:
     (*(smgrsw[which].smgr_unlink))(rnode, InvalidForkNumber, isRedo, blockNum);
+
+    (void)LWLockAcquire(g_instance.bgwriter_cxt.rel_hashtbl_lock, LW_EXCLUSIVE);
+    entry = (DelFileTag*)hash_search(unlink_rel_hashtbl, (void *)&rnode, HASH_FIND, &found);
+    if (found) {
+        entry->fileUnlink = true;
+    }
+    LWLockRelease(g_instance.bgwriter_cxt.rel_hashtbl_lock);
 }
 
 /*
@@ -869,7 +878,8 @@ void smgrmovebuckets(SMgrRelation reln1, SMgrRelation reln2, List *bList)
     (*(smgrsw[reln1->smgr_which].smgr_move_buckets))(reln1->smgr_rnode, reln2->smgr_rnode, bList);
 }
 
-void partition_create_new_storage(Relation rel, Partition part, const RelFileNodeBackend &filenode)
+void partition_create_new_storage(Relation rel, Partition part, const RelFileNodeBackend &filenode,
+    bool keep_old_relfilenode)
 {
     if (RelationIsCrossBucketIndex(rel) || IsCreatingCrossBucketIndex(part)) {
         RelationData dummyrel;
@@ -885,7 +895,7 @@ void partition_create_new_storage(Relation rel, Partition part, const RelFileNod
     /*
      * Schedule unlinking of the old storage at transaction commit.
      */
-    if (!u_sess->attr.attr_storage.enable_recyclebin) {
+    if (!keep_old_relfilenode) {
         PartitionDropStorage(rel, part);
     }
 }
@@ -972,6 +982,76 @@ static void push_unlink_rel_one_fork_to_hashtbl(RelFileNode node, ForkNumber for
     if (del_rel_num > 0 && g_instance.bgwriter_cxt.invalid_buf_proc_latch != NULL) {
         SetLatch(g_instance.bgwriter_cxt.invalid_buf_proc_latch);
     }
+    return;
+}
+
+void SmgrRecoveryPca(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, bool isPcaCheckNeed, bool skipFsync)
+{
+    if (!isPcaCheckNeed) {
+        return;
+    }
+
+    MdRecoveryPcaPage(reln, forknum, blocknum, skipFsync);
+}
+
+void SmgrAssistFileProcess(const char *assistInfo, int assistFd)
+{
+    Assert(assistInfo != NULL);
+    const CfsExtInfo *extInfo = (const CfsExtInfo *)(void *)assistInfo;
+
+    /* make sure if it is compressed file */
+    if (!IS_COMPRESSED_RNODE(extInfo->rnode, extInfo->forknum)) {
+        return;
+    }
+
+    /* check if ext in assist file need to be dealt with */
+    if (extInfo->assistFlag == 0) {
+        return;
+    }
+
+    SMgrRelation relation = smgropen(extInfo->rnode, InvalidBackendId, GetColumnNum(extInfo->forknum));
+    MdAssistFileProcess(relation, assistInfo, assistFd);
+}
+
+void SmgrChunkFragmentsRestoreRecord(const RelFileNode &rnode, ForkNumber forknum)
+{
+    CfsShrinkRecord(rnode, forknum);
+}
+
+void SmgrChunkFragmentsRestore(const RelFileNode& rnode, ForkNumber forknum, char parttype, bool nowait)
+{
+    /* if nowait is true, work just need to be put in shrinker list,
+       jsut return here, this mession will be finished in thread later.
+    */
+    if (nowait) {
+        CfsShrinkerShmemListPush(rnode, forknum, parttype);
+        return;
+    }
+
+    SMgrRelation reln;
+    RelFileNode tmp_rnode = rnode;
+    if (parttype == PARTTYPE_NON_PARTITIONED_RELATION) {
+        reln = smgropen(tmp_rnode, InvalidBackendId, GetColumnNum(forknum));
+        CfsRecycleChunk(reln, forknum);
+    } else if (PART_OBJ_TYPE_TABLE_PARTITION == parttype ||
+           PART_OBJ_TYPE_INDEX_PARTITION == parttype) {
+        List *partid_list = getPartitionObjectIdList(tmp_rnode.relNode, parttype);
+        ListCell *cell;
+        foreach (cell, partid_list) {
+            tmp_rnode.relNode = lfirst_oid(cell);
+            reln = smgropen(tmp_rnode, InvalidBackendId, GetColumnNum(forknum));
+            CfsRecycleChunk(reln, forknum);
+        }
+    } else if (PART_OBJ_TYPE_TABLE_SUB_PARTITION == parttype) {
+        List *subpartid_list = getSubPartitionObjectIdList(tmp_rnode.relNode);
+        ListCell *cell;
+        foreach (cell, subpartid_list) {
+            tmp_rnode.relNode = lfirst_oid(cell);
+            reln = smgropen(tmp_rnode, InvalidBackendId, GetColumnNum(forknum));
+            CfsRecycleChunk(reln, forknum);
+        }
+    }
+
     return;
 }
 

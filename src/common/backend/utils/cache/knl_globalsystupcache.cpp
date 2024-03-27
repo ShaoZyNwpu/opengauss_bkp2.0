@@ -166,16 +166,14 @@ void GlobalSysTupCache::ReleaseGlobalCatCList(GlobalCatCList *cl)
 
 static uint64 GetClEstimateSize(GlobalCatCList *cl)
 {
-    uint64 cl_size = offsetof(GlobalCatCList, members) +
-        (cl->n_members + 1) * sizeof(GlobalCatCTup *) +
-        cl->nkeys * (NAMEDATALEN + CHUNK_ALGIN_PAD) + /* estimate space of keys */
-        CHUNK_ALGIN_PAD;
+    uint64 cl_size = GetMemoryChunkSpace(cl) +
+        cl->nkeys * (NAMEDATALEN + CHUNK_ALGIN_PAD); /* estimate space of keys */
     return cl_size;
 }
 
 static uint64 GetCtEstimateSize(GlobalCatCTup *ct)
 {
-    uint64 ct_size = sizeof(GlobalCatCTup) + MAXIMUM_ALIGNOF + ct->tuple.t_len + CHUNK_ALGIN_PAD;
+    uint64 ct_size = GetMemoryChunkSpace(ct);
     return ct_size;
 }
 
@@ -783,27 +781,45 @@ GlobalCatCTup *GlobalSysTupCache::SearchTupleMiss(InsertCatTupInfo *tup_info)
     cur_skey[1].sk_argument = arguments[1];
     cur_skey[2].sk_argument = arguments[2];
     cur_skey[3].sk_argument = arguments[3];
-    SysScanDesc scandesc =
-        systable_beginscan(relation, m_relinfo.cc_indexoid, IndexScanOK(cc_id), NULL,
-            m_relinfo.cc_nkeys, cur_skey);
 
     if (tup_info->has_concurrent_lock) {
         AcquireGSCTableReadLock(&tup_info->has_concurrent_lock, m_concurrent_lock);
     }
     HeapTuple ntp;
-    while (HeapTupleIsValid(ntp = systable_getnext(scandesc))) {
-        tup_info->ntp = ntp;
-        if (!tup_info->has_concurrent_lock) {
-            tup_info->canInsertGSC = false;
-        } else {
-            tup_info->canInsertGSC = CanTupleInertGSC(ntp);
-            if (!tup_info->canInsertGSC) {
-                /* unlock concurrent immediately, any one can invalid cache now */
-                ReleaseGSCTableReadLock(&tup_info->has_concurrent_lock, m_concurrent_lock);
+    SysScanDesc scandesc = NULL;
+    if (u_sess->hook_cxt.pluginSearchCatHook != NULL) {
+        if (HeapTupleIsValid(ntp = ((searchCatFunc)(u_sess->hook_cxt.pluginSearchCatHook))(relation,
+            m_relinfo.cc_indexoid, cc_id, m_relinfo.cc_nkeys, cur_skey, &scandesc))) {
+            tup_info->ntp = ntp;
+            if (!tup_info->has_concurrent_lock) {
+                tup_info->canInsertGSC = false;
+            } else {
+                tup_info->canInsertGSC = CanTupleInertGSC(ntp);
+                if (!tup_info->canInsertGSC) {
+                    /* unlock concurrent immediately, any one can invalid cache now */
+                    ReleaseGSCTableReadLock(&tup_info->has_concurrent_lock, m_concurrent_lock);
+                }
             }
+            ct = InsertHeapTupleIntoCatCacheInSingle(tup_info);
         }
-        ct = InsertHeapTupleIntoCatCacheInSingle(tup_info);
-        break; /* assume only one match */
+    } else {
+        scandesc =
+            systable_beginscan(relation, m_relinfo.cc_indexoid, IndexScanOK(cc_id), NULL,
+                m_relinfo.cc_nkeys, cur_skey);
+        while (HeapTupleIsValid(ntp = systable_getnext(scandesc))) {
+            tup_info->ntp = ntp;
+            if (!tup_info->has_concurrent_lock) {
+                tup_info->canInsertGSC = false;
+            } else {
+                tup_info->canInsertGSC = CanTupleInertGSC(ntp);
+                if (!tup_info->canInsertGSC) {
+                    /* unlock concurrent immediately, any one can invalid cache now */
+                    ReleaseGSCTableReadLock(&tup_info->has_concurrent_lock, m_concurrent_lock);
+                }
+            }
+            ct = InsertHeapTupleIntoCatCacheInSingle(tup_info);
+            break; /* assume only one match */
+        }
     }
     /* unlock finally */
     if (tup_info->has_concurrent_lock) {
@@ -1297,16 +1313,20 @@ void GlobalSysTupCache::InitHashTable()
     /* this func allow palloc fail */
     size_t sz = (cc_nbuckets + 1) * sizeof(Dllist) + PG_CACHE_LINE_SIZE;
     if (cc_buckets == NULL) {
-        cc_buckets = (Dllist *)CACHELINEALIGN(palloc0(sz));
+        void *origin_ptr = palloc0(sz);
+        cc_buckets = (Dllist *)CACHELINEALIGN(origin_ptr);
+        m_dbEntry->MemoryEstimateAdd(GetMemoryChunkSpace(origin_ptr));
     }
     if (m_bucket_rw_locks == NULL) {
         m_bucket_rw_locks = (pthread_rwlock_t *)palloc0((cc_nbuckets + 1) * sizeof(pthread_rwlock_t));
+        m_dbEntry->MemoryEstimateAdd(GetMemoryChunkSpace(m_bucket_rw_locks));
         for (int i = 0; i <= cc_nbuckets; i++) {
             PthreadRwLockInit(&m_bucket_rw_locks[i], NULL);
         }
     }
     if (m_is_tup_swappingouts == NULL) {
         m_is_tup_swappingouts = (volatile uint32 *)palloc0(sizeof(volatile uint32) * (cc_nbuckets + 1));
+        m_dbEntry->MemoryEstimateAdd(GetMemoryChunkSpace((void *)m_is_tup_swappingouts));
     }
     m_is_list_swappingout = 0;
     
@@ -1361,14 +1381,63 @@ void GlobalSysTupCache::InitCacheInfo(Oid reloid, Oid indexoid, int nkeys, const
 
     if (m_list_rw_lock == NULL) {
         m_list_rw_lock = (pthread_rwlock_t *)palloc0(sizeof(pthread_rwlock_t));
+        m_dbEntry->MemoryEstimateAdd(GetMemoryChunkSpace(m_list_rw_lock));
         PthreadRwLockInit(m_list_rw_lock, NULL);
     }
     if (m_concurrent_lock == NULL) {
         m_concurrent_lock = (pthread_rwlock_t *)palloc0(sizeof(pthread_rwlock_t));
+        m_dbEntry->MemoryEstimateAdd(GetMemoryChunkSpace(m_concurrent_lock));
         PthreadRwLockInit(m_concurrent_lock, NULL);
     }
 
     (void)MemoryContextSwitchTo(old);
+}
+
+uint64 GetTupdescSize(TupleDesc tupdesc)
+{
+    uint64 main_size = GetMemoryChunkSpace(tupdesc);
+    uint64 constr_size = 0;
+    uint64 clusterkey_size = 0;
+    if (tupdesc->constr != NULL) {
+        TupleConstr *constr = tupdesc->constr;
+        constr_size += GetMemoryChunkSpace(constr);
+        if (constr->num_defval > 0) {
+            constr_size += GetMemoryChunkSpace(constr->defval);
+            for (int i = 0; i < constr->num_defval; i++) {
+                constr_size += GetMemoryChunkSpace(constr->defval[i].adbin);
+            }
+            constr_size += GetMemoryChunkSpace(constr->generatedCols);
+        }
+        
+        if (constr->num_check) {
+            constr_size += GetMemoryChunkSpace(constr->check);
+            for (int i = 0; i < constr->num_check; i++) {
+                if (constr->check[i].ccname) {
+                    constr_size += GetMemoryChunkSpace(constr->check[i].ccname);
+                }
+                if (constr->check[i].ccbin) {
+                    constr_size += GetMemoryChunkSpace(constr->check[i].ccbin);
+                }
+            }
+        }
+        if (constr->clusterKeyNum != 0) {
+            clusterkey_size += GetMemoryChunkSpace(constr->clusterKeys);
+        }
+    }
+
+    uint64 defval_size = 0;
+    if (tupdesc->initdefvals != NULL) {
+        defval_size += GetMemoryChunkSpace(tupdesc->initdefvals);
+        TupInitDefVal *pInitDefVal = tupdesc->initdefvals;
+        for (int i = 0; i < tupdesc->natts; i++) {
+            if (!pInitDefVal[i].isNull) {
+                defval_size += GetMemoryChunkSpace(pInitDefVal[i].datum);
+            }
+        }
+    }
+
+    uint64 tupdesc_size = main_size + clusterkey_size + constr_size + defval_size;
+    return tupdesc_size;
 }
 
 void GlobalSysTupCache::InitRelationInfo()
@@ -1403,6 +1472,7 @@ void GlobalSysTupCache::InitRelationInfo()
      */
     if (m_relinfo.cc_tupdesc == NULL) {
         m_relinfo.cc_tupdesc = CopyTupleDesc(RelationGetDescr(relation));
+        m_dbEntry->MemoryEstimateAdd(GetTupdescSize(m_relinfo.cc_tupdesc));
     }
 
     /*
@@ -1411,6 +1481,7 @@ void GlobalSysTupCache::InitRelationInfo()
      */
     if (m_relinfo.cc_relname == NULL) {
         m_relinfo.cc_relname = pstrdup(RelationGetRelationName(relation));
+        m_dbEntry->MemoryEstimateAdd(GetMemoryChunkSpace((void *)m_relinfo.cc_relname));
     }
     Assert(m_relinfo.cc_relisshared == RelationGetForm(relation)->relisshared);
 
@@ -1430,13 +1501,17 @@ void GlobalSysTupCache::InitRelationInfo()
         Oid keytype;
         RegProcedure eqfunc;
         if (m_relinfo.cc_keyno[i] > 0)
-            keytype = m_relinfo.cc_tupdesc->attrs[m_relinfo.cc_keyno[i] - 1]->atttypid;
+            keytype = m_relinfo.cc_tupdesc->attrs[m_relinfo.cc_keyno[i] - 1].atttypid;
         else {
             if (m_relinfo.cc_keyno[i] != ObjectIdAttributeNumber)
                 ereport(FATAL, (errmsg("only sys attr supported in caches is OID")));
             keytype = OIDOID;
         }
-        GetCCHashEqFuncs(keytype, &m_relinfo.cc_hashfunc[i], &eqfunc, &m_relinfo.cc_fastequal[i]);
+        if (u_sess->hook_cxt.pluginCCHashEqFuncs == NULL ||
+            !((pluginCCHashEqFuncs)(u_sess->hook_cxt.pluginCCHashEqFuncs))(keytype, &m_relinfo.cc_hashfunc[i], &eqfunc,
+                &m_relinfo.cc_fastequal[i], cc_id)) {
+            GetCCHashEqFuncs(keytype, &m_relinfo.cc_hashfunc[i], &eqfunc, &m_relinfo.cc_fastequal[i]);
+        }
         /*
          * Do equality-function lookup (we assume this won't need a catalog
          * lookup for any supported type)

@@ -45,10 +45,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef HAVE_GETOPT_H
-#include <getopt.h>
-#endif
 
+#include "tool_common.h"
 #include "access/transam.h"
 #include "access/tuptoaster.h"
 #include "access/multixact.h"
@@ -56,6 +54,9 @@
 #include "access/xlog_internal.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
+#include "getopt_long.h"
+#include "storage/dss/dss_adaptor.h"
+#include "storage/file/fio_device.h"
 
 extern int optind;
 extern char* optarg;
@@ -65,8 +66,14 @@ static XLogSegNo newXlogSegNo;      /* XLogSegNo of new XLOG segment */
 static bool guessed = false;        /* T if we had to guess at any values */
 static const char* progname;
 
+static void DssParaInit(void);
+static void SetGlobalDssParam(void);
+static int  ReadNonDssControlFile(int *fd, char * buffer);
+static int  ReadDssControlFile(int *fd, char *buffer);
 static bool ReadControlFile(void);
 static void GuessControlValues(void);
+static bool GetGucValue(const char *key, char *value);
+static bool CheckConfigFileStatus(void);
 static void PrintControlValues(bool guessed);
 static void RewriteControlFile(void);
 static void FindEndOfXLOG(void);
@@ -76,8 +83,20 @@ static void WriteEmptyXLOG(void);
 static void usage(void);
 
 #define XLOG_NAME_LENGTH 24
+#define MAX_STRING_LENGTH 1024
 const uint64 FREEZE_MAX_AGE = 2000000000;
 
+/* DSS connect parameters */
+static DssOptions dss;
+
+static inline bool is_negative_num(char *str)
+{
+    char *s = str;
+    while (*s != '\0' && isspace(*s)) {
+        s++;
+    }
+    return *s == '-' ? true : false;
+}
 
 int main(int argc, char* argv[])
 {
@@ -96,6 +115,16 @@ int main(int argc, char* argv[])
     char* DataDir = NULL;
     int fd = -1;
     uint64 tmpValue;
+    int option_index;
+    bool setMinXlogSegNo = false;
+
+    static struct option long_options[] = {{"enable-dss", no_argument, NULL, 1},
+        {"socketpath", required_argument, NULL, 2},
+        {"vgname", required_argument, NULL, 3},
+        {NULL, 0, NULL, 0}};
+
+    /* init DSS parameters */
+    DssParaInit();
 
     set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_resetxlog"));
 
@@ -116,7 +145,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    while ((c = getopt(argc, argv, "fl:m:no:O:x:e:")) != -1) {
+    while ((c = getopt_long(argc, argv, "fl:m:no:O:x:e:D:", long_options, &option_index)) != -1) {
         switch (c) {
             case 'f':
                 force = true;
@@ -133,6 +162,10 @@ int main(int argc, char* argv[])
                     fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
                     exit(1);
                 }
+                if (is_negative_num(optarg)) {
+                    fprintf(stderr, _("%s: transaction ID epoch (-e) can't be negative.\n"), progname);
+                    exit(1);
+                }
                 break;
 
             case 'x':
@@ -142,8 +175,14 @@ int main(int argc, char* argv[])
                     fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
                     exit(1);
                 }
-                if (set_xid == 0) {
-                    fprintf(stderr, _("%s: transaction ID (-x) must not be 0\n"), progname);
+                if (is_negative_num(optarg)) {
+                    fprintf(stderr, _("%s: transaction ID (-x) can't be negative.\n"), progname);
+                    exit(1);
+                }
+
+                if (!TransactionIdIsNormal(set_xid)) {
+                    fprintf(stderr, _("%s: transaction ID (-x) must be greater than or equal to %lu.\n"),
+                        progname, FirstNormalTransactionId);
                     exit(1);
                 }
                 break;
@@ -153,6 +192,10 @@ int main(int argc, char* argv[])
                 if (endptr == optarg || *endptr != '\0' || tmpValue > PG_UINT32_MAX) {
                     fprintf(stderr, _("%s: invalid argument for option -o\n"), progname);
                     fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+                    exit(1);
+                }
+                if (is_negative_num(optarg)) {
+                    fprintf(stderr, _("%s: OID (-o) can't be negative.\n"), progname);
                     exit(1);
                 }
                 set_oid = (Oid)tmpValue;
@@ -169,6 +212,10 @@ int main(int argc, char* argv[])
                     fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
                     exit(1);
                 }
+                if (is_negative_num(optarg)) {
+                    fprintf(stderr, _("%s: multitransaction ID (-m) can't be negative.\n"), progname);
+                    exit(1);
+                }
                 if (set_mxid == 0) {
                     fprintf(stderr, _("%s: multitransaction ID (-m) must not be 0\n"), progname);
                     exit(1);
@@ -183,7 +230,7 @@ int main(int argc, char* argv[])
                     exit(1);
                 }
                 if ((int32)set_mxoff == -1) {
-                    fprintf(stderr, _("%s: multitransaction offset (-O) must not be -1\n"), progname);
+                    fprintf(stderr, _("%s: the low 32bit of multitransaction offset (-O) must not be ffffffff\n"), progname);
                     exit(1);
                 }
                 break;
@@ -198,8 +245,22 @@ int main(int argc, char* argv[])
                     fprintf(stderr, _("%s: invalid segment file"), progname);
                     exit(1);
                 }
-                minXlogSegNo = (uint64)log_temp * XLogSegmentsPerXLogId + seg_temp;
+                setMinXlogSegNo = true;
                 break;
+
+#ifndef ENABLE_LITE_MODE
+            case 1:
+                dss.enable_dss = true;
+                break;
+
+            case 2:
+                dss.socketpath = strdup(optarg);
+                break;
+
+            case 3:
+                dss.vgname = strdup(optarg);
+                break;
+#endif
 
             default:
                 fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
@@ -207,10 +268,32 @@ int main(int argc, char* argv[])
         }
     }
 
+    /* the data directory is not necessary in dss mode */
     if (optind >= argc) {
         fprintf(stderr, _("%s: no data directory specified\n"), progname);
         fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
         exit(1);
+    }
+
+    if (dss.enable_dss) {
+        if (dss.socketpath == NULL || strlen(dss.socketpath) == 0 || strncmp("UDS:", dss.socketpath, 4) != 0) {
+            fprintf(stderr, _("%s: socketpath must be specific correctly when enable dss, "
+                "format is: '--socketpath=\"UDS:xxx\"'.\n"), progname);
+            exit(1);
+        }
+        if (dss.vgname == NULL) {
+            fprintf(stderr, _("%s: vgname cannot be NULL when enable dss\n"), progname);
+            exit(1);
+        }
+    } else {
+        if (dss.socketpath != NULL) {
+            fprintf(stderr, _("%s: socketpath cannot be set when disable dss\n"), progname);
+            exit(1);
+        }
+        if (dss.vgname != NULL) {
+            fprintf(stderr, _("%s: vgname cannot be set when disable dss\n"), progname);
+            exit(1);
+        }
     }
 
     /*
@@ -228,16 +311,28 @@ int main(int argc, char* argv[])
 #endif
 
     DataDir = argv[optind];
-
     if (DataDir == NULL || strlen(DataDir) == 0) {
-        fprintf(stderr, _("%s: could not change directory to \"<NULL>\""), progname);
+        fprintf(stderr, _("%s: the data directory is \"<NULL>\""), progname);
         exit(1);
     }
 
     if (chdir(DataDir) < 0) {
-        fprintf(stderr, _("%s: could not change directory to \"%s\": %s\n"), progname, DataDir, strerror(errno));
+        fprintf(stderr, _("%s: could not change directory to \"%s\": %s\n"), 
+            progname, DataDir, strerror(errno));
         exit(1);
     }
+
+    /* register for dssapi */
+    if (dss_device_init(dss.socketpath, dss.enable_dss) != DSS_SUCCESS) {
+        fprintf(stderr, _("%s: fail to init dss device\n"), progname);
+        exit(1);
+    }
+
+    /* set DSS connect parameters */
+    if (dss.enable_dss)
+        SetGlobalDssParam();
+
+    initDataPathStruct(dss.enable_dss);
 
     /*
      * Check for a postmaster lock file --- if there is one, refuse to
@@ -269,6 +364,34 @@ int main(int argc, char* argv[])
     if (!ReadControlFile()) {
         GuessControlValues();
     }
+
+    if (dss.enable_dss) {
+        char guc_value[MAX_STRING_LENGTH] = {0};
+        int curr_inst_id;
+
+        if (!GetGucValue("ss_instance_id", guc_value)) {
+            fprintf(stderr,
+                _("%s: get the guc value of \"ss_instance_id\" failed, "
+                "please check the file \"postgresql.conf\".\n"), progname);
+            exit(1);
+        }
+        curr_inst_id = atoi(guc_value);
+
+        if (curr_inst_id < MIN_INSTANCEID || curr_inst_id > MAX_INSTANCEID) {
+            fprintf(stderr, _("%s: unexpected node id specified, valid range is %d - %d\n"),
+                progname, MIN_INSTANCEID, MAX_INSTANCEID);
+            exit(1);
+        }
+
+        if (curr_inst_id != dss.primaryInstId) {
+            fprintf(stderr,
+                _("%s: you must execute this command in primary node: %d, "
+                "current node id is %d.\n"),
+                progname, dss.primaryInstId, curr_inst_id);
+            exit(1);
+        }
+    }
+
 
     /*
      * Also look at existing segment files to set up newXlogSegNo
@@ -310,6 +433,9 @@ int main(int argc, char* argv[])
     if (minXlogTli > ControlFile.checkPointCopy.ThisTimeLineID)
         ControlFile.checkPointCopy.ThisTimeLineID = minXlogTli;
 
+    if (setMinXlogSegNo)
+        minXlogSegNo = (uint64)log_temp * XLogSegmentsPerXLogId + seg_temp;
+
     if (minXlogSegNo > newXlogSegNo) {
         newXlogSegNo = minXlogSegNo;
     }
@@ -350,6 +476,115 @@ int main(int argc, char* argv[])
     return 0;
 }
 
+static void DssParaInit(void)
+{
+    dss.enable_dss = false;
+    dss.socketpath = NULL;
+    dss.vgname = NULL;
+    dss.primaryInstId = INVALID_INSTANCEID;
+}
+
+static void SetGlobalDssParam(void)
+{
+    errno_t rc = strcpy_s(g_datadir.dss_data, strlen(dss.vgname) + 1, dss.vgname);
+    securec_check_c(rc, "\0", "\0");
+    XLogSegmentSize = DSS_XLOG_SEG_SIZE;
+    /* Check dss connect */
+    struct stat st;
+    if (stat(g_datadir.dss_data, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, _("Could not connect dssserver, vgname: \"%s\", socketpath: \"%s\", \n"
+            "please check that whether the dssserver is manually started and retry later.\n"),
+            dss.vgname, dss.socketpath);
+        exit(1);
+    }
+}
+
+/*
+ * Try to read the existing pg_control file.
+ */
+static int ReadNonDssControlFile(int *fd, char *buffer)
+{
+    int len = 0;
+    len = read(*fd, buffer, PG_CONTROL_SIZE);
+    if (len < 0) {
+        fprintf(stderr, _("%s: could not read file \"%s\": %s\n"), 
+                progname, T_XLOG_CONTROL_FILE, strerror(errno));
+        free(buffer);
+        buffer = NULL;
+        close(*fd);
+        *fd = -1;
+        exit(1);
+    }
+    return len;
+}
+
+/*
+ * Try to read the existing pg_control file in DSS mode.
+ */
+static int ReadDssControlFile(int *fd, char *buffer)
+{
+    char        *tmpDssSrc;
+    struct stat statbuf;
+    int         len;
+    errno_t     rc;
+
+    if (stat(T_XLOG_CONTROL_FILE, &statbuf) < 0) {
+        fprintf(stderr, _("%s: could not stat file \"%s\": %s\n"), 
+                progname, T_XLOG_CONTROL_FILE, strerror(errno));
+        free(buffer);
+        buffer = NULL;
+        close(*fd);
+        *fd = -1;
+        exit(1);
+    }
+
+    len = statbuf.st_size;
+
+    char *tmpBuffer = (char*)malloc(len + 1);
+
+    if (read(*fd, tmpBuffer, len) != len) {
+        fprintf(stderr, _("%s: could not read file \"%s\": %s\n"), 
+                progname, T_XLOG_CONTROL_FILE, strerror(errno));
+        free(buffer);
+        buffer = NULL;
+        free(tmpBuffer);
+        tmpBuffer = NULL;
+        close(*fd);
+        *fd = -1;
+        exit(1);
+    }
+
+    /* 
+     * In dss mode, we need to get the primary instance id
+     * from the pg_control file's last page.
+     */
+    ss_reformer_ctrl_t *reformerCtrl;
+    reformerCtrl = (ss_reformer_ctrl_t *)(tmpBuffer + REFORMER_CTL_INSTANCEID * PG_CONTROL_SIZE);
+    dss.primaryInstId = reformerCtrl->primaryInstId;
+    if (dss.primaryInstId < MIN_INSTANCEID || dss.primaryInstId > MAX_INSTANCEID) {
+        fprintf(stderr, _("%s: unexpected primary node id: %d, valid range is %d - %d.\n"),
+            progname, dss.primaryInstId, MIN_INSTANCEID, MAX_INSTANCEID);
+        free(tmpBuffer);
+        tmpBuffer = NULL;
+        close(*fd);
+        *fd = -1;
+        exit(1);
+    }
+    g_datadir.instance_id = dss.primaryInstId;
+    /* update the dss data path */
+    initDataPathStruct(dss.enable_dss);
+
+    tmpBuffer[len] = '\0';
+    tmpDssSrc = tmpBuffer;
+    tmpDssSrc += dss.primaryInstId * PG_CONTROL_SIZE;
+    rc = memcpy_s(buffer, PG_CONTROL_SIZE, tmpDssSrc, PG_CONTROL_SIZE);
+    securec_check_c(rc, "\0", "\0");
+
+    free(tmpBuffer);
+    tmpBuffer = NULL;
+    return PG_CONTROL_SIZE;
+}
+
 /*
  * Try to read the existing pg_control file.
  *
@@ -364,7 +599,7 @@ static bool ReadControlFile(void)
     pg_crc32 crc;
     errno_t rc = 0;
 
-    if ((fd = open(XLOG_CONTROL_FILE, O_RDONLY | PG_BINARY, 0)) < 0) {
+    if ((fd = open(T_XLOG_CONTROL_FILE, O_RDONLY | PG_BINARY, 0)) < 0) {
         /*
          * If pg_control is not there at all, or we can't read it, the odds
          * are we've been handed a bad DataDir path, so give up. User can do
@@ -373,14 +608,14 @@ static bool ReadControlFile(void)
         fprintf(stderr,
             _("%s: could not open file \"%s\" for reading: %s\n"),
             progname,
-            XLOG_CONTROL_FILE,
+            T_XLOG_CONTROL_FILE,
             strerror(errno));
-        if (errno == ENOENT)
+        if (!dss.enable_dss && errno == ENOENT)
             fprintf(stderr,
                 _("If you are sure the data directory path is correct, execute\n"
-                  "  touch %s\n"
-                  "and try again.\n"),
-                XLOG_CONTROL_FILE);
+                "  touch %s\n"
+                "and try again.\n"),
+                T_XLOG_CONTROL_FILE);
         exit(1);
     }
 
@@ -392,15 +627,10 @@ static bool ReadControlFile(void)
         fd = -1;
         exit(1);
     }
-    len = read(fd, buffer, PG_CONTROL_SIZE);
-    if (len < 0) {
-        fprintf(stderr, _("%s: could not read file \"%s\": %s\n"), progname, XLOG_CONTROL_FILE, strerror(errno));
-        free(buffer);
-        buffer = NULL;
-        close(fd);
-        fd = -1;
-        exit(1);
-    }
+    if (dss.enable_dss)
+        len = ReadDssControlFile(&fd, buffer);
+    else
+        len = ReadNonDssControlFile(&fd, buffer);
     close(fd);
     fd = -1;
 
@@ -494,7 +724,7 @@ static void GuessControlValues(void)
     ControlFile.blcksz = BLCKSZ;
     ControlFile.relseg_size = RELSEG_SIZE;
     ControlFile.xlog_blcksz = XLOG_BLCKSZ;
-    ControlFile.xlog_seg_size = XLOG_SEG_SIZE;
+    ControlFile.xlog_seg_size = XLogSegSize;
     ControlFile.nameDataLen = NAMEDATALEN;
     ControlFile.indexMaxKeys = INDEX_MAX_KEYS;
     ControlFile.toast_max_chunk_size = TOAST_MAX_CHUNK_SIZE;
@@ -510,6 +740,68 @@ static void GuessControlValues(void)
      * eventually, should try to grovel through old XLOG to develop more
      * accurate values for TimeLineID, nextXID, etc.
      */
+}
+
+/*
+ * Get guc the value of key from postgresql.conf.
+ * e.g.
+ * 1. get the last guc value line
+ *    result: "port   =  ' 5432  '  #  database port"
+ * 2. ensure that the last guc value is valid
+ *      key = value     key = value #...
+ *      key = 'value'   key = 'value' #... 
+ *    result: "port   =  ' 5432  '  #  database port"
+ * 3. get the string between the first '=' and the first '#'
+ *    result: "  ' 5432  '  "
+ * 4. cut the head and tail spaces
+ *    result: "' 5432  '"
+ * 5. cut the head and tail char "'"
+ *    result: " 5432  "
+ * 6. cut the head and tail spaces
+ *    result: "5432"
+ */
+static bool GetGucValue(const char *key, char *value)
+{
+    char cmd[MAX_STRING_LENGTH];
+    FILE* fp = NULL;
+
+    if (!CheckConfigFileStatus()) {
+        fprintf(stderr, _("%s: postgresql.conf does not exist!\n"), progname);
+        exit(1);
+    }
+
+    /* generate the command for get guc value */
+    int sret = snprintf_s(cmd, sizeof(cmd), sizeof(cmd) - 1,
+        "grep \"^[[:space:]]*%s[[:space:]]*=\" postgresql.conf | tail -1 | "
+        "grep \"^[[:space:]]*%s[[:space:]*=[[:space:]]*[^']*$\\|"
+        "^[[:space:]]*%s[[:space:]]*=[[:space:]]*[^'#]*#\\|"
+        "^[[:space:]]*%s[[:space:]]*=[[:space:]]*'[^']*'[[:space:]]*$\\|"
+        "^[[:space:]]*%s[[:space:]]*=[[:space:]]*'[^']*'[[:space:]]*#\" | "
+        "sed 's/=/\\n/' | sed 's/#/\\n/' | sed -n 2p | sed 's/^[ \\t]*//g' | "
+        "sed 's/[ \\t]$//g' | sed $'s/^\\'//g' | sed $'s/\\'$//g' | "
+        "sed 's/^[ \\t]*//g' | sed 's/[ \\t]*$//g'", key, key, key, key, key);
+    securec_check_ss_c(sret, "", "");
+
+    if ((fp = popen(cmd, "r")) != NULL) {
+        if (fgets(value, MAX_STRING_LENGTH - 1, fp) != NULL) {
+            uint value_len = strlen(value);
+            value[value_len - 1] = '\0';
+            pclose(fp);
+            return true;
+        }
+    }
+    pclose(fp);
+    return false;
+}
+
+/* check the status of postgresql.conf */
+bool CheckConfigFileStatus()
+{
+    struct stat statbuf;
+
+    if (lstat("postgresql.conf", &statbuf) != 0)
+        return false;
+    return true;
 }
 
 /*
@@ -587,7 +879,8 @@ static void PrintControlValues(bool guessed)
 static void RewriteControlFile(void)
 {
     int fd = -1;
-    char buffer[PG_CONTROL_SIZE] = {0}; /* need not be aligned */
+    /* need to be aligned */
+    char buffer[PG_CONTROL_SIZE] __attribute__((__aligned__(ALIGNOF_BUFFER)));
     errno_t rc = 0;
     /*
      * Adjust fields as needed to force an empty XLOG starting at
@@ -637,12 +930,25 @@ static void RewriteControlFile(void)
     rc = memcpy_s(buffer, PG_CONTROL_SIZE, &ControlFile, sizeof(ControlFileData));
     securec_check_c(rc, "", "");
 
-    unlink(XLOG_CONTROL_FILE);
+    if (!dss.enable_dss)
+        unlink(T_XLOG_CONTROL_FILE);
 
-    fd = open(XLOG_CONTROL_FILE, O_RDWR | O_CREAT | O_EXCL | PG_BINARY, S_IRUSR | S_IWUSR);
+    fd = open(T_XLOG_CONTROL_FILE, O_RDWR | O_CREAT | O_EXCL | PG_BINARY, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         fprintf(stderr, _("%s: could not create pg_control file: %s\n"), progname, strerror(errno));
         exit(1);
+    }
+
+    errno = 0;
+    if (dss.enable_dss) {
+        off_t seekpos = (off_t)BLCKSZ * dss.primaryInstId;
+        if (lseek(fd, seekpos, SEEK_SET) < 0) {
+            fprintf(stderr, _("%s: Can not seek the primary id %d of \"%s\": %s\n"),
+                    progname, dss.primaryInstId, T_XLOG_CONTROL_FILE, strerror(errno));
+            close(fd);
+            fd = -1;
+            exit(1);
+        }
     }
 
     errno = 0;
@@ -700,9 +1006,9 @@ static void FindEndOfXLOG(void)
      * assume any present have been used; in most scenarios this should be
      * conservative, because of xlog.c's attempts to pre-create files.
      */
-    xldir = opendir(XLOGDIR);
+    xldir = opendir(T_SS_XLOGDIR);
     if (xldir == NULL) {
-        fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"), progname, XLOGDIR, strerror(errno));
+        fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"), progname, T_SS_XLOGDIR, strerror(errno));
         exit(1);
     }
 
@@ -746,7 +1052,7 @@ static void FindEndOfXLOG(void)
 #endif
 
     if (errno) {
-        fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"), progname, XLOGDIR, strerror(errno));
+        fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"), progname, T_SS_XLOGDIR, strerror(errno));
         closedir(xldir);
         exit(1);
     }
@@ -778,16 +1084,16 @@ static void KillExistingXLOG(void)
     char path[MAXPGPATH] = {0};
     int nRet = 0;
 
-    xldir = opendir(XLOGDIR);
+    xldir = opendir(T_SS_XLOGDIR);
     if (xldir == NULL) {
-        fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"), progname, XLOGDIR, strerror(errno));
+        fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"), progname, T_SS_XLOGDIR, strerror(errno));
         exit(1);
     }
 
     errno = 0;
     while ((xlde = readdir(xldir)) != NULL) {
         if (strlen(xlde->d_name) == 24 && strspn(xlde->d_name, "0123456789ABCDEF") == 24) {
-            nRet = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", XLOGDIR, xlde->d_name);
+            nRet = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", T_SS_XLOGDIR, xlde->d_name);
             securec_check_ss_c(nRet, "\0", "\0");
             if (unlink(path) < 0) {
                 fprintf(stderr, _("%s: could not delete file \"%s\": %s\n"), progname, path, strerror(errno));
@@ -808,7 +1114,7 @@ static void KillExistingXLOG(void)
 #endif
 
     if (errno) {
-        fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"), progname, XLOGDIR, strerror(errno));
+        fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"), progname, T_SS_XLOGDIR, strerror(errno));
         closedir(xldir);
         exit(1);
     }
@@ -823,13 +1129,15 @@ static void KillExistingArchiveStatus(void)
     DIR* xldir = NULL;
     struct dirent* xlde = NULL;
     char path[MAXPGPATH] = {0};
+    char archStatDir[MAXPGPATH] = {0};
     int nRet = 0;
 
-#define ARCHSTATDIR XLOGDIR "/archive_status"
+    nRet = snprintf_s(archStatDir, MAXPGPATH, MAXPGPATH - 1, "%s/%s", T_SS_XLOGDIR, "/archive_status");
+    securec_check_ss_c(nRet, "\0", "\0");
 
-    xldir = opendir(ARCHSTATDIR);
+    xldir = opendir(archStatDir);
     if (xldir == NULL) {
-        fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"), progname, ARCHSTATDIR, strerror(errno));
+        fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"), progname, archStatDir, strerror(errno));
         exit(1);
     }
 
@@ -837,7 +1145,7 @@ static void KillExistingArchiveStatus(void)
     while ((xlde = readdir(xldir)) != NULL) {
         if (strspn(xlde->d_name, "0123456789ABCDEF") == 24 &&
             (strcmp(xlde->d_name + 24, ".ready") == 0 || strcmp(xlde->d_name + 24, ".done") == 0)) {
-            nRet = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", ARCHSTATDIR, xlde->d_name);
+            nRet = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", archStatDir, xlde->d_name);
             securec_check_ss_c(nRet, "\0", "\0");
             if (unlink(path) < 0) {
                 fprintf(stderr, _("%s: could not delete file \"%s\": %s\n"), progname, path, strerror(errno));
@@ -858,7 +1166,7 @@ static void KillExistingArchiveStatus(void)
 #endif
 
     if (errno) {
-        fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"), progname, ARCHSTATDIR, strerror(errno));
+        fprintf(stderr, _("%s: could not read from directory \"%s\": %s\n"), progname, archStatDir, strerror(errno));
         closedir(xldir);
         exit(1);
     }
@@ -871,23 +1179,18 @@ static void KillExistingArchiveStatus(void)
  */
 static void WriteEmptyXLOG(void)
 {
-    char* buffer = NULL;
     XLogPageHeader page;
     XLogLongPageHeader longpage;
     XLogRecord* record = NULL;
     pg_crc32 crc;
     char path[MAXPGPATH] = {0};
     int fd = -1;
-    int nbytes = 0;
+    uint64 nbytes = 0;
     char* recptr = NULL;
     errno_t rc = EOK;
+    /* need to be aligned */
+    char buffer[PG_CONTROL_SIZE] __attribute__((__aligned__(ALIGNOF_BUFFER)));
 
-    /* Use malloc() to ensure buffer is MAXALIGNED */
-    buffer = (char*)malloc(XLOG_BLCKSZ);
-    if (buffer == NULL) {
-        fprintf(stderr, _("%s: out of memory\n"), progname);
-        exit(1);
-    }
     page = (XLogPageHeader)buffer;
     rc = memset_s(buffer, XLOG_BLCKSZ, 0, XLOG_BLCKSZ);
     securec_check_c(rc, "\0", "\0");
@@ -925,7 +1228,8 @@ static void WriteEmptyXLOG(void)
     rc = snprintf_s(path,
         MAXPGPATH,
         MAXPGPATH - 1,
-        XLOGDIR "/%08X%08X%08X",
+        "%s/%08X%08X%08X",
+        T_SS_XLOGDIR,
         ControlFile.checkPointCopy.ThisTimeLineID,
         (uint32)((newXlogSegNo) / XLogSegmentsPerXLogId),
         (uint32)((newXlogSegNo) % XLogSegmentsPerXLogId));
@@ -936,10 +1240,6 @@ static void WriteEmptyXLOG(void)
     fd = open(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         fprintf(stderr, _("%s: could not open file \"%s\": %s\n"), progname, path, strerror(errno));
-
-        free(buffer);
-        buffer = NULL;
-
         exit(1);
     }
 
@@ -949,37 +1249,42 @@ static void WriteEmptyXLOG(void)
         if (errno == 0)
             errno = ENOSPC;
         fprintf(stderr, _("%s: could not write file \"%s\": %s\n"), progname, path, strerror(errno));
-        free(buffer);
-        buffer = NULL;
         close(fd);
         fd = -1;
         exit(1);
     }
 
-    /* Fill the rest of the file with zeroes */
-    rc = memset_s(buffer, XLOG_BLCKSZ, 0, XLOG_BLCKSZ);
-    securec_check_c(rc, "", "");
-    for (nbytes = XLOG_BLCKSZ; (unsigned int)(nbytes) < XLogSegSize; nbytes += XLOG_BLCKSZ) {
+    if (dss.enable_dss) {
+        /* extend file and fill space at once to avoid performance issue */
         errno = 0;
-        if (write(fd, buffer, XLOG_BLCKSZ) != XLOG_BLCKSZ) {
-            if (errno == 0)
-                errno = ENOSPC;
+        if (ftruncate(fd, XLogSegSize) != 0) {
+            int save_errno = errno;
+            /* if write didn't set errno, assume problem is no disk space */
+            errno = save_errno ? save_errno : ENOSPC;
             fprintf(stderr, _("%s: could not write file \"%s\": %s\n"), progname, path, strerror(errno));
-
-            free(buffer);
-            buffer = NULL;
             close(fd);
             fd = -1;
             exit(1);
+        }
+    } else {
+        /* Fill the rest of the file with zeroes */
+        rc = memset_s(buffer, XLOG_BLCKSZ, 0, XLOG_BLCKSZ);
+        securec_check_c(rc, "", "");
+        for (nbytes = XLOG_BLCKSZ; nbytes < XLogSegSize; nbytes += XLOG_BLCKSZ) {
+            errno = 0;
+            if (write(fd, buffer, XLOG_BLCKSZ) != XLOG_BLCKSZ) {
+                if (errno == 0)
+                    errno = ENOSPC;
+                fprintf(stderr, _("%s: could not write file \"%s\": %s\n"), progname, path, strerror(errno));
+                close(fd);
+                fd = -1;
+                exit(1);
+            }
         }
     }
 
     if (fsync(fd) != 0) {
         fprintf(stderr, _("%s: fsync error: %s\n"), progname, strerror(errno));
-
-        free(buffer);
-        buffer = NULL;
-
         close(fd);
         fd = -1;
         exit(1);
@@ -987,8 +1292,6 @@ static void WriteEmptyXLOG(void)
 
     close(fd);
     fd = -1;
-    free(buffer);
-    buffer = NULL;
 }
 
 static void usage(void)
@@ -998,7 +1301,7 @@ static void usage(void)
     printf(_("Options:\n"));
     printf(_("  -e XIDEPOCH      set next transaction ID epoch\n"));
     printf(_("  -f               force update to be done\n"));
-    printf(_("  -l xlogfile  force minimum WAL starting location for new transaction log\n"));
+    printf(_("  -l xlogfile      force minimum WAL starting location for new transaction log\n"));
     printf(_("  -m XID           set next multitransaction ID\n"));
     printf(_("  -n               no update, just show extracted control values (for testing)\n"));
     printf(_("  -o OID           set next OID\n"));
@@ -1006,6 +1309,13 @@ static void usage(void)
     printf(_("  -V, --version    output version information, then exit\n"));
     printf(_("  -x XID           set next transaction ID\n"));
     printf(_("  -?, --help       show this help, then exit\n"));
+#ifndef ENABLE_LITE_MODE
+    printf(_("  --vgname\n"));
+    printf(_("                   the dss data on dss mode\n"));
+    printf(_("  --enable-dss     enable shared storage mode\n"));
+    printf(_("  --socketpath=SOCKETPATH\n"));
+    printf(_("                   dss connect socket file path\n"));
+#endif
 #if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
     printf("\nReport bugs to GaussDB support.\n");
 #else

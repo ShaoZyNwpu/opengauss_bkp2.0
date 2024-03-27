@@ -62,6 +62,11 @@ static void ListenerSIGUSR1Handler(SIGNAL_ARGS)
     t_thrd.threadpool_cxt.listener->m_reaperAllSession = true;
 }
 
+static void ListenerSIGUSR2Handler(SIGNAL_ARGS)
+{
+    // Do nothing but wakeup for epoll
+}
+
 static void ListenerSIGKILLHandler(SIGNAL_ARGS)
 {
     t_thrd.threadpool_cxt.listener->m_getKilled = true;
@@ -71,7 +76,7 @@ void TpoolListenerMain(ThreadPoolListener* listener)
 {
     t_thrd.proc_cxt.MyProgName = "ThreadPoolListener";
     pgstat_report_appname("ThreadPoolListener");
-
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGHUP, SIG_IGN);
     (void)gspqsignal(SIGINT, SIG_IGN);
     // die with pm
@@ -79,7 +84,7 @@ void TpoolListenerMain(ThreadPoolListener* listener)
     (void)gspqsignal(SIGQUIT, SIG_IGN);
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, ListenerSIGUSR1Handler);
-    (void)gspqsignal(SIGUSR2, SIG_IGN);
+    (void)gspqsignal(SIGUSR2, ListenerSIGUSR2Handler);
     (void)gspqsignal(SIGFPE, FloatExceptionHandler);
     (void)gspqsignal(SIGCHLD, SIG_DFL);
     (void)gspqsignal(SIGHUP, SIG_IGN);
@@ -91,6 +96,7 @@ void TpoolListenerMain(ThreadPoolListener* listener)
     listener->CreateEpoll();
     listener->NotifyReady();
 
+    pgstat_report_activity(STATE_IDLE, NULL);
     TpoolListenerLoop(listener);
     proc_exit(0);
 }
@@ -113,6 +119,7 @@ ThreadPoolListener::ThreadPoolListener(ThreadPoolGroup* group)
     m_epollEvents = NULL;
     m_reaperAllSession = false;
     m_getKilled = false;
+    m_isHang = 0;
     m_freeWorkerList = New(CurrentMemoryContext) DllistWithLock();
     m_readySessionList = New(CurrentMemoryContext) DllistWithLock();
     m_idleSessionList = New(CurrentMemoryContext) DllistWithLock();
@@ -130,11 +137,13 @@ ThreadPoolListener::ThreadPoolListener(ThreadPoolGroup* group)
             PthreadRwLockInit(&m_session_rw_locks[i], NULL);
         }
         m_match_search = 0;
+        m_uninit_count = 0;
         
     } else {
         m_session_nbucket = 0;
         m_session_bucket = NULL;
         m_session_rw_locks = NULL;
+        m_uninit_count = 0;
         m_match_search = 0;
     }
 }
@@ -197,6 +206,19 @@ void ThreadPoolListener::CreateEpoll()
     }
 }
 
+void ThreadPoolListener::dispatch_socked_closed_session(knl_session_context* session)
+{
+    Assert(session->status != KNL_SESS_UNINIT);
+    m_idleSessionList->Remove(&session->elem);
+    if (unlikely(session->status == KNL_SESS_UNINIT)) {
+        session->status = KNL_SESS_CLOSERAW;
+    } else {
+        session->status = KNL_SESS_CLOSE;
+    }
+    session->proc_cxt.MyProcPort->sock = PGINVALID_SOCKET;
+    AddIdleSessionToHead(session);
+}
+
 void ThreadPoolListener::AddEpoll(knl_session_context* session)
 {
     struct epoll_event ev = {0};
@@ -211,6 +233,13 @@ void ThreadPoolListener::AddEpoll(knl_session_context* session)
      * we find an input event of the socket, so we use one_shot mode.
      */
     ev.events = EPOLLRDHUP | EPOLLIN | EPOLLET | EPOLLONESHOT;
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (session->proc_cxt.MyProcPort->protocol_config->server_handshake_first && session->status == KNL_SESS_UNINIT) {
+        ev.events |= EPOLLOUT;
+    } 
+#endif
+    
     ev.data.ptr = (void*)session;
     if (session->status != KNL_SESS_UNINIT) {
         /* CommProxy Support */
@@ -228,16 +257,13 @@ void ThreadPoolListener::AddEpoll(knl_session_context* session)
         }
     }
     if (unlikely(res != 0)) {
-#ifdef USE_ASSERT_CHECKING
-        ereport(PANIC,
-#else
         ereport(WARNING,
-#endif
                 (errmodule(MOD_THREAD_POOL),
                     errmsg("epoll_ctl fail %m, sess status:%d, sock:%d, host:%s, port:%s",
                            session->status, session->proc_cxt.MyProcPort->sock,
                            session->proc_cxt.MyProcPort->remote_host,
                            session->proc_cxt.MyProcPort->remote_port)));
+        dispatch_socked_closed_session(session);
     }
 }
 
@@ -251,16 +277,12 @@ bool ThreadPoolListener::TryFeedWorker(ThreadPoolWorker* worker)
         return true;
     } else {
         if (EnableLocalSysCache()) {
-#ifdef ENABLE_LITE_MODE
             LocalSysDBCache *lsc = worker->GetThreadContextPtr()->lsc_cxt.lsc;
             if (lsc == NULL || lsc->my_database_id == InvalidOid) {
                 m_freeWorkerList->AddTail(&worker->m_elem);
             } else {
                 m_freeWorkerList->AddHead(&worker->m_elem);
             }
-#else
-            m_freeWorkerList->AddHead(&worker->m_elem);
-#endif
         } else {
             m_freeWorkerList->AddTail(&worker->m_elem);
         }
@@ -307,7 +329,12 @@ void ThreadPoolListener::ReaperAllSession()
                 (errmsg("No thread pool worker left while waiting for session close. "
                         "This is a very rare case when all thread pool workers happen to"
                         " encounter FATAL problems before session close.")));
-            abort();
+            /* During DMS reform, we intentionally ereport FATA for threadpool threads' force exit */
+            if (ENABLE_DMS) {
+                m_group->m_sessionCount = 0;
+            } else {
+                abort();
+            }
         }
         /* m_sessionCount should be sum of the list length of m_idleSessionList and m_readySessionList
            and worker's attached session */
@@ -348,10 +375,17 @@ void ThreadPoolListener::WaitTask()
     while (true) {
         if (unlikely(m_getKilled)) {
             m_getKilled = false;
+            ereport(LOG,
+                    (errmodule(MOD_THREAD_POOL),
+                     errmsg("Thread pool listener thread %lu get killed", m_tid)));
             proc_exit(0);
         }
         if (unlikely(m_reaperAllSession)) {
             ReaperAllSession();
+        }
+
+        if (unlikely(m_isHang != 0)) {
+            WakeupReadySessionList();
         }
 
         /* as we specify timeout -1, so 0 will not be return, either > 0 or < 0 */
@@ -403,7 +437,11 @@ knl_session_context* ThreadPoolListener::GetSessionBaseOnEvent(struct epoll_even
             session->status = KNL_SESS_CLOSE;
         }
         return session;
-    } else if (ev->events & EPOLLIN) {
+#ifndef ENABLE_MULTIPLE_NODES
+    } else if (ev->events & (EPOLLIN | EPOLLOUT)) {
+#else
+    } else if (ev->events & EPOLLIN) { 
+#endif
         return session;
     }
     return NULL;
@@ -442,7 +480,7 @@ void ThreadPoolListener::DispatchSession(knl_session_context* session)
                         errmsg("%s remove session:%lu from idleSessionList to readySessionList",
                                __func__, session->session_id)));
             INSTR_TIME_SET_CURRENT(session->last_access_time);
-            
+
             /* Add new session to the head so the connection request can be quickly processed. */
             if (session->status == KNL_SESS_UNINIT) {
                 AddIdleSessionToHead(session);
@@ -455,7 +493,7 @@ void ThreadPoolListener::DispatchSession(knl_session_context* session)
     }
 }
 
-void ThreadPoolListener::DelSessionFromEpoll(knl_session_context* session)
+void ThreadPoolListener::DelSessionFromEpoll(knl_session_context* session, bool sub_count)
 {
     if (ENABLE_THREAD_POOL_DN_LOGICCONN) {
         struct epoll_event ev = {0};
@@ -469,7 +507,10 @@ void ThreadPoolListener::DelSessionFromEpoll(knl_session_context* session)
 #endif
         comm_epoll_ctl(m_epollFd, EPOLL_CTL_DEL, session->proc_cxt.MyProcPort->sock, NULL);
     }
-    (void)pg_atomic_fetch_sub_u32((volatile uint32*)&m_group->m_sessionCount, 1);
+
+    if (sub_count) {
+        (void)pg_atomic_fetch_sub_u32((volatile uint32*)&m_group->m_sessionCount, 1);
+    }
 }
 
 void ThreadPoolListener::RemoveWorkerFromList(ThreadPoolWorker* worker)
@@ -498,6 +539,28 @@ bool ThreadPoolListener::GetSessIshang(instr_time* current_time, uint64* session
     }
     m_readySessionList->ReleaseLock();
     return ishang;
+}
+
+void ThreadPoolListener::WakeupForHang() {
+    pg_atomic_exchange_u32((volatile uint32*)&m_isHang, 1);
+    gs_signal_send(m_tid, SIGUSR2);
+}
+
+void ThreadPoolListener::WakeupReadySessionList() {
+    Dlelem *elem = m_readySessionList->RemoveHead();
+    knl_session_context *sess = NULL;
+    // last time WakeupReadySession() is not finished, but m_isHang is set again
+    while (elem != NULL && m_group->m_idleWorkerNum > 0) {
+        sess = (knl_session_context *)DLE_VAL(elem);
+        ereport(DEBUG2,
+                (errmodule(MOD_THREAD_POOL),
+                 errmsg("WakeupReadySessionList remove a session:%lu from m_readySessionList", sess->session_id)));
+        DispatchSession(sess);
+        elem = m_readySessionList->RemoveHead();
+    }
+    // m_isHang maybe set true when we do checkGroupHang again before it, now we will miss one time.
+    // But if group is actually hang, m_isHang will be set true again.
+    pg_atomic_exchange_u32((volatile uint32*)&m_isHang, 0);
 }
 
 Dlelem *ThreadPoolListener::GetFreeWorker(knl_session_context* session)
@@ -542,45 +605,32 @@ Dlelem *ThreadPoolListener::GetFreeWorker(knl_session_context* session)
 #endif
 }
 
-static Dlelem *GetHeadUnInitSession(DllistWithLock* m_readySessionList)
-{
-    /* uninit session needs be replied first */
-    m_readySessionList->GetLock();
-    Dlelem *head = m_readySessionList->GetHead();
-    if (likely(head != NULL)) {
-        if (((knl_session_context *)DLE_VAL(head))->status != KNL_SESS_UNINIT) {
-            /* go cache hit branch, set it null */
-            head = NULL;
-        } else {
-            head = m_readySessionList->RemoveHeadNoLock();
-        }
-    }
-    m_readySessionList->ReleaseLock();
-    Assert(head == NULL || ((knl_session_context *)DLE_VAL(head))->status == KNL_SESS_UNINIT);
-    return head;
-} 
-
 Dlelem *ThreadPoolListener::GetSessFromReadySessionList(ThreadPoolWorker *worker)
 {
     Assert(EnableLocalSysCache());
-    Dlelem *elt = GetHeadUnInitSession(m_readySessionList);
-    if (elt != NULL) {
+    Dlelem *elt;
+    if (m_uninit_count > UNINIT_SESS_THRESHOLD) {
+        /* reply uninited session first */
+        elt = m_readySessionList->RemoveHead();
+        m_match_search = 0;
         return elt;
     }
+
     do {
-        m_match_search++;
         if (unlikely(m_match_search > MATCH_SEARCH_THRESHOLD)) {
-            m_match_search = 0;
             break;
         }
         LocalSysDBCache *lsc = worker->GetThreadContextPtr()->lsc_cxt.lsc;
-        // worker not init, any session is matched
+
+        /* worker not init, any session is matched */
         if (unlikely(lsc == NULL || lsc->my_database_id == InvalidOid)) {
             break;
         }
-        // now we try to reuse workers syscache
+
+        /* now we try to reuse workers syscache */
         Index hash_index = HASH_INDEX(lsc->my_database_id, (uint32)m_session_nbucket);
         ResourceOwner owner = LOCAL_SYSDB_RESOWNER;
+
         PthreadRWlockRdlock(owner, &m_session_rw_locks[hash_index]);
         elt = DLGetHead(&m_session_bucket[hash_index]);
         if (elt == NULL || ((knl_session_context *)DLE_VAL(elt))->proc_cxt.MyDatabaseId != lsc->my_database_id) {
@@ -594,9 +644,12 @@ Dlelem *ThreadPoolListener::GetSessFromReadySessionList(ThreadPoolWorker *worker
         }
         PthreadRWlockUnlock(owner, &m_session_rw_locks[hash_index]);
 
+        pg_atomic_add_fetch_u32(&m_match_search, 1);
         return &((knl_session_context *)DLE_VAL(elt))->elem;
     } while (0);
 
+    /* cache miss here */
+    m_match_search = 0;
     elt = m_readySessionList->RemoveHead();
     return elt;
 }
@@ -611,6 +664,11 @@ Dlelem *ThreadPoolListener::GetReadySession(ThreadPoolWorker *worker)
         return NULL;
     }
     knl_session_context *session = (knl_session_context *)DLE_VAL(elt);
+    if (session->status == KNL_SESS_UNINIT) {
+        /* the op of incre m_uninit_count and AddHead of m_readySessionList is not atomic */
+        Assert(session->proc_cxt.MyDatabaseId == InvalidOid);
+        pg_atomic_sub_fetch_u32(&m_uninit_count, 1);
+    }
     Oid cur_dbid = session->proc_cxt.MyDatabaseId;
     Index hash_index = HASH_INDEX(cur_dbid, (uint32)m_session_nbucket);
     ResourceOwner owner = LOCAL_SYSDB_RESOWNER;
@@ -626,6 +684,7 @@ void ThreadPoolListener::AddIdleSessionToTail(knl_session_context* session)
         m_readySessionList->AddTail(&session->elem);
         return;
     }
+    Assert(session->status != KNL_SESS_UNINIT);
     Index hash_index = HASH_INDEX(session->proc_cxt.MyDatabaseId, (uint32)m_session_nbucket);
     ResourceOwner owner = LOCAL_SYSDB_RESOWNER;
     PthreadRWlockWrlock(owner, &m_session_rw_locks[hash_index]);
@@ -640,10 +699,12 @@ void ThreadPoolListener::AddIdleSessionToHead(knl_session_context* session)
         m_readySessionList->AddHead(&session->elem);
         return;
     }
+    Assert(session->proc_cxt.MyDatabaseId == InvalidOid && session->status == KNL_SESS_UNINIT);
     Index hash_index = HASH_INDEX(session->proc_cxt.MyDatabaseId, (uint32)m_session_nbucket);
     ResourceOwner owner = LOCAL_SYSDB_RESOWNER;
     PthreadRWlockWrlock(owner, &m_session_rw_locks[hash_index]);
     DLAddHead(&m_session_bucket[hash_index], &session->elem2);
     PthreadRWlockUnlock(owner, &m_session_rw_locks[hash_index]);
     m_readySessionList->AddHead(&session->elem);
+    pg_atomic_add_fetch_u32(&m_uninit_count, 1);
 }

@@ -44,6 +44,7 @@
 #include "storage/smgr/relfilenode.h"
 #include "storage/page_compression.h"
 #include "postmaster/aiocompleter.h"
+#include "storage/file/fio_device_com.h"
 
 /*
  * FileSeek uses the standard UNIX lseek(2) flags.
@@ -67,19 +68,6 @@ typedef struct DataFileIdCacheEntry {
 enum FileExistStatus { FILE_EXIST, FILE_NOT_EXIST, FILE_NOT_REG };
 
 /*
- * On Windows, we have to interpret EACCES as possibly meaning the same as
- * ENOENT, because if a file is unlinked-but-not-yet-gone on that platform,
- * that's what you get.  Ugh.  This code is designed so that we don't
- * actually believe these cases are okay without further evidence (namely,
- * a pending fsync request getting canceled ... see mdsync).
- */
-#ifndef WIN32
-#define FILE_POSSIBLY_DELETED(err) ((err) == ENOENT)
-#else
-#define FILE_POSSIBLY_DELETED(err) ((err) == ENOENT || (err) == EACCES)
-#endif
-
-/*
  * prototypes for functions in fd.c
  */
 
@@ -94,7 +82,8 @@ extern off_t FileSeek(File file, off_t offset, int whence);
 extern int FileTruncate(File file, off_t offset, uint32 wait_event_info = 0);
 extern void FileWriteback(File file, off_t offset, off_t nbytes);
 extern char* FilePathName(File file);
-
+extern void FileAllocate(File file, uint32 offset, uint32 size);
+extern void FileAllocateDirectly(int fd, char* path, uint32 offset, uint32 size);
 extern void FileAsyncCUClose(File* vfdList, int32 vfdnum);
 extern int FileAsyncRead(AioDispatchDesc_t** dList, int32 dn);
 extern int FileAsyncWrite(AioDispatchDesc_t** dList, int32 dn);
@@ -103,6 +92,9 @@ extern int FileAsyncCUWrite(AioDispatchCUDesc_t** dList, int32 dn);
 extern void FileFastExtendFile(File file, uint32 offset, uint32 size, bool keep_size);
 extern int FileRead(File file, char* buffer, int amount);
 extern int FileWrite(File file, const char* buffer, int amount, off_t offset, int fastExtendSize = 0);
+
+/* todo delete */
+extern void* MmapExtentAddress(File fd, int pc_memory_map_size, off_t offset);
 
 // Threading virtual files IO interface, using pread() / pwrite()
 //
@@ -132,6 +124,7 @@ extern void UnlinkCacheFile(const char* pathname);
 /* Operations to allow use of the <dirent.h> library routines */
 extern DIR* AllocateDir(const char* dirname);
 extern struct dirent* ReadDir(DIR* dir, const char* dirname);
+extern struct dirent *ReadDirExtended(DIR *dir, const char *dirname, int elevel);
 extern int FreeDir(DIR* dir);
 /* Operations to allow use of a plain kernel FD, with automatic cleanup */
 extern int OpenTransientFile(FileName fileName, int fileFlags, int fileMode);
@@ -186,8 +179,6 @@ extern FileExistStatus CheckFileExists(const char* path);
 extern bool repair_deleted_file_check(RelFileNodeForkNum fileNode, int fd);
 
 /* Page compression support routines */
-extern void SetupPageCompressMemoryMap(File file, RelFileNode node, const RelFileNodeForkNum& relFileNodeForkNum);
-extern PageCompressHeader *GetPageCompressMemoryMap(File file, uint32 chunk_size);
 
 /* Filename components for OpenTemporaryFile */
 // Note that this macro must be the same to macro in initdb.cpp
@@ -195,5 +186,7 @@ extern PageCompressHeader *GetPageCompressMemoryMap(File file, uint32 chunk_size
 //
 #define PG_TEMP_FILES_DIR "pgsql_tmp"
 #define PG_TEMP_FILE_PREFIX "pgsql_tmp"
+#define SS_PG_TEMP_FILES_DIR "ss_pgsql_tmp"
+#define EIO_RETRY_TIMES 3
 
 #endif /* FD_H */

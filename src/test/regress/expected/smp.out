@@ -6,9 +6,13 @@ create table t2(a int, b int);
 insert into t2 values(generate_series(1, 10), generate_series(1, 30));
 create table t3(a int, b int, c int);
 insert into t3 values(generate_series(1, 50), generate_series(1, 100), generate_series(1, 10));
+create table t4(id int, val text);
+insert into t4 values(generate_series(1,1000), random());
+create index on t4(id);
 analyze t1;
 analyze t2;
 analyze t3;
+analyze t4;
 set query_dop=1002;
 explain (costs off) select * from t2 order by 1,2;
                   QUERY PLAN                  
@@ -110,25 +114,23 @@ select t1.a,t2.b from t1, t2 where t1.a = t2.a order by 1,2;
 set enable_nestloop=off;
 set enable_hashjoin=on;
 explain (costs off) select t1.a,t2.b,t3.c from t1, t2, t3 where t1.a = t2.a and t1.b = t3.c order by 1,2,3;
-                                       QUERY PLAN                                       
-----------------------------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Sort
    Sort Key: t1.a, t2.b, t3.c
    ->  Streaming(type: LOCAL GATHER dop: 1/2)
          ->  Hash Join
                Hash Cond: (t3.c = t1.b)
-               ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
-                     ->  Seq Scan on t3
+               ->  Seq Scan on t3
                ->  Hash
-                     ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
+                     ->  Streaming(type: BROADCAST dop: 2/2)
                            ->  Hash Join
                                  Hash Cond: (t1.a = t2.a)
-                                 ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
-                                       ->  Seq Scan on t1
+                                 ->  Seq Scan on t1
                                  ->  Hash
-                                       ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
+                                       ->  Streaming(type: BROADCAST dop: 2/2)
                                              ->  Seq Scan on t2
-(16 rows)
+(14 rows)
 
 select t1.a,t2.b,t3.c from t1, t2, t3 where t1.a = t2.a and t1.b = t3.c order by 1,2,3;
  a  | b  | c  
@@ -705,29 +707,27 @@ select distinct b from t1 union all select distinct a from t2 order by 1;
 (20 rows)
 
 explain (costs off) select * from t1 where t1.a in (select t2.a from t2, t3 where t2.b = t3.c) order by 1,2,3;
-                                             QUERY PLAN                                             
-----------------------------------------------------------------------------------------------------
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
  Sort
    Sort Key: t1.a, t1.b, t1.c
    ->  Streaming(type: LOCAL GATHER dop: 1/2)
          ->  Hash Join
                Hash Cond: (t1.a = t2.a)
-               ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
-                     ->  Seq Scan on t1
+               ->  Seq Scan on t1
                ->  Hash
                      ->  HashAggregate
                            Group By Key: t2.a
-                           ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
+                           ->  Streaming(type: BROADCAST dop: 2/2)
                                  ->  HashAggregate
                                        Group By Key: t2.a
                                        ->  Hash Join
                                              Hash Cond: (t3.c = t2.b)
-                                             ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
-                                                   ->  Seq Scan on t3
+                                             ->  Seq Scan on t3
                                              ->  Hash
-                                                   ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
+                                                   ->  Streaming(type: BROADCAST dop: 2/2)
                                                          ->  Seq Scan on t2
-(20 rows)
+(18 rows)
 
 select * from t1 where t1.a in (select t2.a from t2, t3 where t2.b = t3.c) order by 1,2,3;
  a  | b  | c | d  
@@ -745,25 +745,23 @@ select * from t1 where t1.a in (select t2.a from t2, t3 where t2.b = t3.c) order
 (10 rows)
 
 explain (costs off) with s1 as (select t1.a as a, t3.b as b from t1,t3 where t1.b=t3.c) select * from t2, s1 where t2.b=s1.a order by 1,2,3,4;
-                                       QUERY PLAN                                       
-----------------------------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Sort
    Sort Key: t2.a, t2.b, t3.b
    ->  Streaming(type: LOCAL GATHER dop: 1/2)
          ->  Hash Join
                Hash Cond: (t3.c = t1.b)
-               ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
-                     ->  Seq Scan on t3
+               ->  Seq Scan on t3
                ->  Hash
-                     ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
+                     ->  Streaming(type: BROADCAST dop: 2/2)
                            ->  Hash Join
                                  Hash Cond: (t1.a = t2.b)
-                                 ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
-                                       ->  Seq Scan on t1
+                                 ->  Seq Scan on t1
                                  ->  Hash
-                                       ->  Streaming(type: LOCAL REDISTRIBUTE dop: 2/2)
+                                       ->  Streaming(type: BROADCAST dop: 2/2)
                                              ->  Seq Scan on t2
-(16 rows)
+(14 rows)
 
 with s1 as (select t1.a as a, t3.b as b from t1,t3 where t1.b=t3.c) select * from t2, s1 where t2.b=s1.a order by 1,2,3,4;
  a  | b  | a  |  b  
@@ -1127,10 +1125,354 @@ select * from t1 order by a limit 10 offset 20;
  30 | 10 | 2 | 30
 (10 rows)
 
+-- test limit and offset
+explain (costs off) select * from t1 limit 1;
+                  QUERY PLAN                  
+----------------------------------------------
+ Limit
+   ->  Streaming(type: LOCAL GATHER dop: 1/2)
+         ->  Limit
+               ->  Seq Scan on t1
+(4 rows)
+
+explain (costs off) select * from t1 limit 1 offset 10;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Limit
+   ->  Limit
+         ->  Streaming(type: LOCAL GATHER dop: 1/2)
+               ->  Limit
+                     ->  Seq Scan on t1
+(5 rows)
+
+explain (costs off) select * from t1 order by 1 limit 1 offset 10;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Limit
+   ->  Limit
+         ->  Sort
+               Sort Key: a
+               ->  Streaming(type: LOCAL GATHER dop: 1/2)
+                     ->  Limit
+                           ->  Sort
+                                 Sort Key: a
+                                 ->  Seq Scan on t1
+(9 rows)
+
+-- test subquery recursive
+explain (costs off) select (select max(id) from t4);
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Result
+   InitPlan 2 (returns $1)
+     ->  Result
+           InitPlan 1 (returns $0)
+             ->  Limit
+                   ->  Index Only Scan Backward using t4_id_idx on t4
+                         Index Cond: (id IS NOT NULL)
+(7 rows)
+
+select (select max(id) from t4);
+ max  
+------
+ 1000
+(1 row)
+
+explain (costs off) select * from (select a, rownum as row from (select a from t3) where rownum <= 10) where row >=5;
+                 QUERY PLAN                  
+---------------------------------------------
+ Subquery Scan on __unnamed_subquery__
+   Filter: (__unnamed_subquery__."row" >= 5)
+   ->  Limit
+         ->  Seq Scan on t3
+(4 rows)
+
+select * from (select a, rownum as row from (select a from t3) where rownum <= 10) where row >=5;
+ a  | row 
+----+-----
+  5 |   5
+  6 |   6
+  7 |   7
+  8 |   8
+  9 |   9
+ 10 |  10
+(6 rows)
+
+create table col_table_001 (id int, name char[] ) with (orientation=column);
+create table col_table_002 (id int, aid int,name char[] ,apple char[]) with (orientation=column);
+insert into col_table_001 values(1, '{a,b,c}' );
+insert into col_table_001 values(2, '{b,b,b}' );
+insert into col_table_001 values(3, '{c,c,c}' );
+insert into col_table_001 values(4, '{a}' );
+insert into col_table_001 values(5, '{b}' );
+insert into col_table_001 values(6, '{c}' );
+insert into col_table_001 values(7, '{a,b,c}' );
+insert into col_table_001 values(8, '{b,c,a}' );
+insert into col_table_001 values(9, '{c,a,b}' );
+insert into col_table_001 values(10, '{c,a,b}' );
+insert into col_table_002 values(11, 1,'{a,s,d}' );
+insert into col_table_002 values(12, 1,'{b,n,m}' );
+insert into col_table_002 values(13, 2,'{c,v,b}' );
+insert into col_table_002 values(14, 1,'{a}' );
+insert into col_table_002 values(15, 1,'{b}' );
+insert into col_table_002 values(15, 2,'{c}' );
+insert into col_table_002 values(17, 1,'{a,s,d}','{a,b,c}' );
+insert into col_table_002 values(18, 1,'{b,n,m}','{a,b,c}' );
+insert into col_table_002 values(19, 2,'{c,v,b}','{a,b,c}');
+insert into col_table_002 values(20, 2,'{c,v,b}','{b,c,a}');
+insert into col_table_002 values(21, 21,'{c,c,b}','{b,c,a}');
+select * from col_table_001 where EXISTS (select * from col_table_002 where col_table_001.name[1] =col_table_002.apple[1]) order by id;
+ id |  name   
+----+---------
+  1 | {a,b,c}
+  2 | {b,b,b}
+  4 | {a}
+  5 | {b}
+  7 | {a,b,c}
+  8 | {b,c,a}
+(6 rows)
+
+select * from col_table_001 where EXISTS (select * from col_table_002 where col_table_001.name[1:3] =col_table_002.apple[1:3]) order by id;
+ id |  name   
+----+---------
+  1 | {a,b,c}
+  7 | {a,b,c}
+  8 | {b,c,a}
+(3 rows)
+
+CREATE TABLE bmsql_item (
+i_id int NoT NULL,
+i_name varchar(24),
+i_price numeric(5,2),
+i_data varchar( 50),
+i_im_id int
+);
+insert into bmsql_item values ('1','sqltest_varchar_1','0.01','sqltest_varchar_1','1') ;
+insert into bmsql_item values ('2','sqltest_varchar_2','0.02','sqltest_varchar_2','2') ;
+insert into bmsql_item values ('3','sqltest_varchar_3','0.03','sqltest_varchar_3','3') ;
+insert into bmsql_item values ('4','sqltest_varchar_4','0.04','sqltest_varchar_4','4') ;
+insert into bmsql_item(i_id) values ('5');
+create table bmsql_warehouse(
+w_id int not null,
+w_ytd numeric(12,2),
+w_tax numeric(4,4),
+w_name varchar(10),
+w_street_1 varchar(20),
+w_street_2 varchar(20),
+w_city varchar(20),
+w_state char(2),
+w_zip char(9)
+);
+insert into bmsql_warehouse values('1','0.01','0.0001','sqltest_va','sqltest_varchar_1','sqltest_varchar_1','sqltest_varchar_1','sq','sqltest_b');
+insert into bmsql_warehouse values('2','0.02','0.0002','sqltest_va','sqltest_varchar_2','sqltest_varchar_2','sqltest_varchar_2','sq','sqltest_b');
+insert into bmsql_warehouse values('3','0.03','0.0003','sqltest_va','sqltest_varchar_3','sqltest_varchar_3','sqltest_varchar_3','sq','sqltest_b');
+insert into bmsql_warehouse values('4','0.04','0.0004','sqltest_va','sqltest_varchar_4','sqltest_varchar_4','sqltest_varchar_4','sq','sqltest_b');
+insert into bmsql_warehouse(w_id) values('5');
+set query_dop=4;
+explain (costs off) select 0.01
+from bmsql_item
+intersect
+select first_value(i_price) over (order by 2)
+from bmsql_item
+where i_id <=(select w_id from bmsql_warehouse
+where bmsql_item.i_name not like 'sqltest_varchar_2' order by 1 limit 1)
+group by i_price;
+                                                                              QUERY PLAN                                                                               
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashSetOp Intersect
+   ->  Append
+         ->  Subquery Scan on "*SELECT* 1"
+               ->  Seq Scan on bmsql_item
+         ->  Subquery Scan on "*SELECT* 2"
+               ->  WindowAgg
+                     ->  Streaming(type: BROADCAST dop: 1/4)
+                           ->  Group
+                                 Group By Key: test_smp.bmsql_item.i_price
+                                 ->  Sort
+                                       Sort Key: test_smp.bmsql_item.i_price
+                                       ->  Streaming(type: LOCAL REDISTRIBUTE dop: 4/1)
+                                             ->  Group
+                                                   Group By Key: test_smp.bmsql_item.i_price
+                                                   ->  Sort
+                                                         Sort Key: test_smp.bmsql_item.i_price
+                                                         ->  Seq Scan on bmsql_item
+                                                               Filter: (i_id <= (SubPlan 1))
+                                                               SubPlan 1
+                                                                 ->  Limit
+                                                                       ->  Sort
+                                                                             Sort Key: bmsql_warehouse.w_id
+                                                                             ->  Result
+                                                                                   One-Time Filter: ((test_smp.bmsql_item.i_name)::text !~~ 'sqltest_varchar_2'::text)
+                                                                                   ->  Seq Scan on bmsql_warehouse
+(25 rows)
+
+select 0.01
+from bmsql_item
+intersect
+select first_value(i_price) over (order by 2)
+from bmsql_item
+where i_id <=(select w_id from bmsql_warehouse
+where bmsql_item.i_name not like 'sqltest_varchar_2' order by 1 limit 1)
+group by i_price;
+ ?column? 
+----------
+      .01
+(1 row)
+
+CREATE FUNCTION f1(text) RETURNS int LANGUAGE SQL IMMUTABLE AS $$ SELECT $1::int;$$;
+CREATE TABLE bmsql_history (
+hist_id int,
+h_c_id int,
+h_c_d_id int,
+h_c_w_id int,
+h_d_id int,
+h_w_id int,
+h_date timestamp(6),
+h_amount numeric(6,2),
+h_data varchar( 24)
+);
+insert into bmsql_history values('1','1','1','1','1','1',to_timestamp('2010-01-01 00:00:00','yyyy-mm-dd hh24:mi:ss'),'0.01','sqltest_varchar_1') ;
+insert into bmsql_history values('2','2','2','2','2','2',to_timestamp('2010-01-02 00:00:00','yyyy-mm-dd hh24:mi:ss'),'0.02','sqltest_varchar_2') ;
+insert into bmsql_history values('3','3','3','3','3','3',to_timestamp('2010-01-03 00:00:00','yyyy-mm-dd hh24:mi:ss'),'0.03','sqltest_varchar_3') ;
+insert into bmsql_history values('4','4','4','4','4','4',to_timestamp('2010-01-03 00:00:00','yyyy-mm-dd hh24:mi:ss'),'0.04','sqltest_varchar_4') ;
+insert into bmsql_history(hist_id) values('') ;
+explain (costs off) select f1('0') c1
+union
+select distinct i_id c2
+from bmsql_item
+where i_id not like (with tmp as (select distinct asin(0) as c1 from bmsql_history where bmsql_item.i_im_id <3)
+select * from tmp);
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ HashAggregate
+   Group By Key: (0)
+   ->  Append
+         ->  Result
+         ->  Streaming(type: LOCAL GATHER dop: 1/4)
+               ->  HashAggregate
+                     Group By Key: bmsql_item.i_id
+                     ->  Streaming(type: LOCAL REDISTRIBUTE dop: 4/1)
+                           ->  HashAggregate
+                                 Group By Key: bmsql_item.i_id
+                                 ->  Seq Scan on bmsql_item
+                                       Filter: ((i_id)::text !~~ ((SubPlan 1))::text)
+                                       SubPlan 1
+                                         ->  Unique
+                                               ->  Result
+                                                     One-Time Filter: (bmsql_item.i_im_id < 3)
+                                                     ->  Seq Scan on bmsql_history
+(17 rows)
+
+select f1('0') c1
+union
+select distinct i_id c2
+from bmsql_item
+where i_id not like (with tmp as (select distinct asin(0) as c1 from bmsql_history where bmsql_item.i_im_id <3)
+select * from tmp);
+ c1 
+----
+  1
+  0
+  2
+(3 rows)
+
+explain (costs off) select distinct i_id c2
+from bmsql_item
+where i_id not like (with tmp as (select distinct asin(0) as c1 from bmsql_history where bmsql_item.i_im_id <3)
+select * from tmp)
+union
+select f1('0') c1;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ HashAggregate
+   Group By Key: bmsql_item.i_id
+   ->  Append
+         ->  Streaming(type: LOCAL GATHER dop: 1/4)
+               ->  HashAggregate
+                     Group By Key: bmsql_item.i_id
+                     ->  Streaming(type: LOCAL REDISTRIBUTE dop: 4/1)
+                           ->  HashAggregate
+                                 Group By Key: bmsql_item.i_id
+                                 ->  Seq Scan on bmsql_item
+                                       Filter: ((i_id)::text !~~ ((SubPlan 1))::text)
+                                       SubPlan 1
+                                         ->  Unique
+                                               ->  Result
+                                                     One-Time Filter: (bmsql_item.i_im_id < 3)
+                                                     ->  Seq Scan on bmsql_history
+         ->  Result
+(17 rows)
+
+select distinct i_id c2
+from bmsql_item
+where i_id not like (with tmp as (select distinct asin(0) as c1 from bmsql_history where bmsql_item.i_im_id <3)
+select * from tmp)
+union
+select f1('0') c1;
+ c2 
+----
+  1
+  0
+  2
+(3 rows)
+
+select f1(0) c1
+union 
+select distinct var_pop(i_id) c2 
+from bmsql_item
+where i_id not like (with tmp as (select distinct asin(0) as c1 from bmsql_history where bmsql_item.i_im_id <3)
+select * from tmp);
+          c1           
+-----------------------
+                     0
+ .25000000000000000000
+(2 rows)
+
+select distinct var_pop(i_id) c2 
+from bmsql_item
+where i_id not like (with tmp as (select distinct asin(0) as c1 from bmsql_history where bmsql_item.i_im_id <3)
+select * from tmp)
+union
+select f1(0) c1;
+          c2           
+-----------------------
+                     0
+ .25000000000000000000
+(2 rows)
+
+CREATE TABLE bmsql_new_order (
+no_w_id int NOT NULL,
+no_d_id int NOT NULL,
+no_o_id int NOT NULL
+);
+insert into bmsql_new_order values('1','1','1');
+insert into bmsql_new_order values('2','2','2');
+insert into bmsql_new_order values('3','3','3');
+insert into bmsql_new_order values('4','4','4');
+insert into bmsql_new_order values('5','5','5');
+select count(*)
+from (select distinct greatest (no_d_id,no_d_id,no_d_id)
+from bmsql_new_order
+where no_o_id not in ( with tmp as (select w_id from bmsql_warehouse where bmsql_new_order.no_w_id >2 or w_id >=3) select * from tmp)) tb1,
+( select count(*) from bmsql_item group by i_im_id,i_im_id having i_im_id like f1('0')
+) tb2;
+ count 
+-------
+     0
+(1 row)
+
 --clean
 set search_path=public;
 drop schema test_smp cascade;
-NOTICE:  drop cascades to 3 other objects
+NOTICE:  drop cascades to 11 other objects
 DETAIL:  drop cascades to table test_smp.t1
 drop cascades to table test_smp.t2
 drop cascades to table test_smp.t3
+drop cascades to table test_smp.t4
+drop cascades to table test_smp.col_table_001
+drop cascades to table test_smp.col_table_002
+drop cascades to table test_smp.bmsql_item
+drop cascades to table test_smp.bmsql_warehouse
+drop cascades to function test_smp.f1(text)
+drop cascades to table test_smp.bmsql_history
+drop cascades to table test_smp.bmsql_new_order

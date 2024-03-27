@@ -245,18 +245,6 @@ static List* extractNodeCStoreIndexScan(Plan* plan, List* ancestors, List* rtabl
     return resSubplan;
 }
 
-static List* extractNodeDfsIndexScan(Plan* plan, List* ancestors, List* rtable, List* subplans)
-{
-    List* resSubplan = NIL;
-    DfsIndexScan* dfsIndexScan = (DfsIndexScan*)plan;
-
-    extractQual(dfsIndexScan->indexqualorig, plan, ancestors, rtable, subplans);
-    extractQual(plan->qual, plan, ancestors, rtable, subplans);
-    resSubplan = extractVecSubplan((Expr*)dfsIndexScan->dfsScan->plan.targetlist, resSubplan, subplans);
-    resSubplan = extractVecSubplan((Expr*)dfsIndexScan->dfsScan->plan.qual, resSubplan, subplans);
-    return resSubplan;
-}
-
 static List* extractNodeBitmapHeapScan(Plan* plan, List* ancestors, List* rtable, List* subplans)
 {
     List* resSubplan = NIL;
@@ -394,16 +382,6 @@ static List* extractNodeWorkTableScan(Plan* plan, List* ancestors, List* rtable,
     return resSubplan;
 }
 
-static List* extractNodeDfsScan(Plan* plan, List* ancestors, List* rtable, List* subplans)
-{
-    List* resSubplan = NIL;
-    DfsScan* dfsScan = (DfsScan*)plan;
-    extractQual(plan->qual, plan, ancestors, rtable, subplans);
-    resSubplan = extractVecSubplan((Expr*)dfsScan->plan.targetlist, resSubplan, subplans);
-    resSubplan = extractVecSubplan((Expr*)dfsScan->plan.qual, resSubplan, subplans);
-    return resSubplan;
-}
-
 static List* extractNodeFunctionScan(Plan* plan, List* ancestors, List* rtable, List* subplans)
 {
     List* resSubplan = NIL;
@@ -512,9 +490,6 @@ void extractNode(Plan* plan, List* ancestors, List* rtable, List* subplans)
         case T_CStoreIndexScan: {
             resSubplan = extractNodeCStoreIndexScan(plan, ancestors, rtable, subplans);
         } break;
-        case T_DfsIndexScan: {
-            resSubplan = extractNodeDfsIndexScan(plan, ancestors, rtable, subplans);
-        } break;
 
 #ifdef PGXC
         case T_ModifyTable:
@@ -561,9 +536,6 @@ void extractNode(Plan* plan, List* ancestors, List* rtable, List* subplans)
         case T_SubqueryScan: 
         case T_VecSubqueryScan:{
             extractQual(plan->qual, plan, ancestors, rtable, subplans);
-        } break;
-        case T_DfsScan: {
-            resSubplan = extractNodeDfsScan(plan, ancestors, rtable, subplans);
         } break;
         case T_Stream:
         case T_VecStream: 
@@ -800,7 +772,7 @@ static List* extractVecSubplan(Expr* node, List* resSubplan, List* subplans)
         } break;
         case T_RowExpr: {
             RowExpr* rowexpr = (RowExpr*)node;
-            Form_pg_attribute* attrs = NULL;
+            FormData_pg_attribute* attrs = NULL;
             ListCell* l = NULL;
             int i;
             TupleDesc tupdesc = NULL;
@@ -830,19 +802,19 @@ static List* extractVecSubplan(Expr* node, List* resSubplan, List* subplans)
             foreach (l, rowexpr->args) {
                 Expr* e = (Expr*)lfirst(l);
 
-                if (!attrs[i]->attisdropped) {
+                if (!attrs[i].attisdropped) {
                     /*
                      * Guard against ALTER COLUMN TYPE on rowtype since
                      * the RowExpr was created.  XXX should we check
                      * typmod too?	Not sure we can be sure it'll be the
                      * same.
                      */
-                    if (exprType((Node*)e) != attrs[i]->atttypid) {
+                    if (exprType((Node*)e) != attrs[i].atttypid) {
                         ereport(ERROR,
                             (errcode(ERRCODE_DATATYPE_MISMATCH),
                                 errmsg("ROW() column has type %s instead of type %s",
                                     format_type_be(exprType((Node*)e)),
-                                    format_type_be(attrs[i]->atttypid))));
+                                    format_type_be(attrs[i].atttypid))));
                     }
                 } else {
                     /*
@@ -995,7 +967,7 @@ static List* extractSubplan(Expr* node, List* resSubplan, List* subplans)
         } break;
         case T_RowExpr: {
             RowExpr* rowexpr = (RowExpr*)node;
-            Form_pg_attribute* attrs = NULL;
+            FormData_pg_attribute* attrs = NULL;
             ListCell* l = NULL;
             int i;
             TupleDesc tupdesc = NULL;
@@ -1015,19 +987,19 @@ static List* extractSubplan(Expr* node, List* resSubplan, List* subplans)
 
             foreach (l, rowexpr->args) {
                 Expr* e = (Expr*)lfirst(l);
-                if (!attrs[i]->attisdropped) {
+                if (!attrs[i].attisdropped) {
                     /*
                      * Guard against ALTER COLUMN TYPE on rowtype since
                      * the RowExpr was created.  XXX should we check
                      * typmod too?	Not sure we can be sure it'll be the
                      * same.
                      */
-                    if (exprType((Node*)e) != attrs[i]->atttypid)
+                    if (exprType((Node*)e) != attrs[i].atttypid)
                         ereport(ERROR,
                             (errcode(ERRCODE_DATATYPE_MISMATCH),
                                 errmsg("ROW() column has type %s instead of type %s",
                                     format_type_be(exprType((Node*)e)),
-                                    format_type_be(attrs[i]->atttypid))));
+                                    format_type_be(attrs[i].atttypid))));
                 } else {
                     /*
                      * Ignore original expression and insert a NULL. We

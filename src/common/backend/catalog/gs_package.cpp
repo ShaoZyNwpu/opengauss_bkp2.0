@@ -176,7 +176,7 @@ bool IsExistPackageName(const char* pkgname)
     return false;
 }
 
-Oid PackageNameListGetOid(List* pkgnameList, bool missing_ok) 
+Oid PackageNameListGetOid(List* pkgnameList, bool missing_ok, bool isPkgBody) 
 {
     Oid pkgOid = InvalidOid;
     char* schemaname = NULL;
@@ -195,6 +195,28 @@ Oid PackageNameListGetOid(List* pkgnameList, bool missing_ok)
         pkgOid = PackageNameGetOid(pkgname, namespaceId);
     } else {
         pkgOid = PackageNameGetOid(pkgname);
+    }
+    if (isPkgBody && OidIsValid(pkgOid)) {
+        HeapTuple tuple = SearchSysCache1(PACKAGEOID, ObjectIdGetDatum(pkgOid));
+        if (!HeapTupleIsValid(tuple)) {
+            ereport(ERROR,
+                (errmodule(MOD_PLSQL), errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                    errmsg("cache lookup failed for package %u", pkgOid),
+                    errdetail("cache lookup failed"),
+                    errcause("System error"),
+                    erraction("rebuild package")));
+        }
+        bool isNull = false;
+        (void)SysCacheGetAttr(PACKAGEOID, tuple, Anum_gs_package_pkgbodydeclsrc, &isNull);
+        if (isNull && !missing_ok) {
+            ereport(ERROR,
+                (errcode(ERRCODE_UNDEFINED_PACKAGE),
+                    errmsg("package body %s does not exist", NameListToString(pkgnameList))));
+        } else if (isNull && missing_ok) {
+            ReleaseSysCache(tuple);
+            return InvalidOid;
+        }
+        ReleaseSysCache(tuple);
     }
     if (!OidIsValid(pkgOid) && !missing_ok) {
         ereport(ERROR,
@@ -393,9 +415,7 @@ Oid PackageSpecCreate(Oid pkgNamespace, const char* pkgName, const Oid ownerId, 
     heap_close(pkgDesc, RowExclusiveLock);
 
     /* Record dependencies */
-    myself.classId = PackageRelationId;
-    myself.objectId = pkgOid;
-    myself.objectSubId = 0;
+    ObjectAddressSet(myself, PackageRelationId, pkgOid);
     isUpgrade = u_sess->attr.attr_common.IsInplaceUpgrade && myself.objectId < FirstBootstrapObjectId && !isReplaced;
     if (isUpgrade) {
         recordPinnedDependency(&myself);
@@ -408,7 +428,7 @@ Oid PackageSpecCreate(Oid pkgNamespace, const char* pkgName, const Oid ownerId, 
 
         recordDependencyOnOwner(PackageRelationId, pkgOid, ownerId);
 
-        recordDependencyOnCurrentExtension(&myself, false);
+        recordDependencyOnCurrentExtension(&myself, isReplaced);
     }
 
     /* Post creation hook for new schema */
@@ -495,6 +515,9 @@ Oid PackageBodyCreate(Oid pkgNamespace, const char* pkgName, const Oid ownerId, 
     }
     oldPkgOid = PackageNameGetOid(pkgName, pkgNamespace);
     if (!OidIsValid(oldPkgOid)) {
+#ifndef ENABLE_MULTIPLE_NODES
+        InsertGsSource(oldPkgOid, pkgNamespace, pkgName, "package body", false);
+#endif
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("package spec not found")));
     }
     /* initialize nulls and values */
@@ -1128,7 +1151,7 @@ void BuildSessionPackageRuntimeForAutoSession(uint64 sessionId, uint64 parentSes
     }
 
     SessionPackageRuntime* parentSessionPkgs = NULL;
-    /* get parent session pkgs, build current session pkgs need include them */
+
     if (parentSessionId != 0) {
         if (!u_sess->plsql_cxt.not_found_parent_session_pkgs) {
             if (u_sess->plsql_cxt.auto_parent_session_pkgs == NULL) {
@@ -1319,7 +1342,20 @@ static void RestorePkgValuesByPkgState(PLpgSQL_package* targetPkg, PackageRuntim
     int endNum = targetPkg->ndatums < pkgState->size ? targetPkg->ndatums : pkgState->size;
     /* when compiling body, need not restore public var */
     if (isInit && targetPkg->is_bodycompiled) {
-        startNum = targetPkg->public_ndatums;
+        HeapTuple pkgTuple = SearchSysCache1(PACKAGEOID, ObjectIdGetDatum(targetPkg->pkg_oid));
+        bool isnull = false;
+        if (HeapTupleIsValid(pkgTuple)) {
+            (void)SysCacheGetAttr(PACKAGEOID, pkgTuple, Anum_gs_package_pkgbodyinitsrc, &isnull);
+        }
+        ReleaseSysCache(pkgTuple);
+        /*
+         * if have no initsrc, just init private vars.
+         * if have initsrc, body compile will fallow spec compile immediately,
+         * initsrc may change public vars, so need restore it again.
+         */
+        if (isnull) {
+            startNum = targetPkg->public_ndatums;
+        }
     }
 
     for (int i = startNum; i < endNum; i++) {
@@ -1650,40 +1686,36 @@ Oid GetOldTupleOid(const char* procedureName, oidvector* parameterTypes, Oid pro
         ReleaseSysCache(oldtup);
         return oldTupleOid;
     }
-    if (enableOutparamOverride) {
-        HeapTuple oldtup = NULL;
-        oldtup = SearchSysCacheForProcAllArgs(PointerGetDatum(procedureName),
-            values[Anum_pg_proc_allargtypes - 1],
-            ObjectIdGetDatum(procNamespace),
-            ObjectIdGetDatum(propackageid),
-            parameterModes);
-        if (!HeapTupleIsValid(oldtup)) {
-            return InvalidOid;
-        }
-        Oid oldTupleOid = HeapTupleGetOid(oldtup);
-        ReleaseSysCache(oldtup);
-        return oldTupleOid;
-    } else {
-        CatCList* catlist = NULL;
-        catlist = SearchSysCacheList1(PROCALLARGS, CStringGetDatum(procedureName));
-        for (int i = 0; i < catlist->n_members; i++) {
-            HeapTuple proctup = t_thrd.lsc_cxt.FetchTupleFromCatCList(catlist, i);
-            Oid packageid = InvalidOid;
-            if (HeapTupleIsValid(proctup)) {
-                Form_pg_proc pform = (Form_pg_proc)GETSTRUCT(proctup);
-                Oid oldTupleOid = HeapTupleGetOid(proctup);
-                /* compare function's namespace */
-                if (pform->pronamespace != procNamespace) {
-                    continue;
+    CatCList* catlist = NULL;
+    catlist = SearchSysCacheList1(PROCALLARGS, CStringGetDatum(procedureName));
+    Oid packageid = InvalidOid;
+    for (int i = 0; i < catlist->n_members; i++) {
+        HeapTuple proctup = t_thrd.lsc_cxt.FetchTupleFromCatCList(catlist, i);
+        if (HeapTupleIsValid(proctup)) {
+            Form_pg_proc pform = (Form_pg_proc)GETSTRUCT(proctup);
+            Oid oldTupleOid = HeapTupleGetOid(proctup);
+            /* compare function's namespace */
+            if (pform->pronamespace != procNamespace) {
+                continue;
+            }
+            bool isNull = false;
+            Datum packageIdDatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_packageid, &isNull);
+            if (!isNull) {
+                packageid = ObjectIdGetDatum(packageIdDatum);
+            }
+            if (packageid != propackageid) {
+                continue;
+            }
+            if (enableOutparamOverride) {
+                Datum procParaType = ProcedureGetAllArgTypes(proctup, &isNull);
+                bool result = DatumGetBool(
+                    DirectFunctionCall2(oidvectoreq, procParaType,
+                                        values[Anum_pg_proc_allargtypes - 1]));
+                if (result) {
+                    ReleaseSysCacheList(catlist);
+                    return oldTupleOid;
                 }
-                bool isNull = false;
-                Datum packageIdDatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_packageid, &isNull);
-                if (!isNull) {
-                    packageid = ObjectIdGetDatum(packageIdDatum);
-                }
-                if (packageid != propackageid) {
-                    continue;
-                }
+            } else {
                 oidvector* procParaType = ProcedureGetArgTypes(proctup);
                 bool result = DatumGetBool(
                     DirectFunctionCall2(oidvectoreq, PointerGetDatum(procParaType),
@@ -1694,9 +1726,9 @@ Oid GetOldTupleOid(const char* procedureName, oidvector* parameterTypes, Oid pro
                 }
             }
         }
-        if (catlist != NULL) {
-            ReleaseSysCacheList(catlist);
-        }
+    }
+    if (catlist != NULL) {
+        ReleaseSysCacheList(catlist);
     }
     return InvalidOid;
 }
@@ -1741,15 +1773,17 @@ bool isSameArgList(CreateFunctionStmt* stmt1, CreateFunctionStmt* stmt2)
         if (inArgNum1 != inArgNum2) {
             return false;
         } else if (inArgNum1 == inArgNum2 && length1 != length2) {
-            char message[MAXSTRLEN];
-            errno_t rc = sprintf_s(message, MAXSTRLEN, "can not override out param:%s", stmt1->funcname);
-            securec_check_ss_c(rc, "", "");
+            char message[MAXSTRLEN], funcname[MAXSTRLEN];
+            char *p = NameListToString(stmt1->funcname);
+            strcpy_s(funcname, MAXSTRLEN, p);
+            pfree(p);
+            errno_t rc = sprintf_s(message, MAXSTRLEN, "can not override out param:%s", funcname);
+            securec_check_ss(rc, "", "");
             InsertErrorMessage(message, stmt1->startLineNumber);
             ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                     errmodule(MOD_PLSQL),
-                    errmsg("can not override out param:%s",
-                    NameListToString(stmt1->funcname))));
+                    errmsg("can not override out param:%s", funcname)));
         }
     } else {
         if (length1 != length2) {
@@ -1803,7 +1837,7 @@ bool isSameArgList(CreateFunctionStmt* stmt1, CreateFunctionStmt* stmt2)
             if (!OidIsValid(toid1)) {
                 char message[MAXSTRLEN];
                 rc = sprintf_s(message, MAXSTRLEN, "type is not exists  %s.", fp1->name);
-                securec_check_ss_c(rc, "", "");
+                securec_check_ss(rc, "", "");
                 InsertErrorMessage(message, stmt1->startLineNumber);
                 ereport(ERROR,
                     (errmodule(MOD_PLSQL), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1824,7 +1858,7 @@ bool isSameArgList(CreateFunctionStmt* stmt1, CreateFunctionStmt* stmt2)
             if (!OidIsValid(toid2)) {
                 char message[MAXSTRLEN];
                 rc = sprintf_s(message, MAXSTRLEN, "type is not exists  %s.", fp2->name);
-                securec_check_ss_c(rc, "", "");
+                securec_check_ss(rc, "", "");
                 InsertErrorMessage(message, stmt1->startLineNumber);
                 ereport(ERROR,
                     (errmodule(MOD_PLSQL), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1848,7 +1882,7 @@ bool isSameArgList(CreateFunctionStmt* stmt1, CreateFunctionStmt* stmt2)
         if (fp1->name == NULL || fp2->name == NULL) {
             char message[MAXSTRLEN];
             rc = sprintf_s(message, MAXSTRLEN, "type is not exists.");
-            securec_check_ss_c(rc, "", "");
+            securec_check_ss(rc, "", "");
             InsertErrorMessage(message, stmt1->startLineNumber);
             ereport(ERROR,
                 (errmodule(MOD_PLSQL), errcode(ERRCODE_INVALID_PARAMETER_VALUE),

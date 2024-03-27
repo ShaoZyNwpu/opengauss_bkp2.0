@@ -228,6 +228,7 @@ typedef enum {
     GUC_PARA_BOOL,  /* bool    */
     GUC_PARA_ENUM,  /* enum    */
     GUC_PARA_INT,   /* int     */
+    GUC_PARA_INT64, /* int64   */
     GUC_PARA_REAL,  /* real    */
     GUC_PARA_STRING /* string  */
 } GucParaType;
@@ -270,12 +271,14 @@ const char *value_type_list[] = {
 const char* unit_eight_kB_parameter_list[] = {
     "backwrite_quantity",
     "effective_cache_size",
+    "pca_shared_buffers",
     "prefetch_quantity",
     "segment_size",
     "shared_buffers",
     "temp_buffers",
     "wal_buffers",
     "wal_segment_size",
+    "huge_page_size",
 };
 /* the size of page, unit is kB */
 #define PAGE_SIZE 8
@@ -546,7 +549,7 @@ static char* form_commandline_options(const char* instance_name, const char* ind
     /* find length required for options */
     for (i = 0; i < config_param_number; i++) {
         if (!is_hba_conf) {
-            buflen += (ALLIG_POSTGRES_CONF_LEN + strlen(config_param[i]));
+            buflen += (int)(ALLIG_POSTGRES_CONF_LEN + strlen(config_param[i]));
             if (config_value[i] != NULL) {
                 buflen += strlen(config_value[i]);
             }
@@ -1091,6 +1094,63 @@ int validate_node_instance_name(char* nodename, int type, char* instance_name)
 
     return 0;
 }
+
+#ifndef ENABLE_MULTIPLE_NODES
+/*
+ ******************************************************************************
+ Function    : gsguc_precheck_forbid_parameters
+ Description : Forbid reload/set/check GUC parameters in list for ALL node type
+ Input       : nodename(indicates node name)
+ Output      : none
+ Return      : bool
+ ******************************************************************************
+ */
+
+/* Forbid parameters for method "reload" with "all" nodes */
+char *gsguc_forbid_list_reload[] = {
+    "listen_addresses",
+    NULL
+};
+
+bool gsguc_precheck_forbid_parameters(char *nodename)
+{
+    /* If set pg_hba, just pass */
+    if (is_hba_conf) {
+        return true;
+    }
+
+    switch (ctl_command) {
+        case SET_CONF_COMMAND:
+            /* process checking parameters for SET mode */
+            break;
+        case RELOAD_CONF_COMMAND:
+            /* process checking parameters for RELOAD mode */
+            if (strncmp(nodename, "all", strlen("all")) != 0) {
+                break;
+            }
+            /* parameters not support '-N all' */
+            for (int i = 0; i < config_param_number && config_param[i] != NULL; i++) {
+                for (int j = 0; gsguc_forbid_list_reload[j] != NULL; j++) {
+                    if (strcmp(config_param[i], gsguc_forbid_list_reload[j]) == 0) {
+                        write_stderr(_("ERROR: \"%s\" can not \"%s\" with \"%s\" method.\n"),
+                            gsguc_forbid_list_reload[j],
+                            get_ctl_command_type(),
+                            nodename);
+                        return false;
+                    }
+                }
+            }
+            break;
+        case CHECK_CONF_COMMAND:
+            /* process checking parameters for CHECK mode */
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+#endif
+
 /*
  ******************************************************************************
  Function    : validate_cluster_guc_options
@@ -1369,10 +1429,16 @@ void process_cluster_guc_option(char* nodename, int type, char* instance_name, c
     }
     else
     {
-        if (0 == strncmp(nodename, "all", sizeof("all")))
+        if (0 == strncmp(nodename, "all", strlen("all"))) {
+#ifndef ENABLE_MULTIPLE_NODES
+            if (!gsguc_precheck_forbid_parameters(nodename)) {
+                exit(1);
+            }
+#endif
             do_all_nodes_instance(instance_name, indatadir);
-        else
+        } else {
             do_remote_instance(nodename, instance_name, indatadir);
+        }
     }
 }
 
@@ -3288,6 +3354,8 @@ GucParaType get_guc_type(const char* type)
         return GUC_PARA_ENUM;
     else if (0 == strncmp(type, "string", strlen("string")))
         return GUC_PARA_STRING;
+    else if (0 == strncmp(type, "int64", strlen("int64")))
+        return GUC_PARA_INT64;
     else
         return GUC_PARA_ERROR;
 }

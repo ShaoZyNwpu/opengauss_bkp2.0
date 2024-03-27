@@ -82,15 +82,15 @@ extern IndexesUsableType eliminate_partition_index_unusable(Oid IndexOid, Prunin
 
 void destroyPruningResult(PruningResult* pruningResult);
 void partitionPruningFromBoundary(PruningContext *context, PruningResult* pruningResult);
-void generateListFromPruningBM(PruningResult* result);
+List* restrictInfoListToExprList(List* restrictInfoList);
+void generateListFromPruningBM(PruningResult* result, PartitionMap *partmap = NULL);
 PruningResult* partitionPruningWalker(Expr* expr, PruningContext* pruningCtx);
 PruningResult* partitionPruningForExpr(PlannerInfo* root, RangeTblEntry* rte, Relation rel, Expr* expr);
 PruningResult* partitionPruningForRestrictInfo(
     PlannerInfo* root, RangeTblEntry* rte, Relation rel, List* restrictInfoList);
-PruningResult* singlePartitionPruningForRestrictInfo(Oid partitionOid, Relation rel);
-PruningResult* SingleSubPartitionPruningForRestrictInfo(Oid subPartitionOid, Relation rel, Oid partOid);
+PruningResult* PartitionPruningForPartitionList(RangeTblEntry* rte, Relation rel);
 extern PruningResult* copyPruningResult(PruningResult* srcPruningResult);
-extern Oid getPartitionOidFromSequence(Relation relation, int partSeq);
+extern Oid getPartitionOidFromSequence(Relation relation, int partSeq, int partitionno = 0);
 extern int varIsInPartitionKey(int attrNo, int2vector* partKeyAttrs, int partKeyNum);
 extern bool checkPartitionIndexUnusable(Oid indexOid, int partItrs, PruningResult* pruning_result);
 
@@ -99,6 +99,7 @@ static inline PartitionMap* GetPartitionMap(PruningContext *context)
 {
     return context->GetPartitionMap(context->relation);
 }
-extern SubPartitionPruningResult* GetSubPartitionPruningResult(List* selectedSubPartitions, int partSeq);
-
+extern SubPartitionPruningResult* GetSubPartitionPruningResult(List* selectedSubPartitions, int partSeq,
+    int partitionno);
+void MergePartitionListsForPruning(RangeTblEntry* rte, Relation rel, PruningResult* pruningRes);
 #endif /* PRUNING_H_ */

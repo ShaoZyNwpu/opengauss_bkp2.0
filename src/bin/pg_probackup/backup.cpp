@@ -23,13 +23,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "tool_common.h"
 #include "thread.h"
 #include "file.h"
 #include "common/fe_memutils.h"
+#include "storage/file/fio_device.h"
+
 
 /* list of dirs which will not to be backuped
    it will be backuped up in external dirs  */
 parray *pgdata_nobackup_dir = NULL;
+
+/* list of logical replication slots */
+parray *logical_replslot = NULL;
 
 static int standby_message_timeout_local = 10 ;	/* 10 sec = default */
 static XLogRecPtr stop_backup_lsn = InvalidXLogRecPtr;
@@ -89,10 +95,11 @@ static void backup_cleanup(bool fatal, void *userdata);
 
 static void *backup_files(void *arg);
 
-static void do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool backup_logs);
+static void do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool backup_logs,
+    bool backup_replslots);
 
 static void pg_start_backup(const char *label, bool smooth, pgBackup *backup,
-                                PGNodeInfo *nodeInfo, PGconn *conn);
+                                PGNodeInfo *nodeInfo, PGconn *conn, bool backup_replslots);
 static void pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn, PGNodeInfo *nodeInfo);
 static int checkpoint_timeout(PGconn *backup_conn);
 
@@ -115,6 +122,7 @@ static bool pg_is_in_recovery(PGconn *conn);
 static void confirm_block_size(PGconn *conn, const char *name, int blcksz);
 static void set_cfs_datafiles(parray *files, const char *root, char *relative, size_t i);
 static bool PathContainPath(const char* path1, const char* path2);
+static bool IsPrimary(PGconn* conn);
 
 static void
 backup_stopbackup_callback(bool fatal, void *userdata)
@@ -130,17 +138,17 @@ backup_stopbackup_callback(bool fatal, void *userdata)
     }
 }
 
-static void run_backup_threads(char *external_prefix, char *database_path, 
-                        parray  *prev_backup_filelist, parray  *external_dirs, 
-                        PGNodeInfo *nodeInfo, XLogRecPtr	prev_backup_start_lsn)
+static void run_backup_threads(char *external_prefix, char *database_path, char *dssdata_path,
+                               parray *prev_backup_filelist, parray *external_dirs, 
+                               PGNodeInfo *nodeInfo, XLogRecPtr	prev_backup_start_lsn)
 {
     int i;
     int nRet = 0;
-    pthread_t   *threads;
+    pthread_t   *threads = NULL;
     bool    backup_isok = true;
     time_t  start_time, end_time;
     char    pretty_time[20];
-    backup_files_arg *threads_args;
+    backup_files_arg *threads_args = NULL;
 
     for (i = 0; i < (int)parray_num(backup_files_list); i++)
     {
@@ -159,6 +167,8 @@ static void run_backup_threads(char *external_prefix, char *database_path,
                 securec_check_ss_c(nRet, "\0", "\0");
                 join_path_components(dirpath, temp, file->rel_path);
             }
+            else if (is_dss_type(file->type))
+                join_path_components(dirpath, dssdata_path, file->rel_path);
             else
                 join_path_components(dirpath, database_path, file->rel_path);
 
@@ -186,7 +196,13 @@ static void run_backup_threads(char *external_prefix, char *database_path,
 
     /* init thread args with own file lists */
     threads = (pthread_t *) palloc(sizeof(pthread_t) * num_threads);
+    if (threads == NULL) {
+        elog(ERROR, "Out of memory");
+    }
     threads_args = (backup_files_arg *) palloc(sizeof(backup_files_arg)*num_threads);
+    if (threads_args == NULL) {
+        elog(ERROR, "Out of memory");
+    }
 
     for (i = 0; i < num_threads; i++)
     {
@@ -195,6 +211,8 @@ static void run_backup_threads(char *external_prefix, char *database_path,
         arg->nodeInfo = nodeInfo;
         arg->from_root = instance_config.pgdata;
         arg->to_root = database_path;
+        arg->src_dss = instance_config.dss.vgdata;
+        arg->dst_dss = dssdata_path;
         arg->external_prefix = external_prefix;
         arg->external_dirs = external_dirs;
         arg->files_list = backup_files_list;
@@ -402,16 +420,47 @@ static void calc_pgdata_bytes()
     elog(INFO, "PGDATA size: %s", pretty_bytes);
 }
 
-static void add_xlog_files_into_backup_list(const char *database_path)
+static void add_xlog_files_into_backup_list(const char *database_path, const char *dssdata_path,
+                                            int instance_id, bool enable_dss)
 {
     int i;
     parray     *xlog_files_list;
     char    pg_xlog_path[MAXPGPATH];
     char    wal_full_path[MAXPGPATH];
+    const char *parent_path;
 
     /* Scan backup PG_XLOG_DIR */
     xlog_files_list = parray_new();
-    join_path_components(pg_xlog_path, database_path, PG_XLOG_DIR);
+
+    /* link dssdata's pg_xlog to database's pg_xlog */
+    if (enable_dss) {
+        char database_xlog[MAXPGPATH];
+        char dssdata_xlog[MAXPGPATH];
+        errno_t rc;
+
+        rc = snprintf_s(dssdata_xlog, MAXPGPATH, MAXPGPATH - 1, "%s/%s%d", dssdata_path, PG_XLOG_DIR, instance_id);
+        securec_check_ss_c(rc, "\0", "\0");
+        join_path_components(database_xlog, database_path, PG_XLOG_DIR);
+
+        /* dssdata_xlog is already exist, destory it and recreate */
+        if (rmdir(dssdata_xlog) != 0) {
+            elog(ERROR, "can not remove xlog dir \"%s\" : %s", dssdata_xlog, strerror(errno));
+        }
+
+        if (symlink(database_xlog, dssdata_xlog) < 0) {
+            elog(ERROR, "can not link dss xlog dir \"%s\" to database xlog dir \"%s\": %s", dssdata_xlog, database_xlog,
+                strerror(errno));
+        }
+
+        rc = strcpy_s(pg_xlog_path, MAXPGPATH, dssdata_xlog);
+        securec_check_c(rc, "\0", "\0");
+        parent_path = dssdata_path;
+    } else {
+        join_path_components(pg_xlog_path, database_path, PG_XLOG_DIR);
+        parent_path = database_path;
+    }
+
+
     dir_list_file(xlog_files_list, pg_xlog_path, false, true, false, false, true, 0,
                             FIO_BACKUP_HOST);
 
@@ -425,6 +474,11 @@ static void add_xlog_files_into_backup_list(const char *database_path)
         if (!S_ISREG(file->mode))
             continue;
 
+        /* refresh file type */
+        if (enable_dss) {
+            file->type = DEV_TYPE_DSS;
+        }
+
         file->crc = pgFileGetCRC(wal_full_path, true, false);
         file->write_size = file->size;
 
@@ -434,7 +488,7 @@ static void add_xlog_files_into_backup_list(const char *database_path)
         pg_free(file->rel_path);
 
         /* Now it is relative to /backup_dir/backups/instance_name/backup_id/database/ */
-        file->rel_path = pgut_strdup(GetRelativePath(wal_full_path, database_path));
+        file->rel_path = pgut_strdup(GetRelativePath(wal_full_path, parent_path));
 
         file->name = last_dir_separator(file->rel_path);
 
@@ -451,7 +505,7 @@ static void add_xlog_files_into_backup_list(const char *database_path)
 
 
 static void sync_files(parray *database_map, const char *database_path, parray *external_dirs,
-                       const char *external_prefix, bool no_sync)
+                       const char *dssdata_path, const char *external_prefix, bool no_sync)
 {
     time_t  start_time, end_time;
     char    pretty_time[20];
@@ -462,19 +516,28 @@ static void sync_files(parray *database_map, const char *database_path, parray *
     if (current.from_replica && !exclusive_backup)
     {
         pgFile *pg_control = NULL;
+        char fullpath[MAXPGPATH];
         for (unsigned int i = 0; i < parray_num(backup_files_list); i++)
         {
             pgFile *tmp_file = (pgFile *)parray_get(backup_files_list, (size_t)i);
             if (tmp_file->external_dir_num == 0 &&
-                (strcmp(tmp_file->rel_path, XLOG_CONTROL_FILE) == 0))
+                (strcmp(tmp_file->name, PG_XLOG_CONTROL_FILE) == 0))
             {
                 pg_control = tmp_file;
                 break;
             }
         }
-        if (!pg_control)
-            elog(ERROR, "Failed to find file \"%s\" in backup filelist.", XLOG_CONTROL_FILE);
-        set_min_recovery_point(pg_control, database_path, current.stop_lsn);
+        if (!pg_control) {
+            elog(ERROR, "Failed to find file \"%s\" in backup filelist.", T_XLOG_CONTROL_FILE);
+        }
+
+        if (is_dss_type(pg_control->type)) {
+            join_path_components(fullpath, dssdata_path, pg_control->rel_path);
+        } else {
+            join_path_components(fullpath, database_path, pg_control->rel_path);
+        }
+
+        set_min_recovery_point(pg_control, fullpath, current.stop_lsn);
     }
     
     /* close and sync page header map */
@@ -492,7 +555,7 @@ static void sync_files(parray *database_map, const char *database_path, parray *
     /* Add archived xlog files into the list of files of this backup */
     if (stream_wal)
     {
-        add_xlog_files_into_backup_list(database_path);
+        add_xlog_files_into_backup_list(database_path, dssdata_path, instance_config.dss.instance_id, IsDssMode());
     }
 
     /* write database map to file and add it to control file */
@@ -531,9 +594,7 @@ static void sync_files(parray *database_map, const char *database_path, parray *
                 continue;
 
             /* construct fullpath */
-            if (file->external_dir_num == 0)
-                join_path_components(to_fullpath, database_path, file->rel_path);
-            else
+            if (file->external_dir_num != 0)
             {
                 char    external_dst[MAXPGPATH];
 
@@ -541,6 +602,10 @@ static void sync_files(parray *database_map, const char *database_path, parray *
                                                  file->external_dir_num);
                 join_path_components(to_fullpath, external_dst, file->rel_path);
             }
+            else if (is_dss_type(file->type))
+                join_path_components(to_fullpath, dssdata_path, file->rel_path);
+            else
+                join_path_components(to_fullpath, database_path, file->rel_path);
 
             if (fio_sync(to_fullpath, FIO_BACKUP_HOST) != 0)
                 elog(ERROR, "Cannot sync file \"%s\": %s", to_fullpath, strerror(errno));
@@ -558,10 +623,11 @@ static void sync_files(parray *database_map, const char *database_path, parray *
  * Move files from 'pgdata' to a subdirectory in 'backup_path'.
  */
 static void
-do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool backup_logs)
+do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool backup_logs, bool backup_replslots)
 {
     int i;
     char    database_path[MAXPGPATH];
+    char    dssdata_path[MAXPGPATH];
     char    external_prefix[MAXPGPATH]; /* Temp value. Used as template */    
     char    label[1024];
     XLogRecPtr	prev_backup_start_lsn = InvalidXLogRecPtr;
@@ -591,7 +657,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
     securec_check_c(rc, "\0", "\0");
 
     /* Call pg_start_backup function in openGauss connect */
-    pg_start_backup(label, smooth_checkpoint, &current, nodeInfo, backup_conn);
+    pg_start_backup(label, smooth_checkpoint, &current, nodeInfo, backup_conn, backup_replslots);
 
     /* Obtain current timeline */
 #if PG_VERSION_NUM >= 90600
@@ -609,6 +675,8 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
 
     pgBackupGetPath(&current, database_path, lengthof(database_path),
                                 DATABASE_DIR);
+    pgBackupGetPath(&current, dssdata_path, lengthof(dssdata_path),
+                                DSSDATA_DIR);
     pgBackupGetPath(&current, external_prefix, lengthof(external_prefix),
                                 EXTERNAL_DIR);
 
@@ -624,10 +692,16 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
     /* list files with the logical path. omit $PGDATA */
     if (fio_is_remote(FIO_DB_HOST))
         fio_list_dir(backup_files_list, instance_config.pgdata,
-                            true, true, false, backup_logs, true, 0);
+                            true, true, false, backup_logs, true, 0, backup_replslots);
     else
         dir_list_file(backup_files_list, instance_config.pgdata,
-                             true, true, false, backup_logs, true, 0, FIO_LOCAL_HOST);
+                             true, true, false, backup_logs, true, 0, FIO_LOCAL_HOST, backup_replslots);
+
+    /* some files are storage in dss server, list them */
+    if (IsDssMode()) {
+        dir_list_file(backup_files_list, instance_config.dss.vgdata,
+                      true, true, false, backup_logs, true, 0, FIO_DSS_HOST);
+    }
 
     /*
      * Get database_map (name to oid) for use in partial restore feature.
@@ -716,7 +790,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
     /*
      * Make directories before backup and setup threads at the same time
      */
-    run_backup_threads(external_prefix, database_path, prev_backup_filelist, 
+    run_backup_threads(external_prefix, database_path, dssdata_path, prev_backup_filelist, 
                     external_dirs, nodeInfo, prev_backup_start_lsn);
 
     /* clean previous backup file list */
@@ -729,7 +803,7 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
     /* Notify end of backup */
     pg_stop_backup(&current, backup_conn, nodeInfo);
     
-    sync_files(database_map, database_path, external_dirs, external_prefix, no_sync);
+    sync_files(database_map, database_path, external_dirs, dssdata_path, external_prefix, no_sync);
 
     /* be paranoid about instance been from the past */
     if (current.backup_mode != BACKUP_MODE_FULL &&
@@ -748,6 +822,11 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
         free_dir_list(pgdata_nobackup_dir);
     }
     pgdata_nobackup_dir = NULL;
+
+    if (logical_replslot) {
+        free_dir_list(logical_replslot);
+    }
+    logical_replslot = NULL;
 
     /* Cleanup */
     if (backup_list)
@@ -849,18 +928,23 @@ static void do_after_backup()
  */
 int
 do_backup(time_t start_time, pgSetBackupParams *set_backup_params,
-        bool no_validate, bool no_sync, bool backup_logs)
+        bool no_validate, bool no_sync, bool backup_logs, bool backup_replslots)
 {
     PGconn  *backup_conn = NULL;
     PGNodeInfo  nodeInfo;
     errno_t rc = 0;
+    PGresult *res = NULL;
 
     /* Initialize PGInfonode */
     pgNodeInit(&nodeInfo);
 
+    /* vgname of dss is already checked in previous step */
     if (!instance_config.pgdata)
         elog(ERROR, "required parameter not specified: PGDATA "
             "(-D, --pgdata)");
+
+    if (IsDssMode() && current.backup_mode != BACKUP_MODE_FULL)
+        elog(ERROR, "only support full backup when enable dss.");
 
     /* Update backup status and other metainfo. */
     current.status = BACKUP_STATUS_RUNNING;
@@ -872,6 +956,8 @@ do_backup(time_t start_time, pgSetBackupParams *set_backup_params,
 
     current.compress_alg = instance_config.compress_alg;
     current.compress_level = instance_config.compress_level;
+
+    current.storage_type = IsDssMode() ? DEV_TYPE_DSS : DEV_TYPE_FILE;
 
     /* Save list of external directories */
     if (instance_config.external_dir_str &&
@@ -924,8 +1010,12 @@ do_backup(time_t start_time, pgSetBackupParams *set_backup_params,
     if (set_backup_params && set_backup_params->note)
         add_note(&current, set_backup_params->note);
 
+    /* for long time backup, session will timeout, then backup will fail. So set the timeout */
+    res = pgut_execute(backup_conn, "SET session_timeout = 0;", 0, NULL);
+    PQclear(res);
+
     /* backup data */
-    do_backup_instance(backup_conn, &nodeInfo, no_sync, backup_logs);
+    do_backup_instance(backup_conn, &nodeInfo, no_sync, backup_logs, backup_replslots);
     pgut_atexit_pop(backup_cleanup, NULL);
 
     /* compute size of wal files of this backup stored in the archive */
@@ -1034,18 +1124,25 @@ confirm_block_size(PGconn *conn, const char *name, int blcksz)
  */
 static void
 pg_start_backup(const char *label, bool smooth, pgBackup *backup,
-                PGNodeInfo *nodeInfo, PGconn *conn)
+                PGNodeInfo *nodeInfo, PGconn *conn, bool backup_replslots)
 {
     PGresult   *res;
     const char *params[2];
     uint32  lsn_hi;
     uint32  lsn_lo;
     int     ret;
+    int i;
+    XLogRecPtr startLsn;
 
     params[0] = label;
 
     /* 2nd argument is 'fast'*/
     params[1] = smooth ? "false" : "true";
+
+    if(!IsPrimary(conn) && IsDssMode()) {
+        elog(ERROR, "backup only support on primary by dss mode");
+    }
+
     if (!exclusive_backup)
         res = pgut_execute(conn,
                                         "SELECT pg_catalog.pg_start_backup($1, $2, false)",
@@ -1068,7 +1165,33 @@ pg_start_backup(const char *label, bool smooth, pgBackup *backup,
     XLogDataFromLSN(ret, PQgetvalue(res, 0, 0), &lsn_hi, &lsn_lo);
     securec_check_for_sscanf_s(ret, 2, "\0", "\0");
     /* Calculate LSN */
-    backup->start_lsn = ((uint64) lsn_hi )<< 32 | lsn_lo;
+    startLsn = ((uint64) lsn_hi )<< 32 | lsn_lo;
+
+    if (backup_replslots) {
+        logical_replslot = parray_new();
+        /* query for logical replication slots of subscriptions */
+        res = pgut_execute(conn,
+                           "SELECT slot_name, restart_lsn FROM pg_catalog.pg_get_replication_slots()"
+                           "WHERE slot_type = 'logical' AND plugin = 'pgoutput'", 0, NULL);
+        if (PQntuples(res) == 0) {
+            elog(LOG, "logical replication slots for subscriptions not found");
+        } else {
+            XLogRecPtr repslotLsn;
+
+            for (i = 0; i < PQntuples(res); i++) {
+                XLogDataFromLSN(ret, PQgetvalue(res, i, 1), &lsn_hi, &lsn_lo);
+                securec_check_for_sscanf_s(ret, 2, "\0", "\0");
+                repslotLsn = ((uint64) lsn_hi )<< 32 | lsn_lo;
+                startLsn = Min(startLsn, repslotLsn);
+                
+                char* slotname = pg_strdup(PQgetvalue(res, i, 0));
+                parray_append(logical_replslot, slotname);
+            }
+            elog(WARNING, "logical replication slots for subscriptions will be backed up. "
+                 "If don't use them after restoring, please drop them to avoid affecting xlog recycling.");
+        }
+    }
+    backup->start_lsn = startLsn;
 
     PQclear(res);
 }
@@ -2006,12 +2129,7 @@ backup_files(void *arg)
         }
 
         /* construct destination filepath */
-        if (file->external_dir_num == 0)
-        {
-            join_path_components(from_fullpath, arguments->from_root, file->rel_path);
-            join_path_components(to_fullpath, arguments->to_root, file->rel_path);
-        }
-        else
+        if (file->external_dir_num != 0)
         {
             char    external_dst[MAXPGPATH];
             char    *external_path = (char *)parray_get(arguments->external_dirs,
@@ -2023,6 +2141,16 @@ backup_files(void *arg)
 
             join_path_components(to_fullpath, external_dst, file->rel_path);
             join_path_components(from_fullpath, external_path, file->rel_path);
+        }
+        else if (is_dss_type(file->type))
+        {
+            join_path_components(from_fullpath, arguments->src_dss, file->rel_path);
+            join_path_components(to_fullpath, arguments->dst_dss, file->rel_path);
+        }
+        else
+        {
+            join_path_components(from_fullpath, arguments->from_root, file->rel_path);
+            join_path_components(to_fullpath, arguments->to_root, file->rel_path);
         }
 
         /* Encountered some strange beast */
@@ -2432,6 +2560,16 @@ check_external_for_tablespaces(parray *external_list, PGconn *backup_conn)
 
     res = pgut_execute(backup_conn, query, 0, NULL);
 
+    /* Check that external directories do not contain dsspath */
+    for (i = 0; i < (int)parray_num(external_list); i++) {
+        char *external_path = (char *)parray_get(external_list, i);
+        if (is_dss_file(external_path))
+            elog(ERROR,
+                "External directory path (-E option) \"%s\" "
+                "contains dss path, which is not allow now",
+                external_path);
+    }
+
     /* Check successfull execution of query */
     if (!res)
         elog(ERROR, "Failed to get list of tablespaces");
@@ -2571,4 +2709,52 @@ static bool PathContainPath(const char* path1, const char* path2)
     return false;
 }
 
+static bool IsPrimary(PGconn* conn)
+{
+#define MAXRUNMODE 64
+    PGresult* res = NULL;
+    const char* sql_string = "select local_role from pg_stat_get_stream_replications();";
+    char* val = NULL;
+    char run_mode[MAXRUNMODE] = {0};
+    GaussState state;
+    errno_t tnRet = EOK;
 
+    if (PQstatus(conn) != CONNECTION_OK) {
+        PQfinish(conn);
+        conn = NULL;
+        elog(ERROR,"could not connect to the local server: connection failed!\n");
+    }
+
+    /* Get local role from the local server. */
+    res = PQexec(conn, sql_string);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        PQfinish(conn);
+        conn = NULL;
+        elog(ERROR, "could not get local role from the local server");
+    }
+    
+    if (PQnfields(res) != 1 || PQntuples(res) != 1) {
+        int ntuples = PQntuples(res);
+        int nfields = PQnfields(res);
+        PQclear(res);
+        PQfinish(conn);
+        conn = NULL;
+        elog(ERROR,"invalid response from primary server: "
+              "Expected 1 tuple with 1 fields, got %d tuples with %d fields.",
+            ntuples,
+            nfields);
+    }
+
+    if ((val = PQgetvalue(res, 0, 0)) != NULL) {
+        tnRet = strncpy_s(run_mode, MAXRUNMODE, val, strlen(val));
+        securec_check_c(tnRet, "\0", "\0");
+        run_mode[MAXRUNMODE - 1] = '\0';
+    }
+    PQclear(res);
+
+    if (!strncmp(run_mode, "Primary", MAXRUNMODE)) {
+        return true;
+    }
+    return false;
+}

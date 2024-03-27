@@ -55,6 +55,7 @@
                                 status == STATE_STREAM_WAIT_CONNECT_NODES || \
                                 status == STATE_STREAM_WAIT_PRODUCER_READY || \
                                 status == STATE_WAIT_XACTSYNC)
+#define WAIT_READY_MAX_TIMES 10000
 
 ThreadPoolGroup::ThreadPoolGroup(int maxWorkerNum, int expectWorkerNum, int maxStreamNum,
                                  int groupId, int numaId, int cpuNum, int* cpuArr, bool enableBindCpuNuma)
@@ -72,7 +73,7 @@ ThreadPoolGroup::ThreadPoolGroup(int maxWorkerNum, int expectWorkerNum, int maxS
       m_sessionCount(0),
       m_waitServeSessionCount(0),
       m_processTaskCount(0),
-      m_hasHanged(0),
+      m_isTooBusy(0),
       m_groupId(groupId),
       m_numaId(numaId),
       m_groupCpuNum(cpuNum),
@@ -192,11 +193,15 @@ void ThreadPoolGroup::ReleaseWorkerSlot(int i)
 
 void ThreadPoolGroup::WaitReady()
 {
-    while (true) {
+    int cnt = 0;
+    while (cnt++ < WAIT_READY_MAX_TIMES) {
         if (m_listenerNum == 1) {
             break;
         }
         pg_usleep(500);
+    }
+    if (m_listenerNum != 1) {
+        ereport(ERROR, (errmsg_internal("ThreadPoolGroup::WaitReady() timeout, m_listenerNum= %d", m_listenerNum)));
     }
 }
 
@@ -244,7 +249,8 @@ void ThreadPoolGroup::AddWorkerIfNecessary()
 
     if (m_workerNum < m_expectWorkerNum) {
         for (int i = 0; i < m_expectWorkerNum; i++) {
-            if (m_workers[i].stat.slotStatus == THREAD_SLOT_UNUSE) {
+            if (m_workers[i].stat.slotStatus == THREAD_SLOT_UNUSE &&
+                g_threadPoolControler->GetScheduler()->m_canAdjustPool) {
                 if (m_workers[i].worker != NULL) {
                     pfree_ext(m_workers[i].worker);
                 }
@@ -371,25 +377,38 @@ void ThreadPoolGroup::ShutDownThreads()
     alock.unLock();
 }
 
-bool ThreadPoolGroup::IsGroupHang()
+bool ThreadPoolGroup::IsGroupTooBusy()
 {
     if (pg_atomic_exchange_u32((volatile uint32*)&m_processTaskCount, 0) != 0 ||
         m_idleWorkerNum != 0)
         return false;
 
-    bool ishang = m_listener->GetSessIshang(&m_current_time, &m_sessionId);
-    return ishang;
+    bool isTooBusy = m_listener->GetSessIshang(&m_current_time, &m_sessionId);
+    return isTooBusy;
 }
 
-void ThreadPoolGroup::SetGroupHanged(bool isHang)
+bool ThreadPoolGroup::CheckGroupHang()
 {
-    pg_atomic_exchange_u32((volatile uint32*)&m_hasHanged, (uint32)isHang);
+    if (m_waitServeSessionCount == 0 || m_idleWorkerNum < m_workerNum)
+        return false;
+
+    bool isHang = m_listener->GetSessIshang(&m_current_time, &m_sessionId);
+    if (!isHang)
+        return false;
+
+    m_listener->WakeupForHang();
+    return true;
 }
 
-bool ThreadPoolGroup::IsGroupHanged()
+void ThreadPoolGroup::SetGroupTooBusy(bool isTooBusy)
+{
+    pg_atomic_exchange_u32((volatile uint32*)&m_isTooBusy, (uint32)isTooBusy);
+}
+
+bool ThreadPoolGroup::isGroupAlreadyTooBusy()
 {
     pg_memory_barrier();
-    return m_hasHanged != 0;
+    return m_isTooBusy != 0;
 }
 
 void ThreadPoolGroup::AttachThreadToCPU(ThreadId thread, int cpu)
@@ -513,9 +532,10 @@ void ThreadPoolGroup::ReturnStreamToPool(Dlelem* elem)
 
 void ThreadPoolGroup::RemoveStreamFromPool(Dlelem* elem, int idx)
 {
-    m_freeStreamList->Remove(elem);
-    pg_atomic_fetch_sub_u32((volatile uint32*)&m_idleStreamNum, 1);
     pthread_mutex_lock(&m_mutex);
+    if (elem && m_freeStreamList->RemoveConfirm(elem)) {
+        (void)pg_atomic_fetch_sub_u32((volatile uint32*)&m_idleStreamNum, 1);
+    }
     m_streams[idx].stat.slotStatus = THREAD_SLOT_UNUSE;
     m_streamNum--;
     pthread_mutex_unlock(&m_mutex);
@@ -533,6 +553,7 @@ void ThreadPoolGroup::ReduceStreams()
                 break;
             }
             ThreadPoolStream* stream = (ThreadPoolStream*)DLE_VAL(elem);
+            pg_atomic_fetch_sub_u32((volatile uint32*)&m_idleStreamNum, 1);
             stream->WakeUpToUpdate(THREAD_EXIT);
         }
     }

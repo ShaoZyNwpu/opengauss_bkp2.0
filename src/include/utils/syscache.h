@@ -61,7 +61,7 @@ enum SysCacheIdentifier {
     DATABASEOID,
     DATASOURCENAME,
     DATASOURCEOID,
-    DB4AI_MODELOID,
+    SUBSCRIPTIONRELMAP,
     DB4AI_MODEL,
     DEFACLROLENSPOBJ,
     DIRECTORYNAME,
@@ -129,8 +129,14 @@ enum SysCacheIdentifier {
     STREAMCQLOOKUPID,
     STREAMCQMATRELID,
     STREAMCQOID,
+#ifdef ENABLE_MULTIPLE_NODES
     STREAMCQRELID,
     STREAMCQSCHEMACHANGE,
+#endif
+#ifndef ENABLE_MULTIPLE_NODES
+    EVENTTRIGGERNAME,
+    EVENTTRIGGEROID,
+#endif
     STREAMOID,
     STREAMRELID,
     REAPERCQOID,
@@ -161,7 +167,8 @@ enum SysCacheIdentifier {
     UIDRELID,
     DBPRIVOID,
     DBPRIVROLE,
-    DBPRIVROLEPRIV
+    DBPRIVROLEPRIV,
+    SETTYPOIDNAME
 };
 struct cachedesc {
     Oid reloid;   /* OID of the relation being cached */

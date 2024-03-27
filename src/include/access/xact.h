@@ -54,7 +54,9 @@ typedef enum {
     XACT_EVENT_PREPARE,
     XACT_EVENT_COMMIT_PREPARED,
     XACT_EVENT_ROLLBACK_PREPARED,
-    XACT_EVENT_PREROLLBACK_CLEANUP  // For MOT, to cleanup some internal resources.
+    XACT_EVENT_PREROLLBACK_CLEANUP, // For MOT, to cleanup some internal resources.
+    XACT_EVENT_POST_COMMIT_CLEANUP, // For MOT, to cleanup some dropped function JIT sources.
+    XACT_EVENT_STMT_FINISH          // For MOT, to notify end of statement.
 } XactEvent;
 
 typedef void (*XactCallback)(XactEvent event, void* arg);
@@ -62,6 +64,7 @@ typedef void (*XactCallback)(XactEvent event, void* arg);
 typedef enum {
     SUBXACT_EVENT_START_SUB,
     SUBXACT_EVENT_COMMIT_SUB,
+    SUBXACT_EVENT_CLEANUP_SUB,
     SUBXACT_EVENT_ABORT_SUB
 } SubXactEvent;
 
@@ -159,6 +162,7 @@ typedef struct xl_xact_commit {
     int nlibrary;          /* number of library */
     /* Array of ColFileNode(s) to drop at commit */
     ColFileNodeRel xnodes[1]; /* VARIABLE LENGTH ARRAY */
+                           /* ColFileNode is used in new verion */
                            /* ARRAY OF COMMITTED SUBTRANSACTION XIDs FOLLOWS */
                            /* ARRAY OF SHARED INVALIDATION MESSAGES FOLLOWS */
                            /* xl_xact_origin if XACT_HAS_ORIGIN present */
@@ -191,8 +195,13 @@ typedef struct xl_xact_abort {
     int nlibrary;          /* number of library */
     /* Array of ColFileNode(s) to drop at abort */
     ColFileNodeRel xnodes[1]; /* VARIABLE LENGTH ARRAY */
+						   /* ColFileNode is used in new verion */
                            /* ARRAY OF ABORTED SUBTRANSACTION XIDs FOLLOWS */
 } xl_xact_abort;
+
+#define GET_SUB_XACTS(xnodes, nRels, compress)                            \
+    (compress) ? ((TransactionId *)&(((ColFileNode *)(void *)(xnodes))[(nRels)])) \
+               : ((TransactionId *)&(((ColFileNodeRel *)(void *)(xnodes))[(nRels)]))
 
 /* Note the intentional lack of an invalidation message array c.f. commit */
 
@@ -260,6 +269,99 @@ typedef struct {
     LocalSysDBCache *lsc_dbcache;
 } StreamTxnContext;
 
+/*
+ *     transaction states - transaction state from server perspective
+ */
+typedef enum TransState {
+    TRANS_DEFAULT,    /* idle */
+    TRANS_START,      /* transaction starting */
+    TRANS_INPROGRESS, /* inside a valid transaction */
+    TRANS_COMMIT,     /* commit in progress */
+    TRANS_ABORT,      /* abort in progress */
+    TRANS_PREPARE,     /* prepare in progress */
+    TRANS_UNDO        /* applying undo */
+} TransState;
+
+/*
+ *     transaction block states - transaction state of client queries
+ *
+ * Note: the subtransaction states are used only for non-topmost
+ * transactions; the others appear only in the topmost transaction.
+ */
+typedef enum TBlockState {
+    /* not-in-transaction-block states */
+    TBLOCK_DEFAULT, /* idle */
+    TBLOCK_STARTED, /* running single-query transaction */
+
+    /* transaction block states */
+    TBLOCK_BEGIN,         /* starting transaction block */
+    TBLOCK_INPROGRESS,    /* live transaction */
+    TBLOCK_END,           /* COMMIT received */
+    TBLOCK_ABORT,         /* failed xact, awaiting ROLLBACK */
+    TBLOCK_ABORT_END,     /* failed xact, ROLLBACK received */
+    TBLOCK_ABORT_PENDING, /* live xact, ROLLBACK received */
+    TBLOCK_PREPARE,       /* live xact, PREPARE received */
+    TBLOCK_UNDO,          /* Need rollback to be executed for this topxact */
+
+    /* subtransaction states */
+    TBLOCK_SUBBEGIN,         /* starting a subtransaction */
+    TBLOCK_SUBINPROGRESS,    /* live subtransaction */
+    TBLOCK_SUBRELEASE,       /* RELEASE received */
+    TBLOCK_SUBCOMMIT,        /* COMMIT received while TBLOCK_SUBINPROGRESS */
+    TBLOCK_SUBABORT,         /* failed subxact, awaiting ROLLBACK */
+    TBLOCK_SUBABORT_END,     /* failed subxact, ROLLBACK received */
+    TBLOCK_SUBABORT_PENDING, /* live subxact, ROLLBACK received */
+    TBLOCK_SUBRESTART,       /* live subxact, ROLLBACK TO received */
+    TBLOCK_SUBABORT_RESTART, /* failed subxact, ROLLBACK TO received */
+    TBLOCK_SUBUNDO           /* Need rollback to be executed for this subxact */
+} TBlockState;
+
+/*
+ *     transaction state structure
+ */
+struct TransactionStateData {
+#ifdef PGXC /* PGXC_COORD */
+    /* my GXID, or Invalid if none */
+    GlobalTransactionId transactionId;
+    GTM_TransactionKey txnKey;
+    bool isLocalParameterUsed; /* Check if a local parameter is active
+                                * in transaction block (SET LOCAL, DEFERRED) */
+    DList *savepointList;      /* SavepointData list */
+#else
+    TransactionId transactionId; /* my XID, or Invalid if none */
+#endif
+    SubTransactionId subTransactionId;   /* my subxact ID */
+    char *name;                          /* savepoint name, if any */
+    int savepointLevel;                  /* savepoint level */
+    TransState state;                    /* low-level state */
+    TBlockState blockState;              /* high-level state */
+    int nestingLevel;                    /* transaction nesting depth */
+    int gucNestLevel;                    /* GUC context nesting depth */
+    MemoryContext curTransactionContext; /* my xact-lifetime context */
+    ResourceOwner curTransactionOwner;   /* my query resources */
+    TransactionId *childXids;            /* subcommitted child XIDs, in XID order */
+    int nChildXids;                      /* # of subcommitted child XIDs */
+    int maxChildXids;                    /* allocated size of childXids[] */
+    Oid prevUser;                        /* previous CurrentUserId setting */
+    int prevSecContext;                  /* previous SecurityRestrictionContext */
+    bool prevXactReadOnly;               /* entry-time xact r/o state */
+    bool startedInRecovery;              /* did we start in recovery? */
+    bool didLogXid;                      /* has xid been included in WAL record? */
+    struct TransactionStateData* parent; /* back link to parent */
+
+#ifdef ENABLE_MOT
+    /* which storage engine tables are used in current transaction for D/I/U/S statements */
+    StorageEngineType storageEngineType;
+#endif
+
+    UndoRecPtr first_urp[UNDO_PERSISTENCE_LEVELS]; /* First UndoRecPtr create by this transaction */
+    UndoRecPtr latest_urp[UNDO_PERSISTENCE_LEVELS]; /* Last UndoRecPtr created by this transaction */
+    UndoRecPtr latest_urp_xact[UNDO_PERSISTENCE_LEVELS]; /* Last UndoRecPtr created by this transaction including its
+                                                          * parent if any */
+    bool perform_undo;
+    bool  subXactLock;
+};
+
 #define STCSaveElem(dest, src) ((dest) = (src))
 #define STCRestoreElem(dest, src) ((src) = (dest))
 
@@ -306,7 +408,6 @@ extern TransactionId GetCurrentTransactionIdIfAny(void);
 extern GTM_TransactionHandle GetTransactionHandleIfAny(TransactionState s);
 extern GTM_TransactionHandle GetCurrentTransactionHandleIfAny(void);
 extern TransactionState GetCurrentTransactionState(void);
-extern TransactionId GetParentTransactionIdIfAny(TransactionState s);
 extern void ResetTransactionInfo(void);
 extern void EndParallelWorkerTransaction(void);
 
@@ -327,7 +428,6 @@ extern bool GetCurrentCommandIdUsed(void);
 extern TimestampTz GetCurrentTransactionStartTimestamp(void);
 extern TimestampTz GetCurrentStatementStartTimestamp(void);
 extern TimestampTz GetCurrentStatementLocalStartTimestamp(void);
-extern TimestampTz GetCurrentTransactionStopTimestamp(void);
 extern void SetCurrentStatementStartTimestamp();
 #ifdef PGXC
 extern TimestampTz GetCurrentGTMStartTimestamp(void);
@@ -421,7 +521,7 @@ extern void parseAndRemoveLibrary(char* library, int nlibrary);
 extern bool IsInLiveSubtransaction();
 extern void ExtendCsnlogForSubtrans(TransactionId parent_xid, int nsub_xid, TransactionId* sub_xids);
 extern CommitSeqNo SetXact2CommitInProgress(TransactionId xid, CommitSeqNo csn);
-extern void XactGetRelFiles(XLogReaderState* record, ColFileNodeRel** xnodesPtr, int* nrelsPtr);
+extern void XactGetRelFiles(XLogReaderState* record, ColFileNode** xnodesPtr, int* nrelsPtr, bool* compress);
 extern bool XactWillRemoveRelFiles(XLogReaderState *record);
 extern HTAB* relfilenode_hashtbl_create();
 extern CommitSeqNo getLocalNextCSN();
@@ -454,9 +554,11 @@ extern void ApplyUndoActions(void);
 extern void SetUndoActionsInfo(void);
 extern void ResetUndoActionsInfo(void);
 extern bool CanPerformUndoActions(void);
-extern void push_unlink_rel_to_hashtbl(ColFileNodeRel *xnodes, int nrels);
+extern void push_unlink_rel_to_hashtbl(ColFileNode *xnodes, int nrels);
 
 extern void XactCleanExceptionSubTransaction(SubTransactionId head);
 extern char* GetCurrentTransactionName();
 extern List* GetTransactionList(List *head);
+extern void BeginTxnForAutoCommitOff();
+extern bool IsTransactionInProgressState();
 #endif /* XACT_H */

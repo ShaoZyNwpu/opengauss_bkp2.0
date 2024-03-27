@@ -138,6 +138,10 @@ static bool process_inside_value(const StatementData *statement_data, RawValue *
     rc = memset_s(err_msg, MAX_ERRMSG_LENGTH, 0, MAX_ERRMSG_LENGTH);
     securec_check_c(rc, "\0", "\0");
     if (!raw_value->process(cached_column, err_msg)) {
+        if (statement_data->conn->errorMessage.len != 0) {
+            return false;
+        }
+
         if (strlen(err_msg) == 0) {
             printfPQExpBuffer(&statement_data->conn->errorMessage,
                 libpq_gettext("ERROR(CLIENT): failed to process data of processed column\n"));
@@ -383,7 +387,6 @@ DecryptDataRes ValuesProcessor::deprocess_value(PGconn *conn, const unsigned cha
          * if the size is smaller the size of Oid, so setting oid is not there
          * and this is an error
          */
-        fprintf(stderr, "ERROR(CLIENT): wrong value for processed column\n");
         if (format == 0) {
             libpq_free(unescaped_processed_data);
         }
@@ -450,7 +453,7 @@ DecryptDataRes ValuesProcessor::deprocess_value(PGconn *conn, const unsigned cha
 const bool ValuesProcessor::textual_rep(const Oid oid)
 {
     return (oid != BOOLOID && oid != INT8OID && oid != INT2OID && oid != INT1OID && oid != INT4OID && oid != OIDOID &&
-        oid != NUMERICOID);
+        oid != NUMERICOID && oid != FLOAT4OID && oid != FLOAT8OID);
 }
 
 void ValuesProcessor::process_text_format(unsigned char **plain_text, size_t &plain_text_size,

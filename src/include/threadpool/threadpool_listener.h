@@ -36,6 +36,7 @@ public:
     ThreadPoolGroup* m_group;
     volatile bool m_reaperAllSession;
     bool m_getKilled;
+    volatile int m_isHang;
 
     ThreadPoolListener(ThreadPoolGroup* group);
     ~ThreadPoolListener();
@@ -45,13 +46,16 @@ public:
     bool TryFeedWorker(ThreadPoolWorker* worker);
     void AddNewSession(knl_session_context* session);
     void WaitTask();
-    void DelSessionFromEpoll(knl_session_context* session);
+    void DelSessionFromEpoll(knl_session_context* session, bool sub_count);
     void RemoveWorkerFromList(ThreadPoolWorker* worker);
     void AddEpoll(knl_session_context* session);
+    void dispatch_socked_closed_session(knl_session_context* session);
     void SendShutDown();
     void ReaperAllSession();
     void ShutDown() const;
     bool GetSessIshang(instr_time* current_time, uint64* sessionId);
+    void WakeupForHang();
+    void WakeupReadySessionList();
 
     inline ThreadPoolGroup* GetGroup()
     {
@@ -66,16 +70,6 @@ public:
         m_tid = 0;
     }
 
-#ifdef ENABLE_LITE_MODE
-    inline bool IsBusy()
-    {
-        if (m_group->m_waitServeSessionCount == 0 && m_group->m_processTaskCount > 2) {
-            return false;
-        } else {
-            return true;
-        }
-    }
-#endif
 private:
     void HandleConnEvent(int nevets);
     knl_session_context* GetSessionBaseOnEvent(struct epoll_event* ev);
@@ -100,8 +94,10 @@ private:
     int m_session_nbucket;
     Dllist *m_session_bucket;  // add rwlock
     pthread_rwlock_t *m_session_rw_locks;
-    uint32 m_match_search;
+    volatile uint32 m_match_search;
+    volatile uint32 m_uninit_count;
     const uint32 MATCH_SEARCH_THRESHOLD = 10;
+    const uint32 UNINIT_SESS_THRESHOLD = 10;
 };
 
 #endif /* THREAD_POOL_LISTENER_H */

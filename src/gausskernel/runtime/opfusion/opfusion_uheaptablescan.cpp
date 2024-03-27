@@ -55,7 +55,7 @@ UHeapTableScanFusion::UHeapTableScanFusion(SeqScan *node, PlannedStmt *planstmt,
 void UHeapTableScanFusion::Init(long max_rows)
 {
     m_rel = heap_open(m_reloid, AccessShareLock);
-    m_scan = (UHeapScanDesc)UHeapBeginScan(m_rel, GetActiveSnapshot(), m_tupDesc->natts);
+    m_scan = (UHeapScanDesc)UHeapBeginScan(m_rel, GetActiveSnapshot(), m_tupDesc->natts, NULL);
     *m_direction = ForwardScanDirection;
     Assert(m_scan != NULL);
 }
@@ -100,7 +100,7 @@ TupleTableSlot *UHeapTableScanFusion::getTupleSlot()
             m_tmpisnull[i] = m_isnull[m_attrno[i] - 1];
         }
 
-        HeapTuple tmptup = (HeapTuple)tableam_tops_form_tuple(m_tupDesc, m_tmpvals, m_tmpisnull, HEAP_TUPLE);
+        HeapTuple tmptup = (HeapTuple)tableam_tops_form_tuple(m_tupDesc, m_tmpvals, m_tmpisnull);
         Assert(tmptup != NULL);
 
         (void)ExecStoreTuple(tmptup, /* tuple to store */

@@ -50,6 +50,10 @@ typedef struct BgWorkerContext {
     char        *databaseName;
     char        *userName;
     bool        enable_cluster_resize;
+    uint64      parent_query_id;
+    uint64      parent_session_id;
+    Oid         myTempNamespace;
+    Oid         myTempToastNamespace;
     bgworker_main main_entry;
     bgworker_exit exit_entry;
 } BgWorkerContext;
@@ -89,6 +93,7 @@ extern bool RegisterBackgroundWorker(BackgroundWorker *worker);
 extern int LaunchBackgroundWorkers(int nworkers, void *bgshared, bgworker_main bgmain, bgworker_exit bgexit);
 extern void BackgroundWorkerMain(void);
 extern bool IsBgWorkerProcess(void);
+extern bool IsDMSWorkerProcess(void);
 extern void BgworkerListSyncQuit();
 extern void BgworkerListWaitFinish(int *nparticipants);
 extern void InitBgworkerGlobal(void);

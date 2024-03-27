@@ -62,8 +62,6 @@ typedef struct ReadPipeline {
 
 #define MAX_XLOG_READ_BUFFER (0xFFFFF) /* 8k uint */
 
-#define MAX_ALLOC_SEGNUM (4) /* 16* 4 */
-
 typedef enum {
     WORKER_STATE_STOP = 0,
     WORKER_STATE_RUN,
@@ -71,15 +69,6 @@ typedef enum {
     WORKER_STATE_EXIT,
     WORKER_STATE_EXITING,
 } ReadWorkersState;
-
-typedef enum {
-    TRIGGER_NORMAL = 0,
-    TRIGGER_PRIMARY,
-    TRIGGER_STADNBY,
-    TRIGGER_FAILOVER,
-    TRIGGER_SWITCHOVER,
-    TRIGGER_SMARTSHUTDOWN,
-} Enum_TriggeredState;
 
 typedef enum {
     NONE,
@@ -195,7 +184,6 @@ const static uint64 OUTPUT_WAIT_COUNT = 0x7FFFFFF;
 const static uint64 PRINT_ALL_WAIT_COUNT = 0x7FFFFFFFF;
 extern RedoItem g_redoEndMark;
 extern RedoItem g_terminateMark;
-extern uint32 g_startupTriggerState;
 extern uint32 g_readManagerTriggerFlag;
 
 inline int get_batch_redo_num()
@@ -237,6 +225,7 @@ PGPROC *StartupPidGetProc(ThreadId pid);
 extern void SetStartupBufferPinWaitBufId(int bufid);
 extern void GetStartupBufferPinWaitBufId(int *bufids, uint32 len);
 void UpdateStandbyState(HotStandbyState newState);
+void UpdateMinRecoveryForTrxnRedoThd(XLogRecPtr minRecoveryPoint);
 
 /* Redo end state saved by each page worker. */
 void **GetXLogInvalidPagesFromWorkers();
@@ -252,13 +241,11 @@ void GetReplayedRecPtr(XLogRecPtr *startPtr, XLogRecPtr *endPtr);
 void StartupSendFowarder(RedoItem *item);
 XLogRecPtr GetSafeMinCheckPoint();
 RedoWaitInfo redo_get_io_event(int32 event_id);
-void redo_get_wroker_statistic(uint32 *realNum, RedoWorkerStatsData *worker, uint32 workerLen);
+void redo_get_worker_statistic(uint32 *realNum, RedoWorkerStatsData *worker, uint32 workerLen);
 void CheckCommittingCsnList();
-void redo_get_wroker_time_count(RedoWorkerTimeCountsInfo **workerCountInfoList, uint32 *realNum);
+void redo_get_worker_time_count(RedoWorkerTimeCountsInfo **workerCountInfoList, uint32 *realNum);
 void DumpDispatcher();
 
 }  // namespace extreme_rto
-
-extreme_rto::Enum_TriggeredState CheckForSatartupStatus(void);
 
 #endif

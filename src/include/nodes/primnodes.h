@@ -22,6 +22,7 @@
 #include "access/attnum.h"
 #include "nodes/pg_list.h"
 #include "nodes/params.h"
+#include "db4ai/db4ai.h"
 
 /* ----------------------------------------------------------------
  *						node definitions
@@ -67,6 +68,13 @@ typedef enum OptCompress {
     COMPRESS_HIGH,
 } OptCompress;
 
+/* How to handle rows that duplicate unique key values */
+typedef enum OnDuplicateAction {
+    DUPLICATE_ERROR = 0,
+    DUPLICATE_IGNORE,
+    DUPLICATE_REPLACE
+} OnDuplicate;
+
 /*
  * RangeVar - range variable, used in FROM clauses
  *
@@ -97,6 +105,8 @@ typedef struct RangeVar {
     Oid foreignOid;
 #endif
     bool withVerExpr;
+    List* partitionNameList; /* for FROM table PARTITION (p1, subp2, ...) clause */
+    List* indexhints;        /* a list of b mode index hint indexHintDefinition members */
 } RangeVar;
 
 /*
@@ -114,11 +124,18 @@ typedef struct IntoClause {
     char* tableSpaceName;    /* table space to use, or NULL */
     bool skipData;           /* true for WITH NO DATA */
     bool ivm;                /* true for WITH IVM */
-    char relkind;     /* RELKIND_RELATION or RELKIND_MATVIEW */
+    char relkind;            /* RELKIND_RELATION or RELKIND_MATVIEW */
+    List* userVarList;       /* user define variables list */
+    List* copyOption;        /* copyOption for select...into statement */
+    char* filename;          /* filename for select...into statement */
+    bool is_outfile;         /* true for outfile */
 #ifdef PGXC
     struct DistributeBy* distributeby; /* distribution to use, or NULL */
     struct PGXCSubCluster* subcluster; /* subcluster node members */
 #endif
+    List* tableElts;         /* column definitions(list of ColumnDef) */
+    Node *autoIncStart; /* DefElem for AUTO_INCREMENT = value*/
+    OnDuplicateAction onduplicate;     /* how to handle rows that duplicate unique key values */
 } IntoClause;
 
 /* ----------------------------------------------------------------
@@ -236,8 +253,9 @@ typedef struct Param {
     int32 paramtypmod;   /* typmod value, if known */
     Oid paramcollid;     /* OID of collation, or InvalidOid if none */
     int location;        /* token location, or -1 if unknown */
-    Oid tableOfIndexType; /* type Oid of table of */
+    Oid tableOfIndexType; /* type Oid of table of (wait to discard) */
     Oid recordVarTypOid; /* package record var's composite type oid */
+    List* tableOfIndexTypeList; /* type Oid list of table of, max size 6 */
 } Param;
 
 /*
@@ -839,6 +857,7 @@ typedef struct CaseExpr {
     List* args;      /* the arguments (list of WHEN clauses) */
     Expr* defresult; /* the default result (ELSE clause) */
     int location;    /* token location, or -1 if unknown */
+    bool fromDecode; /* whether is parsed from decode expr, no need to (de-)serialize */
 } CaseExpr;
 
 /*
@@ -1025,6 +1044,12 @@ typedef struct XmlExpr {
     int location; /* token location, or -1 if unknown */
 } XmlExpr;
 
+typedef struct PrefixKey {
+    Expr xpr;
+    Expr* arg; /* should be a ColumnRef or Var */
+    int length; /* prefix length */
+} PrefixKey;
+
 /* ----------------
  * NullTest
  *
@@ -1138,6 +1163,7 @@ typedef struct SetToDefault {
     int32 typeMod; /* typemod for substituted value */
     Oid collation; /* collation for the substituted value */
     int location;  /* token location, or -1 if unknown */
+    bool lrchild_unknown;
 } SetToDefault;
 
 /* value expressions (changed for client_logic feature) */
@@ -1165,6 +1191,15 @@ typedef struct CurrentOfExpr {
     char* cursor_name; /* name of referenced cursor, or NULL */
     int cursor_param;  /* refcursor parameter number, or 0 */
 } CurrentOfExpr;
+
+/* SetVariableExpr used for getting guc variable's value */
+typedef struct {
+    Expr xpr;
+    char* name;
+    Expr* value;
+    bool is_session;    /* true is session, only used in B compability */
+    bool is_global;     /* true is global, only used in B compability */
+} SetVariableExpr;
 
 /* --------------------
  * TargetEntry -
@@ -1231,6 +1266,9 @@ typedef struct TargetEntry {
     AttrNumber resorigcol; /* column's number in source table */
     bool resjunk;          /* set to true to eliminate the attribute from
                             * final target list */
+    Index rtindex;         /* used when multiple modifying. It indicates the resultRelation 
+                            * to which this TLE belongs. */
+    bool isStartWithPseudo; 
 } TargetEntry;
 
 /* mainly support Start with */
@@ -1430,62 +1468,5 @@ typedef struct UpsertExpr {
 #define DB4AI_SNAPSHOT_VERSION_DELIMITER 1
 #define DB4AI_SNAPSHOT_VERSION_SEPARATOR 2
 
-typedef enum MetricML{
-    // classifier
-    METRIC_ML_ACCURACY,
-    METRIC_ML_F1,
-    METRIC_ML_PRECISION,
-    METRIC_ML_RECALL,
-    // General purpouse
-    METRIC_ML_LOSS,
-    // regression
-    METRIC_ML_MSE,
-    // distance
-    METRIC_ML_DISTANCE_L1,
-    METRIC_ML_DISTANCE_L2,
-    METRIC_ML_DISTANCE_L2_SQUARED,
-    METRIC_ML_DISTANCE_L_INF,
-    // xgboost
-    METRIC_ML_AUC,    // area under curve
-    METRIC_ML_AUC_PR, // area under pr curve
-    METRIC_ML_MAP,    // mean avg. precision
-    METRIC_ML_RMSE,   // root mean square err
-    METRIC_ML_RMSLE,  // root mean square log err
-    METRIC_ML_MAE,    // mean abs. value
-    METRIC_ML_INVALID,
-} MetricML;
-
-typedef enum {
-   TYPE_BOOL = 0,
-   TYPE_BYTEA,
-   TYPE_INT32,
-   TYPE_INT64,
-   TYPE_FLOAT32,
-   TYPE_FLOAT64,
-   TYPE_FLOAT64ARRAY,
-   TYPE_NUMERIC,
-   TYPE_TEXT,
-   TYPE_VARCHAR,
-   TYPE_INVALID_PREDICTION,
-} PredictionType;
-
-typedef enum {
-    // algorithms implememted through the generic API
-    LOGISTIC_REGRESSION = 0,
-    SVM_CLASSIFICATION,
-    LINEAR_REGRESSION,
-    PCA,
-    KMEANS,
-    XG_REG_LOGISTIC,
-    XG_BIN_LOGISTIC,
-    XG_REG_SQE, // regression with squared error
-    XG_REG_GAMMA,
-    MULTICLASS,
-
-    // for internal use
-    INVALID_ALGORITHM_ML,
-
-
-} AlgorithmML;
 
 #endif /* PRIMNODES_H */

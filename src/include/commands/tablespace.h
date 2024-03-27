@@ -15,9 +15,9 @@
 #define TABLESPACE_H
 
 #include "access/xloginsert.h"
+#include "catalog/objectaddress.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
-#include "storage/dfs/dfs_connector.h"
 #include "workload/workload.h"
 #include "catalog/indexing.h"
 
@@ -31,7 +31,7 @@
 #define CRITICA_POINT_VALUE 104857600 /* 100 MB */
 #define TABLESPACE_THRESHOLD_RATE 0.9 /* threshold rate */
 #define TABLESPACE_UNLIMITED_STRING "unlimited"
-#define PG_LOCATION_DIR "pg_location"
+#define PG_LOCATION_DIR (g_instance.datadir_cxt.locationDir)
 
 typedef struct TableSpaceUsageSlot {
     uint64 maxSize;
@@ -94,18 +94,18 @@ typedef struct TableSpaceOpts {
     {                                                                                                          \
         if (RelationIsSegmentTable(relation)) {                                                            \
             TableSpaceUsageManager::IsExceedMaxsize(relation->rd_node.spcNode, 0, true);                       \
-        } else if (relation->rd_id != ClassOidIndexId) {                                                                                               \
+        } else if (relation->rd_id >= FirstBootstrapObjectId) {                                                \
             TableSpaceUsageManager::IsExceedMaxsize(relation->rd_node.spcNode, requestSize, false);            \
         }                                                                                                      \
         perm_space_increase(                                                                                   \
             relation->rd_rel->relowner, requestSize, RelationUsesSpaceType(relation->rd_rel->relpersistence)); \
     }
 
-extern void CreateTableSpace(CreateTableSpaceStmt* stmt);
+extern Oid CreateTableSpace(CreateTableSpaceStmt* stmt);
 extern void DropTableSpace(DropTableSpaceStmt* stmt);
-extern void RenameTableSpace(const char* oldname, const char* newname);
-extern void AlterTableSpaceOwner(const char* name, Oid newOwnerId);
-extern void AlterTableSpaceOptions(AlterTableSpaceOptionsStmt* stmt);
+extern ObjectAddress RenameTableSpace(const char* oldname, const char* newname);
+extern ObjectAddress AlterTableSpaceOwner(const char* name, Oid newOwnerId);
+extern Oid AlterTableSpaceOptions(AlterTableSpaceOptionsStmt* stmt);
 extern bool IsSpecifiedTblspc(Oid spcOid, const char* specifedTblspc);
 
 extern void TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo);
@@ -121,10 +121,6 @@ extern char* GetTablespaceOptionValue(Oid spcNode, const char* optionName);
  * Get the all optioin values.
  */
 extern List* GetTablespaceOptionValues(Oid spcNode);
-/*
- * Get the DfsSrvOptions info from pg_tablespace.
- */
-extern DfsSrvOptions* GetDfsSrvOptions(Oid spcNode);
 
 extern void PrepareTempTablespaces(void);
 

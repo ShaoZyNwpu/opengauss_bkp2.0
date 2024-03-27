@@ -115,6 +115,7 @@ enum ModuleId {
     MOD_WALRECEIVER,  /* walreceiver */
     MOD_USTORE,     /* ustore */
     MOD_UNDO,       /* undo */
+    MOD_TIMECAPSULE, /* timecapsule */
     MOD_GEN_COL,   /* generated column */
     MOD_DCF,        /* DCF paxos */
     MOD_DB4AI,      /* DB4AI & AUTOML */
@@ -128,6 +129,7 @@ enum ModuleId {
     MOD_SEC_SDD,       /* Security sub-module: sensitive data discovery */
     MOD_SEC_TDE,       /* Security sub-module: transparent data encryption */
 
+    MOD_COMM_FRAMEWORK,    /* for basic communication framework */
     MOD_COMM_PROXY,    /* for cbb comm_proxy */
     MOD_COMM_POOLER,   /* for pooler communication */
     MOD_VACUUM,     /* lazy vacuum */
@@ -135,8 +137,18 @@ enum ModuleId {
     MOD_SPI,
     MOD_NEST_COMPILE,
     MOD_RESOWNER,
+    MOD_GSSTACK,
     MOD_LOGICAL_DECODE,    /* logical decode */
     MOD_GPRC, /* global package runtime cache */
+    MOD_DISASTER_READ,
+    MODE_REPSYNC, /* debug info for func SyncRepWaitForLSN */
+    MOD_SQLPATCH,
+    MOD_DMS, /* DMS */
+    MOD_DSS, /* dss api module */
+
+    MOD_GPI, /* debug info for global partition index */
+    MOD_PARTITION,
+    MOD_SRF, /* debug info for SRF */
 
     /*
      * Add your module id above.

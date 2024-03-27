@@ -65,6 +65,7 @@ typedef struct {
     Query* viewParse; /* the query which defines/populates data */
     /* These fields are filled by intorel_startup: */
     Relation rel;            /* relation to write to */
+    ObjectAddress reladdr;      /* address of rel, for ExecCreateTableAs */
     CommandId output_cid;    /* cmin to insert in output tuples */
     int hi_options;          /* heap_insert performance options */
     BulkInsertState bistate; /* bulk insert state */
@@ -313,21 +314,34 @@ int64 MlogGetMaxSeqno(Oid mlogid)
  */
 void SetRelationIsScannable(Relation relation)
 {
-   Page page;
+    Page page;
+    char* unaligned_buffer = NULL;
 
-   Assert(relation->rd_rel->relkind == RELKIND_MATVIEW);
-   Assert(relation->rd_isscannable == false);
+    Assert(relation->rd_rel->relkind == RELKIND_MATVIEW);
+    Assert(relation->rd_isscannable == false);
 
-   RelationOpenSmgr(relation);
-   page = (Page)palloc(BLCKSZ);
-   PageInit(page, BLCKSZ, 0, true);
-   PageSetChecksumInplace(page, 0);
-   smgrextend(relation->rd_smgr, MAIN_FORKNUM, 0, (char *) page, true);
-   pfree(page);
+    RelationOpenSmgr(relation);
 
-   smgrimmedsync(relation->rd_smgr, MAIN_FORKNUM);
+    if (ENABLE_DSS) {
+        unaligned_buffer = (char*)palloc(BLCKSZ + ALIGNOF_BUFFER);
+        page = (Page)BUFFERALIGN(unaligned_buffer);
+    } else {
+        page = (Page)palloc(BLCKSZ);
+    }
 
-   RelationCacheInvalidateEntry(relation->rd_id);
+    PageInit(page, BLCKSZ, 0, true);
+    PageSetChecksumInplace(page, 0);
+    smgrextend(relation->rd_smgr, MAIN_FORKNUM, 0, (char *) page, true);
+
+    if (ENABLE_DSS) {
+        pfree(unaligned_buffer);
+    } else {
+        pfree(page);
+    }
+
+    smgrimmedsync(relation->rd_smgr, MAIN_FORKNUM);
+
+    RelationCacheInvalidateEntry(relation->rd_id);
 }
 
 static Index get_index_ref(QueryDesc* queryDesc, Oid relid)
@@ -382,7 +396,7 @@ static void ExecHandleMatData(TupleTableSlot *slot, Relation matview, Oid mapid,
     HeapTuple tuple;
     Oid matid = RelationGetRelid(matview);
 
-    if (slot == NULL || slot->tts_isempty) {
+    if (slot == NULL || TTS_EMPTY(slot)) {
         return;
     }
 
@@ -442,7 +456,7 @@ static void ExecHandleIncData(TupleTableSlot *slot, Relation matview, Oid mapid,
     HeapTuple tuple;
     Oid mvid = RelationGetRelid(matview);
 
-    if (slot == NULL || slot->tts_isempty) {
+    if (slot == NULL || TTS_EMPTY(slot)) {
         return;
     }
 
@@ -590,7 +604,7 @@ static bool mlog_form_tuple(Relation mlog, HeapTuple mlogTup, Relation rel, Heap
     Datum rel_values[rel->rd_att->natts] = {0};
     bool rel_nulls[rel->rd_att->natts] = {0};
     for (i = 0, j = 0; i < rel->rd_att->natts; i++) {
-        if (rel->rd_att->attrs[i]->attisdropped) {
+        if (rel->rd_att->attrs[i].attisdropped) {
             rel_nulls[i] = true;
         } else {
             rel_values[i] = values[MlogAttributeNum + j];
@@ -791,7 +805,7 @@ static void ExecutorRefreshMatInc(QueryDesc* queryDesc, Query *query,
     return;
 }
 
-void ExecRefreshMatViewInc(RefreshMatViewStmt *stmt, const char *queryString,
+ObjectAddress ExecRefreshMatViewInc(RefreshMatViewStmt *stmt, const char *queryString,
                  ParamListInfo params, char *completionTag)
 {
     Oid matviewOid;
@@ -802,6 +816,10 @@ void ExecRefreshMatViewInc(RefreshMatViewStmt *stmt, const char *queryString,
     QueryDesc* queryDesc = NULL;
     bool isTimeNULL = false;
     Datum curtime;
+    Oid save_userid;
+    int save_sec_context;
+    int save_nestlevel;
+    ObjectAddress address;
 
     /* Get current timestamp */
     curtime = DirectFunctionCall1(timestamptz_timestamp, GetCurrentTimestamp());
@@ -811,17 +829,26 @@ void ExecRefreshMatViewInc(RefreshMatViewStmt *stmt, const char *queryString,
      */
     matviewOid = RangeVarGetRelidExtended(stmt->relation,
                                            ExclusiveLock,
-                                           false, false, false, false,
+                                           false, false, false, true,
                                            RangeVarCallbackOwnsTable, NULL);
 
     Oid mapid = DatumGetObjectId(get_matview_mapid(matviewOid));
     Datum oldTime = get_matview_refreshtime(matviewOid, &isTimeNULL);
     if (timestamp_cmp_internal(DatumGetTimestamp(curtime),
             DatumGetTimestamp(oldTime)) <= 0) {
-        return;
+        return InvalidObjectAddress;
     }
 
     matviewRel = heap_open(matviewOid, ExclusiveLock);
+
+    /*
+     * Switch to the owner's userid, so that any functions are run as that
+     * user.  Also lock down security-restricted operations and arrange to
+     * make GUC variable changes local to this command.
+     */
+    GetUserIdAndSecContext(&save_userid, &save_sec_context);
+    SetUserIdAndSecContext(matviewRel->rd_rel->relowner, save_sec_context | SECURITY_RESTRICTED_OPERATION);
+    save_nestlevel = NewGUCNestLevel();
 
     /* Make sure it is a materialized view. */
     if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW) {
@@ -872,6 +899,7 @@ void ExecRefreshMatViewInc(RefreshMatViewStmt *stmt, const char *queryString,
 
     vacuum_mlog_for_matview(matviewOid);
 
+    ObjectAddressSet(address, RelationRelationId, matviewOid);
     /* and clean up */
     ExecutorFinish(queryDesc);
     ExecutorEnd(queryDesc);
@@ -880,14 +908,20 @@ void ExecRefreshMatViewInc(RefreshMatViewStmt *stmt, const char *queryString,
 
     heap_close(matviewRel, NoLock);
 
-    return;
+    /* Roll back any GUC changes */
+    AtEOXact_GUC(false, save_nestlevel);
+
+    /* Restore userid and security context */
+    SetUserIdAndSecContext(save_userid, save_sec_context);
+
+    return address;
 }
 
 /*
  * ExecRefreshMatViewEpq -- execute a REFRESH MATERIALIZED VIEW command.
  * The Matview must be INCREMENTAL.
  */
-void ExecRefreshIncMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
+ObjectAddress ExecRefreshIncMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
                             ParamListInfo params, char *completionTag)
 {
     Oid mapid;
@@ -898,6 +932,10 @@ void ExecRefreshIncMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
     PlannedStmt* plan = NULL;
     QueryDesc* queryDesc = NULL;
     Datum curtime;
+    Oid save_userid;
+    int save_sec_context;
+    int save_nestlevel;
+    ObjectAddress address;
 
     /* Get current timestamp */
     curtime = DirectFunctionCall1(timestamptz_timestamp, GetCurrentTimestamp());
@@ -907,10 +945,19 @@ void ExecRefreshIncMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
      */
     matviewOid = RangeVarGetRelidExtended(stmt->relation,
                                            AccessExclusiveLock,
-                                           false, false, false, false,
+                                           false, false, false, true,
                                            RangeVarCallbackOwnsTable, NULL);
     mapid = DatumGetObjectId(get_matview_mapid(matviewOid));
     matviewRel = heap_open(matviewOid, AccessExclusiveLock);
+
+    /*
+     * Switch to the owner's userid, so that any functions are run as that
+     * user.  Also lock down security-restricted operations and arrange to
+     * make GUC variable changes local to this command.
+     */
+    GetUserIdAndSecContext(&save_userid, &save_sec_context);
+    SetUserIdAndSecContext(matviewRel->rd_rel->relowner, save_sec_context | SECURITY_RESTRICTED_OPERATION);
+    save_nestlevel = NewGUCNestLevel();
 
     /* Make sure it is a materialized view. */
     if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW) {
@@ -973,12 +1020,18 @@ void ExecRefreshIncMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
     ExecutorEnd(queryDesc);
     FreeQueryDesc(queryDesc);
 
+    ObjectAddressSet(address, RelationRelationId, matviewOid);
     heap_close(matviewRel, NoLock);
+    /* Roll back any GUC changes */
+    AtEOXact_GUC(false, save_nestlevel);
 
-    return;
+    /* Restore userid and security context */
+    SetUserIdAndSecContext(save_userid, save_sec_context);
+
+    return address;
 }
 
-void ExecRefreshCtasMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
+ObjectAddress ExecRefreshCtasMatViewAll(RefreshMatViewStmt *stmt, const char *queryString,
                  ParamListInfo params, char *completionTag)
 {
     Oid matviewOid;
@@ -990,6 +1043,10 @@ void ExecRefreshCtasMatViewAll(RefreshMatViewStmt *stmt, const char *queryString
     Oid OIDNewHeap;
     DestReceiver *dest = NULL;
     Datum curtime;
+    Oid save_userid;
+    int save_sec_context;
+    int save_nestlevel;
+    ObjectAddress address;
 
     curtime = DirectFunctionCall1(timestamptz_timestamp, GetCurrentTimestamp());
 
@@ -997,9 +1054,18 @@ void ExecRefreshCtasMatViewAll(RefreshMatViewStmt *stmt, const char *queryString
      * Get a lock until end of transaction.
      */
     matviewOid = RangeVarGetRelidExtended(stmt->relation,
-                                          AccessExclusiveLock, false, false, false, false,
+                                          AccessExclusiveLock, false, false, false, true,
                                           RangeVarCallbackOwnsTable, NULL);
     matviewRel = heap_open(matviewOid, NoLock);
+
+    /*
+     * Switch to the owner's userid, so that any functions are run as that
+     * user.  Also lock down security-restricted operations and arrange to
+     * make GUC variable changes local to this command.
+     */
+    GetUserIdAndSecContext(&save_userid, &save_sec_context);
+    SetUserIdAndSecContext(matviewRel->rd_rel->relowner, save_sec_context | SECURITY_RESTRICTED_OPERATION);
+    save_nestlevel = NewGUCNestLevel();
 
     /* Make sure it is a materialized view. */
     if (matviewRel->rd_rel->relkind != RELKIND_MATVIEW) {
@@ -1087,13 +1153,21 @@ void ExecRefreshCtasMatViewAll(RefreshMatViewStmt *stmt, const char *queryString
     finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, u_sess->utils_cxt.RecentXmin, GetOldestMultiXactId());
 
     RelationCacheInvalidateEntry(matviewOid);
+
+    /* Roll back any GUC changes */
+    AtEOXact_GUC(false, save_nestlevel);
+
+    /* Restore userid and security context */
+    SetUserIdAndSecContext(save_userid, save_sec_context);
+    ObjectAddressSet(address, RelationRelationId, matviewOid);
+    return address;
 }
 
 bool isIncMatView(RangeVar *rv)
 {
     Oid matviewOid = RangeVarGetRelidExtended(rv,
                                            NoLock,
-                                           false, false, false, false,
+                                           false, false, false, true,
                                            RangeVarCallbackOwnsTable, NULL);
     Relation matviewRel = heap_open(matviewOid, AccessShareLock);
 
@@ -1131,7 +1205,7 @@ bool isIncMatView(RangeVar *rv)
  * The scannable state is changed based on whether the contents reflect the
  * result set of the materialized view's query.
  */
-void ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
+ObjectAddress ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
                  ParamListInfo params, char *completionTag)
 {
     if (isIncMatView(stmt->relation)) {
@@ -1190,7 +1264,7 @@ static void ExecCreateMatInc(QueryDesc*queryDesc, Query *query, Relation matview
         while ((tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection)) != NULL) {
             HeapTuple tmpTuple = NULL;
             /* here we want handle every tuple. */
-            if (rel->rd_tam_type == TAM_USTORE) {
+            if (rel->rd_tam_ops == TableAmUstore) {
                 tmpTuple = UHeapToHeap(rel->rd_att, (UHeapTuple)tuple);
                 tmpTuple->t_xid_base = ((UHeapTuple)tuple)->t_xid_base;
                 tmpTuple->t_data->t_choice.t_heap.t_xmin = ((UHeapTuple)tuple)->disk_tuple->xid;
@@ -1230,7 +1304,7 @@ static void ExecCreateMatInc(QueryDesc*queryDesc, Query *query, Relation matview
     return;
 }
 
-void ExecCreateMatViewInc(CreateTableAsStmt* stmt, const char* queryString, ParamListInfo params)
+ObjectAddress  ExecCreateMatViewInc(CreateTableAsStmt* stmt, const char* queryString, ParamListInfo params)
 {
     Datum curtime;
     Relation matview;
@@ -1241,6 +1315,7 @@ void ExecCreateMatViewInc(CreateTableAsStmt* stmt, const char* queryString, Para
     QueryDesc* queryDesc = NULL;
     PlannedStmt* plan = NULL;
     DestReceiver* dest = NULL;
+    ObjectAddress address;
 
     /* Get current timestamp */
     curtime = DirectFunctionCall1(timestamptz_timestamp, GetCurrentTimestamp());
@@ -1283,7 +1358,7 @@ void ExecCreateMatViewInc(CreateTableAsStmt* stmt, const char* queryString, Para
     update_matview_tuple(matviewid, true, curtime);
 
     ExecCreateMatInc(queryDesc, query, matview, mapid, curtime);
-
+    address = ((DR_intorel *) dest)->reladdr;
     (*dest->rShutdown)(dest);
 
     /* and clean up */
@@ -1301,6 +1376,7 @@ void ExecCreateMatViewInc(CreateTableAsStmt* stmt, const char* queryString, Para
     }
 
     CommandCounterIncrement();
+    return address;
 }
 
 /*
@@ -1546,12 +1622,12 @@ static Oid create_mlog_table(Oid relid)
     tablespaceid = rel->rd_rel->reltablespace;
 
     TupleDesc relDesc = rel->rd_att;
-    Form_pg_attribute* relAtts = relDesc->attrs;
+    FormData_pg_attribute* relAtts = relDesc->attrs;
 
     int relAttnumAll = relDesc->natts;
     int relAttnum = relDesc->natts;
     for (i = 0; i < relAttnumAll; i++) {
-        if (relAtts[i]->attisdropped) {
+        if (relAtts[i].attisdropped) {
             relAttnum--;
         }
     }
@@ -1563,20 +1639,20 @@ static Oid create_mlog_table(Oid relid)
     TupleDescInitEntry(tupdesc, (AttrNumber)MlogAttributeXid, "xid", INT8OID, -1, 0);
     TupleDescInitEntry(tupdesc, (AttrNumber)MlogAttributeSeqno, "seqno", INT8OID, -1, 0);
 
-    tupdesc->attrs[MlogAttributeAction - 1]->attstorage = 'p';
-    tupdesc->attrs[MlogAttributeTime - 1]->attstorage = 'p';
-    tupdesc->attrs[MlogAttributeCtid - 1]->attstorage = 'p';
-    tupdesc->attrs[MlogAttributeXid - 1]->attstorage = 'p';
-    tupdesc->attrs[MlogAttributeSeqno - 1]->attstorage = 'p';
+    tupdesc->attrs[MlogAttributeAction - 1].attstorage = 'p';
+    tupdesc->attrs[MlogAttributeTime - 1].attstorage = 'p';
+    tupdesc->attrs[MlogAttributeCtid - 1].attstorage = 'p';
+    tupdesc->attrs[MlogAttributeXid - 1].attstorage = 'p';
+    tupdesc->attrs[MlogAttributeSeqno - 1].attstorage = 'p';
 
     for (i = 1, j = 1; i <= relAttnumAll; i++) {
-        if (relAtts[i - 1]->attisdropped) {
+        if (relAtts[i - 1].attisdropped) {
             continue;
         }
         TupleDescInitEntry(tupdesc, (AttrNumber)MlogAttributeNum + j,
-                    NameStr(relAtts[i - 1]->attname), relAtts[i - 1]->atttypid,
-                    relAtts[i - 1]->atttypmod, relAtts[i - 1]->attndims);
-        tupdesc->attrs[MlogAttributeNum + j - 1]->attstorage = relAtts[i - 1]->attstorage;
+                    NameStr(relAtts[i - 1].attname), relAtts[i - 1].atttypid,
+                    relAtts[i - 1].atttypmod, relAtts[i - 1].attndims);
+        tupdesc->attrs[MlogAttributeNum + j - 1].attstorage = relAtts[i - 1].attstorage;
         j++;
     }
 
@@ -1671,7 +1747,7 @@ static Oid create_mlog_table(Oid relid)
         List *colnames = NIL;
 
         for (int i = 0; i < tupdesc->natts; i++) {
-            Form_pg_attribute attr = tupdesc->attrs[i];
+            Form_pg_attribute attr = &tupdesc->attrs[i];
             if(IsTypeDistributable(attr->atttypid)) {
                 Value *colValue = makeString(pstrdup(attr->attname.data));
                 colnames = lappend(colnames, colValue);
@@ -1799,11 +1875,11 @@ Oid create_matview_map(Oid matviewoid)
     TupleDescInitEntry(tupdesc, (AttrNumber)MatMapAttributeRelctid, "rel_ctid", TIDOID, -1, 0);
     TupleDescInitEntry(tupdesc, (AttrNumber)MatMapAttributeRelxid, "rel_xid", XIDOID, -1, 0);
 
-    tupdesc->attrs[0]->attstorage = 'p';
-    tupdesc->attrs[1]->attstorage = 'p';
-    tupdesc->attrs[2]->attstorage = 'p';
-    tupdesc->attrs[3]->attstorage = 'p';
-    tupdesc->attrs[4]->attstorage = 'p';
+    tupdesc->attrs[0].attstorage = 'p';
+    tupdesc->attrs[1].attstorage = 'p';
+    tupdesc->attrs[2].attstorage = 'p';
+    tupdesc->attrs[3].attstorage = 'p';
+    tupdesc->attrs[4].attstorage = 'p';
 
     /* add internal_mask_enable */
     reloptions = AddInternalOption(reloptions, INTERNAL_MASK_DDELETE |
@@ -2030,7 +2106,7 @@ void insert_into_mlog_table(Relation rel, Oid mlogid, HeapTuple tuple, ItemPoint
     int relAttnumAll = relDesc->natts;
     int relAttnum = relDesc->natts;
     for (i = 0; i < relAttnumAll; i++) {
-        if (relDesc->attrs[i]->attisdropped) {
+        if (relDesc->attrs[i].attisdropped) {
             relAttnum--;
         }
     }
@@ -2077,7 +2153,7 @@ void insert_into_mlog_table(Relation rel, Oid mlogid, HeapTuple tuple, ItemPoint
         heap_deform_tuple(tuple, relDesc, rel_values, rel_isnulls);
 
         for (i = 0, j = 0; i < relAttnumAll; i++) {
-            if (relDesc->attrs[i]->attisdropped) {
+            if (relDesc->attrs[i].attisdropped) {
                 ereport(DEBUG5,
                         (errmodule(MOD_OPT), errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("Skip dropped column %d on base table when insert into mlog table", i)));

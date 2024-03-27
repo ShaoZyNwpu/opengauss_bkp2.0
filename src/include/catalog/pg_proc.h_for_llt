@@ -2072,6 +2072,36 @@ DATA(insert OID =  2284 ( regexp_replace	   PGNSP PGUID 12 1 0 0 0 f f f f f f i
 DESCR("replace text using regexp");
 DATA(insert OID =  2285 ( regexp_replace	   PGNSP PGUID 12 1 0 0 0 f f f f f f i 4 0 25 "25 25 25 25" _null_ _null_ _null_ _null_ textregexreplace _null_ _null_ _null_ "" f));
 DESCR("replace text using regexp");
+DATA(insert OID =  1116 ( regexp_replace	   PGNSP PGUID 12 1 0 0 0 f f f f f f i 2 0 25 "25 25" _null_ _null_ _null_ _null_	regexp_replace_noopt _null_ _null_ _null_ "" f));
+DESCR("replace text using regexp");
+DATA(insert OID =  1117 ( regexp_replace	   PGNSP PGUID 12 1 0 0 0 f f f f f f i 4 0 25 "25 25 25 23" _null_ _null_ _null_ _null_ regexp_replace_position _null_ _null_ _null_ "" f));
+DESCR("replace text using regexp");
+DATA(insert OID =  1118 ( regexp_replace	   PGNSP PGUID 12 1 0 0 0 f f f f f f i 5 0 25 "25 25 25 23 23" _null_ _null_ _null_ _null_	regexp_replace_occur _null_ _null_ _null_ "" f));
+DESCR("replace text using regexp");
+DATA(insert OID =  1119 ( regexp_replace	   PGNSP PGUID 12 1 0 0 0 f f f f f f i 6 0 25 "25 25 25 23 23 25" _null_ _null_ _null_ _null_ regexp_replace_matchopt _null_ _null_ _null_ "" f));
+DESCR("replace text using regexp");
+DATA(insert OID =  385 ( regexp_count   PGNSP PGUID 12 1 1 0 0 f f f f t f i 2 0 23 "25 25" _null_ _null_ _null_ _null_ regexp_count_noopt _null_ _null_ _null_ "" f));
+DESCR("find all match count for regexp");
+DATA(insert OID =  386 ( regexp_count   PGNSP PGUID 12 1 1 0 0 f f f f f f i 3 0 23 "25 25 23" _null_ _null_ _null_ _null_ regexp_count_position _null_ _null_ _null_ "" f));
+DESCR("find all match count for regexp");
+DATA(insert OID =  387 ( regexp_count   PGNSP PGUID 12 1 1 0 0 f f f f f f i 4 0 23 "25 25 23 25" _null_ _null_ _null_ _null_ regexp_count_matchopt _null_ _null_ _null_ "" f));
+DESCR("find all match count for regexp");
+DATA(insert OID =  630 ( regexp_instr   PGNSP PGUID 12 1 1 0 0 f f f f t f i 2 0 23 "25 25" _null_ _null_ _null_ _null_ regexp_instr_noopt _null_ _null_ _null_ "" f));
+DESCR("find match position for regexp");
+DATA(insert OID =  631 ( regexp_instr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 3 0 23 "25 25 23" _null_ _null_ _null_ _null_ regexp_instr_position _null_ _null_ _null_ "" f));
+DESCR("find match position for regexp");
+DATA(insert OID =  632 ( regexp_instr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 4 0 23 "25 25 23 23" _null_ _null_ _null_ _null_ regexp_instr_occurren _null_ _null_ _null_ "" f));
+DESCR("find match position for regexp");
+DATA(insert OID =  633 ( regexp_instr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 5 0 23 "25 25 23 23 23" _null_ _null_ _null_ _null_ regexp_instr_returnopt _null_ _null_ _null_ "" f));
+DESCR("find match position for regexp");
+DATA(insert OID =  634 ( regexp_instr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 6 0 23 "25 25 23 23 23 25" _null_ _null_ _null_ _null_ regexp_instr_matchopt _null_ _null_ _null_ "" f));
+DESCR("find match position for regexp");
+DATA(insert OID =  1566 ( regexp_substr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 3 0 23 "25 25 23" _null_ _null_ _null_ _null_ regexp_substr_with_position _null_ _null_ _null_ "" f));
+DESCR("extract text matching regular expression");
+DATA(insert OID =  1567 ( regexp_substr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 4 0 23 "25 25 23 23" _null_ _null_ _null_ _null_ regexp_substr_with_occur _null_ _null_ _null_ "" f));
+DESCR("extract text matching regular expression");
+DATA(insert OID =  1568 ( regexp_substr   PGNSP PGUID 12 1 1 0 0 f f f f f f i 5 0 23 "25 25 23 23 25" _null_ _null_ _null_ _null_ regexp_substr_with_opt _null_ _null_ _null_ "" f));
+DESCR("extract text matching regular expression");
 DATA(insert OID =  2763 ( regexp_matches   PGNSP PGUID 12 1 1 0 0 f f f f t t i 2 0 1009 "25 25" _null_ _null_ _null_ _null_ regexp_matches_no_flags _null_ _null_ _null_ "" f));
 DESCR("find all match groups for regexp");
 DATA(insert OID =  2764 ( regexp_matches   PGNSP PGUID 12 1 10 0 0 f f f f t t i 3 0 1009 "25 25 25" _null_ _null_ _null_ _null_ regexp_matches _null_ _null_ _null_ "" f));
@@ -2682,6 +2712,14 @@ DESCR("checksum aggregate text input into a numeric");
 DATA(insert OID = 4601 (  checksumtext_agg_transfn	   PGNSP PGUID 12 1 0 0 0 f f f f f f i 2 0 1700 "1700 25" _null_ _null_ _null_ _null_ checksumtext_agg_transfn _null_ _null_ _null_ "" f));
 DESCR("checksumtext aggregate transition function");
 
+DATA(insert OID = 4097 (  group_concat				PGNSP PGUID 12 1 0 2276 0 t f f f f f i 2 0 25 "25 2276" "{25,2276}" "{i,v}" _null_ _null_ aggregate_dummy _null_ _null_ _null_ "" f));
+DESCR("concatenate values in each grouping with separators");
+DATA(insert OID = 4098 (  group_concat_finalfn		PGNSP PGUID 12 1 0 0 0 f f f f f f i 1 0 25 "2281" _null_ _null_ _null_ _null_ group_concat_finalfn _null_ _null_ _null_ "" f));
+DESCR("aggregate final function");
+DATA(insert OID = 4099 (  group_concat_transfn		PGNSP PGUID 12 1 0 2276 0 f f f f f f i 3 0 2281 "2281 25 2276" "{2281,25,2276}" "{i,i,v}" _null_ _null_ group_concat_transfn _null_ _null_ _null_ "" f));
+DESCR("aggregate transition function");
+
+
 /* To ASCII conversion */
 DATA(insert OID = 1845 ( to_ascii	PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 25 "25" _null_ _null_ _null_ _null_	to_ascii_default _null_ _null_ _null_ "" f));
 DESCR("encode text from DB encoding to ASCII text");
@@ -3137,6 +3175,11 @@ DATA(insert OID = 1946 (  encode						PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 2
 DESCR("convert bytea value into some ascii-only text string");
 DATA(insert OID = 1947 (  decode						PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 17 "25 25" _null_ _null_ _null_ _null_ binary_decode _null_ _null_ _null_ "" f));
 DESCR("convert ascii-encoded text string into bytea value");
+
+DATA(insert OID = 7429 (  aes_decrypt      PGNSP PGUID 12 1 0 0 0 f f f f f f s 3 0 25 "25 25 25" _null_ _null_ _null_ _null_ aes_decrypt _null_ _null_ _null_ "" f)));
+DESCR("decrypt string with initvector");
+DATA(insert OID = 3308 (  aes_encrypt      PGNSP PGUID 12 1 0 0 0 f f f f f f s 3 0 25 "25 25 25" _null_ _null_ _null_ _null_ aes_encrypt _null_ _null_ _null_ "" f)));
+DESCR("encrypt string with initvector");
 
 DATA(insert OID = 1948 (  byteaeq		   PGNSP PGUID 12 1 0 0 0 f f f t t f i 2 0 16 "17 17" _null_ _null_ _null_ _null_ byteaeq _null_ _null_ _null_ "" f));
 DATA(insert OID = 1949 (  bytealt		   PGNSP PGUID 12 1 0 0 0 f f f t t f i 2 0 16 "17 17" _null_ _null_ _null_ _null_ bytealt _null_ _null_ _null_ "" f));
@@ -3949,6 +3992,10 @@ DESCR("I/O");
 DATA(insert OID = 2300 (  trigger_in		PGNSP PGUID 12 1 0 0 0 f f f f f f i 1 0 2279 "2275" _null_ _null_ _null_ _null_ trigger_in _null_ _null_ _null_ "" f));
 DESCR("I/O");
 DATA(insert OID = 2301 (  trigger_out		PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 2275 "2279" _null_ _null_ _null_ _null_ trigger_out _null_ _null_ _null_ "" f));
+DATA(insert OID = 3594 (  event_trigger_in PGNSP PGUID 12 1 0 0 0 f f f f f f i 1 0 3838 "2275" _null_ _null_ _null_ _null_ event_trigger_in _null_ _null_ _null_ ));
+DESCR("I/O");
+DATA(insert OID = 3595 (  event_trigger_out    PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 2275 "3838" _null_ _null_ _null_ _null_ event_trigger_out _null_ _null_ _null_ ));
+DESCR("I/O");
 DESCR("I/O");
 DATA(insert OID = 2302 (  language_handler_in	PGNSP PGUID 12 1 0 0 0 f f f f f f i 1 0 2280 "2275" _null_ _null_ _null_ _null_ language_handler_in _null_ _null_ _null_ "" f));
 DESCR("I/O");
@@ -4975,7 +5022,7 @@ DATA(insert OID = 3779 (  pg_create_physical_replication_slot PGNSP PGUID 12 1 0
 DESCR("create a physical replication slot");
 DATA(insert OID = 3783 (  pg_drop_replication_slot PGNSP PGUID 12 1 0 0 0 f f f f f f v 1 0 2278 "19" _null_ _null_ _null_ _null_ pg_drop_replication_slot _null_ _null_ _null_ ""f));
 DESCR("drop a replication slot");
-DATA(insert OID = 3784 (  pg_get_replication_slots	PGNSP PGUID 12 1 10 0 0 f f f f f t s 0 0 2249 "" "{25,25,26,16,28,25,16}" "{o,o,o,o,o,o,o}" "{slot_name,slot_type,datoid,active,xmin,restart_lsn,dummy_standby}" _null_ pg_get_replication_slots _null_ _null_ _null_ ""f));
+DATA(insert OID = 3784 (  pg_get_replication_slots	PGNSP PGUID 12 1 10 0 0 f f f f f t s 0 0 2249 "" "{25,25,25,26,16,28,28,25,16,25}" "{o,o,o,o,o,o,o,o,o,o}" "{slot_name,plugin,slot_type,datoid,active,xmin,catalog_xmin,restart_lsn,dummy_standby,confirmed_flush}" _null_ pg_get_replication_slots _null_ _null_ _null_ ""f));
 DESCR("information about replication slots currently in use");
 
 /* Parser function for ngram */
@@ -5737,6 +5784,8 @@ DATA(insert OID = 4208 ( get_db_source_datasize PGNSP PGUID 12 1 0 0 0 f f f f t
 DESCR("total source datasize for the current database");
 DATA(insert OID = 4209 ( pg_clean_region_info PGNSP PGUID 12 1 0 0 0 f f f f t f s 0 0 1043 "" _null_ _null_ _null_ _null_ pg_clean_region_info _null_ _null_ _null_ "" f));
 DESCR("clean region map information cache for the current database");
+DATA(insert OID = 9040 (  gs_xlog_keepers PGNSP PGUID 12 1 0 0 0 f f f f t f v 0 0 2249 "" "{25,25,25}" "{o,o,o}" "{keeptype, keepsegment, describe}" _null_ gs_xlog_keepers _null_ _null_ _null_ "" f));
+DESCR("get xlog clean blocker");
 
 /*
  * Symbolic values for provolatile column: these indicate whether the result

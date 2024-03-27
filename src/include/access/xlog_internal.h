@@ -57,7 +57,8 @@
         nRet = snprintf_s(path,                            \
             len,                                     \
             len - 1,                                 \
-            XLOGDIR "/%08X%08X%08X",                       \
+            "%s/%08X%08X%08X",                             \
+            SS_XLOGDIR,                                       \
             tli,                                           \
             (uint32)((logSegNo) / XLogSegmentsPerXLogId),  \
             (uint32)((logSegNo) % XLogSegmentsPerXLogId)); \
@@ -103,7 +104,8 @@
         nRet = snprintf_s(path,                            \
             len,                                     \
             len - 1,                                 \
-            XLOGDIR "/%08X%08X%08X",                       \
+            "%s/%08X%08X%08X",                             \
+            SS_XLOGDIR,                                       \
             tli,                                           \
             (uint32)((logSegNo) / XLogSegmentsPerXLogId),  \
             (uint32)((logSegNo) % XLogSegmentsPerXLogId)); \
@@ -142,7 +144,7 @@
 #define StatusFilePath(path, len, xlog, suffix)                                                               \
     do {                                                                                                 \
         int nRet = 0;                                                                                    \
-        nRet = snprintf_s(path, len, len - 1, XLOGDIR "/archive_status/%s%s", xlog, suffix); \
+        nRet = snprintf_s(path, len, len - 1, "%s/%s%s", ARCHIVEDIR, xlog, suffix); \
         securec_check_ss(nRet, "\0", "\0");                                                              \
     } while (0)
 
@@ -168,7 +170,8 @@
         nRet = snprintf_s(path,                            \
             len,                                     \
             len - 1,                                 \
-            XLOGDIR "/%08X%08X%08X.%08X.backup",           \
+            "%s/%08X%08X%08X.%08X.backup",                 \
+            SS_XLOGDIR,                                       \
             tli,                                           \
             (uint32)((logSegNo) / XLogSegmentsPerXLogId),  \
             (uint32)((logSegNo) % XLogSegmentsPerXLogId),  \
@@ -219,9 +222,10 @@ typedef struct RmgrData {
     void (*rm_startup)(void);
     void (*rm_cleanup)(void);
     bool (*rm_safe_restartpoint)(void);
-    bool (*rm_undo)(URecVector *urecvector, int startIdx, int endIdx,
+    int (*rm_undo)(URecVector *urecvector, int startIdx, int endIdx,
                     TransactionId xid, Oid reloid, Oid partitionoid,
-                    BlockNumber blkno, bool isFullChain);
+                    BlockNumber blkno, bool isFullChain, 
+                    int preRetCode, Oid *preReloid, Oid *prePartitionoid);
     void (*rm_undo_desc) (StringInfo buf, UndoRecord *record);
     const char* (*rm_type_name)(uint8 subtype);
 } RmgrData;

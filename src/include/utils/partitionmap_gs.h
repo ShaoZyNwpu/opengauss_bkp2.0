@@ -62,37 +62,30 @@ typedef struct PartitionIdentifier {
     Oid partitionId;
 } PartitionIdentifier;
 
-/**
- *partition map is used to  find which partition a record is mapping to.
- *and  pruning the unused partition when querying.the map has two part:
- *and  range part and interval part.
- *range part is a array of RangeElement which is sorted by RangeElement.boundary
- *interval part is array of IntervalElement which is sorted by IntervalElement.sequenceNum
- *binary search is used to routing in  range part of map , and in interval part
- *we use (recordValue-lowBoundary_of_interval)/interval to get the sequenceNum of
- *a interval partition
- *
+/*
+ * partition map is used to  find which partition a record is mapping to.
+ * and  pruning the unused partition when querying.the map has two part:
+ * and  range part and interval part.
+ * range part is a array of RangeElement which is sorted by RangeElement
  */
 typedef struct RangeElement {
-    Oid partitionOid;                     /*the oid of partition*/
-    int len;                              /*the length of partition key number*/
-    Const* boundary[RANGE_PARTKEYMAXNUM]; /*upper bond of partition */
-    bool isInterval;                      /* is interval partition */
+    Oid partitionOid;                        /* the oid of partition */
+    int partitionno;                         /* the partitionno of partition */
+    int len;                                 /* the length of partition key number */
+    Const* boundary[RANGE_PARTKEYMAXNUM];    /* upper bond of partition */
+    bool isInterval;                         /* is interval partition */
 } RangeElement;
-
-typedef struct IntervalElement {
-    Oid partitionOid; /* the oid of partition */
-    int sequenceNum;  /* the logic number of interval partition. */
-} IntervalElement;
 
 typedef struct ListPartElement {
     Oid partitionOid;                     /* the oid of partition */
+    int partitionno;                      /* the partitionno of partition */
     int len;                              /* the length of values */
-    Const** boundary;                      /* list values */
+    PartitionKey* boundary;
 } ListPartElement;
 
 typedef struct HashPartElement {
     Oid partitionOid;                     /* the oid of partition */
+    int partitionno;                      /* the partitionno of partition */
     Const* boundary[1];                   /* hash bucket */
 } HashPartElement;
 
@@ -118,6 +111,8 @@ typedef struct RangePartitionMap {
 
 bool ValueSatisfyLowBoudary(Const** partKeyValue, RangeElement* partition, Interval* intervalValue, bool topClosed);
 extern int2vector* GetPartitionKey(const PartitionMap* partMap);
+extern Const **transformConstIntoPartkeyType(FormData_pg_attribute* attrs, int2vector* partitionKey, Const **boundary,
+    int len);
 
 typedef struct ListPartitionMap {
     PartitionMap type;
@@ -146,7 +141,7 @@ typedef struct HashPartitionMap {
         }                                                                              \
     } while (0)
 
-#define partitionRoutingForTuple(rel, tuple, partIdentfier)                                                           \
+#define partitionRoutingForTuple(rel, tuple, partIdentfier, canIgnore, partExprKeyIsNull)                             \
     do {                                                                                                              \
         TupleDesc tuple_desc = NULL;                                                                                  \
         int2vector *partkey_column = NULL;                                                                            \
@@ -162,13 +157,27 @@ typedef struct HashPartitionMap {
         tuple_desc = (rel)->rd_att;                                                                                   \
         for (i = 0; i < partkey_column_n; i++) {                                                                      \
             isnull = false;                                                                                           \
-            column_raw = (is_ustore)                                                                                  \
-                             ? UHeapFastGetAttr((UHeapTuple)(tuple), partkey_column->values[i], tuple_desc, &isnull)  \
-                             : fastgetattr((HeapTuple)(tuple), partkey_column->values[i], tuple_desc, &isnull);       \
-            values[i] =                                                                                               \
-                transformDatum2Const((rel)->rd_att, partkey_column->values[i], column_raw, isnull, &consts[i]);       \
+            if (partExprKeyIsNull) {                                                                                  \
+                column_raw = (is_ustore)                                                                              \
+                            ? UHeapFastGetAttr((UHeapTuple)(tuple), partkey_column->values[i], tuple_desc, &isnull)   \
+                            : fastgetattr((HeapTuple)(tuple), partkey_column->values[i], tuple_desc, &isnull);        \
+                values[i] =                                                                                           \
+                    transformDatum2Const((rel)->rd_att, partkey_column->values[i], column_raw, isnull, &consts[i]);   \
+            } else {                                                                                                  \
+                column_raw = Datum(tuple);                                                                            \
+                values[i] =                                                                                           \
+                    transformDatum2ConstForPartKeyExpr((rel)->partMap, column_raw, isnull, &consts[i]);               \
+            }                                                                                                         \
         }                                                                                                             \
         if (PartitionMapIsInterval((rel)->partMap) && values[0]->constisnull) {                                       \
+            if (canIgnore) {                                                                                          \
+                /* treat type as PART_TYPE_RANGE because PART_TYPE_INTERVAL will create a new partition.              \
+                 * this will be handled by caller and directly return */                                              \
+                (partIdentfier)->partArea = PART_AREA_RANGE;                                                          \
+                (partIdentfier)->fileExist = false;                                                                   \
+                (partIdentfier)->partitionId = InvalidOid;                                                            \
+                break;                                                                                                \
+            }                                                                                                         \
             ereport(ERROR,                                                                                            \
                     (errcode(ERRCODE_INTERNAL_ERROR), errmsg("inserted partition key does not map to any partition"), \
                      errdetail("inserted partition key cannot be NULL for interval-partitioned table")));             \
@@ -202,7 +211,7 @@ typedef struct HashPartitionMap {
         } else if ((rel)->partMap->type == PART_TYPE_LIST) {                                                           \
             (result)->partArea = PART_AREA_LIST;                                                                       \
             (result)->partitionId =                                                                                    \
-                getListPartitionOid(((rel)->partMap), (keyValue), &((result)->partSeq), topClosed);                    \
+                getListPartitionOid(((rel)->partMap), (keyValue), (valueLen), &((result)->partSeq), topClosed);        \
             if ((result)->partSeq < 0) {                                                                               \
                 (result)->fileExist = false;                                                                           \
             } else {                                                                                                   \
@@ -253,28 +262,32 @@ typedef struct HashPartitionMap {
         }                                                                                                              \
     } while (0)
 
-#define partitionRoutingForValueEqual(rel, keyValue, valueLen, topClosed, result)                                      \
-    do {                                                                                                               \
-        if ((rel)->partMap->type == PART_TYPE_LIST) {                                                                 \
-            (result)->partArea = PART_AREA_LIST;                                                                      \
-            (result)->partitionId = getListPartitionOid(((rel)->partMap), (keyValue), &((result)->partSeq), topClosed);          \
-            if ((result)->partSeq < 0) {                                                                               \
-                (result)->fileExist = false;                                                                           \
-            } else {                                                                                                   \
-                (result)->fileExist = true;                                                                            \
-            }                                                                                                          \
-        } else if ((rel)->partMap->type == PART_TYPE_HASH) {                                                           \
-            (result)->partArea = PART_AREA_HASH;                                                                      \
-            (result)->partitionId = getHashPartitionOid(((rel)->partMap), (keyValue), &((result)->partSeq), topClosed);          \
-            if ((result)->partSeq < 0) {                                                                               \
-                (result)->fileExist = false;                                                                           \
-            } else {                                                                                                   \
-                (result)->fileExist = true;                                                                            \
-            }                                                                                                          \
-        } else {                                                                                                       \
-            ereport(ERROR,                                                                                             \
-                (errcode(ERRCODE_INTERNAL_ERROR), errmsg("Unsupported partition strategy:%d", (rel)->partMap->type))); \
-        }                                                                                                              \
+#define partitionRoutingForValueEqual(rel, keyValue, valueLen, topClosed, result)                               \
+    do {                                                                                                        \
+        (keyValue) = transformConstIntoPartkeyType(((rel)->rd_att->attrs), GetPartitionKey((rel)->partMap),     \
+                                                   (keyValue), (valueLen));                                     \
+        if ((rel)->partMap->type == PART_TYPE_LIST) {                                                           \
+            (result)->partArea = PART_AREA_LIST;                                                                \
+            (result)->partitionId =                                                                             \
+                getListPartitionOid(((rel)->partMap), (keyValue), (valueLen), &((result)->partSeq), topClosed); \
+            if ((result)->partSeq < 0) {                                                                        \
+                (result)->fileExist = false;                                                                    \
+            } else {                                                                                            \
+                (result)->fileExist = true;                                                                     \
+            }                                                                                                   \
+        } else if ((rel)->partMap->type == PART_TYPE_HASH) {                                                    \
+            (result)->partArea = PART_AREA_HASH;                                                                \
+            (result)->partitionId =                                                                             \
+                getHashPartitionOid(((rel)->partMap), (keyValue), &((result)->partSeq), topClosed);             \
+            if ((result)->partSeq < 0) {                                                                        \
+                (result)->fileExist = false;                                                                    \
+            } else {                                                                                            \
+                (result)->fileExist = true;                                                                     \
+            }                                                                                                   \
+        } else {                                                                                                \
+            ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),                                                    \
+                            errmsg("Unsupported partition strategy:%d", (rel)->partMap->type)));                \
+        }                                                                                                       \
     } while (0)
 
 typedef enum PruningResultState { PRUNING_RESULT_EMPTY, PRUNING_RESULT_SUBSET, PRUNING_RESULT_FULL } PruningResultState;
@@ -312,7 +325,9 @@ void getFakeReationForPartitionOid(HTAB **fakeRels, MemoryContext cxt, Relation 
                                           Relation *fakeRelation, Partition *partition, LOCKMODE lmode);
 
 
-#define searchFakeReationForPartitionOid(fakeRels, cxt, rel, partOid, fakeRelation, partition, lmode)              \
+/* search fake relation with partOid. The partitionno is used to retry search. In some cases we don't need partitionno,
+ * such as index search/ddl operation, just input INVALID_PARTITION_NO */
+#define searchFakeReationForPartitionOid(fakeRels, cxt, rel, partOid, partitionno, fakeRelation, partition, lmode) \
     do {                                                                                                           \
         PartRelIdCacheKey _key = {partOid, -1};                                                                    \
         Relation partParentRel = rel;                                                                              \
@@ -322,10 +337,17 @@ void getFakeReationForPartitionOid(HTAB **fakeRels, MemoryContext cxt, Relation 
         }                                                                                                          \
         if (RelationIsSubPartitioned(rel) && !RelationIsIndex(rel)) {                                              \
             Oid parentOid = partid_get_parentid(partOid);                                                          \
+            if (!OidIsValid(parentOid)) {                                                                          \
+                ereport(ERROR,                                                                                     \
+                        (errcode(ERRCODE_PARTITION_ERROR),                                                         \
+                         errmsg("partition %u does not exist on relation \"%s\" when search the fake relation",    \
+                                partOid, RelationGetRelationName(rel)),                                            \
+                         errdetail("this partition may have already been dropped")));                              \
+            }                                                                                                      \
             if (parentOid != rel->rd_id) {                                                                         \
                 Partition partForSubPart = NULL;                                                                   \
-                getFakeReationForPartitionOid(&fakeRels, cxt, rel, parentOid, &partRelForSubPart, &partForSubPart, \
-                                              lmode);                                                              \
+                getFakeReationForPartitionOid                                                                      \
+                    (&fakeRels, cxt, rel, parentOid, &partRelForSubPart, &partForSubPart, lmode);                  \
                 partParentRel = partRelForSubPart;                                                                 \
             }                                                                                                      \
         }                                                                                                          \
@@ -337,7 +359,7 @@ void getFakeReationForPartitionOid(HTAB **fakeRels, MemoryContext cxt, Relation 
         if (PointerIsValid(fakeRels)) {                                                                            \
             FakeRelationIdCacheLookup(fakeRels, _key, fakeRelation, partition);                                    \
             if (!RelationIsValid(fakeRelation)) {                                                                  \
-                partition = partitionOpen(partParentRel, partOid, lmode);                                          \
+                partition = PartitionOpenWithPartitionno(partParentRel, partOid, partitionno, lmode);              \
                 fakeRelation = partitionGetRelation(partParentRel, partition);                                     \
                 FakeRelationCacheInsert(fakeRels, fakeRelation, partition, -1);                                    \
             }                                                                                                      \
@@ -352,7 +374,7 @@ void getFakeReationForPartitionOid(HTAB **fakeRels, MemoryContext cxt, Relation 
             ctl.hcxt = cxt;                                                                                        \
             fakeRels = hash_create("fakeRelationCache by OID", FAKERELATIONCACHESIZE, &ctl,                        \
                                    HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);                                      \
-            partition = partitionOpen(partParentRel, partOid, lmode);                                              \
+            partition = PartitionOpenWithPartitionno(partParentRel, partOid, partitionno, lmode);                  \
             fakeRelation = partitionGetRelation(partParentRel, partition);                                         \
             FakeRelationCacheInsert(fakeRels, fakeRelation, partition, -1);                                        \
         }                                                                                                          \
@@ -453,8 +475,10 @@ void getFakeReationForPartitionOid(HTAB **fakeRels, MemoryContext cxt, Relation 
 typedef struct SubPartitionPruningResult {
     NodeTag type;
     int partSeq;
+    int partitionno;
     Bitmapset* bm_selectedSubPartitions;
     List* ls_selectedSubPartitions;
+    List* ls_selectedSubPartitionnos;
 } SubPartitionPruningResult;
 
 typedef struct PruningResult {
@@ -466,6 +490,7 @@ typedef struct PruningResult {
                         /*if interval partitions is empty, intervalOffset=-1*/
     Bitmapset* intervalSelectedPartitions;
     List* ls_rangeSelectedPartitions;
+    List* ls_selectedPartitionnos;
     List* ls_selectedSubPartitions;
     Param* paramArg;
     OpExpr* exprPart;
@@ -479,6 +504,7 @@ extern PartitionIdentifier* partOidGetPartID(Relation rel, Oid partOid);
 
 extern void RebuildPartitonMap(PartitionMap* oldMap, PartitionMap* newMap);
 extern void RebuildRangePartitionMap(RangePartitionMap* oldMap, RangePartitionMap* newMap);
+extern bool EqualPartitonMap(const PartitionMap* partMap1, const PartitionMap* partMap2);
 
 bool isPartKeyValuesInPartition(RangePartitionMap* partMap, Const** partKeyValues, int partkeyColumnNum, int partSeq);
 
@@ -496,10 +522,14 @@ int ValueCmpLowBoudary(Const** partKeyValue, const RangeElement* partition, Inte
 extern void get_typlenbyval(Oid typid, int16 *typlen, bool *typbyval);
 extern RangeElement* copyRangeElements(RangeElement* src, int elementNum, int partkeyNum);
 extern int rangeElementCmp(const void* a, const void* b);
+extern int ListElementCmp(const void* a, const void* b);
 extern int HashElementCmp(const void* a, const void* b);
 extern void DestroyListElements(ListPartElement* src, int elementNum);
 extern void PartitionMapDestroyHashArray(HashPartElement* hashArray, int arrLen);
 extern void partitionMapDestroyRangeArray(RangeElement* rangeArray, int arrLen);
-extern void RelationDestroyPartitionMap(PartitionMap* partMap);
+extern void DestroyPartitionMap(PartitionMap* partMap);
+/* search fake relation with partOid, if no need partitionno, just input 0 */
+extern bool trySearchFakeReationForPartitionOid(HTAB** fakeRels, MemoryContext cxt, Relation rel, Oid partOid,
+    int partitionno, Relation* fakeRelation, Partition* partition, LOCKMODE lmode, bool checkSubPart = true);
 
 #endif /* PARTITIONMAP_GS_H_ */

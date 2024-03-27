@@ -36,14 +36,16 @@ typedef struct {
 } locate_agg_of_level_context;
 
 typedef struct {
-    int win_location;
-} locate_windowfunc_context;
+    int location;
+} locate_func_context;
 
 static bool contain_aggs_of_level_or_above_walker(Node* node, int* sublevels_up);
 static bool contain_aggs_of_level_walker(Node* node, contain_aggs_of_level_context* context);
 static bool locate_agg_of_level_walker(Node* node, locate_agg_of_level_context* context);
+static bool contain_srfunc_walker(Node* node, void* context);
+static bool locate_srfunc_walker(Node* node, locate_func_context* context);
 static bool contain_windowfuncs_walker(Node* node, void* context);
-static bool locate_windowfunc_walker(Node* node, locate_windowfunc_context* context);
+static bool locate_windowfunc_walker(Node* node, locate_func_context* context);
 static bool checkExprHasSubLink_walker(Node* node, void* context);
 static Relids offset_relid_set(Relids relids, int offset);
 static Relids adjust_relid_set(Relids relids, int oldrelid, int newrelid);
@@ -211,6 +213,60 @@ static bool locate_agg_of_level_walker(Node* node, locate_agg_of_level_context* 
 }
 
 /*
+ * checkExprHasSetReturningFuncs -
+ *	Check if an expression contains a set-returning function call of the
+ *	current query level.
+ */
+bool checkExprHasSetReturningFuncs(Node* node)
+{
+    /*
+     * Must be prepared to start with a Query or a bare expression tree; if
+     * it's a Query, we don't want to increment sublevels_up.
+     */
+    return query_or_expression_tree_walker(node, (bool (*)())contain_srfunc_walker, NULL, 0);
+}
+
+static bool contain_srfunc_walker(Node* node, void* context)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, FuncExpr) && ((FuncExpr*)node)->funcretset)
+        return true; /* abort the tree traversal and return true */
+    /* Mustn't recurse into subselects */
+    return expression_tree_walker(node, (bool (*)())contain_srfunc_walker, (void*)context);
+}
+
+int locate_srfunc(Node* node)
+{
+    locate_func_context context;
+
+    context.location = -1; /* in case we find nothing */
+
+    /*
+     * Must be prepared to start with a Query or a bare expression tree; if
+     * it's a Query, we don't want to increment sublevels_up.
+     */
+    (void)query_or_expression_tree_walker(node, (bool (*)())locate_srfunc_walker, (void*)&context, 0);
+
+    return context.location;
+}
+
+static bool locate_srfunc_walker(Node* node, locate_func_context* context)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, FuncExpr) && ((FuncExpr*)node)->funcretset) {
+        if (((FuncExpr*)node)->location >= 0) {
+            context->location = ((FuncExpr*)node)->location;
+            return true; /* abort the tree traversal and return true */
+        }
+        /* else fall through to examine argument */
+    }
+    /* Mustn't recurse into subselects */
+    return expression_tree_walker(node, (bool (*)())locate_srfunc_walker, (void*)context);
+}
+
+/*
  * checkExprHasWindowFuncs -
  *	Check if an expression contains a window function call of the
  *	current query level.
@@ -249,9 +305,9 @@ static bool contain_windowfuncs_walker(Node* node, void* context)
  */
 int locate_windowfunc(Node* node)
 {
-    locate_windowfunc_context context;
+    locate_func_context context;
 
-    context.win_location = -1; /* in case we find nothing */
+    context.location = -1; /* in case we find nothing */
 
     /*
      * Must be prepared to start with a Query or a bare expression tree; if
@@ -259,16 +315,16 @@ int locate_windowfunc(Node* node)
      */
     (void)query_or_expression_tree_walker(node, (bool (*)())locate_windowfunc_walker, (void*)&context, 0);
 
-    return context.win_location;
+    return context.location;
 }
 
-static bool locate_windowfunc_walker(Node* node, locate_windowfunc_context* context)
+static bool locate_windowfunc_walker(Node* node, locate_func_context* context)
 {
     if (node == NULL)
         return false;
     if (IsA(node, WindowFunc)) {
         if (((WindowFunc*)node)->location >= 0) {
-            context->win_location = ((WindowFunc*)node)->location;
+            context->location = ((WindowFunc*)node)->location;
             return true; /* abort the tree traversal and return true */
         }
         /* else fall through to examine argument */
@@ -413,8 +469,8 @@ void OffsetVarNodes(Node* node, int offset, int sublevels_up)
         if (sublevels_up == 0) {
             ListCell* l = NULL;
 
-            if (qry->resultRelation)
-                qry->resultRelation += offset;
+            if (qry->resultRelations)
+                linitial_int(qry->resultRelations) += offset;
             foreach (l, qry->rowMarks) {
                 RowMarkClause* rc = (RowMarkClause*)lfirst(l);
 
@@ -485,6 +541,18 @@ static bool ChangeVarNodes_walker(Node* node, ChangeVarNodes_context* context)
             rtr->rtindex = context->new_index;
         /* the subquery itself is visited separately */
         return false;
+    }
+    if (IsA(node, TargetEntry)) {
+        TargetEntry* te = (TargetEntry*)node;
+
+        if (context->sublevels_up == 0 && te->rtindex == (unsigned int)context->rt_index)
+            te->rtindex = context->new_index;
+    }
+    if (IsA(node, WithCheckOption)) {
+        WithCheckOption* wco = (WithCheckOption*)node;
+
+        if (context->sublevels_up == 0 && wco->rtindex == (unsigned int)context->rt_index)
+            wco->rtindex = context->new_index;
     }
     if (IsA(node, JoinExpr)) {
         JoinExpr* j = (JoinExpr*)node;
@@ -567,8 +635,11 @@ void ChangeVarNodes(Node* node, int rt_index, int new_index, int sublevels_up)
         if (sublevels_up == 0) {
             ListCell* l = NULL;
 
-            if (qry->resultRelation == rt_index)
-                qry->resultRelation = new_index;
+            foreach (l, qry->resultRelations) {
+                if (lfirst_int(l) == rt_index) {
+                    lfirst_int(l) = new_index;
+                }
+            }
             foreach (l, qry->rowMarks) {
                 RowMarkClause* rc = (RowMarkClause*)lfirst(l);
 
@@ -1208,12 +1279,16 @@ Node* map_variable_attnos(
 }
 
 /*
- * ResolveNew - replace Vars with corresponding items from a targetlist
+ * ReplaceVarsFromTargetList - replace Vars with items from a targetlist
  *
  * Vars matching target_varno and sublevels_up are replaced by the
  * entry with matching resno from targetlist, if there is one.
- * If not, we either change the unmatched Var's varno to update_varno
- * (when event == CMD_UPDATE) or replace it with a constant NULL.
+ *
+ * If there is no matching resno for such a Var, the action depends on the
+ * nomatch_option:
+ *	REPLACEVARS_REPORT_ERROR: throw an error
+ *	REPLACEVARS_CHANGE_VARNO: change Var's varno to nomatch_varno
+ *	REPLACEVARS_SUBSTITUTE_NULL: replace Var with a NULL Const of same type
  *
  * The caller must also provide target_rte, the RTE describing the target
  * relation.  This is needed to handle whole-row Vars referencing the target.
@@ -1224,13 +1299,13 @@ Node* map_variable_attnos(
 typedef struct {
     RangeTblEntry* target_rte;
     List* targetlist;
-    int event;
-    int update_varno;
-} ResolveNew_context;
+    ReplaceVarsNoMatchOption nomatch_option;
+    int nomatch_varno;
+} ReplaceVarsFromTargetList_context;
 
-static Node* ResolveNew_callback(Var* var, replace_rte_variables_context* context)
+static Node* ReplaceVarsFromTargetList_callback(Var* var, replace_rte_variables_context* context)
 {
-    ResolveNew_context* rcon = (ResolveNew_context*)context->callback_arg;
+    ReplaceVarsFromTargetList_context* rcon = (ReplaceVarsFromTargetList_context*)context->callback_arg;
     TargetEntry* tle = NULL;
 
     if (var->varattno == InvalidAttrNumber) {
@@ -1269,24 +1344,33 @@ static Node* ResolveNew_callback(Var* var, replace_rte_variables_context* contex
     tle = get_tle_by_resno(rcon->targetlist, var->varattno);
     if (tle == NULL || tle->resjunk) {
         /* Failed to find column in insert/update tlist */
-        if (rcon->event == CMD_UPDATE) {
-            /* For update, just change unmatched var's varno */
-            var = (Var*)copyObject(var);
-            var->varno = rcon->update_varno;
-            var->varnoold = rcon->update_varno;
-            return (Node*)var;
-        } else {
-            /* Otherwise replace unmatched var with a null */
-            /* need coerce_to_domain in case of NOT NULL domain constraint */
-            return coerce_to_domain((Node*)makeNullConst(var->vartype, var->vartypmod, var->varcollid),
-                InvalidOid,
-                -1,
-                var->vartype,
-                COERCE_IMPLICIT_CAST,
-                -1,
-                false,
-                false);
+        switch (rcon->nomatch_option) {
+            case REPLACEVARS_REPORT_ERROR:
+                /* fall through, throw error below */
+                break;
+
+            case REPLACEVARS_CHANGE_VARNO:
+                var = (Var*)copyObject(var);
+                var->varno = rcon->nomatch_varno;
+                var->varnoold = rcon->nomatch_varno;
+                return (Node*)var;
+
+            case REPLACEVARS_SUBSTITUTE_NULL:
+                /*
+                 * If Var is of domain type, we should add a CoerceToDomain
+                 * node, in case there is a NOT NULL domain constraint.
+                 */
+                return coerce_to_domain((Node*)makeNullConst(var->vartype, var->vartypmod, var->varcollid),
+                                        InvalidOid,
+                                        -1,
+                                        var->vartype,
+                                        COERCE_IMPLICIT_CAST,
+                                        -1,
+                                        false,
+                                        false);
         }
+        ereport(ERROR, (errmsg("could not find replacement targetlist entry for attno %d", var->varattno)));
+        return NULL; /* keep compiler quiet */
     } else {
         /* Make a copy of the tlist item to return */
         Node* newnode = (Node*)copyObject(tle->expr);
@@ -1299,16 +1383,16 @@ static Node* ResolveNew_callback(Var* var, replace_rte_variables_context* contex
     }
 }
 
-Node* ResolveNew(Node* node, int target_varno, int sublevels_up, RangeTblEntry* target_rte, List* targetlist, int event,
-    int update_varno, bool* outer_hasSubLinks)
+Node* ReplaceVarsFromTargetList(Node* node, int target_varno, int sublevels_up, RangeTblEntry* target_rte,
+    List* targetlist, ReplaceVarsNoMatchOption nomatch_option, int nomatch_varno, bool* outer_hasSubLinks)
 {
-    ResolveNew_context context;
+    ReplaceVarsFromTargetList_context context;
 
     context.target_rte = target_rte;
     context.targetlist = targetlist;
-    context.event = event;
-    context.update_varno = update_varno;
+    context.nomatch_option = nomatch_option;
+    context.nomatch_varno = nomatch_varno;
 
     return replace_rte_variables(
-        node, target_varno, sublevels_up, ResolveNew_callback, (void*)&context, outer_hasSubLinks);
+        node, target_varno, sublevels_up, ReplaceVarsFromTargetList_callback, (void*)&context, outer_hasSubLinks);
 }

@@ -8,9 +8,11 @@ create table t1 (c1 int, c2 numeric, c3 numeric, c4 int, colreal real);
 create table t2 (c1 int, c2 numeric, c3 numeric, c4 int, colreal real);
 create index idx1 on t1(c2);
 create index idx2 on t1(c3);
-insert into t1 select generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000);
-insert into t1 select generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000);
-insert into t1 select generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000), generate_series(10, 100000);
+\parallel on 3
+insert into t1 select generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000);
+insert into t1 select generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000);
+insert into t1 select generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000), generate_series(10, 10000);
+\parallel off
 insert into t1 values (1,2,3,5,0),(1,2,3,6,0),(1,3,2,7,0),(1,3,2,8,0);
 insert into t2 select * from t1;
 create index on t2(c2);
@@ -99,7 +101,6 @@ explain (verbose on, costs off) select sum(c1) from t1 where c2=1 limit 1;
                Index Cond: (t1.c2 = 1::numeric)
 (7 rows)
 
-
 -- agg fusion
 drop index idx2;
 -- index t1(c2): indexonlyscan
@@ -120,7 +121,6 @@ select sum(c2) from t1 where c2=3;
    6
 (1 row)
 
-
 -- index t1(c2): indexscan
 explain (verbose on, costs off) select sum(c3) from t1 where c2=3;
                 QUERY PLAN                
@@ -138,7 +138,6 @@ select sum(c3) from t1 where c2=3;
 -----
    4
 (1 row)
-
 
 -- index t1(c3, c2): indexonlyscan
 drop index idx1;
@@ -187,7 +186,6 @@ explain (verbose on, costs off) select sum(c2) from t1 where c2=3;
          Index Cond: (t1.c2 = 3::numeric)
 (6 rows)
 
-
 select sum(c3) from t1 where c3=3;
  sum 
 -----
@@ -212,7 +210,6 @@ select sum(c2) from t1 where c2=3;
    6
 (1 row)
 
-
 -- sort fusion
 explain (verbose on, costs off) select c3 from t1 where c3 < 10 order by c2;
                   QUERY PLAN                   
@@ -235,14 +232,13 @@ select c3 from t1 where c3 < 10 order by c2;
   3
 (4 rows)
 
-
 -- nestloop fusion
 drop table if exists tn1, tn2;
 NOTICE:  table "tn1" does not exist, skipping
 NOTICE:  table "tn2" does not exist, skipping
 create table tn1(c1 int, c2 int, c3 int);
 create table tn2(c1 int, c2 int, c3 int);
-insert into tn1 select generate_series(20, 100000), generate_series(20, 100000), generate_series(20, 100000);
+insert into tn1 select generate_series(20, 10000), generate_series(20, 10000), generate_series(20, 10000);
 insert into tn2 select * from tn1;
 insert into tn1 values (1,2,3),(4,5,6),(7,8,9);
 insert into tn2 values (11,12,13),(14,15,16),(17,18,19);
@@ -356,9 +352,57 @@ select tn2.c1, tn1.c1 from tn1,tn2 where tn1.c2 <20 and tn2.c2 <20;
  17 |  7
 (9 rows)
 
-
 drop table if exists t1, t2;
 drop table if exists tn1, tn2;
+-- test opfusion update time
+show enable_opfusion;
+ enable_opfusion 
+-----------------
+ on
+(1 row)
+
+drop table if exists test_opfusion_update;
+NOTICE:  table "test_opfusion_update" does not exist, skipping
+create table test_opfusion_update(a int);
+insert into test_opfusion_update values(1);
+-- use two sleep to make sure stat has been reported
+select pg_sleep(0.5);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+select pg_sleep(0.5);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+select pg_stat_get_last_data_changed_time(oid) != 0 from pg_class where relname = 'test_opfusion_update';
+ ?column? 
+----------
+ t
+(1 row)
+
+drop table test_opfusion_update;
+-- test pbe opfusion when param set null
+create table test_bypass (a int, b int);
+create index itest on test_bypass(a);
+insert into test_bypass values(1,2);
+prepare p1 as select * from test_bypass where a = $1;
+execute p1(null);
+ a | b 
+---+---
+(0 rows)
+
+execute p1(1);
+ a | b 
+---+---
+ 1 | 2
+(1 row)
+
+drop table test_bypass;
+-- clean 
 reset enable_seqscan;
 reset enable_bitmapscan;
 reset enable_material;

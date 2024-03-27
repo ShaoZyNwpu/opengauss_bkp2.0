@@ -436,24 +436,29 @@ bool ProcessConfigFileMessage(char *buf, Size len)
         return false;
     }
 
-    reserve_item = alloc_opt_lines(RESERVE_SIZE);
+    reserve_item = alloc_opt_lines(g_reserve_param_num);
     if (reserve_item == NULL) {
         ereport(LOG, (errmsg("Alloc mem for reserved parameters failed")));
         return false;
     }
 
-    /* 1. lock postgresql.conf */
+    /* 1. lock postgresql.conf 
+     * Get two locks for postgresql.conf before making changes, please refer to 
+     * AlterSystemSetConfigFile() in guc.cpp for detailed explanations.
+     */
     if (get_file_lock(t_thrd.dcf_cxt.dcfCtxInfo->gucconf_lock_file, &filelock) != CODE_OK) {
         release_opt_lines(reserve_item);
         ereport(LOG, (errmsg("Modify the postgresql.conf failed : can not get the file lock ")));
         return false;
     }
+    LWLockAcquire(ConfigFileLock, LW_EXCLUSIVE);
 
     /* 2. load reserved parameters to reserve_item(array in memeory) */
     retcode = copy_asyn_lines(t_thrd.dcf_cxt.dcfCtxInfo->gucconf_file, reserve_item, g_reserve_param);
     if (retcode != CODE_OK) {
         release_opt_lines(reserve_item);
         release_file_lock(&filelock);
+        LWLockRelease(ConfigFileLock);
         ereport(LOG, (errmsg("copy asynchronization items failed: %s\n", gs_strerror(retcode))));
         return false;
     }
@@ -463,6 +468,7 @@ bool ProcessConfigFileMessage(char *buf, Size len)
     if (retcode != CODE_OK) {
         release_opt_lines(reserve_item);
         release_file_lock(&filelock);
+        LWLockRelease(ConfigFileLock);
         ereport(LOG, (errmsg("create %s failed: %s\n", conf_bak, gs_strerror(retcode))));
         return false;
     }
@@ -471,6 +477,7 @@ bool ProcessConfigFileMessage(char *buf, Size len)
     retcode = update_temp_file(conf_bak, reserve_item, g_reserve_param);
     if (retcode != CODE_OK) {
         release_file_lock(&filelock);
+        LWLockRelease(ConfigFileLock);
         release_opt_lines(reserve_item);
         ereport(LOG, (errmsg("update gaussdb config file failed: %s\n", gs_strerror(retcode))));
         return false;
@@ -478,6 +485,7 @@ bool ProcessConfigFileMessage(char *buf, Size len)
         ereport(LOG, (errmsg("update gaussdb config file success")));
         if (rename(conf_bak, t_thrd.dcf_cxt.dcfCtxInfo->gucconf_file) != 0) {
             release_file_lock(&filelock);
+            LWLockRelease(ConfigFileLock);
             release_opt_lines(reserve_item);
             ereport(LOG, (errcode_for_file_access(), errmsg("could not rename \"%s\" to \"%s\": %m", conf_bak,
                                                             t_thrd.dcf_cxt.dcfCtxInfo->gucconf_file)));
@@ -489,6 +497,7 @@ bool ProcessConfigFileMessage(char *buf, Size len)
     if (lstat(t_thrd.dcf_cxt.dcfCtxInfo->gucconf_file, &statbuf) != 0) {
         if (errno != ENOENT) {
             release_file_lock(&filelock);
+            LWLockRelease(ConfigFileLock);
             release_opt_lines(reserve_item);
             ereport(ERROR, (errcode_for_file_access(), errmsg("could not stat file or directory \"%s\": %m",
                                                               t_thrd.dcf_cxt.dcfCtxInfo->gucconf_file)));
@@ -505,6 +514,7 @@ bool ProcessConfigFileMessage(char *buf, Size len)
     }
 
     release_file_lock(&filelock);
+    LWLockRelease(ConfigFileLock);
     release_opt_lines(reserve_item);
 
     /* notify postmaster the config file has changed */
@@ -816,6 +826,7 @@ bool SyncConfigFile(unsigned int* follower_id)
         ereport(LOG, (errmsg("get lock failed when send gaussdb config file to the peer.")));
         return false;
     }
+    LWLockAcquire(ConfigFileLock, LW_EXCLUSIVE);
     PG_TRY();
     {
         opt_lines = read_guc_file(path);
@@ -830,10 +841,12 @@ bool SyncConfigFile(unsigned int* follower_id)
     if (!read_guc_file_success) {
         /* if failed to read guc file, will log the error info in PG_CATCH(), no need to log again. */
         release_file_lock(&filelock);
+        LWLockRelease(ConfigFileLock);
         return false;
     }
     if (opt_lines == nullptr) {
         release_file_lock(&filelock);
+        LWLockRelease(ConfigFileLock);
         ereport(LOG, (errmsg("the config file has no data, please check it.")));
         return false;
     }
@@ -855,6 +868,7 @@ bool SyncConfigFile(unsigned int* follower_id)
     pfree(temp_buf);
     temp_buf = NULL;
     release_file_lock(&filelock);
+    LWLockRelease(ConfigFileLock);
 
     if (is_broadcast) {
         sent = (dcf_broadcast_msg(1, buf, len) == 0);
@@ -929,7 +943,7 @@ void PromoteCallbackFunc()
            /* Database Security: Support database audit */
            if (t_thrd.walreceiverfuncs_cxt.WalRcv &&
                t_thrd.walreceiverfuncs_cxt.WalRcv->node_state >= NODESTATE_SMART_DEMOTE_REQUEST &&
-               t_thrd.walreceiverfuncs_cxt.WalRcv->node_state <= NODESTATE_FAST_DEMOTE_REQUEST) {
+               t_thrd.walreceiverfuncs_cxt.WalRcv->node_state <= NODESTATE_EXTRM_FAST_DEMOTE_REQUEST) {
                /* Now it's only assumed the primary was demoted successfully but actually it  only succeeded in DCF. */
                t_thrd.walreceiverfuncs_cxt.WalRcv->node_state = NODESTATE_STANDBY_PROMOTING;
                t_thrd.postmaster_cxt.audit_standby_switchover = true;

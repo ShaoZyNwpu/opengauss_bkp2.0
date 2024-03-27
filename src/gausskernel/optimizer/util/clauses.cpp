@@ -46,6 +46,7 @@
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
+#include "parser/parsetree.h"
 #include "pgxc/pgxc.h"
 #include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
@@ -62,14 +63,6 @@ typedef struct {
     PlannerInfo* root;
     AggClauseCosts* costs;
 } count_agg_clauses_context;
-
-typedef struct {
-    ParamListInfo boundParams;
-    PlannerInfo* root;
-    List* active_fns;
-    Node* case_val;
-    bool estimate;
-} eval_const_expressions_context;
 
 typedef struct {
     int nargs;
@@ -124,8 +117,6 @@ static List* simplify_or_arguments(
 static List* simplify_and_arguments(
     List* args, eval_const_expressions_context* context, bool* haveNull, bool* forceFalse);
 static Node* simplify_boolean_equality(Oid opno, List* args);
-static Expr* simplify_function(Oid funcid, Oid result_type, int32 result_typmod, Oid result_collid, Oid input_collid,
-    List** args_p, bool process_args, bool allow_non_const, eval_const_expressions_context* context);
 static List* expand_function_arguments(List* args, Oid result_type, HeapTuple func_tuple);
 static List* reorder_function_arguments(List* args, HeapTuple func_tuple);
 static List* add_function_defaults(List* args, HeapTuple func_tuple);
@@ -435,7 +426,8 @@ static bool is_dn_agg_function_only(Oid funcId, List* args, bool hasgroupclause,
         TIMESTAMPTZLISTAGGFUNCOID,        // timestamptz_listagg
         TIMESTAMPTZLISTAGGNOARG2FUNCOID,  // timestamptz_listagg_without_delimiter
         INTERVALLISTAGGFUNCOID,           // interval_listagg
-        INTERVALLISTAGGNOARG2FUNCOID      // interval_listagg_without_delimiter
+        INTERVALLISTAGGNOARG2FUNCOID,     // interval_listagg_without_delimiter
+        GROUPCONCATFUNCOID                // group_concat
     };
 
     if (funcId >= FirstNormalObjectId)
@@ -698,6 +690,35 @@ static void count_agg_clauses_walker_isa(Node* node, count_agg_clauses_context* 
         costs->transitionSpace += avgwidth + 2 * sizeof(void*);
         costs->aggWidth += avgwidth;
     } else if (aggtranstype == INTERNALOID) {
+#ifndef ENABLE_MULTIPLE_NODES
+        /* 
+         * XXX: we apply the pg commit 69c8fbac201652282e18b0e2e301d4ada991fbde
+         * but the difference of pg_aggregate bwtween pg and og
+         * we have to do some hard code here(og's pg_aggregate doesn't have the column aggtransspace)
+         */
+        switch (aggtransfn) {
+            case 5439: /* int8_avg_accum_numeric */
+                costs->transitionSpace +=48;
+                costs->aggWidth += 48;
+                break;
+            case 5440: /* numeric_accum_numeric */
+            case 5442: /* numeric_avg_accum_numeric */
+                costs->transitionSpace += 128;
+                costs->aggWidth += 128;
+                break;
+            default:
+                /*
+                * INTERNAL transition type is a special case: although INTERNAL
+                * is pass-by-value, it's almost certainly being used as a pointer
+                * to some large data structure.  We assume usage of
+                * ALLOCSET_DEFAULT_INITSIZE, which is a good guess if the data is
+                * being kept in a private memory context, as is done by
+                * array_agg() for instance.
+                */
+                costs->transitionSpace += ALLOCSET_DEFAULT_INITSIZE;
+                costs->aggWidth += ALLOCSET_DEFAULT_INITSIZE;
+        }
+#else
         /*
             * INTERNAL transition type is a special case: although INTERNAL
             * is pass-by-value, it's almost certainly being used as a pointer
@@ -708,6 +729,7 @@ static void count_agg_clauses_walker_isa(Node* node, count_agg_clauses_context* 
             */
         costs->transitionSpace += ALLOCSET_DEFAULT_INITSIZE;
         costs->aggWidth += ALLOCSET_DEFAULT_INITSIZE;
+#endif
     } else {
         costs->aggWidth += get_typavgwidth(aggtranstype, -1);
     }
@@ -836,20 +858,39 @@ static bool find_window_functions_walker(Node* node, WindowLists* lists)
 /*
  * expression_returns_set_rows
  *	  Estimate the number of rows returned by a set-returning expression.
- *	  The result is 1 if there are no set-returning functions.
+ *	  The result is 1 if it's not a set-returning expression.
  *
- * We use the product of the rowcount estimates of all the functions in
- * the given tree (this corresponds to the behavior of ExecMakeFunctionResult
- * for nested set-returning functions).
+ * We should only examine the top-level function or operator; it used to be
+ * appropriate to recurse, but not anymore.  (Even if there are more SRFs in
+ * the function's inputs, their multipliers are accounted for separately.)
  *
  * Note: keep this in sync with expression_returns_set() in nodes/nodeFuncs.c.
  */
 double expression_returns_set_rows(Node* clause)
 {
-    double result = 1;
+    if (u_sess->attr.attr_common.enable_expr_fusion && u_sess->attr.attr_sql.query_dop_tmp == 1) {
+        if (clause == NULL)
+            return 1.0;
+        if (IsA(clause, FuncExpr)) {
+            FuncExpr *expr = (FuncExpr *)clause;
 
-    (void)expression_returns_set_rows_walker(clause, &result);
-    return clamp_row_est(result);
+            if (expr->funcretset)
+                return clamp_row_est(get_func_rows(expr->funcid));
+        }
+        if (IsA(clause, OpExpr)) {
+            OpExpr *expr = (OpExpr *)clause;
+            if (expr->opretset) {
+                set_opfuncid(expr);
+                return clamp_row_est(get_func_rows(expr->opfuncid));
+            }
+        }
+        return 1.0;
+    } else {
+        double result = 1;
+
+        (void)expression_returns_set_rows_walker(clause, &result);
+        return clamp_row_est(result);
+    }
 }
 
 static void expression_returns_set_rows_walker_isa(Node* node, double* count)
@@ -1324,6 +1365,7 @@ static bool contain_leaky_functions_walker(Node* node, void* context)
         case T_BooleanTest:
         case T_List:
         case T_HashFilter:
+        case T_UserVar:
 
             /*
              * We know these node types don't contain function calls; but
@@ -2168,7 +2210,7 @@ static bool rowtype_field_matches(
         ReleaseTupleDesc(tupdesc);
         return false;
     }
-    attr = tupdesc->attrs[fieldnum - 1];
+    attr = &tupdesc->attrs[fieldnum - 1];
     if (attr->attisdropped || attr->atttypid != expectedtype || attr->atttypmod != expectedtypmod ||
         attr->attcollation != expectedcollation) {
         ReleaseTupleDesc(tupdesc);
@@ -2345,6 +2387,25 @@ Node* eval_const_expressions_params(PlannerInfo* root, Node* node, ParamListInfo
     return eval_const_expressions_mutator(node, &context);
 }
 
+/*
+ * eval_const_expression_value
+ * only for set user_defined variables scenes.
+ * the difference between eval_const_expression_value and eval_const_expressions_params is
+ * that estimate is set to true.
+ */
+Node *eval_const_expression_value(PlannerInfo* root, Node* node, ParamListInfo boundParams)
+{
+    eval_const_expressions_context context;
+
+    context.boundParams = boundParams;
+    context.root = root;      /* for inlined-function dependencies */
+    context.active_fns = NIL; /* nothing being recursively simplified */
+    context.case_val = NULL;  /* no CASE being examined */
+    context.estimate = true; /* unsafe transformations OK */
+
+    return eval_const_expressions_mutator(node, &context);
+}
+
 /* --------------------
  * estimate_expression_value
  *
@@ -2379,6 +2440,56 @@ Node* estimate_expression_value(PlannerInfo* root, Node* node, EState* estate)
     return eval_const_expressions_mutator(node, &context);
 }
 
+/* --------------------
+ * simplify_select_into_expression
+ *
+ * Only for select ... into varlist statement.
+ *
+ * This function attempts to bind the value of parameter
+ * in the part of Select part without into_clause
+ * for the following process to calculate the value.
+ * --------------------
+ */
+Node* simplify_select_into_expression(Node* node, ParamListInfo boundParams, int *targetlist_len)
+{
+    eval_const_expressions_context context;
+
+    context.boundParams = boundParams;
+    context.root = NULL;      /* for inlined-function dependencies */
+    context.active_fns = NIL; /* nothing being recursively simplified */
+    context.case_val = NULL;  /* no CASE being examined */
+    context.estimate = true; /* unsafe transformations OK */
+
+    Query *qt = (Query *)((SubLink *)node)->subselect;
+    List *fromList = qt->jointree->fromlist;
+    ListCell *fc = NULL;
+    foreach (fc, fromList) {
+        Node *jtnode = (Node *)lfirst(fc);
+        if (IsA(jtnode, RangeTblRef)) {
+            int varno = ((RangeTblRef *)jtnode)->rtindex;
+            RangeTblEntry *rte = rt_fetch(varno, qt->rtable);
+            if (rte->funcexpr != NULL && IsA(rte->funcexpr, FuncExpr)) {
+                rte->funcexpr = eval_const_expressions_mutator((Node *)rte->funcexpr, &context);
+            }
+        }
+    }
+
+    ListCell *lc = NULL;
+    List *newTargetList = NIL;
+    foreach (lc, qt->targetList) {
+        TargetEntry *te = (TargetEntry *)lfirst(lc);
+        if (!te->resjunk) {
+            (*targetlist_len)++; 
+        }
+        Node *tn = (Node *)te->expr;
+        tn = eval_const_expressions_mutator(tn, &context);
+        te->expr = (Expr *)tn;
+        newTargetList = lappend(newTargetList, te);
+    }
+    qt->targetList = newTargetList;
+    return node;
+}
+
 Node* eval_const_expressions_mutator(Node* node, eval_const_expressions_context* context)
 {
     if (node == NULL)
@@ -2387,10 +2498,19 @@ Node* eval_const_expressions_mutator(Node* node, eval_const_expressions_context*
         case T_Param: {
             Param* param = (Param*)node;
 
+            if (ENABLE_CACHEDPLAN_MGR && context->boundParams != NULL && context->boundParams->params_lazy_bind) {
+                return (Node *)copyObject(param);
+            }
             /* Look to see if we've been given a value for this Param */
             if (param->paramkind == PARAM_EXTERN && context->boundParams != NULL && param->paramid > 0 &&
                 param->paramid <= context->boundParams->numParams) {
-                ParamExternData* prm = &context->boundParams->params[param->paramid - 1];
+                ParamListInfo paramInfo = context->boundParams;
+                ParamExternData* prm = &paramInfo->params[param->paramid - 1];
+
+                /* give hook a chance in case parameter in dynamic */
+                if (!OidIsValid(prm->ptype) && paramInfo->paramFetch != NULL) {
+                    (*paramInfo->paramFetch)(paramInfo, param->paramid);
+                }
 
                 if (OidIsValid(prm->ptype)) {
                     /* OK to substitute parameter value? */
@@ -3581,7 +3701,7 @@ static Node* simplify_boolean_equality(Oid opno, List* args)
  * will be done even if simplification of the function call itself is not
  * possible.
  */
-static Expr* simplify_function(Oid funcid, Oid result_type, int32 result_typmod, Oid result_collid, Oid input_collid,
+Expr* simplify_function(Oid funcid, Oid result_type, int32 result_typmod, Oid result_collid, Oid input_collid,
     List** args_p, bool process_args, bool allow_non_const, eval_const_expressions_context* context)
 {
     List* args = *args_p;
@@ -4018,17 +4138,17 @@ static void recheck_cast_function_args(List* args, Oid result_type, HeapTuple fu
         }
     }
 
-    /* if argtype is table of, change its element type */
-    for (int i = 0; i < nargs; i++) {
-        Oid baseOid = InvalidOid;
-        if (isTableofType(proargtypes[i], &baseOid, NULL)) {
-            proargtypes[i] = baseOid;
-        }
-    }
-
     errno_t errorno;
     errorno = memcpy_s(declared_arg_types, FUNC_MAX_ARGS * sizeof(Oid), proargtypes, proc_arg * sizeof(Oid));
     securec_check(errorno, "", "");
+
+    /* if argtype is table of, change its element type */
+    for (int i = 0; i < nargs; i++) {
+        Oid baseOid = InvalidOid;
+        if (isTableofType(declared_arg_types[i], &baseOid, NULL)) {
+            declared_arg_types[i] = baseOid;
+        }
+    }
 
     rettype =
         enforce_generic_type_consistency(actual_arg_types, declared_arg_types, nargs, funcform->prorettype, false);
@@ -4171,7 +4291,11 @@ static Expr* evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
     newexpr->args = args;
     newexpr->location = -1;
 
-    return evaluate_expr((Expr*)newexpr, result_type, result_typmod, result_collid);
+    bool can_ignore = false;
+    if (context != NULL && context->root != NULL && context->root->parse != NULL && context->root->parse->hasIgnore) {
+        can_ignore = true;
+    }
+    return evaluate_expr((Expr*)newexpr, result_type, result_typmod, result_collid, can_ignore);
 }
 
 /*
@@ -4322,6 +4446,7 @@ static Expr* inline_function(Oid funcid, Oid result_type, Oid result_collid, Oid
         querytree->cteList || querytree->rtable || querytree->jointree->fromlist || querytree->jointree->quals ||
         querytree->groupClause || querytree->havingQual || querytree->windowClause || querytree->distinctClause ||
         querytree->sortClause || querytree->limitOffset || querytree->limitCount || querytree->setOperations ||
+        (querytree->is_flt_frame && querytree->hasTargetSRFs) ||
         list_length(querytree->targetList) != 1)
         goto fail;
 
@@ -4347,16 +4472,17 @@ static Expr* inline_function(Oid funcid, Oid result_type, Oid result_collid, Oid
     AssertEreport(!modifyTargetList, MOD_OPT, "");
 
     /*
-     * Additional validity checks on the expression.  It mustn't return a set,
-     * and it mustn't be more volatile than the surrounding function (this is
-     * to avoid breaking hacks that involve pretending a function is immutable
-     * when it really ain't).  If the surrounding function is declared strict,
-     * then the expression must contain only strict constructs and must use
-     * all of the function parameters (this is overkill, but an exact analysis
-     * is hard).
+     * Additional validity checks on the expression.  It mustn't be more
+     * volatile than the surrounding function (this is to avoid breaking hacks
+     * that involve pretending a function is immutable when it really ain't).
+     * If the surrounding function is declared strict, then the expression
+     * must contain only strict constructs and must use all of the function
+     * parameters (this is overkill, but an exact analysis is hard).
      */
-    if (expression_returns_set(newexpr))
-        goto fail;
+    if (!querytree->is_flt_frame) {
+        if (expression_returns_set(newexpr))
+            goto fail;
+    }
 
     if (funcform->provolatile == PROVOLATILE_IMMUTABLE && contain_mutable_functions(newexpr))
         goto fail;
@@ -4600,8 +4726,10 @@ static void sql_inline_error_callback(void* arg)
  *
  * We use the executor's routine ExecEvalExpr() to avoid duplication of
  * code and ensure we get the same result as the executor would get.
+ *
+ * Note: parameter can_ignore indicates whether ERROR is ignorable when casting type. TRUE if SQL has keyword IGNORE.
  */
-Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result_collation)
+Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result_collation, bool can_ignore)
 {
     EState* estate = NULL;
     ExprState* exprstate = NULL;
@@ -4636,7 +4764,11 @@ Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result
      * fortuitous, but it's not so unreasonable --- a constant expression does
      * not depend on context, by definition, n'est ce pas?
      */
-    const_val = ExecEvalExprSwitchContext(exprstate, GetPerTupleExprContext(estate), &const_is_null, NULL);
+    ExprContext* econtext = GetPerTupleExprContext(estate);
+    if (econtext != NULL) {
+        econtext->can_ignore = can_ignore;
+    }
+    const_val = ExecEvalExprSwitchContext(exprstate, econtext, &const_is_null, NULL);
 
     /* Get info needed about result datatype */
     get_typlenbyval(result_type, &resultTypLen, &resultTypByVal);

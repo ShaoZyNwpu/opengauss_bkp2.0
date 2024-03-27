@@ -19,7 +19,6 @@
 #include "access/xloginsert.h"
 #include "access/cbtree.h"
 #include "access/cstore_am.h"
-#include "access/dfs/dfs_am.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
@@ -223,7 +222,7 @@ static void ginHeapTupleBulkInsert(GinBuildState *buildstate, OffsetNumber attnu
 {
     Datum *entries = NULL;
     GinNullCategory *categories = NULL;
-    int32 nentries;
+    int32 nentries = 0;
     MemoryContext oldCtx;
 
     oldCtx = MemoryContextSwitchTo(buildstate->funcCtx);
@@ -479,7 +478,7 @@ Datum cginbuild(PG_FUNCTION_ARGS)
             list_free(varsOrigin);
         }
         heapScanAttrNumbers[i] = keycol;
-        transferFuncs[i] = GetTransferFuncByTypeOid(heap->rd_att->attrs[heapScanAttrNumbers[i] - 1]->atttypid);
+        transferFuncs[i] = GetTransferFuncByTypeOid(heap->rd_att->attrs[heapScanAttrNumbers[i] - 1].atttypid);
     }
 
     /* add ctid column for cstore scan */

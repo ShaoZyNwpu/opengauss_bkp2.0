@@ -45,7 +45,7 @@ static void dw_empty_buftag_page_old(uint16 org_start, uint16 max_idx)
     MemoryContext old_mem_cxt = MemoryContextSwitchTo(dw_single_cxt->mem_cxt);
     char *unaligned_buf = (char *)palloc0(BLCKSZ + BLCKSZ); /* one more BLCKSZ for alignment */
     char *buf = (char *)TYPEALIGN(BLCKSZ, unaligned_buf);
-    
+
     for (int i = org_start; i < max_idx - org_start; i++) {
         if (i >= SINGLE_BLOCK_TAG_NUM * (batch + 1)) {
             uint32 tag_offset = (batch + 1) * BLCKSZ; /* need skip file head */
@@ -327,7 +327,7 @@ uint16 seg_dw_single_flush(BufferDesc *buf_desc, bool* flush_old_file)
 
     if (!dw_flush) {
         *flush_old_file = false;
-        pos = second_version_dw_single_flush(buf_desc->tag, block, page_lsn, buf_desc->encrypt, phy_tag);
+        pos = second_version_dw_single_flush(buf_desc->tag, block, page_lsn, buf_desc->extra->encrypt, phy_tag);
     }
     return pos;
 }

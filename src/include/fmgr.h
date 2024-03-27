@@ -155,13 +155,14 @@ typedef struct FunctionCallInfoData {
     fmNodePtr resultinfo;                        /* pass or return extra info about result */
     Oid fncollation;                             /* collation for function to use */
     bool isnull;                                 /* function must set true if result is NULL */
+    bool can_ignore;                             /* function can ignore overflow or underflow conditions for type transform function */
     short nargs;                                 /* # arguments actually passed */
     Datum* arg;                                  /* Arguments passed to function */
     bool* argnull;                               /* T if arg[i] is actually NULL */
     Oid* argTypes;                               /* Argument type */
     Datum prealloc_arg[FUNC_PREALLOCED_ARGS];    /* prealloced arguments.*/
     bool prealloc_argnull[FUNC_PREALLOCED_ARGS]; /* prealloced argument null flags.*/
-    Oid prealloc_argTypes[FUNC_PREALLOCED_ARGS]; /* prealloced argument type */
+    Oid prealloc_argTypes[FUNC_PREALLOCED_ARGS] = {InvalidOid}; /* prealloced argument type */
     ScalarVector* argVector;                     /* Scalar Vector */
     RefcusorInfoData refcursor_data;
     UDFInfoType udfInfo;
@@ -179,6 +180,7 @@ typedef struct FunctionCallInfoData {
         resultinfo = NULL;
         nargs = 0;
         isnull = false;
+        can_ignore = false;
     }
 } FunctionCallInfoData;
 
@@ -213,6 +215,7 @@ extern DynamicFileList* file_tail;
 
 #define EXTRA_NARGS 3
 
+extern bool directory_exists(const char* direct);
 extern bool file_exists(const char* name);
 /*
  * This routine fills a FmgrInfo struct, given the OID
@@ -302,7 +305,7 @@ extern void fmgr_info_copy(FmgrInfo* dstinfo, FmgrInfo* srcinfo, MemoryContext d
         (Fcinfo).fncollation = (Collation);                                             \
         (Fcinfo).isnull = false;                                                        \
         (Fcinfo).nargs = (Nargs);                                                       \
-        if ((Nargs) > FUNC_PREALLOCED_ARGS) {                                           \
+        if (unlikely((Nargs) > FUNC_PREALLOCED_ARGS)) {                                 \
             (Fcinfo).arg = (Datum*)palloc0((Nargs) * sizeof(Datum));                    \
             (Fcinfo).argnull = (bool*)palloc0((Nargs) * sizeof(bool));                  \
             (Fcinfo).argTypes = (Oid*)palloc0((Nargs) * sizeof(Oid));                   \
@@ -449,7 +452,7 @@ typedef const Pg_magic_struct* (*PGModuleMagicFunction)(void);
  * directly-computed parameter list.  Note that neither arguments nor result
  * are allowed to be NULL.
  */
-extern Datum DirectFunctionCall1Coll(PGFunction func, Oid collation, Datum arg1);
+extern Datum DirectFunctionCall1Coll(PGFunction func, Oid collation, Datum arg1, bool can_ignore = false);
 extern Datum DirectFunctionCall2Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2);
 extern Datum DirectFunctionCall3Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2, Datum arg3);
 extern Datum DirectFunctionCall4Coll(PGFunction func, Oid collation, Datum arg1, Datum arg2, Datum arg3, Datum arg4);
@@ -561,10 +564,10 @@ typedef struct {
 } CFunInfo;
 
 /* Special cases for convenient invocation of datatype I/O functions. */
-extern Datum InputFunctionCall(FmgrInfo* flinfo, char* str, Oid typioparam, int32 typmod);
+extern Datum InputFunctionCall(FmgrInfo* flinfo, char* str, Oid typioparam, int32 typmod, bool can_ignore = false);
 extern Datum InputFunctionCallForDateType(
     FmgrInfo* flinfo, char* str, Oid typioparam, int32 typmod, char* date_time_fmt);
-extern Datum OidInputFunctionCall(Oid functionId, char* str, Oid typioparam, int32 typmod);
+extern Datum OidInputFunctionCall(Oid functionId, char* str, Oid typioparam, int32 typmod, bool can_ignore = false);
 extern char* OutputFunctionCall(FmgrInfo* flinfo, Datum val);
 extern char* OidOutputFunctionCall(Oid functionId, Datum val);
 extern Datum ReceiveFunctionCall(FmgrInfo* flinfo, fmStringInfo buf, Oid typioparam, int32 typmod);

@@ -120,7 +120,7 @@ NON_EXEC_STATIC void TwoPhaseCleanerMain()
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, SIG_IGN);
     (void)gspqsignal(SIGUSR2, SIG_IGN); /* not used */
-
+    (void)gspqsignal(SIGURG, print_stack);
     /* Reset some signals that are accepted by postmaster but not here */
     (void)gspqsignal(SIGCHLD, SIG_DFL);
     (void)gspqsignal(SIGTTIN, SIG_DFL);
@@ -205,6 +205,12 @@ NON_EXEC_STATIC void TwoPhaseCleanerMain()
 
         if (t_thrd.tpcleaner_cxt.shutdown_requested) {
             /* Normal exit from the twophasecleaner is here */
+            ereport(LOG, (errmsg("TwoPhaseCleaner exits via SIGTERM")));
+            proc_exit(0);
+        }
+
+        if (SS_PRIMARY_DEMOTING) {
+            ereport(LOG, (errmsg("TwoPhaseCleaner exits via SS global var")));
             proc_exit(0);
         }
 
@@ -326,6 +332,7 @@ static void TwoPCShutdownHandler(SIGNAL_ARGS)
 {
     int save_errno = errno;
 
+    ereport(LOG, (errmsg("TwoPhaseCleaner received SIGTERM")));
     t_thrd.tpcleaner_cxt.shutdown_requested = true;
 
     if (t_thrd.proc)

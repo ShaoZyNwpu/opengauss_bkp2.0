@@ -153,11 +153,11 @@ int main(int argc, char** argv)
         {"role", required_argument, NULL, 2},
         {"section", required_argument, NULL, 3},
         {"use-set-session-authorization", no_argument, &use_setsessauth, 1},
-#if !defined(ENABLE_MULTIPLE_NODES) && !defined(ENABLE_LITE_MODE)
+#if !defined(ENABLE_MULTIPLE_NODES)
         {"no-publications", no_argument, &no_publications, 1},
 #endif
         {"no-security-labels", no_argument, &no_security_labels, 1},
-#if !defined(ENABLE_MULTIPLE_NODES) && !defined(ENABLE_LITE_MODE)
+#if !defined(ENABLE_MULTIPLE_NODES)
         {"no-subscriptions", no_argument, &no_subscriptions, 1},
 #endif
         {"rolepassword", required_argument, NULL, 5},
@@ -743,7 +743,7 @@ static void restore_getopts(int argc, char** argv, struct option* options, Resto
 
 void usage(const char* pchProgname)
 {
-    printf(_("%s restores a openGauss database from an archive created by gs_dump.\n\n"), pchProgname);
+    printf(_("%s restores an openGauss database from an archive created by gs_dump.\n\n"), pchProgname);
     printf(_("Usage:\n"));
     printf(_("  %s [OPTION]... FILE\n"), pchProgname);
 
@@ -777,11 +777,11 @@ void usage(const char* pchProgname)
     printf(_("  --disable-triggers                    disable triggers during data-only restore\n"));
     printf(_("  --no-data-for-failed-tables           do not restore data of tables that could not be\n"
              "                                        created\n"));
-#if !defined(ENABLE_MULTIPLE_NODES) && !defined(ENABLE_LITE_MODE)
+#if !defined(ENABLE_MULTIPLE_NODES)
     printf(_("  --no-publications                     do not restore publications\n"));
 #endif
     printf(_("  --no-security-labels                  do not restore security labels\n"));
-#if !defined(ENABLE_MULTIPLE_NODES) && !defined(ENABLE_LITE_MODE)
+#if !defined(ENABLE_MULTIPLE_NODES)
     printf(_("  --no-subscriptions                    do not restore subscriptions\n"));
 #endif
     printf(_("  --no-tablespaces                      do not restore tablespace assignments\n"));

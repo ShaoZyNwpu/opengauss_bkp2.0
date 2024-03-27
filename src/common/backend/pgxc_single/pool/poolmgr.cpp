@@ -669,13 +669,13 @@ char* session_options(void)
 
         char *rawString = strdup(value);
         SplitIdentifierString(rawString, ',', &value_list);
-        free(rawString);
         foreach (l, value_list) {
             char* value = (char*)lfirst(l);
             appendStringInfoString(&options, value);
             if (lnext(l))
                 appendStringInfoChar(&options, ',');
         }
+        free(rawString);
 
         list_free_ext(value_list);
     }
@@ -1256,8 +1256,8 @@ retry:
         /*
          * Wait 0.5 sec in order to void failure.
          */
-        pg_usleep(500000);
         if (loops < 3) {
+            pg_usleep(500000);
             loops++;
             goto retry;
         } else {

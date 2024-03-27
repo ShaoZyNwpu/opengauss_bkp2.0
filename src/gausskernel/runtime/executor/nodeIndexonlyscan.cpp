@@ -44,6 +44,7 @@
 #include "optimizer/pruning.h"
 
 
+static TupleTableSlot* ExecIndexOnlyScan(PlanState* state);
 static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node);
 static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node);
 
@@ -137,15 +138,18 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
     econtext = node->ss.ps.ps_ExprContext;
     slot = node->ss.ss_ScanTupleSlot;
     isUHeap = RelationIsUstoreFormat(node->ss.ss_currentRelation);
-    tmpslot = MakeSingleTupleTableSlot(RelationGetDescr(scandesc->heapRelation),
-        false, scandesc->heapRelation->rd_tam_type);
-
+    if (isUHeap) {
+        tmpslot = MakeSingleTupleTableSlot(RelationGetDescr(scandesc->heapRelation),
+        false, scandesc->heapRelation->rd_tam_ops);
+    }
     /*
      * OK, now that we have what we need, fetch the next tuple.
      */
     while ((tid = scan_handler_idx_getnext_tid(scandesc, direction)) != NULL) {
         HeapTuple tuple = NULL;
         IndexScanDesc indexScan = GetIndexScanDesc(scandesc);
+
+        CHECK_FOR_INTERRUPTS();
 
         /*
          * We can skip the heap fetch if the TID references a heap page on
@@ -176,7 +180,7 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
             /* ustore with multi-version ubtree only recheck IndexTuple when xs_recheck_itup is set */
             if (indexScan->xs_recheck_itup) {
                 node->ioss_HeapFetches++;
-                if (!IndexFetchUHeap(indexScan, tmpslot)) {
+                if (!IndexFetchUHeap(indexScan, tmpslot, &node->ss.ps.state->have_current_xact_date)) {
                     continue; /* this TID indicate no visible tuple */
                 }
                 if (!RecheckIndexTuple(indexScan, tmpslot)) {
@@ -190,7 +194,7 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
              * Rats, we have to visit the heap to check visibility.
              */
             node->ioss_HeapFetches++;
-            if (!IndexFetchSlot(indexScan, slot, isUHeap)) {
+            if (!IndexFetchSlot(indexScan, slot, isUHeap, &node->ss.ps.state->have_current_xact_date)) {
 #ifdef DEBUG_INPLACE
                 /* Now ustore does not support hash bucket table */
                 Assert(indexScan == scandesc);
@@ -259,7 +263,9 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
          */
         if (tuple == NULL)
             PredicateLockPage(indexScan->heapRelation, ItemPointerGetBlockNumber(tid), estate->es_snapshot);
-        ExecDropSingleTupleTableSlot(tmpslot);
+        if (isUHeap) {
+            ExecDropSingleTupleTableSlot(tmpslot);
+        }
         return slot;
     }
 
@@ -267,7 +273,9 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
      * if we get here it means the index scan failed so we are at the end of
      * the scan..
      */
-    ExecDropSingleTupleTableSlot(tmpslot);
+    if (isUHeap) {
+        ExecDropSingleTupleTableSlot(tmpslot);
+    }
     return ExecClearTuple(slot);
 }
 
@@ -319,8 +327,9 @@ static bool IndexOnlyRecheck(IndexOnlyScanState* node, TupleTableSlot* slot)
  *		ExecIndexOnlyScan(node)
  * ----------------------------------------------------------------
  */
-TupleTableSlot* ExecIndexOnlyScan(IndexOnlyScanState* node)
+static TupleTableSlot* ExecIndexOnlyScan(PlanState* state)
 {
+    IndexOnlyScanState* node = castNode(IndexOnlyScanState, state);
     /*
      * If we have runtime keys and they've not already been set up, do it now.
      */
@@ -382,7 +391,8 @@ void ExecReScanIndexOnlyScan(IndexOnlyScanState* node)
          * if node->ss.ss_ReScan = true, just do rescaning as non-partitioned
          * table; else switch to next partition for scaning.
          */
-        if (node->ss.ss_ReScan) {
+        if (node->ss.ss_ReScan ||
+            (((Scan *)node->ss.ps.plan)->partition_iterator_elimination)) {
             /* reset the rescan falg */
             node->ss.ss_ReScan = false;
         } else {
@@ -481,6 +491,7 @@ void ExecEndIndexOnlyScan(IndexOnlyScanState* node)
             if (RelationIsSubPartitioned(heapRelation)) {
                 releaseSubPartitionList(node->ioss_RelationDesc, &(node->ioss_IndexPartitionList), NoLock);
                 releaseSubPartitionList(node->ss.ss_currentRelation, &(node->ss.subpartitions), NoLock);
+                releasePartitionList(node->ss.ss_currentRelation, &(node->ss.partitions), NoLock);
             } else {
                 /* close index partition */
                 releasePartitionList(node->ioss_RelationDesc, &(node->ioss_IndexPartitionList), NoLock);
@@ -550,6 +561,7 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
     indexstate->ss.isPartTbl = node->scan.isPartTbl;
     indexstate->ss.partScanDirection = node->indexorderdir;
     indexstate->ss.currentSlot = 0;
+    indexstate->ss.ps.ExecProcNode = ExecIndexOnlyScan;
 
     /*
      * Miscellaneous initialization
@@ -582,8 +594,8 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
     /*
      * tuple table initialization
      */
-    ExecInitResultTupleSlot(estate, &indexstate->ss.ps, currentRelation->rd_tam_type);
-    ExecInitScanTupleSlot(estate, &indexstate->ss, currentRelation->rd_tam_type);
+    ExecInitResultTupleSlot(estate, &indexstate->ss.ps, currentRelation->rd_tam_ops);
+    ExecInitScanTupleSlot(estate, &indexstate->ss, currentRelation->rd_tam_ops);
 
     /*
      * Build the scan tuple type using the indextlist generated by the
@@ -592,7 +604,7 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
      * types of the original datums.  (It's the AM's responsibility to return
      * suitable data anyway.)
      */
-    tupDesc = ExecTypeFromTL(node->indextlist, false, false, TAM_HEAP);
+    tupDesc = ExecTypeFromTL(node->indextlist, false, false);
     ExecAssignScanType(&indexstate->ss, tupDesc);
 
     /*
@@ -600,11 +612,11 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
      */
     ExecAssignResultTypeFromTL(
             &indexstate->ss.ps,
-            indexstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor->tdTableAmType);
+            indexstate->ss.ss_ScanTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     ExecAssignScanProjectionInfo(&indexstate->ss);
 
-    Assert(indexstate->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->tdTableAmType != TAM_INVALID);
+    Assert(indexstate->ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor->td_tam_ops);
 
     /*
      * If we are just doing EXPLAIN (ie, aren't going to run the plan), stop
@@ -732,9 +744,11 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
                     if (TransactionIdPrecedes(FirstNormalTransactionId, scanSnap->xmax) &&
                         !TransactionIdIsCurrentTransactionId(relfrozenxid64) &&
                         TransactionIdPrecedes(scanSnap->xmax, relfrozenxid64)) {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_SNAPSHOT_INVALID),
-                                 (errmsg("Snapshot too old."))));
+                        ereport(ERROR, (errcode(ERRCODE_SNAPSHOT_INVALID),
+                            (errmsg("Snapshot too old, IndexOnlyScan is  PartTbl, the info: snapxmax is %lu, "
+                                "snapxmin is %lu, csn is %lu, relfrozenxid64 is %lu, globalRecycleXid is %lu.",
+                                scanSnap->xmax, scanSnap->xmin, scanSnap->snapshotcsn, relfrozenxid64,
+                                g_instance.undo_cxt.globalRecycleXid))));
                     }
                 }
 
@@ -757,9 +771,11 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
             if (TransactionIdPrecedes(FirstNormalTransactionId, scanSnap->xmax) &&
                 !TransactionIdIsCurrentTransactionId(relfrozenxid64) &&
                 TransactionIdPrecedes(scanSnap->xmax, relfrozenxid64)) {
-                ereport(ERROR,
-                        (errcode(ERRCODE_SNAPSHOT_INVALID),
-                         (errmsg("Snapshot too old."))));
+                ereport(ERROR, (errcode(ERRCODE_SNAPSHOT_INVALID),
+                    (errmsg("Snapshot too old, IndexOnlyScan is not  PartTbl, the info: snapxmax is %lu, "
+                        "snapxmin is %lu, csn is %lu, relfrozenxid64 is %lu, globalRecycleXid is %lu.",
+                        scanSnap->xmax, scanSnap->xmin, scanSnap->snapshotcsn, relfrozenxid64,
+                        g_instance.undo_cxt.globalRecycleXid))));
             }
         }
 
@@ -828,6 +844,11 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
     int subPartParamno = -1;
     ParamExecData* subPartParam = NULL;
 
+    IndexOnlyScanState* indexOnlyState = node;
+    IndexOnlyScan *indexOnlyScan = (IndexOnlyScan *)node->ss.ps.plan;
+    Snapshot scanSnap;
+    scanSnap = TvChooseScanSnap(indexOnlyState->ioss_RelationDesc, &indexOnlyScan->scan, &indexOnlyState->ss);
+
     if (BufferIsValid(node->ioss_VMBuffer)) {
         ReleaseBuffer(node->ioss_VMBuffer);
         node->ioss_VMBuffer = InvalidBuffer;
@@ -878,7 +899,7 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
     /* Initialize scan descriptor. */
     node->ioss_ScanDesc = scan_handler_idx_beginscan(node->ss.ss_currentPartition,
         node->ioss_CurrentIndexPartition,
-        node->ss.ps.state->es_snapshot,
+        scanSnap,
         node->ioss_NumScanKeys,
         node->ioss_NumOrderByKeys,
         (ScanState*)node);
@@ -943,33 +964,49 @@ void ExecInitPartitionForIndexOnlyScan(IndexOnlyScanState* indexstate, EState* e
             indexstate->ss.part_id = 0;
         }
         
-        ListCell* cell = NULL;
+        ListCell* cell1 = NULL;
+        ListCell* cell2 = NULL;
         List* part_seqs = resultPlan->ls_rangeSelectedPartitions;
-        foreach (cell, part_seqs) {
+        List* partitionnos = resultPlan->ls_selectedPartitionnos;
+        Assert(list_length(part_seqs) == list_length(partitionnos));
+        StringInfo partNameInfo = makeStringInfo();
+        StringInfo partOidInfo = makeStringInfo();
+
+        forboth (cell1, part_seqs, cell2, partitionnos) {
             Oid indexpartitionid = InvalidOid;
             List* partitionIndexOidList = NIL;
             Oid tablepartitionid = InvalidOid;
-            int partSeq = lfirst_int(cell);
+            int partSeq = lfirst_int(cell1);
+            int partitionno = lfirst_int(cell2);
 
             /* get table partition and add it to a list for following scan */
-            tablepartitionid = getPartitionOidFromSequence(currentRelation, partSeq);
-            tablepartition = partitionOpen(currentRelation, tablepartitionid, lock);
+            tablepartitionid = getPartitionOidFromSequence(currentRelation, partSeq, partitionno);
+            tablepartition = PartitionOpenWithPartitionno(currentRelation, tablepartitionid, partitionno, lock);
             indexstate->ss.partitions = lappend(indexstate->ss.partitions, tablepartition);
+
+            appendStringInfo(partNameInfo, "%s ", tablepartition->pd_part->relname.data);
+            appendStringInfo(partOidInfo, "%u ", tablepartitionid);
+
             if (RelationIsSubPartitioned(currentRelation)) {
-                ListCell *lc = NULL;
+                ListCell *lc1 = NULL;
+                ListCell *lc2 = NULL;
                 SubPartitionPruningResult *subPartPruningResult =
-                    GetSubPartitionPruningResult(resultPlan->ls_selectedSubPartitions, partSeq);
+                    GetSubPartitionPruningResult(resultPlan->ls_selectedSubPartitions, partSeq, partitionno);
                 if (subPartPruningResult == NULL) {
                     continue;
                 }
                 List *subpartList = subPartPruningResult->ls_selectedSubPartitions;
+                List *subpartitionnos = subPartPruningResult->ls_selectedSubPartitionnos;
+                Assert(list_length(subpartList) == list_length(subpartitionnos));
                 List *subIndexList = NIL;
                 List *subPartList = NIL;
                 Relation tablepartrel = partitionGetRelation(currentRelation, tablepartition);
-                foreach (lc, subpartList) {
-                    int subpartSeq = lfirst_int(lc);
-                    Oid subpartitionid = getPartitionOidFromSequence(tablepartrel, subpartSeq);
-                    Partition subpart = partitionOpen(tablepartrel, subpartitionid, AccessShareLock);
+                forboth (lc1, subpartList, lc2, subpartitionnos) {
+                    int subpartSeq = lfirst_int(lc1);
+                    int subpartitionno = lfirst_int(lc2);
+                    Oid subpartitionid = getPartitionOidFromSequence(tablepartrel, subpartSeq, subpartitionno);
+                    Partition subpart =
+                        PartitionOpenWithPartitionno(tablepartrel, subpartitionid, subpartitionno, AccessShareLock);
                     subPartList = lappend(subPartList, subpart);
 
                     partitionIndexOidList = PartitionGetPartIndexList(subpart);
@@ -991,7 +1028,6 @@ void ExecInitPartitionForIndexOnlyScan(IndexOnlyScanState* indexstate, EState* e
                     subIndexList = lappend(subIndexList, indexpartition);
                 }
                 releaseDummyRelation(&tablepartrel);
-                partitionClose(currentRelation, tablepartition, lock);
                 indexstate->ss.subPartLengthList =
                     lappend_int(indexstate->ss.subPartLengthList, list_length(subPartList));
                 indexstate->ss.subpartitions = lappend(indexstate->ss.subpartitions, subPartList);

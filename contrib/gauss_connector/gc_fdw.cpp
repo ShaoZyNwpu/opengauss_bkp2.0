@@ -348,7 +348,7 @@ static void gcGetForeignRelSize(PlannerInfo* root, RelOptInfo* baserel, Oid fore
      * columns used in them.  Doesn't seem worth detecting that case though.)
      */
     fpinfo->attrs_used = NULL;
-    pull_varattnos((Node*)baserel->reltargetlist, baserel->relid, &fpinfo->attrs_used);
+    pull_varattnos((Node*)baserel->reltarget->exprs, baserel->relid, &fpinfo->attrs_used);
     foreach (lc, fpinfo->local_conds) {
         RestrictInfo* rinfo = lfirst_node(RestrictInfo, lc);
 
@@ -390,7 +390,7 @@ static void gcGetForeignRelSize(PlannerInfo* root, RelOptInfo* baserel, Oid fore
             baserel->pages = 10;
             const int BLOCK_NUM = 10;
             baserel->tuples =
-                (double)(BLOCK_NUM * BLCKSZ) / (baserel->width + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits)));
+                (double)(BLOCK_NUM * BLCKSZ) / (baserel->reltarget->width + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits)));
         }
 
         /* Estimate baserel size as best we can with local statistics. */
@@ -448,8 +448,9 @@ static void gcGetForeignPaths(PlannerInfo* root, RelOptInfo* baserel, Oid foreig
         fpinfo->startup_cost,
         fpinfo->total_cost,
         NIL,  /* no pathkeys */
-        NULL, /* no outer rel either */
-        NIL,  /* no fdw_private list */
+        NULL, /* no outer rel either  */
+        NULL, /* no outer path either */
+        NIL,  /* no fdw_private list  */
         u_sess->opt_cxt.query_dop);
     add_path(root, baserel, (Path*)path);
 }
@@ -459,7 +460,7 @@ static void gcGetForeignPaths(PlannerInfo* root, RelOptInfo* baserel, Oid foreig
  *		Create ForeignScan plan node which implements selected best path
  */
 static ForeignScan* gcGetForeignPlan(PlannerInfo* root, RelOptInfo* foreignrel, Oid foreigntableid,
-    ForeignPath* best_path, List* tlist, List* scan_clauses)
+    ForeignPath* best_path, List* tlist, List* scan_clauses, Plan* outer_plan)
 {
     GcFdwRelationInfo* fpinfo = (GcFdwRelationInfo*)foreignrel->fdw_private;
     Index scan_relid;
@@ -617,7 +618,8 @@ static ForeignScan* gcGetForeignPlan(PlannerInfo* root, RelOptInfo* foreignrel, 
      * field of the finished plan node; we can't keep them in private state
      * because then they wouldn't be subject to later planner processing.
      */
-    return make_foreignscan(tlist, local_exprs, scan_relid, params_list, fdw_private, EXEC_ON_DATANODES);
+    return make_foreignscan(tlist, local_exprs, scan_relid, params_list, fdw_private, NIL, NIL, NULL,
+        EXEC_ON_DATANODES);
 }
 
 /*
@@ -700,7 +702,7 @@ static void gcBeginForeignScan(ForeignScanState* node, int eflags)
 
         for (int i = 0; i < list_length(fsstate->retrieved_attrs); i++) {
             int attidx = list_nth_int(fsstate->retrieved_attrs, i);
-            Form_pg_attribute attr = slot->tts_tupleDescriptor->attrs[attidx - 1];
+            Form_pg_attribute attr = &slot->tts_tupleDescriptor->attrs[attidx - 1];
             const char* attname = (const char*)(attr->attname.data);
             TupleDescInitEntry(scan_desc, i + 1, attname, attr->atttypid, attr->atttypmod, 0);
         }
@@ -745,8 +747,8 @@ static void gcBeginForeignScan(ForeignScanState* node, int eflags)
         fsstate->resultSlot->tts_isnull[i] = true;
     }
 
-    fsstate->resultSlot->tts_isempty = false;
-    fsstate->scanSlot->tts_isempty = false;
+    fsstate->resultSlot->tts_flags &= ~TTS_FLAG_EMPTY;
+    fsstate->scanSlot->tts_flags &= ~TTS_FLAG_EMPTY;
 
     fsstate->attinmeta = TupleDescGetAttInMetadata(fsstate->tupdesc);
 
@@ -862,7 +864,7 @@ static void postgresConstructResultSlotWithArray(ForeignScanState* node)
     for (scanAttr = 0, resultAttr = 0; resultAttr < resultDesc->natts; resultAttr++, scanAttr += map) {
         Assert(list_length(colmap) == resultDesc->natts);
 
-        Oid typoid = resultDesc->attrs[resultAttr]->atttypid;
+        Oid typoid = resultDesc->attrs[resultAttr].atttypid;
         Value* val = (Value*)list_nth(colmap, resultAttr);
         map = val->val.ival;
 
@@ -917,7 +919,7 @@ static void postgresConstructResultSlotWithArray(ForeignScanState* node)
     }
 
     resultSlot->tts_nvalid = resultDesc->natts;
-    resultSlot->tts_isempty = false;
+    resultSlot->tts_flags &= ~TTS_FLAG_EMPTY;
 }
 
 static void postgresMapResultFromScanSlot(ForeignScanState* node)
@@ -956,7 +958,7 @@ static TupleTableSlot* gcIterateNormalForeignScan(ForeignScanState* node)
 
     /* reset tupleslot on the begin */
     (void)ExecClearTuple(fsstate->resultSlot);
-    fsstate->resultSlot->tts_isempty = false;
+    fsstate->resultSlot->tts_flags &= ~TTS_FLAG_EMPTY;
 
     TupleTableSlot* slot = node->ss.ss_ScanTupleSlot;
 
@@ -1467,7 +1469,7 @@ static void gc_estimate_path_cost_size(PlannerInfo* root, RelOptInfo* foreignrel
          * between foreign relations.
          */
         rows = foreignrel->rows;
-        width = foreignrel->width;
+        width = foreignrel->reltarget->width;
 
         /* Back into an estimate of the number of retrieved rows. */
         retrieved_rows = clamp_row_est(rows / fpinfo->local_conds_sel);
@@ -1811,17 +1813,17 @@ static void gcfdw_fetch_remote_table_info(
     pq_sendint(&retbuf, tupdesc->natts, 4);
 
     for (int i = 0; i < tupdesc->natts; i++) {
-        att_name_len = strlen(tupdesc->attrs[i]->attname.data);
+        att_name_len = strlen(tupdesc->attrs[i].attname.data);
         pq_sendint(&retbuf, att_name_len, 4);
-        pq_sendbytes(&retbuf, tupdesc->attrs[i]->attname.data, att_name_len);
+        pq_sendbytes(&retbuf, tupdesc->attrs[i].attname.data, att_name_len);
 
-        Assert(InvalidOid != tupdesc->attrs[i]->atttypid);
+        Assert(InvalidOid != tupdesc->attrs[i].atttypid);
 
-        type_name = get_typename(tupdesc->attrs[i]->atttypid);
+        type_name = get_typename(tupdesc->attrs[i].atttypid);
         type_name_len = strlen(type_name);
         pq_sendint(&retbuf, type_name_len, 4);
         pq_sendbytes(&retbuf, type_name, type_name_len);
-        pq_sendint(&retbuf, tupdesc->attrs[i]->atttypmod, 4);
+        pq_sendint(&retbuf, tupdesc->attrs[i].atttypmod, 4);
         pfree(type_name);
     }
 
@@ -2366,7 +2368,7 @@ static void conversion_error_callback(void *arg)
         TupleDesc tupdesc = RelationGetDescr(errpos->rel);
 
         if (errpos->cur_attno > 0 && errpos->cur_attno <= tupdesc->natts) {
-            attname = NameStr(tupdesc->attrs[errpos->cur_attno - 1]->attname);
+            attname = NameStr(tupdesc->attrs[errpos->cur_attno - 1].attname);
         } else if (errpos->cur_attno == SelfItemPointerAttributeNumber) {
             attname = "ctid";
         } else if (errpos->cur_attno == ObjectIdAttributeNumber) {
@@ -2586,7 +2588,7 @@ static void GcFdwCopyRemoteInfo(PgFdwRemoteInfo* new_remote_info, PgFdwRemoteInf
 bool hasSpecialArrayType(TupleDesc desc)
 {
     for (int i = 0; i < desc->natts; i++) {
-        Oid typoid = desc->attrs[i]->atttypid;
+        Oid typoid = desc->attrs[i].atttypid;
 
         if (INT8ARRAYOID == typoid || FLOAT8ARRAYOID == typoid || FLOAT4ARRAYOID == typoid || NUMERICARRAY == typoid) {
             return true;

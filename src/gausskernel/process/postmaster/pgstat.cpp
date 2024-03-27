@@ -67,6 +67,7 @@
 #include "storage/pg_shmem.h"
 #include "storage/procsignal.h"
 #include "storage/procarray.h"
+#include "storage/smgr/relfilenode_hash.h"
 #include "threadpool/threadpool.h"
 #include "utils/ascii.h"
 #include "utils/atomic.h"
@@ -92,6 +93,9 @@
 #include "instruments/instr_slow_query.h"
 #include "instruments/instr_statement.h"
 #include "instruments/instr_handle_mgr.h"
+#ifdef ENABLE_MOT
+#include "storage/mot/jit_exec.h"
+#endif
 
 #ifdef ENABLE_UT
 #define static
@@ -370,6 +374,7 @@ static void pgstat_collect_thread_status_setup_memcxt(void);
 static void pgstat_collect_thread_status_clear_resource(void);
 
 const char* pgstat_get_wait_io(WaitEventIO w);
+const char* pgstat_get_wait_dms(WaitEventDMS w);
 
 static void pgstat_setheader(PgStat_MsgHdr* hdr, StatMsgType mtype);
 void pgstat_send(void* msg, int len);
@@ -783,10 +788,10 @@ static void pgstat_free_tablist(void)
 /* ----------
  * pgstat_report_stat() -
  *
- *	Called from tcop/postgres.c to send the so far collected per-table
- *	and function usage statistics to the collector.  Note that this is
- *	called only when not within a transaction, so it is fair to use
- *	transaction stop time as an approximation of current time.
+ *	Must be called by processes that performs DML: tcop/postgres.c, logical
+ *	receiver processes, SPI worker, etc. to send the so far collected
+ *	per-table and function usage statistics to the collector.  Note that this
+ *	is called only when not within a transaction, so it is fair to use
  * ----------
  */
 void pgstat_report_stat(bool force)
@@ -1269,7 +1274,11 @@ static HTAB* pgstat_collect_tabkeys(void)
             continue;
 
         tabkey.tableid = HeapTupleGetOid(tuple);
-        tabkey.statFlag = partForm->parentid;
+        if (partForm->parttype == PART_OBJ_TYPE_TABLE_SUB_PARTITION) {
+            tabkey.statFlag = partid_get_parentid(partForm->parentid);
+        } else {
+            tabkey.statFlag = partForm->parentid;
+        }
 
         CHECK_FOR_INTERRUPTS();
 
@@ -1618,7 +1627,7 @@ void pgstat_report_analyze(Relation rel, PgStat_Counter livetuples, PgStat_Count
     pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_ANALYZE);
     msg.m_databaseid = rel->rd_rel->relisshared ? InvalidOid : u_sess->proc_cxt.MyDatabaseId;
     msg.m_tableoid = RelationGetRelid(rel);
-    msg.m_statFlag = rel->parentId;
+    msg.m_statFlag = RelationIsSubPartitionOfSubPartitionTable(rel) ? rel->grandparentId : rel->parentId;
     msg.m_autovacuum = IsAutoVacuumWorkerProcess() || IsFromAutoVacWoker();
     msg.m_analyzetime = GetCurrentTimestamp();
     msg.m_live_tuples = livetuples;
@@ -3744,6 +3753,16 @@ void pgstat_report_parent_sessionid(uint64 sessionid, uint32 level)
     beentry->st_thread_level = level;
 }
 
+void pgstat_report_bgworker_parent_sessionid(uint64 sessionid)
+{
+    volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
+
+    if (IS_PGSTATE_TRACK_UNDEFINE)
+        return;
+
+    beentry->st_parent_sessionid = sessionid;
+}
+
 /* ----------
  * pgstat_report_connected_gtm_host() -
  *
@@ -4320,6 +4339,11 @@ const char* pgstat_get_wait_event(uint32 wait_event_info)
             event_name = pgstat_get_wait_io(w);
             break;
         }
+        case PG_WAIT_DMS: {
+            WaitEventDMS w = (WaitEventDMS)wait_event_info;
+            event_name = pgstat_get_wait_dms(w);
+            break;
+        }
         default:
             event_name = "unknown wait event";
             break;
@@ -4570,6 +4594,171 @@ const char* pgstat_get_wait_io(WaitEventIO w)
             break;
         case WAIT_EVENT_UNDO_META_SYNC:
             event_name = "UndoMetaSync";
+            break;
+        case WAIT_EVENT_LOGICAL_SYNC_DATA:
+            event_name = "LogicalSyncData";
+            break;
+        case WAIT_EVENT_LOGICAL_SYNC_STATE_CHANGE:
+            event_name = "LogicalSyncStateChange";
+            break;
+        case WAIT_EVENT_REPLICATION_ORIGIN_DROP:
+            event_name = "ReplicationOriginDrop";
+            break;
+        case WAIT_EVENT_REPLICATION_SLOT_DROP:
+            event_name = "ReplicationSlotDrop";
+            break;
+        default:
+            event_name = "unknown wait event";
+            break;
+    }
+    return event_name;
+}
+
+/* ----------
+ * pgstat_get_wait_dms() -
+ *
+ * Convert WaitEventDMS to string.
+ * ----------
+ */
+const char* pgstat_get_wait_dms(WaitEventDMS w)
+{
+    const char* event_name = "unknown wait event";
+
+    switch (w) {
+        case WAIT_EVENT_IDLE_WAIT:
+            event_name = "IdleWait";
+            break;
+        case WAIT_EVENT_GC_BUFFER_BUSY:
+            event_name = "GcBufferBusy";
+            break;
+        case WAIT_EVENT_DCS_REQ_MASTER4PAGE_1WAY:
+            event_name = "DcsReqMaster4Page1Way";
+            break;
+        case WAIT_EVENT_DCS_REQ_MASTER4PAGE_2WAY:
+            event_name = "DcsReqMaster4Page2Way";
+            break;
+        case WAIT_EVENT_DCS_REQ_MASTER4PAGE_3WAY:
+            event_name = "DcsReqMaster4Page3Way";
+            break;
+        case WAIT_EVENT_DCS_REQ_MASTER4PAGE_TRY:
+            event_name = "DcsReqMaster4PageTry";
+            break;
+        case WAIT_EVENT_DCS_REQ_OWNER4PAGE:
+            event_name = "DcsReqOwner4Page";
+            break;
+        case WAIT_EVENT_DCS_CLAIM_OWNER:
+            event_name = "DcsCliamOwner";
+            break;
+        case WAIT_EVENT_DCS_RELEASE_OWNER:
+            event_name = "DcsReleaseOwner";
+            break;
+        case WAIT_EVENT_DCS_INVLDT_SHARE_COPY_REQ:
+            event_name = "DcsInvldtShareCopyReq";
+            break;
+        case WAIT_EVENT_DCS_INVLDT_SHARE_COPY_PROCESS:
+            event_name = "DcsInvldtShareCopyProcess";
+            break;
+        case WAIT_EVENT_DCS_TRANSFER_PAGE_LATCH:
+            event_name = "DcsTransferPageLatch";
+            break;
+        case WAIT_EVENT_DCS_TRANSFER_PAGE_READONLY2X:
+            event_name = "DcsTransferPageReadonly2X";
+            break;
+        case WAIT_EVENT_DCS_TRANSFER_PAGE_FLUSHLOG:
+            event_name = "DcsTransferPageFlushlog";
+            break;
+        case WAIT_EVENT_DCS_TRANSFER_PAGE:
+            event_name = "DcsTransferPage";
+            break;
+        case WAIT_EVENT_PCR_REQ_BTREE_PAGE:
+            event_name = "PcrReqBtreePage";
+            break;
+        case WAIT_EVENT_PCR_REQ_HEAP_PAGE:
+            event_name = "PcrReqHeapPage";
+            break;
+        case WAIT_EVENT_PCR_REQ_MASTER:
+            event_name = "PcrReqMaster";
+            break;
+        case WAIT_EVENT_PCR_REQ_OWNER:
+            event_name = "PcrReqOwner";
+            break;
+        case WAIT_EVENT_PCR_CHECK_CURR_VISIBLE:
+            event_name = "PcrCheckCurrVisible";
+            break;
+        case WAIT_EVENT_TXN_REQ_INFO:
+            event_name = "TxnReqInfo";
+            break;
+        case WAIT_EVENT_TXN_REQ_SNAPSHOT:
+            event_name = "TxnReqSnapshot";
+            break;
+        case WAIT_EVENT_DLS_REQ_LOCK:
+            event_name = "DlsReqLock";
+            break;
+        case WAIT_EVENT_DLS_REQ_TABLE:
+            event_name = "DlsReqTable";
+            break;
+        case WAIT_EVENT_DLS_REQ_PART_X:
+            event_name = "DlsReqPartX";
+            break;
+        case WAIT_EVENT_DLS_REQ_PART_S:
+            event_name = "DlsReqPartS";
+            break;
+        case WAIT_EVENT_DLS_WAIT_TXN:
+            event_name = "DlsWaitTxn";
+            break;
+        case WAIT_EVENT_DEAD_LOCK_TXN:
+            event_name = "DeadLockTxn";
+            break;
+        case WAIT_EVENT_DEAD_LOCK_TABLE:
+            event_name = "DeadLockTable";
+            break;
+        case WAIT_EVENT_DEAD_LOCK_ITL:
+            event_name = "DeadLockItl";
+            break;
+        case WAIT_EVENT_BROADCAST_BTREE_SPLIT:
+            event_name = "BroadcastBtreeSplit";
+            break;
+        case WAIT_EVENT_BROADCAST_ROOT_PAGE:
+            event_name = "BroadcastBootPage";
+            break;
+        case WAIT_EVENT_QUERY_OWNER_ID:
+            event_name = "QueryOwnerId";
+            break;
+        case WAIT_EVENT_LATCH_X:
+            event_name = "LatchX";
+            break;
+        case WAIT_EVENT_LATCH_S:
+            event_name = "LatchS";
+            break;
+        case WAIT_EVENT_LATCH_X_REMOTE:
+            event_name = "LatchXRemote";
+            break;
+        case WAIT_EVENT_LATCH_S_REMOTE:
+            event_name = "LatchSRemote";
+            break;
+        case WAIT_EVENT_ONDEMAND_REDO:
+            event_name = "OndemandRedo";
+            break;
+        case WAIT_EVENT_PAGE_STATUS_INFO:
+            event_name = "PageStatusInfo";
+            break;
+        case WAIT_EVENT_OPENGAUSS_SEND_XMIN:
+            event_name = "OpenGaussSendXmin";
+            break;
+        case WAIT_EVENT_DCS_REQ_CREATE_XA_RES:
+            event_name = "DcsReqCreateXaRes";
+            break;
+        case WAIT_EVENT_DCS_REQ_DELETE_XA_RES:
+            event_name = "DcsReqDeleteXaRes";
+            break;
+        case WAIT_EVENT_DCS_REQ_XA_OWNER_ID:
+            event_name = "DcsReqXaOwnerId";
+            break;
+        case WAIT_EVENT_DCS_REQ_XA_IN_USE:
+            event_name = "DcsReqXaInUse";
+            break;
+        case WAIT_EVENT_DCS_REQ_END_XA:
+            event_name = "DcsReqEndXa";
             break;
         default:
             event_name = "unknown wait event";
@@ -5266,7 +5455,7 @@ void PgstatCollectorMain()
      * except SIGHUP and SIGQUIT.  Note we don't need a SIGUSR1 handler to
      * support latch operations, because g_instance.stat_cxt.pgStatLatch is local not shared.
      */
-
+    (void)gspqsignal(SIGURG, print_stack);
     (void)gspqsignal(SIGHUP, pgstat_sighup_handler);
     (void)gspqsignal(SIGINT, SIG_IGN);
     (void)gspqsignal(SIGTERM, SIG_IGN);
@@ -5797,6 +5986,9 @@ static void pgstat_write_statsfile(bool permanent)
         // write the bad page information recorded in global_repair_bad_block_stat.
         hash_seq_init(&repairStat, g_instance.repair_cxt.global_repair_bad_block_stat);
         while ((repairEntry = (BadBlockEntry*)hash_seq_search(&repairStat)) != NULL) {
+            if (repairEntry->repair_time != -1) {
+                continue;
+            }
             fputc('R', fpout);
             rc = fwrite(repairEntry, sizeof(BadBlockEntry), 1, fpout);
             (void)rc; /* we'll check for error with ferror */
@@ -5858,6 +6050,17 @@ static void pgstat_write_statsfile(bool permanent)
         unlink(u_sess->stat_cxt.pgstat_stat_filename);
 }
 
+static HTAB* pgstat_read_statsfile_hashcreate(const char* tableString, int hashSize, HASHCTL* hashCtl)
+{
+    HTAB* hashTable;
+    if (IsGlobalStatsTrackerProcess()) {
+        hashTable = hash_create(tableString, hashSize, hashCtl, HASH_ELEM | HASH_FUNCTION | HASH_SHRCTX);
+    } else {
+        hashTable = hash_create(tableString, hashSize, hashCtl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+    }
+    return hashTable;
+}
+
 /* ----------
  * pgstat_read_statsfile() -
  *
@@ -5899,7 +6102,8 @@ static HTAB* pgstat_read_statsfile(Oid onlydb, bool permanent)
     hash_ctl.entrysize = sizeof(PgStat_StatDBEntry);
     hash_ctl.hash = oid_hash;
     hash_ctl.hcxt = u_sess->stat_cxt.pgStatLocalContext;
-    dbhash = hash_create("Databases hash", PGSTAT_DB_HASH_SIZE, &hash_ctl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+
+    dbhash = pgstat_read_statsfile_hashcreate("Databases hash", PGSTAT_DB_HASH_SIZE, &hash_ctl);
 
     /*
      * Clear out global statistics so they start from zero in case we can't
@@ -5998,17 +6202,15 @@ static HTAB* pgstat_read_statsfile(Oid onlydb, bool permanent)
                 hash_ctl.entrysize = sizeof(PgStat_StatTabEntry);
                 hash_ctl.hash = tag_hash;
                 hash_ctl.hcxt = u_sess->stat_cxt.pgStatLocalContext;
-                dbentry->tables = hash_create(
-                    "Per-database table", PGSTAT_TAB_HASH_SIZE, &hash_ctl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+                dbentry->tables = pgstat_read_statsfile_hashcreate("Per-database table",
+                    PGSTAT_TAB_HASH_SIZE, &hash_ctl);
 
                 hash_ctl.keysize = sizeof(Oid);
                 hash_ctl.entrysize = sizeof(PgStat_StatFuncEntry);
                 hash_ctl.hash = oid_hash;
                 hash_ctl.hcxt = u_sess->stat_cxt.pgStatLocalContext;
-                dbentry->functions = hash_create("Per-database function",
-                    PGSTAT_FUNCTION_HASH_SIZE,
-                    &hash_ctl,
-                    HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+                dbentry->functions = pgstat_read_statsfile_hashcreate("Per-database function",
+                    PGSTAT_FUNCTION_HASH_SIZE, &hash_ctl);
 
                 /*
                  * Arrange that following records add entries to this
@@ -6504,7 +6706,7 @@ static void pgstat_recv_inquiry(PgStat_MsgInquiry* msg, int len)
         g_instance.stat_cxt.last_statrequest = msg->inquiry_time;
 }
 
-static void inline init_tabentry_truncate(PgStat_StatTabEntry* tabentry, PgStat_TableEntry* tabmsg)
+static inline void init_tabentry_truncate(PgStat_StatTabEntry* tabentry, PgStat_TableEntry* tabmsg)
 {
     tabentry->n_live_tuples = 0;
     tabentry->n_dead_tuples = 0;
@@ -6974,6 +7176,17 @@ static void pgstat_recv_vacuum(PgStat_MsgVacuum* msg, int len)
     } else {
         tabentry->vacuum_timestamp = msg->m_vacuumtime;
         tabentry->vacuum_count++;
+    }
+
+    /* the deadtuples in main partition should also be updated */
+    if (OidIsValid(msg->m_statFlag)) {
+        PgStat_StatTabEntry* main_tabentry = pgstat_get_tab_entry(dbentry, msg->m_statFlag, false, InvalidOid);
+        if (main_tabentry != NULL) {
+            if (msg->m_tuples < 0)
+                main_tabentry->n_dead_tuples = 0;
+            else
+                main_tabentry->n_dead_tuples = Max(0, main_tabentry->n_dead_tuples - msg->m_tuples);
+        }
     }
 }
 
@@ -7912,6 +8125,44 @@ MotMemoryDetail* GetMotMemoryDetail(uint32* num, bool isGlobal)
 
     return returnDetailArray;
 }
+
+MotJitDetail* GetMotJitDetail(uint32* num)
+{
+    MotJitDetail* returnDetailArray = NULL;
+
+    *num = 0;
+
+    // Ensure that MOT FDW routine and Xact callbacks are registered.
+    if (!u_sess->mot_cxt.callbacks_set) {
+        ForeignDataWrapper* fdw = GetForeignDataWrapperByName(MOT_FDW, false);
+        if (fdw != NULL) {
+            (void)GetFdwRoutine(fdw->fdwhandler);
+        }
+    }
+
+    returnDetailArray = JitExec::MOTGetJitDetail(num);
+
+    return returnDetailArray;
+}
+
+MotJitProfile* GetMotJitProfile(uint32* num)
+{
+    MotJitProfile* returnProfileArray = NULL;
+
+    *num = 0;
+
+    // Ensure that MOT FDW routine and Xact callbacks are registered.
+    if (!u_sess->mot_cxt.callbacks_set) {
+        ForeignDataWrapper* fdw = GetForeignDataWrapperByName(MOT_FDW, false);
+        if (fdw != NULL) {
+            (void)GetFdwRoutine(fdw->fdwhandler);
+        }
+    }
+
+    returnProfileArray = JitExec::MOTGetJitProfile(num);
+
+    return returnProfileArray;
+}
 #endif
 
 int64 getCpuTime(void)
@@ -8367,6 +8618,21 @@ static void pgstat_recv_filestat(PgStat_MsgFile* msg, int len)
 
     if (i == NUM_FILES || entry->fn == InvalidOid) {
         LWLockAcquire(FileStatLock, LW_EXCLUSIVE);
+        if (i == NUM_FILES) {
+            TimestampTz longestTime = GetCurrentTimestamp();
+            int minLocation = 0;
+            for (int j = 0; j < NUM_FILES; j++) {
+                entry = (PgStat_FileEntry*)&pgStatFileArray[j];
+                if (entry->time < longestTime) {
+                    longestTime = entry->time;
+                    minLocation = j;
+                }
+            }
+            fileStatCount = minLocation;
+            ereport(DEBUG1, (errmodule(MOD_INSTR), 
+                errmsg("the latest filenum is %d, update is %ld",
+                    fileStatCount, pgStatFileArray[fileStatCount].time)));
+        }
         entry = (PgStat_FileEntry*)&pgStatFileArray[fileStatCount];
 
         /* reset this entry */
@@ -8382,6 +8648,7 @@ static void pgstat_recv_filestat(PgStat_MsgFile* msg, int len)
     }
 
     entry->changeCount++;
+    entry->time = GetCurrentTimestamp();
     g_instance.stat_cxt.fileIOStat->changeCount++;
 
     if ('r' == msg->rw) {
@@ -8594,7 +8861,7 @@ static void calculateThreadMemoryContextStats(const volatile PGPROC* proc, const
             threadId = proc->pid;
             rc = strncpy_s(threadType,
                 PROC_NAME_LEN,
-                (proc->myProgName != NULL) ? (const char*)proc->myProgName : "",
+                (proc->myProgName[0] != '\0') ? (const char*)proc->myProgName : "",
                 PROC_NAME_LEN - 1);
             securec_check(rc, "\0", "\0");
             getSessionID(sessId, proc->myStartTime, threadId);
@@ -9227,16 +9494,16 @@ TableDistributionInfo* getTableStat(TupleDesc tuple_desc, int dirty_pecent, int 
             "select                                                                                "
             "c.relname,                                                                            "
             "n.nspname,                                                                            "
-            "pg_stat_get_tuples_inserted(c.oid),                                                   "
-            "pg_stat_get_tuples_updated(c.oid),                                                    "
-            "pg_stat_get_tuples_deleted(c.oid),                                                    "
-            "pg_stat_get_live_tuples(c.oid) n_live_tuples,                                         "
-            "pg_stat_get_dead_tuples(c.oid) n_dead_tuples                                          "
+            "pg_catalog.pg_stat_get_tuples_inserted(c.oid),                                                   "
+            "pg_catalog.pg_stat_get_tuples_updated(c.oid),                                                    "
+            "pg_catalog.pg_stat_get_tuples_deleted(c.oid),                                                    "
+            "pg_catalog.pg_stat_get_live_tuples(c.oid) n_live_tuples,                                         "
+            "pg_catalog.pg_stat_get_dead_tuples(c.oid) n_dead_tuples                                          "
             "from pg_class c                                                                       "
             "left join pg_namespace n on (c.relnamespace = n.oid)                                  "
             "where c.relkind = 'r' and relpersistence <> 't'                                       "
             "and cast((n_dead_tuples)/(n_live_tuples+n_dead_tuples+0.00001) * 100                  "
-            "as numeric(5,2)) >= %d                                                                "
+            "as pg_catalog.numeric(5,2)) >= %d                                                                "
             "and (n_live_tuples+n_dead_tuples) >= %d                                               "
             "and n.nspname not in ('pg_toast','information_schema','cstore','pmk');                ",
             dirty_pecent,
@@ -9246,16 +9513,16 @@ TableDistributionInfo* getTableStat(TupleDesc tuple_desc, int dirty_pecent, int 
             "select                                                                                "
             "c.relname,                                                                            "
             "n.nspname,                                                                            "
-            "pg_stat_get_tuples_inserted(c.oid),                                                   "
-            "pg_stat_get_tuples_updated(c.oid),                                                    "
-            "pg_stat_get_tuples_deleted(c.oid),                                                    "
-            "pg_stat_get_live_tuples(c.oid) n_live_tuples,                                         "
-            "pg_stat_get_dead_tuples(c.oid) n_dead_tuples                                          "
+            "pg_catalog.pg_stat_get_tuples_inserted(c.oid),                                                   "
+            "pg_catalog.pg_stat_get_tuples_updated(c.oid),                                                    "
+            "pg_catalog.pg_stat_get_tuples_deleted(c.oid),                                                    "
+            "pg_catalog.pg_stat_get_live_tuples(c.oid) n_live_tuples,                                         "
+            "pg_catalog.pg_stat_get_dead_tuples(c.oid) n_dead_tuples                                          "
             "from pg_class c                                                                       "
             "left join pg_namespace n on (c.relnamespace = n.oid)                                  "
             "where c.relkind = 'r' and relpersistence <> 't'                                       "
             "and cast((n_dead_tuples)/(n_live_tuples+n_dead_tuples+0.00001) * 100                  "
-            "as numeric(5,2)) >= %d                                                                "
+            "as pg_catalog.numeric(5,2)) >= %d                                                                "
             "and (n_live_tuples+n_dead_tuples) >= %d                                               "
             "and n.nspname = \'%s\';                                                               ",
             dirty_pecent,
@@ -9283,7 +9550,7 @@ TableDistributionInfo* get_remote_stat_pagewriter(TupleDesc tuple_desc)
         "select                                                                "
         "node_name, pgwr_actual_flush_total_num, pgwr_last_flush_num, remain_dirty_page_num,   "
         "queue_head_page_rec_lsn, queue_rec_lsn, current_xlog_insert_lsn, ckpt_redo_point      "
-        "from local_pagewriter_stat();                                                         ");
+        "from pg_catalog.local_pagewriter_stat();                                                         ");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9306,7 +9573,7 @@ TableDistributionInfo* get_remote_stat_ckpt(TupleDesc tuple_desc)
         "select                                                     "
         "node_name,ckpt_redo_point,ckpt_clog_flush_num,ckpt_csnlog_flush_num,       "
         "ckpt_multixact_flush_num,ckpt_predicate_flush_num,ckpt_twophase_flush_num  "
-        "from local_ckpt_stat();                                                    ");
+        "from pg_catalog.local_ckpt_stat();                                                    ");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9329,7 +9596,7 @@ TableDistributionInfo* get_remote_stat_bgwriter(TupleDesc tuple_desc)
         "select                                                                     "
         "node_name,bgwr_actual_flush_total_num,bgwr_last_flush_num,candidate_slots, "
         "get_buffer_from_list,get_buf_clock_sweep                                   "
-        "from local_bgwriter_stat();                                                ");
+        "from pg_catalog.local_bgwriter_stat();                                                ");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9352,7 +9619,7 @@ TableDistributionInfo* get_remote_stat_candidate(TupleDesc tuple_desc)
         "select                                                                     "
         "node_name,candidate_slots,get_buf_from_list,get_buf_clock_sweep,           "
         "seg_candidate_slots,seg_get_buf_from_list,seg_get_buf_clock_sweep          "
-        "from local_candidate_stat();                                               ");
+        "from pg_catalog.local_candidate_stat();                                               ");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9374,7 +9641,7 @@ TableDistributionInfo* get_remote_single_flush_dw_stat(TupleDesc tuple_desc)
 
     appendStringInfo(&buf,
         "SELECT node_name, curr_dwn, curr_start_page, total_writes, file_trunc_num, file_reset_num "
-        "FROM local_single_flush_dw_stat();");
+        "FROM pg_catalog.local_single_flush_dw_stat();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9397,7 +9664,7 @@ TableDistributionInfo* get_remote_stat_double_write(TupleDesc tuple_desc)
         "SELECT node_name, curr_dwn, curr_start_page, file_trunc_num, file_reset_num, "
         "total_writes, low_threshold_writes, high_threshold_writes, "
         "total_pages, low_threshold_pages, high_threshold_pages, file_id "
-        "FROM local_double_write_stat();");
+        "FROM pg_catalog.local_double_write_stat();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9425,7 +9692,7 @@ TableDistributionInfo* get_remote_stat_redo(TupleDesc tuple_desc)
         "process_pending_counter, process_pending_total_dur, "
         "apply_counter, apply_total_dur, "
         "speed, local_max_ptr, primary_flush_ptr, worker_info "
-        "FROM local_redo_stat();");
+        "FROM pg_catalog.local_redo_stat();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9444,7 +9711,7 @@ TableDistributionInfo* get_rto_stat(TupleDesc tuple_desc)
 
     initStringInfo(&buf);
 
-    appendStringInfo(&buf, "SELECT node_name, rto_info FROM local_rto_stat();");
+    appendStringInfo(&buf, "SELECT node_name, rto_info FROM pg_catalog.local_rto_stat();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9466,7 +9733,7 @@ TableDistributionInfo* get_recovery_stat(TupleDesc tuple_desc)
     appendStringInfo(&buf,
         "SELECT node_name, standby_node_name, source_ip, source_port, dest_ip, dest_port, current_rto, target_rto, "
         "current_sleep_time FROM "
-        "local_recovery_status();");
+        "pg_catalog.local_recovery_status();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9489,7 +9756,7 @@ TableDistributionInfo* streaming_hadr_get_recovery_stat(TupleDesc tuple_desc)
         "SELECT hadr_sender_node_name, hadr_receiver_node_name, "
         "source_ip, source_port, dest_ip, dest_port, current_rto, target_rto, current_rpo, target_rpo, "
         "rto_sleep_time, rpo_sleep_time FROM "
-        "gs_hadr_local_rto_and_rpo_stat();");
+        "pg_catalog.gs_hadr_local_rto_and_rpo_stat();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9508,7 +9775,7 @@ TableDistributionInfo* get_remote_node_xid_csn(TupleDesc tuple_desc)
 
     initStringInfo(&buf);
 
-    appendStringInfo(&buf, "select node_name, next_xid, next_csn FROM gs_get_next_xid_csn();");
+    appendStringInfo(&buf, "select node_name, next_xid, next_csn FROM pg_catalog.gs_get_next_xid_csn();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
     distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
@@ -9590,10 +9857,11 @@ void initGlobalBadBlockStat()
         hash_ctl.hcxt = global_bad_block_mcxt;
         hash_ctl.keysize = sizeof(BadBlockHashKey);
         hash_ctl.entrysize = sizeof(BadBlockHashEnt);
-        hash_ctl.hash = tag_hash;
+        hash_ctl.hash = BadBlockHashKeyHash;
+        hash_ctl.match = BadBlockHashKeyMatch;
 
-        global_bad_block_stat =
-            hash_create("bad block stat global hash table", 64, &hash_ctl, HASH_ELEM | HASH_SHRCTX | HASH_FUNCTION);
+        global_bad_block_stat = hash_create("bad block stat global hash table", 64, &hash_ctl,
+                                            HASH_ELEM | HASH_SHRCTX | HASH_FUNCTION | HASH_COMPARE);
     }
 
     LWLockRelease(BadBlockStatHashLock);
@@ -9623,10 +9891,11 @@ void initLocalBadBlockStat()
         hash_ctl.hcxt = t_thrd.stat_cxt.local_bad_block_mcxt;
         hash_ctl.keysize = sizeof(BadBlockHashKey);
         hash_ctl.entrysize = sizeof(BadBlockHashEnt);
-        hash_ctl.hash = tag_hash;
+        hash_ctl.hash = BadBlockHashKeyHash;
+        hash_ctl.match = BadBlockHashKeyMatch;
 
-        t_thrd.stat_cxt.local_bad_block_stat =
-            hash_create("bad block stat session hash table", 16, &hash_ctl, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+        t_thrd.stat_cxt.local_bad_block_stat = hash_create("bad block stat session hash table", 16, &hash_ctl,
+                                                           HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
     }
 }
 
@@ -9698,10 +9967,11 @@ void resetBadBlockStat()
     hash_ctl.hcxt = global_bad_block_mcxt;
     hash_ctl.keysize = sizeof(BadBlockHashKey);
     hash_ctl.entrysize = sizeof(BadBlockHashEnt);
-    hash_ctl.hash = tag_hash;
+    hash_ctl.hash = BadBlockHashKeyHash;
+    hash_ctl.match = BadBlockHashKeyMatch;
 
     global_bad_block_stat =
-        hash_create("bad block stat hash table", 64, &hash_ctl, HASH_ELEM | HASH_SHRCTX | HASH_FUNCTION);
+        hash_create("bad block stat hash table", 64, &hash_ctl, HASH_ELEM | HASH_SHRCTX | HASH_FUNCTION | HASH_COMPARE);
 
     LWLockRelease(BadBlockStatHashLock);
 }
@@ -9909,11 +10179,13 @@ void pgstat_fetch_sql_rt_info_internal(SqlRTInfo* sqlrt)
 
 void pgstat_reply_percentile_record_count()
 {
-    StringInfoData buf;
-    g_instance.stat_cxt.calculate_on_other_cn = true;
-
+    if (u_sess->percentile_cxt.LocalsqlRT != NULL) {
+        pfree_ext(u_sess->percentile_cxt.LocalsqlRT);
+        u_sess->percentile_cxt.LocalCounter = 0;
+    }
     (void)pgstat_fetch_sql_rt_info_counter();
 
+    StringInfoData buf;
     pq_beginmessage(&buf, 'c');
     pq_sendint(&buf, u_sess->percentile_cxt.LocalCounter, sizeof(int));
     pq_endmessage(&buf);
@@ -9936,7 +10208,6 @@ void pgstat_reply_percentile_record()
     }
     pq_beginmessage(&buf, 'f');
     pq_endmessage(&buf);
-    g_instance.stat_cxt.calculate_on_other_cn = false;
     pq_flush();
 }
 

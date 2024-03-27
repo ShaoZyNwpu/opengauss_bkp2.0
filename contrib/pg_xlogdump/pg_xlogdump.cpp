@@ -32,6 +32,9 @@
 #include "replication/replicainternal.h"
 #include "rmgrdesc.h"
 #include "storage/smgr/segment.h"
+#include "storage/page_compression.h"
+#include "storage/dss/dss_adaptor.h"
+#include "storage/file/fio_device.h"
 
 static const char* progname;
 
@@ -43,6 +46,8 @@ typedef struct XLogDumpPrivate {
     bool endptr_reached;
     char* shareStorageXlogFilePath;
     long shareStorageXlogSize;
+    bool enable_dss;
+    char* socketpath;
 } XLogDumpPrivate;
 
 typedef struct XLogDumpConfig {
@@ -76,7 +81,7 @@ typedef struct XLogDumpStats {
 } XLogDumpStats;
 
 static void XLogDumpTablePage(XLogReaderState* record, int block_id, RelFileNode rnode, BlockNumber blk);
-static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLogRecPtr startptr, char* buf, Size count);
+static void XLogDumpXLogRead(char* directory, TimeLineID timeline_id, XLogRecPtr startptr, char* buf, Size count);
 static int XLogDumpReadPage(XLogReaderState* state, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetPtr,
     char* readBuff, TimeLineID* curFileTLI, char* xlog_path = NULL);
 static void XLogDumpCountRecord(XLogDumpConfig* config, XLogDumpStats* stats, XLogReaderState* record);
@@ -87,6 +92,7 @@ static void XLogDumpDisplayStats(XLogDumpConfig* config, XLogDumpStats* stats);
 static void usage(void);
 
 static int fuzzy_open_file(const char* directory, const char* fname);
+static int open_dss_file(char* directory, const char* fname);
 static void split_path(char* path, char** dir, char** fname);
 static bool verify_directory(const char* directory);
 static void print_rmgr_list(void);
@@ -223,6 +229,21 @@ static int fuzzy_open_file(const char* directory, const char* fname)
     return -1;
 }
 
+// for dss storage
+static int open_dss_file(char* directory, const char* fname)
+{
+    int fd = -1;
+    char fpath[MAXPGPATH];
+
+    /* directory / fname */
+    canonicalize_path(directory);
+    snprintf(fpath, MAXPGPATH, "%s/%s", directory, fname);
+    if (dss_open_file(fpath, O_RDONLY | PG_BINARY, 0, &fd) == GS_SUCCESS) {
+        return fd;
+    }
+    return -1;
+}
+
 /*
  * write the full page to disk.
  */
@@ -326,7 +347,7 @@ static void XLogDumpReadSharedStorage(char* directory, XLogRecPtr startptr, long
  * given timeline, containing the specified record pointer; store the data in
  * the passed buffer.
  */
-static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLogRecPtr startptr, char* buf, Size count)
+static void XLogDumpXLogRead(char* directory, TimeLineID timeline_id, XLogRecPtr startptr, char* buf, Size count)
 {
     char* p = NULL;
     XLogRecPtr recptr;
@@ -358,7 +379,11 @@ static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLog
 
             XLogFileName(fname, MAXFNAMELEN, timeline_id, sendSegNo);
 
-            sendFile = fuzzy_open_file(directory, fname);
+            if (is_dss_file(directory)) {
+                sendFile = open_dss_file(directory, fname);
+            } else {
+                sendFile = fuzzy_open_file(directory, fname);
+            }
 
             if (sendFile < 0)
                 fatal_error("could not find file \"%s\": %s", fname, strerror(errno));
@@ -518,6 +543,7 @@ static void XLogDumpDisplayRecord(XLogDumpConfig* config, XLogReaderState* recor
     int block_id;
     XLogRecPtr lsn;
     XLogRecPtr xl_prev = XLogRecGetPrev(record);
+    RelFileCompressOption compOpt;
 
     printf("REDO @ %X/%X; LSN %X/%X: prev %X/%X; xid " XID_FMT "; term %u; len %u; total %u; crc %u; "
            "desc: %s - ",
@@ -555,6 +581,15 @@ static void XLogDumpDisplayRecord(XLogDumpConfig* config, XLogReaderState* recor
         if (IsBucketFileNode(rnode)) {
             printf("/%d", rnode.bucketNode);
         }
+
+        if (rnode.opt != 0) {
+            TransCompressOptions(rnode, &compOpt);
+            printf(", compressed file: byteConvert: %u, diffConvert: %u, PreallocChunks: %u, compressLevel: %u"
+                ", compressAlgorithm: %u, compressChunkSize: %u.",
+                compOpt.byteConvert, compOpt.diffConvert, compOpt.compressPreallocChunks,
+                compOpt.compressLevelSymbol, compOpt.compressAlgorithm, CHUNK_SIZE_LIST[compOpt.compressChunkSize]);
+        }
+        
         StorageType storage_type = HEAP_DISK;
         if (IsSegmentFileNode(rnode)) {
             storage_type = SEGMENT_PAGE;
@@ -796,6 +831,8 @@ static void usage(void)
     printf("  -z, --stats            show statistics instead of records\n");
     printf("  -v, --verbose          show detailed information\n");
     printf("  -?, --help             show this help, then exit\n");
+    printf("  --enable-dss           enable shared storage mode\n");
+    printf("  --socketpath=SOCKETPATH  dss connect socket file path\n");
 }
 
 int main(int argc, char** argv)
@@ -812,12 +849,14 @@ int main(int argc, char** argv)
 
     static struct option long_options[] = {{"bkp-details", no_argument, NULL, 'b'},
         {"end", required_argument, NULL, 'e'},
+        {"enable-dss", no_argument, NULL, 1},
         {"follow", no_argument, NULL, 'f'},
         {"help", no_argument, NULL, '?'},
         {"limit", required_argument, NULL, 'n'},
         {"path", required_argument, NULL, 'p'},
         {"rmgr", required_argument, NULL, 'r'},
         {"start", required_argument, NULL, 's'},
+        {"socketpath", required_argument, NULL, 2},
         {"timeline", required_argument, NULL, 't'},
         {"write-fpw", no_argument, NULL, 'w'},
         {"xid", required_argument, NULL, 'x'},
@@ -841,6 +880,8 @@ int main(int argc, char** argv)
     dumpprivate.endptr = InvalidXLogRecPtr;
     dumpprivate.endptr_reached = false;
     dumpprivate.shareStorageXlogFilePath = NULL;
+    dumpprivate.enable_dss = false;
+    dumpprivate.socketpath = NULL;
     const long defaultShareStorageXlogSize = 512 * 1024 * 1024 * 1024L;
     dumpprivate.shareStorageXlogSize = defaultShareStorageXlogSize;
 
@@ -948,6 +989,13 @@ int main(int argc, char** argv)
             case 'z':
                 config.stats = true;
                 break;
+            case 1:
+                dumpprivate.enable_dss = true;
+                break;
+            case 2:
+                dumpprivate.enable_dss = true;
+                dumpprivate.socketpath = strdup(optarg);
+                break;
             default:
                 goto bad_argument;
         }
@@ -958,6 +1006,32 @@ int main(int argc, char** argv)
         goto bad_argument;
     }
 
+    // dss device init
+    if (dss_device_init(dumpprivate.socketpath, dumpprivate.enable_dss) != DSS_SUCCESS) {
+        fatal_error("failed to init dss device");
+    }
+
+    if (dumpprivate.enable_dss) {
+        if (dumpprivate.socketpath == NULL || strlen(dumpprivate.socketpath) == 0 ||
+            strncmp("UDS:", dumpprivate.socketpath, 4) != 0) {
+            fprintf(stderr, "%s: socketpath must be specific correctly when enable dss, "
+                "format is: '--socketpath=\"UDS:xxx\"'.\n", progname);
+            goto bad_argument;
+        }
+
+        char* directory = dumpprivate.inpath == NULL ? argv[optind] : dumpprivate.inpath;
+        if (directory != NULL) {
+            if (directory[0] != '+' || strstr(directory, "/") == NULL) {
+                fprintf(stderr, "%s: xlog file path should be absolutely when enable dss\n", progname);
+                goto bad_argument;
+            }
+        } else {
+            fprintf(stderr, "%s: xlog file path must be specified when enable dss\n", progname);
+            goto bad_argument;
+        }
+
+    }
+
     if (dumpprivate.inpath != NULL) {
         /* validate path points to directory */
         if (!verify_directory(dumpprivate.inpath)) {
@@ -965,6 +1039,9 @@ int main(int argc, char** argv)
             goto bad_argument;
         }
     }
+
+    if (dumpprivate.enable_dss)
+        XLogSegmentSize = DSS_XLOG_SEG_SIZE;
 
     /* parse files as start/end boundaries, extract path if not specified */
     if (optind < argc) {
@@ -987,7 +1064,12 @@ int main(int argc, char** argv)
                 fatal_error("cannot open directory \"%s\": %s", dumpprivate.inpath, strerror(errno));
         }
 
-        fd = fuzzy_open_file(dumpprivate.inpath, fname);
+        if (is_dss_file(dumpprivate.inpath)) {
+            fd = open_dss_file(dumpprivate.inpath, fname);
+        } else {
+            fd = fuzzy_open_file(dumpprivate.inpath, fname);
+        }
+
         if (fd < 0)
             fatal_error("could not open file \"%s\"", fname);
         close(fd);
@@ -1019,7 +1101,12 @@ int main(int argc, char** argv)
             /* ignore directory, already have that */
             split_path(argv[optind + 1], &directory, &fname);
 
-            fd = fuzzy_open_file(dumpprivate.inpath, fname);
+            if (is_dss_file(dumpprivate.inpath)) {
+                fd = open_dss_file(dumpprivate.inpath, fname);
+            } else {
+                fd = fuzzy_open_file(dumpprivate.inpath, fname);
+            }
+
             if (fd < 0)
                 fatal_error("could not open file \"%s\"", fname);
             close(fd);

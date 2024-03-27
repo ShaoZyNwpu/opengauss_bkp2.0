@@ -66,8 +66,6 @@
  *    quick, before we're queued, since after Phase 2 we're already queued.
  * -------------------------------------------------------------------------
  */
-#include "storage/dfs/dfscache_mgr.h"
-
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
@@ -96,6 +94,7 @@
 #include "instruments/instr_event.h"
 #include "instruments/instr_statement.h"
 #include "tsan_annotation.h"
+#include "storage/cfs/cfs_buffers.h"
 
 #ifndef MAX
 #define MAX(A, B) ((B) > (A) ? (B) : (A))
@@ -144,7 +143,7 @@ static const char *BuiltinTrancheNames[] = {
     "UniqueSQLMappingLock",
     "InstrUserLockId",
     "GPCMappingLock",
-    "UspagrpMappingLock", 
+    "UspagrpMappingLock",
     "ProcXactMappingLock",
     "ASPMappingLock",
     "GlobalSeqLock",
@@ -166,6 +165,7 @@ static const char *BuiltinTrancheNames[] = {
     "MultiXactMember Ctl",
     "OldSerXid SLRU Ctl",
     "WALInsertLock",
+    "SnapshotBlockLock",
     "DoubleWriteLock",
     "DWSingleFlushFirstLock",
     "DWSingleFlushSecondLock",
@@ -188,12 +188,17 @@ static const char *BuiltinTrancheNames[] = {
     "SegmentHeadPartitionLock",
     "TwoPhaseStatePartLock",
     "RoleIdPartLock",
+    "GPRCMappingLock",
+    "StandbyStmtHistLock",
     "PgwrSyncQueueLock",
     "BarrierHashTblLock",
     "PageRepairHashTblLock",
     "FileRepairHashTblLock",
-    "ReplicationOriginSlotLock",
-    "AuditIndextblLock"
+    "ReplicationOriginLock",
+    "AuditIndextblLock",
+    "PCABufferContentLock",
+    "XlogTrackPartLock",
+    "SSSnapshotXminCachePartLock"
 };
 
 static void RegisterLWLockTranches(void);
@@ -374,9 +379,6 @@ int NumLWLocks(void)
     /* cucache_mgr.cpp CU Cache calculates its own requirements */
     numLocks += DataCacheMgrNumLocks();
 
-    /* dfscache_mgr.cpp Meta data Cache calculates its own requirements */
-    numLocks += MetaCacheMgrNumLocks();
-
     /* proc.c needs one for each backend or auxiliary process. For prepared xacts,
      * backendLock is actually not allocated. */
     numLocks += (2 * GLOBAL_ALL_PROCS - g_instance.attr.attr_storage.max_prepared_xacts * NUM_TWOPHASE_PARTITIONS);
@@ -391,7 +393,11 @@ int NumLWLocks(void)
     numLocks += NUM_CLOG_PARTITIONS * CLOGShmemBuffers();
 
     /* multixact.c needs two SLRU areas */
-    numLocks += NUM_MXACTOFFSET_BUFFERS + NUM_MXACTMEMBER_BUFFERS;
+    if (ENABLE_DSS) {
+        numLocks += DSS_MAX_MXACTOFFSET + DSS_MAX_MXACTMEMBER;
+    } else {
+        numLocks += NUM_MXACTOFFSET_BUFFERS + NUM_MXACTMEMBER_BUFFERS;
+    }
 
     /* async.c needs one per Async buffer */
     numLocks += NUM_ASYNC_BUFFERS;
@@ -402,6 +408,9 @@ int NumLWLocks(void)
     /* slot.c needs one for each slot */
     numLocks += g_instance.attr.attr_storage.max_replication_slots;
 
+    /* double write.c standy snapshot needs one io block lock  */
+    numLocks += 1;
+
     /* double write.c needs flush lock */
     numLocks += 1;   /* dw batch flush lock */
     numLocks += 3;  /* dw single flush pos lock (two version) + second version buftag page lock */
@@ -411,7 +420,7 @@ int NumLWLocks(void)
 
     /* for WALFlushWait lock, WALBufferInitWait lock and WALInitSegment lock */
     numLocks += 3;
-    
+
     /* for recovery state queue */
     numLocks += 1;
 
@@ -429,6 +438,9 @@ int NumLWLocks(void)
     /* for barrier preparse hashtbl */
     numLocks += 1;
 
+    /* for xlog track hash table */
+    numLocks += NUM_XLOG_TRACK_PARTITIONS;
+
     /*
      * Add any requested by loadable modules; for backwards-compatibility
      * reasons, allocate at least NUM_USER_DEFINED_LWLOCKS of them even if
@@ -436,6 +448,9 @@ int NumLWLocks(void)
      */
     t_thrd.storage_cxt.lock_addin_request_allowed = false;
     numLocks += Max(t_thrd.storage_cxt.lock_addin_request, NUM_USER_DEFINED_LWLOCKS);
+
+    /* bufmgr.c needs two for each shared buffer */
+    numLocks += (int)pca_lock_count();
 
     return numLocks;
 }
@@ -623,10 +638,27 @@ static void InitializeLWLocks(int numLocks)
     for (id = 0; id < NUM_TWOPHASE_PARTITIONS; id++, lock++) {
         LWLockInitialize(&lock->lock, LWTRANCHE_TWOPHASE_STATE);
     }
-    
+
     for (id = 0; id < NUM_SESSION_ROLEID_PARTITIONS; id++, lock++) {
         LWLockInitialize(&lock->lock, LWTRANCHE_ROLEID_PARTITION);
     }
+
+    for (id = 0; id < NUM_GPRC_PARTITIONS; id++, lock++) {
+        LWLockInitialize(&lock->lock, LWTRANCHE_GPRC_MAPPING);
+    }
+
+    for (id = 0; id < NUM_STANDBY_STMTHIST_PARTITIONS; id++, lock++) {
+        LWLockInitialize(&lock->lock, LWTRANCHE_STANDBY_STMTHIST);
+    }
+
+    for (id = 0; id < NUM_XLOG_TRACK_PARTITIONS; id++, lock++) {
+        LWLockInitialize(&lock->lock, LWTRANCHE_XLOG_TRACK_PARTITION);
+    }
+
+    for (id = 0; id < NUM_SS_SNAPSHOT_XMIN_CACHE_PARTITIONS; id++, lock++) {
+        LWLockInitialize(&lock->lock, LWTRANCHE_SS_SNAPSHOT_XMIN_PARTITION);
+    }
+
     Assert((lock - t_thrd.shemem_ptr_cxt.mainLWLockArray) == NumFixedLWLocks);
 
     for (id = NumFixedLWLocks; id < numLocks; id++, lock++) {

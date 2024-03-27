@@ -262,7 +262,7 @@ void DataReceiverMain(void)
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, SIG_IGN);
     (void)gspqsignal(SIGUSR2, SIG_IGN);
-
+    (void)gspqsignal(SIGURG, print_stack);
     /* Reset some signals that are accepted by postmaster but not here */
     (void)gspqsignal(SIGCHLD, SIG_DFL);
     (void)gspqsignal(SIGTTIN, SIG_DFL);
@@ -310,6 +310,8 @@ void DataReceiverMain(void)
     datarcv->sendPosition.queueid = datarcv->receivePosition.queueid = datarcv->localWritePosition.queueid = 0;
     datarcv->sendPosition.queueoff = datarcv->receivePosition.queueoff = datarcv->localWritePosition.queueoff = 0;
     SpinLockRelease(&datarcv->mutex);
+    pgstat_report_appname("Data Receiver");
+    pgstat_report_activity(STATE_IDLE, NULL);
 
     /* Loop until end-of-streaming or error */
     for (;;) {

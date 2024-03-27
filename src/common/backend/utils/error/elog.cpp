@@ -96,7 +96,9 @@
 
 #include "tcop/stmt_retry.h"
 #include "replication/walsender.h"
-
+#include "nodes/pg_list.h"
+#include "utils/builtins.h"
+#include "funcapi.h"
 #undef _
 #define _(x) err_gettext(x)
 
@@ -134,6 +136,8 @@ static void write_eventlog(int level, const char* line, int len);
 #endif
 
 static const int CREATE_ALTER_SUBSCRIPTION = 16;
+static const int CREATE_ALTER_USERMAPPING = 18;
+static const int GRANT_USAGE = 19;
 
 /* Macro for checking t_thrd.log_cxt.errordata_stack_depth is reasonable */
 #define CHECK_STACK_DEPTH()                                               \
@@ -146,7 +150,6 @@ static const int CREATE_ALTER_SUBSCRIPTION = 16;
 
 static void log_line_prefix(StringInfo buf, ErrorData* edata);
 static void send_message_to_server_log(ErrorData* edata);
-static void send_message_to_frontend(ErrorData* edata);
 static char* expand_fmt_string(const char* fmt, ErrorData* edata);
 static const char* useful_strerror(int errnum);
 static const char* error_severity(int elevel);
@@ -158,7 +161,6 @@ static void setup_formatted_log_time(void);
 static void setup_formatted_start_time(void);
 extern void send_only_message_to_frontend(const char* message, bool is_putline);
 static char* mask_Password_internal(const char* query_string);
-static char* mask_error_password(const char* query_string, int str_len);
 static void truncate_identified_by(char* query_string, int query_len);
 static char* mask_execute_direct_cmd(const char* query_string);
 static bool is_execute_cmd(const char* query_string);
@@ -168,6 +170,7 @@ static void eraseSingleQuotes(char* query_string);
 static int output_backtrace_to_log(StringInfoData* pOutBuf);
 static void write_asp_chunks(char *data, int len, bool end);
 static void write_asplog(char *data, int len, bool end);
+const char* password_mask = "********";
 
 #define MASK_OBS_PATH()                                                                                 \
     do {                                                                                                \
@@ -176,6 +179,7 @@ static void write_asplog(char *data, int len, bool end);
             if (mask_string == NULL) {                                                                  \
                 mask_string = MemoryContextStrdup(                                                      \
                     SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);                     \
+                vol_mask_string = mask_string;                                                          \
             }                                                                                           \
             if (unlikely(yyextra.literallen != (int)strlen(childStmt))) {                               \
                 ereport(ERROR,                                                                          \
@@ -248,7 +252,7 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
      * Check some cases in which we want to promote an error into a more
      * severe error.  None of this logic applies for non-error messages.
      */
-    if (elevel >= ERROR) {
+    if (elevel >= ERROR && u_sess != NULL) {
         /*
          * If we are inside a critical section, all errors become PANIC
          * errors.	See miscadmin.h.
@@ -272,7 +276,7 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
         if (elevel == ERROR) {
             if (t_thrd.log_cxt.PG_exception_stack == NULL ||
                 t_thrd.proc_cxt.proc_exit_inprogress ||
-                t_thrd.xact_cxt.applying_subxact_undo)
+                t_thrd.xact_cxt.executeSubxactUndo)
             {
                 elevel = FATAL;
             }
@@ -308,11 +312,19 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
          */
         for (i = 0; i <= t_thrd.log_cxt.errordata_stack_depth; i++)
             elevel = Max(elevel, t_thrd.log_cxt.errordata[i].elevel);
-        if (elevel == FATAL && t_thrd.role == JOB_WORKER) {
+        if (elevel == FATAL && (t_thrd.role == JOB_WORKER || t_thrd.role == DMS_WORKER)) {
             elevel = ERROR;
         }
     }
-
+    if (u_sess == NULL && (g_instance.role == VUNKNOWN || t_thrd.role == MASTER_THREAD)) {
+        // there out of memory in startup, we exit directly.
+        /* Ooops, hard crash time; very little we can do safely here */
+        write_stderr("error occurred at %s:%d before error message processing is available\n"
+                     " u_sess is NULL! gaussdb is exit now.\n",
+            filename ? filename : "(unknown file)",
+            lineno);
+        _exit(-1);
+    }
     /*
      * Now decide whether we need to process this report at all; if it's
      * warning or less and not enabled for logging, just return FALSE without
@@ -542,7 +554,7 @@ void errfinish(int dummy, ...)
     edata->backtrace_log = NULL;
 
     /* get backtrace info */
-    if (edata->elevel >= u_sess->attr.attr_common.backtrace_min_messages) {
+    if (edata->elevel >= u_sess->attr.attr_common.backtrace_min_messages && !t_thrd.log_cxt.output_backtrace_log) {
         StringInfoData buf;
         initStringInfo(&buf);
 
@@ -572,6 +584,7 @@ void errfinish(int dummy, ...)
         u_sess->catalog_cxt.setCurCreateSchema = false;
         u_sess->catalog_cxt.curCreateSchema = NULL;
         u_sess->exec_cxt.isLockRows = false;
+        u_sess->exec_cxt.isFlashBack = false;
     }
 
     /*
@@ -607,6 +620,11 @@ void errfinish(int dummy, ...)
          */
 
         t_thrd.log_cxt.recursion_depth--;
+
+        if (EnableLocalSysCache()) {
+            MemoryContextSwitchTo(oldcontext);
+        }
+
         PG_RE_THROW();
     }
 
@@ -844,11 +862,13 @@ int errcode_for_file_access(void)
 
             /* File not found */
         case ENOENT: /* No such file or directory */
+        case ERR_DSS_FILE_NOT_EXIST: /*  No such file in dss */
             edata->sqlerrcode = ERRCODE_UNDEFINED_FILE;
             break;
 
             /* Duplicate file */
         case EEXIST: /* File exists */
+        case ERR_DSS_DIR_CREATE_DUPLICATED: /* File or directory already existed in DSS */
             edata->sqlerrcode = ERRCODE_DUPLICATE_FILE;
             break;
 
@@ -863,6 +883,7 @@ int errcode_for_file_access(void)
 
             /* Insufficient resources */
         case ENOSPC: /* No space left on device */
+        case ERR_DSS_NO_SPACE: /* No space left on dss */
             edata->sqlerrcode = ERRCODE_DISK_FULL;
             break;
 
@@ -1631,7 +1652,9 @@ void EmitErrorReport(void)
         if (can_skip && need_skip_by_retry) {
             /* skip sending messsage to front, do noting for now */
         } else {
-            send_message_to_frontend(edata);
+            if (u_sess->proc_cxt.MyProcPort && u_sess->proc_cxt.MyProcPort->protocol_config) {
+                u_sess->proc_cxt.MyProcPort->protocol_config->fn_send_message(edata);
+            }
         }
     }
 
@@ -2847,6 +2870,8 @@ int output_backtrace_to_log(StringInfoData* pOutBuf)
     AutoMutexLock btLock(&bt_lock);
 
     btLock.lock();
+    
+    t_thrd.log_cxt.output_backtrace_log = true;
 
     if (t_thrd.log_cxt.thd_bt_symbol) {
         free(t_thrd.log_cxt.thd_bt_symbol);
@@ -2862,6 +2887,7 @@ int output_backtrace_to_log(StringInfoData* pOutBuf)
 
     if (NULL == t_thrd.log_cxt.thd_bt_symbol) {
         appendStringInfoString(pOutBuf, "Failed to get backtrace symbols.\n");
+        t_thrd.log_cxt.output_backtrace_log = false;
         btLock.unLock();
         return -1;
     }
@@ -2878,7 +2904,7 @@ int output_backtrace_to_log(StringInfoData* pOutBuf)
      */
     free(t_thrd.log_cxt.thd_bt_symbol);
     t_thrd.log_cxt.thd_bt_symbol = NULL;
-
+    t_thrd.log_cxt.output_backtrace_log = false;
     btLock.unLock();
 
     return 0;
@@ -2993,7 +3019,11 @@ static void send_message_to_server_log(ErrorData* edata)
         char* randomPlanInfo = NULL;
         char* mask_string = NULL;
         mask_string = maskPassword(t_thrd.postgres_cxt.debug_query_string);
-        if (edata->sqlerrcode == ERRCODE_SYNTAX_ERROR) {
+        /*
+         * For B-compatible database with dolphin, there're some scenarios that
+         * maskPassword couldn't cover.
+         */
+        if (edata->sqlerrcode == ERRCODE_SYNTAX_ERROR || u_sess->attr.attr_sql.dolphin) {
             if (mask_string != NULL) {
                 truncate_identified_by(mask_string, strlen(mask_string));
             } else {
@@ -3119,8 +3149,9 @@ static void send_message_to_server_log(ErrorData* edata)
     }
 
     /* If in the syslogger process, try to write messages direct to file */
-    FILE* logfile = LOG_DESTINATION_CSVLOG ? t_thrd.logger.csvlogFile : t_thrd.logger.syslogFile;
-    if (t_thrd.role == SYSLOGGER && logfile != NULL) {
+    if (t_thrd.role == SYSLOGGER &&
+        t_thrd.log_cxt.Log_destination & LOG_DESTINATION_STDERR &&
+        t_thrd.logger.syslogFile != NULL) {
         write_syslogger_file(buf.data, buf.len, LOG_DESTINATION_STDERR);
     }
 
@@ -3439,7 +3470,7 @@ int combiner_errdata(RemoteErrorData* pErrData)
 /*
  * Write error report to client
  */
-static void send_message_to_frontend(ErrorData* edata)
+void send_message_to_frontend(ErrorData* edata)
 {
     StringInfoData msgbuf;
 
@@ -3472,6 +3503,10 @@ static void send_message_to_frontend(ErrorData* edata)
 
     )
         return;
+
+    if (DB_IS_CMPT(B_FORMAT)) {
+        pushErrorData(edata);
+    }
 
     /* 'N' (Notice) is for nonfatal conditions, 'E' is for errors */
     pq_beginmessage(&msgbuf, (edata->elevel < ERROR) ? 'N' : 'E');
@@ -3850,6 +3885,54 @@ static void append_with_tabs(StringInfo buf, const char* str)
 }
 
 /*
+ * Reaper -- get current time.
+ */
+void get_time_now(char* nowTime, int timeLen)
+{
+    time_t formatTime;
+    struct timeval current = {0};
+    const int tmpBufSize = 32;
+    char tmpBuf[tmpBufSize] = {0};
+
+    if (nowTime == NULL || timeLen == 0) {
+        return;
+    }
+
+    (void)gettimeofday(&current, NULL);
+    formatTime = current.tv_sec;
+    struct tm* pTime = localtime(&formatTime);
+    strftime(tmpBuf, sizeof(tmpBuf), "%Y-%m-%d %H:%M:%S", pTime);
+
+    errno_t rc = sprintf_s(nowTime, timeLen - 1, "%s.%ld ", tmpBuf, current.tv_usec / 1000);
+    securec_check_ss(rc, "\0", "\0");
+}
+
+void write_stderr_with_prefix(const char* fmt, ...)
+{
+    va_list ap;
+    const int timeBufSize = 256;
+    const int bufSize = 2048;
+    char timeBuf[timeBufSize] = {0};
+    char buf[bufSize] = {0};
+
+    /* syslogger thread can not write log into pipe */
+    if (t_thrd.role == SYSLOGGER) {
+        return;
+    }
+
+    get_time_now(timeBuf, timeBufSize);
+
+    fmt = _(fmt);
+    va_start(ap, fmt);
+    errno_t rc = sprintf_s(buf, bufSize - 1, "%s[%lu] %s\n", timeBuf, t_thrd.proc_cxt.MyProcPid, fmt);
+    securec_check_ss(rc, "\0", "\0");
+
+    vfprintf(stderr, buf, ap);
+    fflush(stderr);
+    va_end(ap);
+}
+
+/*
  * Write errors to stderr (or by equal means when stderr is
  * not available). Used before ereport/elog can be used
  * safely (memory context, GUC load etc)
@@ -3983,6 +4066,8 @@ static char* mask_word(char* query_string, int query_len, const char* word, int 
     char* lower_string = (char*)palloc0(query_len + 1);
     rc = memcpy_s(lower_string, query_len, query_string, query_len);
     securec_check(rc, "\0", "\0");
+    bool truncate = false;
+    int set_password_len = 0;
 
     tolower_func(lower_string);
 
@@ -4004,16 +4089,30 @@ static char* mask_word(char* query_string, int query_len, const char* word, int 
         }
         token_len++;
     }
+
+    /* set password for user=password */
+    if (strncmp(token_ptr, "for", token_len) == 0) {
+        token_ptr += token_len;
+        set_password_len = token_len + 1;
+        for (int i = 0; i < query_len - head_len - token_len; i++) {
+            if (token_ptr[i] == '=') {
+                truncate = true;
+                break;
+            }
+            set_password_len++;
+        }
+    }
     tail_ptr = token_ptr + token_len;
     tail_len = query_len - head_len - token_len;
 
-    rc = memcpy_s(mask_string, query_len + mask_len + 1, query_string, head_len);
+    rc = memcpy_s(mask_string, query_len + mask_len + 1, query_string, head_len + set_password_len);
     securec_check(rc, "\0", "\0");
-    rc = memset_s(mask_string + head_len, query_len + mask_len + 1 - head_len, '*', mask_len);
+    rc = memset_s(mask_string + head_len + set_password_len, query_len + mask_len + 1 - head_len - set_password_len,
+                  '*', mask_len);
     securec_check(rc, "\0", "\0");
-    bool is_identified_by = ((strstr(word, " identified by ") == NULL) ? false : true);
-    if (is_identified_by) {
-        mask_string[head_len + mask_len] = '\0';
+    truncate = truncate || ((strstr(word, " identified by ") == NULL) ? false : true);
+    if (truncate) {
+        mask_string[head_len + mask_len + set_password_len] = '\0';
     } else {
         rc = memcpy_s(mask_string + head_len + mask_len, query_len + 1 - head_len, tail_ptr, tail_len);
         securec_check(rc, "\0", "\0");
@@ -4058,7 +4157,7 @@ static void truncate_identified_by(char* query_string, int query_len)
     pfree_ext(lower_string);
 }
 
-static char* mask_error_password(const char* query_string, int str_len)
+char* mask_error_password(const char* query_string, int str_len)
 {
     char* mask_string = NULL;
     errno_t rc = EOK;
@@ -4101,6 +4200,9 @@ static char* mask_execute_direct_cmd(const char* query_string)
             break;
         }
     }
+    if (position >= query_len) {
+        return NULL;
+    }
     /* Parsing execute direct on detail content */
     parse_query = (char*)palloc0(query_len - position);
     rc = memcpy_s(parse_query, (query_len - position), 
@@ -4109,6 +4211,10 @@ static char* mask_execute_direct_cmd(const char* query_string)
     rc = strcat_s(parse_query, (query_len - position), ";\0");
     securec_check(rc, "\0", "\0");
     mask_query = mask_Password_internal(parse_query);
+    if (mask_query == NULL) {
+        pfree_ext(parse_query);
+        return NULL;
+    }
     mask_len = strlen(mask_query);
     /* Concatenate character string */
     tmp_string = (char*)palloc0(mask_len + 1 + position + 1);
@@ -4152,6 +4258,12 @@ static bool is_execute_cmd(const char* query_string)
         }
         encrypt = strstr(format_str, "gs_encrypt");
         decrypt = strstr(format_str, "gs_decrypt");
+        if ((encrypt != NULL) || (decrypt != NULL)) {
+            pfree_ext(format_str);
+            return true;
+        }
+        encrypt = strstr(format_str, "aes_encrypt");
+        decrypt = strstr(format_str, "aes_decrypt");
         if ((encrypt != NULL) || (decrypt != NULL)) {
             pfree_ext(format_str);
             return true;
@@ -4228,7 +4340,7 @@ char* mask_funcs3_parameters(const char* query_string)
     return mask_string;
 }
 
-static void inline ClearYylval(const core_YYSTYPE *yylval)
+static inline void ClearYylval(const core_YYSTYPE *yylval)
 {
     int rc = memset_s(yylval->str, strlen(yylval->str), 0, strlen(yylval->str));
     securec_check(rc, "\0", "\0");
@@ -4253,7 +4365,6 @@ static int get_reallen_of_credential(char *param)
  * Mask the password in statment CREATE ROLE, CREATE USER, ALTER ROLE, ALTER USER, CREATE GROUP
  * SET ROLE, CREATE DATABASE LINK, and some function
  */
-
 static char* mask_Password_internal(const char* query_string)
 {
     int i = 0;
@@ -4264,8 +4375,16 @@ static char* mask_Password_internal(const char* query_string)
     int currToken = 59; /* initialize prevToken as ';' */
     bool isPassword = false;
     char* mask_string = NULL;
+    /*
+     * In the release version, the compiler optimizes 'mask_string' parameter.
+     * After siglongjump in PG_CATCH, the value of 'mask_string' may not be up-to-date.
+     * Therefore, the return value of mask_Password_internal maybe uncontrollable.
+     * We use a valatile copy of 'mask_string' named 'vol_mask_string' as the return value
+     * to void uncontrollable behavior caused by compiler optimizations.
+     */
+    volatile char* vol_mask_string = mask_string;
     /* the function list need mask */
-    const char* funcs[] = {"dblink_connect", "create_credential"};
+    const char* funcs[] = {"create_credential"};
     bool is_create_credential = false;
     bool is_create_credential_passwd = false;
     int funcNum = sizeof(funcs) / sizeof(funcs[0]);
@@ -4280,7 +4399,7 @@ static char* mask_Password_internal(const char* query_string)
 
     /* the functions need to mask all contents */
     const char* funCrypt[] = {"gs_encrypt_aes128", "gs_decrypt_aes128", "gs_encrypt", "gs_decrypt",
-        "pg_create_physical_replication_slot_extern"};
+        "aes_encrypt", "aes_decrypt", "pg_create_physical_replication_slot_extern", "dblink_connect"};
     int funCryptNum = sizeof(funCrypt) / sizeof(funCrypt[0]);
     bool isCryptFunc = false;
 
@@ -4314,6 +4433,9 @@ static char* mask_Password_internal(const char* query_string)
      * 14 - create/alter text search dictionary
      * 15 - for funCrypt
      * 16 - create/alter subscription(CREATE_ALTER_SUBSCRIPTION)
+     * 17 - set password (b compatibility)
+     * 18 - create/alter user mapping
+     * 19 - grant usage on *.*(b compatibility, same as create/alter user)
      */
     int curStmtType = 0;
     int prevToken[5] = {0};
@@ -4327,9 +4449,11 @@ static char* mask_Password_internal(const char* query_string)
     bool saveEscapeStringWarning = u_sess->attr.attr_sql.escape_string_warning;
     bool need_clear_yylval = false;
     /* initialize the flex scanner  */
-    yyscanner = scanner_init(query_string, &yyextra, ScanKeywords, NumScanKeywords);
+    yyscanner = scanner_init(query_string, &yyextra, &ScanKeywords, ScanKeywordTokens);
     yyextra.warnOnTruncateIdent = false;
     u_sess->attr.attr_sql.escape_string_warning = false;
+    /* forbid password truncate */
+    u_sess->parser_cxt.isForbidTruncate = true;
 
     /*set t_thrd.log_cxt.recursion_depth to 0 for avoiding MemoryContextReset called*/
     t_thrd.log_cxt.recursion_depth = 0;
@@ -4373,6 +4497,7 @@ static char* mask_Password_internal(const char* query_string)
                         if (mask_string == NULL) {
                             mask_string = MemoryContextStrdup(
                                 SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                            vol_mask_string = mask_string;
                         }
 
                         /*
@@ -4391,6 +4516,7 @@ static char* mask_Password_internal(const char* query_string)
                             securec_check(rc, "\0", "\0");
                             pfree_ext(mask_string);
                             mask_string = maskStrNew;
+                            vol_mask_string = mask_string;
                         }
 
                         /*
@@ -4427,9 +4553,6 @@ static char* mask_Password_internal(const char* query_string)
                 if (ch == '\'' || ch == '\"')
                     ++position[idx];
 
-                /* Calcute the difference between origin password length and mask password length */
-                position[idx] -= truncateLen;
-
                 if (!is_create_credential) {
                     length[idx] = strlen(yylval.str);
                 } else if (isPassword) {
@@ -4459,6 +4582,7 @@ static char* mask_Password_internal(const char* query_string)
                     if (mask_string == NULL) {
                         mask_string = MemoryContextStrdup(
                             SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                        vol_mask_string = mask_string;
                     }
                     int maskLen = u_sess->attr.attr_security.Password_min_length;
                     for (i = 0; i < idx; ++i) {
@@ -4467,17 +4591,19 @@ static char* mask_Password_internal(const char* query_string)
                          *  the len of password may be shorter than actual, 
                          *  we need to find the start position of password word by looking forward.
                          */ 
-                        char wordHead = position[i] > 0 ? mask_string[position[i] - 1] : '\0';
+                        char wordHead = position[i] > 0 ? query_string[position[i] - 1] : '\0';
                         if (isPassword && wordHead != '\0' && wordHead != '\'' && wordHead != '\"') {
                             while (position[i] > 0 && !isspace(wordHead) && wordHead != '\'' && wordHead != '\"') {
                                 position[i]--;
-                                wordHead = mask_string[position[i] - 1];
+                                wordHead = query_string[position[i] - 1];
                             }
-                            length[i] = strlen(mask_string + position[i]);
+                            length[i] = strlen(query_string + position[i]);
                             /* if the last char is ';', we should keep it */
-                            if (mask_string[position[i] + length[i] - 1] == ';') {
+                            if (query_string[position[i] + length[i] - 1] == ';') {
                                 length[i]--;
                             }
+                            curStmtType = 0;
+                            isPassword = false;
                         }
 
                         /*
@@ -4485,8 +4611,9 @@ static char* mask_Password_internal(const char* query_string)
                          * Calcute length of '\'' and double this length.
                          */
                         int lengthOfQuote = 0;
+                        int yyvalLen = (yylval.str != NULL) ? (int)strlen(yylval.str) : 0;
                         for (int len = 0; len < length[i]; len++) {
-                            if ((yylval.str != NULL) && (yylval.str[len] == '\'')) {
+                            if (len < yyvalLen && (yylval.str[len] == '\'')) {
                                 lengthOfQuote++;
                             }
                         }
@@ -4501,20 +4628,23 @@ static char* mask_Password_internal(const char* query_string)
                             securec_check(rc, "\0", "\0");
                             pfree_ext(mask_string);
                             mask_string = maskStrNew;
+                            vol_mask_string = mask_string;
                         }
 
-                        char* maskBegin = mask_string + position[i];
-                        int copySize = strlen(mask_string) - position[i] - length[i] + 1;
-                        rc = memmove_s(maskBegin + maskLen, copySize, maskBegin + length[i], copySize);
-                        securec_check(rc, "", "");
+                        char* maskBegin = mask_string + (position[i] - truncateLen);
+                        int copySize = strlen(mask_string) - (position[i] - truncateLen) - length[i] + 1;
+                        if ((position[i] - truncateLen) >= 0 && copySize > 0) {
+                            rc = memmove_s(maskBegin + maskLen, copySize, maskBegin + length[i], copySize);
+                            securec_check(rc, "", "");
+                            rc = memset_s(maskBegin, maskLen, '*', maskLen);
+                            securec_check(rc, "", "");
+                        }
                         /*
                          * After masking password, the origin password had been transformed to '*', which length equals
                          * to u_sess->attr.attr_security.Password_min_length.
                          * So we should record the difference between origin password length and mask password length.
                          */
                         truncateLen = strlen(query_string) - strlen(mask_string);
-                        rc = memset_s(maskBegin, maskLen, '*', maskLen);
-                        securec_check(rc, "", "");
 
                         need_clear_yylval = true;
                     }
@@ -4524,7 +4654,7 @@ static char* mask_Password_internal(const char* query_string)
                     }
                     idx = 0;
                     isPassword = false;
-                    if (curStmtType == 10 || curStmtType == 11) {
+                    if (curStmtType == 10 || curStmtType == 11 || curStmtType == CREATE_ALTER_USERMAPPING) {
                         curStmtType = 0;
                     }
                 }
@@ -4582,9 +4712,17 @@ static char* mask_Password_internal(const char* query_string)
                         /* For create/alter data source: sensitive opt is 'password' */
                         curStmtType = 11;
                         currToken = IDENT;
+                    } else if (DB_IS_CMPT(B_FORMAT) && prevToken[0] == SET) {
+                        curStmtType = 17;
+                    } else if (prevToken[1] == MAPPING && prevToken[2] == SERVER && prevToken[3] == OPTIONS) {
+                        curStmtType = CREATE_ALTER_USERMAPPING;
+                        currToken = IDENT;
                     }
-                    isPassword = true;
-                    idx = 0;
+
+                    if (curStmtType != 17) {
+                        isPassword = true;
+                        idx = 0;
+                    }
                     break;
                 case BY:
                     isPassword = (curStmtType > 0 && prevToken[0] == IDENTIFIED);
@@ -4696,6 +4834,7 @@ static char* mask_Password_internal(const char* query_string)
                             if (mask_string == NULL) {
                                 mask_string = MemoryContextStrdup(
                                     SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                                vol_mask_string = mask_string;
                             }
                             
                             if (yylloc > position_crypt) {
@@ -4731,9 +4870,10 @@ static char* mask_Password_internal(const char* query_string)
                         if (NULL == mask_string) {
                             mask_string = MemoryContextStrdup(
                                 SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                            vol_mask_string = mask_string;
                         }
                         for (i = 0; i < idx; ++i) {
-                            rc = memset_s(mask_string + position[i], length[i], '*', length[i]);
+                            rc = memset_s(mask_string + (position[i] - truncateLen), length[i], '*', length[i]);
                             securec_check(rc, "", "");
                         }
                         idx = 0;
@@ -4771,6 +4911,12 @@ static char* mask_Password_internal(const char* query_string)
                     isPassword = false;
                     idx = 0;
                     break;
+                case 61: /* character '=' */
+                    /* for mask 'set password' in b compatibility */
+                    isPassword = (curStmtType == 17);
+                    if (isPassword)
+                        idx = 0;
+                    break;
                 case FOREIGN:
                     if (prevToken[0] == CREATE || prevToken[0] == ALTER) {
                         prevToken[1] = FOREIGN;
@@ -4784,6 +4930,8 @@ static char* mask_Password_internal(const char* query_string)
                 case SERVER:
                     if (prevToken[0] == CREATE || prevToken[0] == ALTER) {
                         prevToken[1] = SERVER;
+                    } else if (prevToken[1] == MAPPING) {
+                        prevToken[2] = SERVER;
                     }
                     break;
                 case OPTIONS:
@@ -4792,6 +4940,8 @@ static char* mask_Password_internal(const char* query_string)
                     } else if (prevToken[1] == FOREIGN && prevToken[2] == TABLE) {
                         prevToken[3] = OPTIONS;
                     } else if (prevToken[1] == DATA_P && prevToken[2] == SOURCE_P) {
+                        prevToken[3] = OPTIONS;
+                    } else if (prevToken[1] == MAPPING && prevToken[2] == SERVER) {
                         prevToken[3] = OPTIONS;
                     }
                     break;
@@ -4832,7 +4982,8 @@ static char* mask_Password_internal(const char* query_string)
 
                     if ((prevToken[1] == SERVER && prevToken[2] == OPTIONS) ||
                         (prevToken[1] == FOREIGN && prevToken[2] == TABLE && prevToken[3] == OPTIONS)) {
-                        if (pg_strcasecmp(yylval.str, "secret_access_key") == 0) {
+                        if (pg_strcasecmp(yylval.str, "secret_access_key") == 0 ||
+                            pg_strcasecmp(yylval.str, "password") == 0) {
                             /* create/alter server  */
                             curStmtType = 10;
                         } else {
@@ -4842,9 +4993,11 @@ static char* mask_Password_internal(const char* query_string)
                     } else if (prevToken[1] == DATA_P && prevToken[2] == SOURCE_P && prevToken[3] == OPTIONS) {
                         /*
                          * For create/alter data source: sensitive opts are 'username' and 'password'.
-                         * 'username' is marked here, while 'password' is marked as a standard Token, not here.
+                         * 'username' is marked here, while 'password' is usually marked as a standard Token.
+                         * However, password will be taken as SCONST if wrapped around double-quote, which needs
+                         * to be handled here.
                          */
-                        if (pg_strcasecmp(yylval.str, "username") == 0) {
+                        if (pg_strcasecmp(yylval.str, "username") == 0 || pg_strcasecmp(yylval.str, "password") == 0) {
                             curStmtType = 11;
                         } else {
                             curStmtType = 0;
@@ -4865,6 +5018,23 @@ static char* mask_Password_internal(const char* query_string)
                          */
                         curStmtType = pg_strcasecmp(yylval.str, "conninfo") == 0 ? CREATE_ALTER_SUBSCRIPTION : 0;
                         idx = 0;
+                    } else if (prevToken[1] == MAPPING && prevToken[2] == SERVER && prevToken[3] == OPTIONS) {
+                        /*
+                         * For create/alter user mapping: sensitive opt is 'password'.
+                         * 'password' is usually marked as a standard Token.
+                         * However, password will be taken as SCONST if wrapped around double-quote, which needs
+                         * to be handled here.
+                         */
+                        if (pg_strcasecmp(yylval.str, "password") == 0) {
+                            curStmtType = CREATE_ALTER_USERMAPPING;
+                            isPassword = true;
+                        } else {
+                            curStmtType = 0;
+                        }
+                        idx = 0;
+                    } else if (DB_IS_CMPT(B_FORMAT) && prevToken[1] == GRANT &&
+                        pg_strcasecmp(yylval.str, "usage") == 0) {
+                        curStmtType = GRANT_USAGE;
                     }
                     break;
                 case SCONST:
@@ -4874,10 +5044,36 @@ static char* mask_Password_internal(const char* query_string)
                             if (mask_string == NULL) {
                                 mask_string = MemoryContextStrdup(
                                     SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                                vol_mask_string = mask_string;
                             }
+                            if (strstr(mask_string, "secret_access_key") != NULL) {
+                                int plen = strlen(mask_string) + strlen(password_mask) + 1;
+                                char* maskStrTmp = (char*)palloc(plen);
+                                rc = memset_s(maskStrTmp, plen, '\0', plen);
+                                securec_check(rc, "", "");
+                                rc = memcpy_s(maskStrTmp, plen, mask_string, strlen(mask_string));
+                                securec_check(rc, "", "");
+                                char* after_ak = pg_strdup(maskStrTmp + position[0] + length[0]);
+                                rc = memcpy_s(maskStrTmp + position[0], plen, password_mask, strlen(password_mask));
+                                securec_check(rc, "", "");
+                                rc = memcpy_s(maskStrTmp + position[0] + strlen(password_mask),
+                                    plen, after_ak, strlen(after_ak) + 1);
+                                securec_check(rc, "", "");
 
-                            rc = memset_s(mask_string + position[0], length[0], '*', length[0]);
-                            securec_check(rc, "", "");
+                                char* maskStrNew = MemoryContextStrdup(
+                                    SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), maskStrTmp);
+                                rc = memset_s(mask_string, strlen(mask_string), '\0', strlen(mask_string));
+                                securec_check(rc, "", "");
+                                pfree_ext(mask_string);
+                                pfree_ext(maskStrTmp);
+                                mask_string = maskStrNew;
+                                vol_mask_string = mask_string;
+                                free(after_ak);
+                                after_ak = NULL;
+                            } else {
+                                rc = memset_s(mask_string + position[0], length[0], '*', length[0]);
+                                securec_check(rc, "", "");
+                            }
                             idx = 0;
                             curStmtType = 0;
                         }
@@ -4896,6 +5092,7 @@ static char* mask_Password_internal(const char* query_string)
                         if (mask_string == NULL) {
                             mask_string = MemoryContextStrdup(
                                 SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                            vol_mask_string = mask_string;
                         }
                         /*
                          * mask to the end of string, cause the length[0] may be shorter than actual.
@@ -4908,7 +5105,7 @@ static char* mask_Password_internal(const char* query_string)
                         if (query_string[position[0] + maskLen - 1] == ';') {
                             maskLen--;
                         }
-                        rc = memset_s(mask_string + position[0], maskLen, '*', maskLen);
+                        rc = memset_s(mask_string + (position[0] - truncateLen), maskLen, '*', maskLen);
                         securec_check(rc, "", "");
                         /* the yylval store the conninfo, so we clear it here */
                         ClearYylval(&yylval);
@@ -4939,12 +5136,23 @@ static char* mask_Password_internal(const char* query_string)
                         if (mask_string == NULL) {
                             mask_string = MemoryContextStrdup(
                                 SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                            vol_mask_string = mask_string;
                         }
                         int maskLen = yylloc - conninfoStartPos;
                         rc = memset_s(mask_string + conninfoStartPos, maskLen, '*', maskLen);
                         securec_check(rc, "", "");
                         idx = 0;
                         curStmtType = 0;
+                    }
+                    break;
+                case MAPPING:
+                    if (prevToken[0] == USER) {
+                        prevToken[1] = MAPPING;
+                    }
+                    break;
+                case GRANT:
+                    if (DB_IS_CMPT(B_FORMAT) && prevToken[0] == ';') {
+                        prevToken[1] = GRANT;
                     }
                     break;
                 default:
@@ -4986,6 +5194,8 @@ static char* mask_Password_internal(const char* query_string)
     t_thrd.log_cxt.recursion_depth = saveRecursionDepth;
     t_thrd.int_cxt.InterruptHoldoffCount = saveInterruptHoldoffCount;
     u_sess->attr.attr_sql.escape_string_warning = saveEscapeStringWarning;
+    /* reset the forbid truncate flag */
+    u_sess->parser_cxt.isForbidTruncate = false;
 
     if (yyextra.scanbuflen > 0) {
         rc = memset_s(yyextra.scanbuf, yyextra.scanbuflen, 0, yyextra.scanbuflen);
@@ -4998,8 +5208,8 @@ static char* mask_Password_internal(const char* query_string)
         pfree_ext(yyextra.literalbuf);
     }
 
-    return mask_string;
-
+    /* return the valatile copy of mask_string to ensure that the latest value is returned. */
+    return (char *)vol_mask_string;
 }
 
 static void eraseSingleQuotes(char* query_string)
@@ -5116,4 +5326,230 @@ static void write_asplog(char *data, int len, bool end)
     } else {
         write_asp_chunks(data, len, end);
     }
+}
+
+typedef struct {
+    enum_dolphin_error_level elevel;
+    int errorcode;
+    char *message;
+} DolphinErrorData;
+
+ErrorDataArea *initErrorDataArea()
+{
+    ErrorDataArea *errorDataArea = (ErrorDataArea *)palloc0(sizeof(ErrorDataArea));
+    errorDataArea->current_edata_count_by_level = (uint64 *)palloc0(4 * sizeof(uint64));
+    errorDataArea->sqlErrorDataList = NIL;
+    errorDataArea->current_edata_count = 0;
+    for (int i = 0; i <= enum_dolphin_error_level::B_END; i++) {
+        errorDataArea->current_edata_count_by_level[i] = 0;
+    }
+    return errorDataArea;
+}
+
+void cleanErrorDataArea(ErrorDataArea *errorDataArea)
+{
+    Assert(errorDataArea != NULL);
+    list_free_deep(errorDataArea->sqlErrorDataList);
+    errorDataArea->sqlErrorDataList = NIL;
+    errorDataArea->current_edata_count = 0;
+    for (int i = 0; i <= enum_dolphin_error_level::B_END; i++) {
+        errorDataArea->current_edata_count_by_level[i] = 0;
+    }
+}
+
+void copyErrorDataArea(ErrorDataArea *from, ErrorDataArea *to)
+{
+    cleanErrorDataArea(to);
+
+    MemoryContext oldcontext;
+
+    oldcontext = MemoryContextSwitchTo(u_sess->dolphin_errdata_ctx.dolphinErrorDataMemCxt);
+
+    ListCell *lc = NULL;
+    lc = list_head(from->sqlErrorDataList);
+    foreach (lc, from->sqlErrorDataList) {
+        DolphinErrorData *eData = (DolphinErrorData *)lfirst(lc);
+        DolphinErrorData *newErrData = (DolphinErrorData *)palloc(sizeof(DolphinErrorData));
+        newErrData->elevel = eData->elevel;
+        newErrData->errorcode = eData->errorcode;
+        newErrData->message = pstrdup(eData->message);
+        to->sqlErrorDataList = lappend(to->sqlErrorDataList, newErrData);
+    }
+    to->current_edata_count = from->current_edata_count;
+    for (int i = 0; i <= enum_dolphin_error_level::B_END; i++) {
+        to->current_edata_count_by_level[i] = from->current_edata_count_by_level[i];
+    }
+    MemoryContextSwitchTo(oldcontext);
+}
+
+void resetErrorDataArea(bool stacked)
+{
+    /* reset all count to zero and list to null */
+    MemoryContext oldcontext;
+    oldcontext = MemoryContextSwitchTo(u_sess->dolphin_errdata_ctx.dolphinErrorDataMemCxt);
+    ErrorDataArea *errorDataArea = u_sess->dolphin_errdata_ctx.errorDataArea;
+    ErrorDataArea *lastErrorDataArea = u_sess->dolphin_errdata_ctx.lastErrorDataArea;
+    if (stacked) {
+        copyErrorDataArea(errorDataArea, lastErrorDataArea);
+    } else {
+        cleanErrorDataArea(lastErrorDataArea);
+    }
+    cleanErrorDataArea(errorDataArea);
+    MemoryContextSwitchTo(oldcontext);
+}
+
+enum_dolphin_error_level errorLevelToDolphin(int elevel)
+{
+    if (elevel < WARNING) {
+        return enum_dolphin_error_level::B_NOTE;
+    } else if (elevel == WARNING) {
+        return enum_dolphin_error_level::B_WARNING;
+    } else {
+        return enum_dolphin_error_level::B_ERROR;
+    }
+}
+
+void pushErrorData(ErrorData *edata)
+{
+    MemoryContext oldcontext;
+    ErrorDataArea *errorDataArea = u_sess->dolphin_errdata_ctx.errorDataArea;
+    oldcontext = MemoryContextSwitchTo(u_sess->dolphin_errdata_ctx.dolphinErrorDataMemCxt);
+    if (u_sess->dolphin_errdata_ctx.max_error_count >= SqlErrorDataCount()) {
+        if (u_sess->dolphin_errdata_ctx.sql_note == true ||
+            errorLevelToDolphin(edata->elevel) != enum_dolphin_error_level::B_NOTE) {
+            DolphinErrorData *dolphinErrorData = (DolphinErrorData *)palloc(sizeof(DolphinErrorData));
+            dolphinErrorData->elevel = errorLevelToDolphin(edata->elevel);
+            dolphinErrorData->errorcode = edata->sqlerrcode;
+            dolphinErrorData->message = pstrdup(edata->message);
+            errorDataArea->sqlErrorDataList = lappend(errorDataArea->sqlErrorDataList, dolphinErrorData);
+            errorDataArea->current_edata_count++;
+            errorDataArea->current_edata_count_by_level[errorLevelToDolphin(edata->elevel)]++;
+        }
+    }
+    MemoryContextSwitchTo(oldcontext);
+}
+
+int32 SqlErrorDataErrorCount(ErrorDataArea *errorDataArea)
+{
+    return errorDataArea->current_edata_count_by_level[enum_dolphin_error_level::B_ERROR];
+}
+
+int32 SqlErrorDataWarnCount(ErrorDataArea *errorDataArea)
+{
+    return errorDataArea->current_edata_count_by_level[enum_dolphin_error_level::B_NOTE] +
+           errorDataArea->current_edata_count_by_level[enum_dolphin_error_level::B_WARNING] +
+           errorDataArea->current_edata_count_by_level[enum_dolphin_error_level::B_ERROR];
+}
+
+int SqlErrorDataCount()
+{
+    return list_length(u_sess->dolphin_errdata_ctx.errorDataArea->sqlErrorDataList);
+}
+#define NUM_SHOW_WARNINGS_COLUMNS 3
+
+typedef struct {
+    ErrorDataArea *errorDataArea;
+    int currIdx;
+    int limit;
+    ListCell *lc = NULL;
+} ErrorDataAreaStatus;
+
+void gramShowWarningsErrors(int offset, int count, DestReceiver *dest, bool isShowErrors)
+{
+    TupOutputState *tstate = NULL;
+    TupleDesc tupdesc;
+
+    /* need a tuple descriptor representing three TEXT columns */
+    tupdesc = CreateTemplateTupleDesc(NUM_SHOW_WARNINGS_COLUMNS, false);
+    TupleDescInitEntry(tupdesc, (AttrNumber)1, "level", TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)2, "code", INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)3, "message", TEXTOID, -1, 0);
+
+    /* prepare for projection of tuples */
+    tstate = begin_tup_output_tupdesc(dest, tupdesc);
+    ErrorDataArea *errorDataArea = u_sess->dolphin_errdata_ctx.lastErrorDataArea;
+    int currIdx = 0;
+    int limit = count;
+    ListCell *lc = NULL;
+    while (currIdx < list_length(errorDataArea->sqlErrorDataList)) {
+        if (limit <= 0) {
+            break;
+        }
+        if (currIdx < offset) {
+            currIdx++;
+            continue;
+        }
+        Datum values[NUM_SHOW_WARNINGS_COLUMNS] = {0};
+        bool nulls[NUM_SHOW_WARNINGS_COLUMNS] = {false};
+        if (lc == NULL) {
+            List *sqlErrorDataList = errorDataArea->sqlErrorDataList;
+            lc = list_head(sqlErrorDataList);
+        } else {
+            lc = lnext(lc);
+        }
+        Assert(lc != NULL);
+        DolphinErrorData *eData = (DolphinErrorData *)lfirst(lc);
+        values[1] = Int32GetDatum(eData->errorcode);
+
+        if (isShowErrors) {
+            if (eData->elevel == enum_dolphin_error_level::B_ERROR) {
+                values[0] = CStringGetTextDatum("Error");
+            } else {
+                currIdx++;
+                continue;
+            }
+        } else {
+            switch (eData->elevel) {
+                case enum_dolphin_error_level::B_NOTE:
+                    values[0] = CStringGetTextDatum("Note");
+                    break;
+                case enum_dolphin_error_level::B_WARNING:
+                    values[0] = CStringGetTextDatum("Warning");
+                    break;
+                case enum_dolphin_error_level::B_ERROR:
+                default:
+                    values[0] = CStringGetTextDatum("Error");
+                    break;
+            }
+        }
+
+        if (eData->message) {
+            values[2] = CStringGetTextDatum(eData->message);
+        } else {
+            values[2] = CStringGetTextDatum("");
+        }
+        limit--;
+        currIdx++;
+        do_tup_output(tstate, values, NUM_SHOW_WARNINGS_COLUMNS, nulls, NUM_SHOW_WARNINGS_COLUMNS);
+
+        /* clean up */
+        pfree(DatumGetPointer(values[0]));
+        pfree(DatumGetPointer(values[2]));
+    }
+    end_tup_output(tstate);
+    copyErrorDataArea(u_sess->dolphin_errdata_ctx.lastErrorDataArea, u_sess->dolphin_errdata_ctx.errorDataArea);
+}
+
+void gramShowWarningsErrorsCount(DestReceiver *dest, bool isShowErrors)
+{
+    TupOutputState *tstate = NULL;
+    TupleDesc tupdesc;
+    Datum values[1] = {0};
+    bool isnull[1] = {false};
+
+    /* need a tuple descriptor representing three TEXT columns */
+    tupdesc = CreateTemplateTupleDesc(1, false);
+    TupleDescInitEntry(tupdesc, (AttrNumber)1, "count", INT4OID, -1, 0);
+
+    /* prepare for projection of tuples */
+    tstate = begin_tup_output_tupdesc(dest, tupdesc);
+    ErrorDataArea *errorDataArea = u_sess->dolphin_errdata_ctx.lastErrorDataArea;
+    if (isShowErrors) {
+        values[0] = Int32GetDatum(SqlErrorDataErrorCount(errorDataArea));
+    } else {
+        values[0] = Int32GetDatum(SqlErrorDataWarnCount(errorDataArea));
+    }
+    do_tup_output(tstate, values, 1, isnull, 1);
+    end_tup_output(tstate);
+    copyErrorDataArea(u_sess->dolphin_errdata_ctx.lastErrorDataArea, u_sess->dolphin_errdata_ctx.errorDataArea);
 }

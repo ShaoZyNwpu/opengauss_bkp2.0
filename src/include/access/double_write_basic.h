@@ -28,19 +28,21 @@
 #include <fcntl.h> /* need open() flags */
 #include "c.h"
 #include "utils/palloc.h"
-
+#include "fmgr/fmgr_comp.h"
 #include "storage/lock/lwlock.h"
 
 static const uint32 HALF_K = 512;
 
-static const char OLD_DW_FILE_NAME[] = "global/pg_dw";
-static const char DW_FILE_NAME_PREFIX[] = "global/pg_dw_";
-static const char SINGLE_DW_FILE_NAME[] = "global/pg_dw_single";
-static const char DW_BUILD_FILE_NAME[] = "global/pg_dw.build";
-static const char DW_UPGRADE_FILE_NAME[] = "global/dw_upgrade";
-static const char DW_BATCH_UPGRADE_META_FILE_NAME[] = "global/dw_batch_upgrade_meta";
-static const char DW_BATCH_UPGRADE_BATCH_FILE_NAME[] = "global/dw_batch_upgrade_files";
-static const char DW_META_FILE[] = "global/pg_dw_meta";
+#define OLD_DW_FILE_NAME (g_instance.datadir_cxt.dw_subdir_cxt.dwOldPath)
+#define DW_FILE_NAME_PREFIX (g_instance.datadir_cxt.dw_subdir_cxt.dwPathPrefix)
+#define SINGLE_DW_FILE_NAME (g_instance.datadir_cxt.dw_subdir_cxt.dwSinglePath)
+#define DW_BUILD_FILE_NAME (g_instance.datadir_cxt.dw_subdir_cxt.dwBuildPath)
+#define DW_UPGRADE_FILE_NAME (g_instance.datadir_cxt.dw_subdir_cxt.dwUpgradePath) 
+#define DW_BATCH_UPGRADE_META_FILE_NAME (g_instance.datadir_cxt.dw_subdir_cxt.dwBatchUpgradeMetaPath) 
+#define DW_BATCH_UPGRADE_BATCH_FILE_NAME (g_instance.datadir_cxt.dw_subdir_cxt.dwBatchUpgradeFilePath)
+#define DW_META_FILE (g_instance.datadir_cxt.dw_subdir_cxt.dwMetaPath)
+#define DW_EXT_DIRECTORY (g_instance.datadir_cxt.dw_subdir_cxt.dwExtChunkPath)
+#define DW_STORAGE_TYPE ((device_type_t)g_instance.datadir_cxt.dw_subdir_cxt.dwStorageType)
 
 static const uint32 DW_TRY_WRITE_TIMES = 8;
 #ifndef WIN32
@@ -49,6 +51,13 @@ static const int DW_FILE_FLAG = (O_RDWR | O_SYNC | O_DIRECT | PG_BINARY);
 static const mode_t DW_FILE_PERM = (S_IRUSR | S_IWUSR);
 
 static const int DW_FILE_EXTEND_SIZE = (BLCKSZ * HALF_K);
+
+/* compress ext in dw: 128pages(logic)  -> 128pages(pcd) + 1page(pca) */
+static const uint32 DW_EXT_PAGE_NUM = 129;
+static const uint32 DW_EXT_LOGIC_PAGE_NUM = DW_EXT_PAGE_NUM - 1;
+
+/* 128pages(pcd) + 1page(pca) + 1page(assist file info) */
+static const int DW_ASSIST_FILE_SIZE = (BLCKSZ * DW_EXT_PAGE_NUM + BLCKSZ);
 
 /* 32k pages, 8k each, file size 256M in total */
 static const uint16 DW_FILE_PAGE = 32768;
@@ -102,8 +111,10 @@ typedef struct st_dw_file_head {
 
 /* write the st_dw_meta_file data into the first three sector of the page */
 static const uint32 DW_META_FILE_BLOCK_NUM = 3;
-
 static const uint32 DW_FILE_HEAD_ID_NUM = 3;
+
+/* number of retries to open or create dw files   */
+static const int DW_FILE_RETRY_TIMES = 3;
 
 /* write file head 3 times, distributed in start, middle, end of the first page of dw file */
 static const uint16 g_dw_file_head_ids[DW_FILE_HEAD_ID_NUM] = {0, 8, 15};
@@ -179,5 +190,8 @@ typedef struct dw_stat_info_single {
 
 extern const dw_view_col_t g_dw_view_col_arr[DW_VIEW_COL_NUM];
 extern const dw_view_col_t g_dw_single_view[DW_SINGLE_VIEW_COL_NUM];
+
+Datum gs_block_dw_io(PG_FUNCTION_ARGS);
+Datum gs_is_dw_io_blocked(PG_FUNCTION_ARGS);
 
 #endif /* DOUBLE_WRITE_BASIC_H */

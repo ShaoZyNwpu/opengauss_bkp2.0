@@ -64,6 +64,15 @@ typedef enum {
     STANDBY_SNAPSHOT_READY
 } HotStandbyState;
 
+typedef enum {
+    TRIGGER_NORMAL = 0,
+    TRIGGER_PRIMARY,
+    TRIGGER_STADNBY,
+    TRIGGER_FAILOVER,
+    TRIGGER_SWITCHOVER,
+    TRIGGER_SMARTSHUTDOWN,
+} Enum_TriggeredState;
+
 #define InHotStandby (t_thrd.xlog_cxt.standbyState >= STANDBY_SNAPSHOT_PENDING)
 
 #define DUMMYSTANDBY_CONNECT_INTERVAL 3  // unit second
@@ -83,6 +92,14 @@ extern volatile uint64 sync_system_identifier;
 #define XLOG_FROM_ARCHIVE (1 << 0) /* Restored using restore_command */
 #define XLOG_FROM_PG_XLOG (1 << 1) /* Existing file in pg_xlog */
 #define XLOG_FROM_STREAM (1 << 2)  /* Streamed from master */
+
+#define DORADO_STANDBY_CLUSTER (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY && \
+                                g_instance.attr.attr_storage.xlog_file_path != 0)
+#define DORADO_PRIMARY_CLUSTER (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_PRIMARY && \
+                                g_instance.attr.attr_storage.xlog_file_path != 0)
+#define DORADO_STANDBY_CLUSTER_MAINSTANDBY_NODE ((t_thrd.postmaster_cxt.HaShmData->current_mode ==  STANDBY_MODE) && \
+                                                (g_instance.attr.attr_common.cluster_run_mode == RUN_MODE_STANDBY) && \
+                                                (g_instance.attr.attr_storage.xlog_file_path != 0))
 
 /*
  * Recovery target type.
@@ -132,7 +149,8 @@ typedef enum WalLevel {
 #define XLogHintBitIsNeeded() (g_instance.attr.attr_storage.wal_log_hints)
 
 /* Do we need to WAL-log information required only for Hot Standby and logical replication? */
-#define XLogStandbyInfoActive() (g_instance.attr.attr_storage.wal_level >= WAL_LEVEL_HOT_STANDBY)
+#define XLogStandbyInfoActive()                                         \
+    (g_instance.attr.attr_storage.wal_level >= WAL_LEVEL_HOT_STANDBY)
 /* Do we need to WAL-log information required only for logical replication? */
 #define XLogLogicalInfoActive() (g_instance.attr.attr_storage.wal_level >= WAL_LEVEL_LOGICAL)
 extern const char* DemoteModeDescs[];
@@ -249,6 +267,13 @@ struct WALInitSegLockPadded {
 #define LAZY_BACKWRITE 0x0400       /* lazy backwrite */
 #define PAGERANGE_BACKWRITE 0x0800  /* PageRangeBackWrite */
 
+#define CHECKPOINT_LEN (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + sizeof(CheckPoint))
+#define CHECKPOINTNEW_LEN (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + sizeof(CheckPointNew))
+#define CHECKPOINTPLUS_LEN (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + sizeof(CheckPointPlus))
+#define CHECKPOINTUNDO_LEN (SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + sizeof(CheckPointUndo))
+
+#define FOLLOWER_TRIGER_SLEEP_LOOP_COUNT 1000
+#define FOLLOWER_SLEEP_USECS 1000
 
 /* Checkpoint statistics */
 typedef struct CheckpointStatsData {
@@ -515,6 +540,8 @@ typedef struct XLogCtlData {
     bool SharedRecoveryInProgress;
 
     bool IsRecoveryDone;
+    bool IsOnDemandBuildDone;
+    bool IsOnDemandRedoDone;
 
     /*
      * SharedHotStandbyActive indicates if we're still in crash or archive
@@ -535,6 +562,13 @@ typedef struct XLogCtlData {
      * to appear.
      */
     Latch recoveryWakeupLatch;
+
+    /**
+     * used to wake up startup process in extroRtoMode and recovery_min_apply_delay > 0,
+     * to wake up startup process,  which is waiting in RecoveryApplyDelay(), to avoid 
+     * startup process contend for recoveryWakeupLatch with XLogPageRead process.
+     */
+    Latch recoveryWakeupDelayLatch;
 
     Latch dataRecoveryLatch;
 
@@ -602,6 +636,11 @@ typedef struct XLogCtlData {
     XLogRecPtr remain_segs_start_point;
     bool is_need_log_remain_segs;
     XLogRecPtr remainCommitLsn;
+    
+    bool walrcv_reply_dueto_commit;
+
+    /* streaming replication during pre-reading for dss */
+    XLogRecPtr xlogFlushPtrForPerRead;
 
     slock_t info_lck; /* locks shared variables shown above */
 } XLogCtlData;
@@ -624,6 +663,39 @@ struct XlogFlushStats{
     uint64 currOpenXlogSegNo;
     TimestampTz lastRestTime;
 };
+
+typedef enum WalKeeper {
+    WALKEEPER_BASECHECK = 0,
+    WALKEEPER_SEGMENT_KEEP,
+    WALKEEPER_SLOTS,
+    WALKEEPER_BASEBACKUP,
+    WALKEEPER_BUILD,
+    WALKEEPER_INVALIDSEND,
+    WALKEEPER_DUMMYSTANDBY,
+    WALKEEPER_INVALIDSLOT,
+    WALKEEPER_CBM,
+    WALKEEPER_CHECKPOINT,
+    WALKEEPER_ARCHIVE,
+    WALKEEPER_RESISTARCHIVE,
+    WALKEEPER_COODRECYCLE,
+    WALKEEPER_MAX
+} WalKeeper;
+
+typedef struct WalKeeperDesc {
+    WalKeeper   keeper_id;
+    char        *keeper_name;
+    char        *keeper_desc;
+}WalKeeperDesc;
+
+typedef struct XlogKeeper {
+    XLogSegNo   segno;
+    bool        valid;
+} XlogKeeper;
+
+typedef struct WalKeeperPriv {
+    int             loop;
+    XlogKeeper      *keeper;
+}WalKeeperPriv;
 
 extern XLogSegNo GetNewestXLOGSegNo(const char* workingPath);
 /*
@@ -663,6 +735,8 @@ extern bool RecoveryInProgress(void);
 extern bool HotStandbyActive(void);
 extern bool HotStandbyActiveInReplay(void);
 extern bool XLogInsertAllowed(void);
+extern bool SSXLogInsertAllowed(void);
+extern bool SSModifySharedLunAllowed(void);
 extern void GetXLogReceiptTime(TimestampTz* rtime, bool* fromStream);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID* targetTLI, XLogRecPtr* ReplayReadPtr = NULL);
 extern void SetXLogReplayRecPtr(XLogRecPtr readRecPtr, XLogRecPtr endRecPtr);
@@ -670,6 +744,8 @@ extern void DumpXlogCtl();
 
 extern void CheckRecoveryConsistency(void);
 
+extern void set_walrcv_reply_dueto_commit(bool need_reply);
+bool get_walrcv_reply_dueto_commit(void);
 extern XLogRecPtr GetXLogReplayRecPtrInPending(void);
 extern XLogRecPtr GetStandbyFlushRecPtr(TimeLineID* targetTLI);
 extern XLogRecPtr GetXLogInsertRecPtr(void);
@@ -788,7 +864,6 @@ extern char* TrimStr(const char* str);
 
 extern void CloseXlogFilesAtThreadExit(void);
 extern void SetLatestXTime(TimestampTz xtime);
-XLogRecord* XLogParallelReadNextRecord(XLogReaderState* xlogreader);
 
 void ResourceManagerStartup(void);
 void ResourceManagerStop(void);
@@ -820,7 +895,6 @@ void ReadShareStorageCtlInfo(ShareStorageXLogCtl* ctlInfo);
 pg_crc32c CalShareStorageCtlInfoCrc(const ShareStorageXLogCtl *ctlInfo);
 int ReadXlogFromShareStorage(XLogRecPtr startLsn, char *buf, int expectReadLen);
 int WriteXlogToShareStorage(XLogRecPtr startLsn, char *buf, int writeLen);
-void FsyncXlogToShareStorage();
 Size SimpleValidatePage(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, char* page);
 void ShareStorageInit();
 void FindLastRecordCheckInfoOnShareStorage(XLogRecPtr *lastRecordPtr, pg_crc32 *lastRecordCrc,
@@ -832,6 +906,18 @@ void rename_recovery_conf_for_roach();
 bool CheckForFailoverTrigger(void);
 bool CheckForSwitchoverTrigger(void);
 void HandleCascadeStandbyPromote(XLogRecPtr *recptr);
+void update_dirty_page_queue_rec_lsn(XLogRecPtr current_insert_lsn, bool need_immediately_update = false);
+XLogRecord *ReadCheckpointRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, int whichChkpt);
+int emode_for_corrupt_record(int emode, XLogRecPtr RecPtr);
+bool timeLineInHistory(TimeLineID tli, List *expectedTLEs);
+Enum_TriggeredState CheckForSatartupStatus(void);
+bool CheckForStandbyTrigger(void);
+void UpdateMinrecoveryInAchive();
+bool NewDataIsInBuf(XLogRecPtr expectedRecPtr);
+bool rescanLatestTimeLine(void);
+int XLogFileReadAnyTLI(XLogSegNo segno, int emode, uint32 sources);
+int SSXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
+    XLogRecPtr targetRecPtr, char *readBuf, TimeLineID *readTLI, char* xlog_path);
 
 extern XLogRecPtr XlogRemoveSegPrimary;
 
@@ -885,6 +971,12 @@ static inline void WakeupWalSemaphore(PGSemaphore sema)
     PGSemaphoreUnlock(sema);
 }
 
+static inline void FsyncXlogToShareStorage()
+{
+    Assert(g_instance.xlog_cxt.shareStorageopCtl.isInit && (g_instance.xlog_cxt.shareStorageopCtl.opereateIf != NULL));
+    g_instance.xlog_cxt.shareStorageopCtl.opereateIf->fsync();
+}
+
 /*
  * Options for enum values stored in other modules
  */
@@ -905,9 +997,13 @@ void RecoveryDropSegsFromRemainSegsFile(struct HTAB* drop_segs_hbtl, char* buf, 
 void RecoveryShrinkExtentsFromRemainSegsFile(struct HTAB* shrink_extents_htbl, char* buf, uint32* used_len);
 void WriteRemainSegsFile(int fd, const char* buffer, uint32 used_len);
 void InitXlogStatuEntryTblSize();
-void CheckShareStorageWriteLock();
+void GetWritePermissionSharedStorage();
 XLogRecPtr GetFlushMainStandby();
 extern bool RecoveryIsSuspend(void);
 
 extern void InitUndoCountThreshold();
+
+/* for recovery */
+void SSWriteInstanceControlFile(int fd, const char* buffer, int id, off_t size);
+extern XlogKeeper* generate_xlog_keepers(void);
 #endif /* XLOG_H */

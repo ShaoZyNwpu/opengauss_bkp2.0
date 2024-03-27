@@ -1098,9 +1098,112 @@ drop procedure pro_tblof_pro_013_1();
 drop type pro_tblof_013;
 drop table pro_tblof_tbl_013;
 
+set behavior_compat_options = 'allow_procedure_compile_check';
+create or replace procedure pro19
+as
+a int;
+begin
+ select c1 from t1 into ;             
+ select c1 from t1  limit  1  a;       
+ select c1 from t1 where c2=1 intoo a; 
+ select c1 from t1 into b;                          
+end;
+/
+
+create or replace procedure pro20
+as
+a int;
+begin
+ select  into a from t1.c1;
+ select 1  into ab;
+end;
+/
+
+create or replace procedure pro21
+as
+a int;
+begin
+ select 1  into ab;
+ select 1  intoo a;
+ dbe_output.print_line('a  is:'||a);
+end;
+/
+
+create or replace procedure pro22
+as
+a int;
+b char(1);
+begin
+ b=:1;
+ select 1  into a;
+ dbe_output.print_line('a  is:'||a);
+end;
+/
+set behavior_compat_options = '';
+
 drop package if exists package_020;
 drop package if exists z_pk2;
 drop package if exists aa;
 truncate DBE_PLDEVELOPER.gs_source;
 truncate DBE_PLDEVELOPER.gs_errors;
+
+DO
+$$
+BEGIN
+  CREATE TABLE t(c float(0));
+END;
+$$;
+
+DO
+$$
+BEGIN
+  CREATE TABLE t(c float(55));
+END;
+$$;
+
+create or replace package pck1 as
+type t1 is ref cursor;
+type t2 is record(c1 t1,c2 int);
+end pck1;
+/
+
+create or replace function testInsertRecordError1() RETURNS int as $$
+declare
+i int;
+begin
+i = 1;
+insert into insert_table values i;
+return 1;
+end;
+$$ language plpgsql;
+
+truncate dbe_pldeveloper.gs_errors;
+create table tab_1139605(id int,a1 int);
+create function fun_1139605()return int
+as
+b int;
+begin
+select a1 into b,c from tab_1139605 where id=1;
+return b;
+end;
+/
+select count(*) from dbe_pldeveloper.gs_errors;
+
 set plsql_show_all_error to off;
+
+delete from DBE_PLDEVELOPER.gs_source;
+create package pac_1139606 is
+procedure pro_1139606();
+function fun_1139606();
+end pac_1139606;
+/
+select name, status, src from DBE_PLDEVELOPER.gs_source;
+delete from DBE_PLDEVELOPER.gs_source;
+
+create package pac_1139606 is
+procedure pro_1139606();
+end pac_1139606;
+/
+select name, status, src from DBE_PLDEVELOPER.gs_source;
+delete from DBE_PLDEVELOPER.gs_source;
+drop package pac_1139606;
